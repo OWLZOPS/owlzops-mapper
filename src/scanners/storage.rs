@@ -1,0 +1,32 @@
+use crate::models::{DiskInfo, StorageInfo};
+use std::process::Command;
+use sysinfo::Disks;
+
+pub fn gather_storage_info() -> StorageInfo {
+    let mut disks = Vec::new();
+    for disk in Disks::new_with_refreshed_list().list() {
+        let fs_type = disk.file_system().to_string_lossy().to_lowercase();
+        if fs_type.contains("squashfs") || fs_type.contains("tmpfs") || fs_type.contains("overlay") { continue; }
+
+        let mount_point = disk.mount_point().to_string_lossy().to_string();
+        let mut inode_usage = None;
+
+        if let Ok(output) = Command::new("df").arg("-i").arg(&mount_point).output() {
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = stdout_str.lines().collect();
+            if lines.len() > 1 {
+                let parts: Vec<&str> = lines[1].split_whitespace().collect();
+                if parts.len() >= 5 { inode_usage = Some(parts[4].to_string()); }
+            }
+        }
+
+        disks.push(DiskInfo {
+            mount_point,
+            total_gb: disk.total_space() / (1024 * 1024 * 1024),
+            used_gb: (disk.total_space() - disk.available_space()) / (1024 * 1024 * 1024),
+            inode_usage_percent: inode_usage,
+        });
+    }
+
+    StorageInfo { disks }
+}
