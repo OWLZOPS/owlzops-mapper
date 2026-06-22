@@ -56,7 +56,7 @@ jobs:
           - fedora:latest
           - rockylinux:8
           - rockylinux:9
-          - quay.io/centos/centos:stream9   # CentOS Stream 9
+          - quay.io/centos/centos:stream9
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: opensuse/leap:latest
-      options: --entrypoint /bin/bash   # исправляет отсутствие sh
+      options: --entrypoint /bin/bash
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
