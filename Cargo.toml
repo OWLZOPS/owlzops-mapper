@@ -6,7 +6,7 @@ description = "Owlzops Infrastructure Discovery Agent"
 
 [dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
-sysinfo = "0.30.13"
+sysinfo = "0.39.5"
 bollard = "0.16.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
