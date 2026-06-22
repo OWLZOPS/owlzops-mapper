@@ -1,0 +1,27 @@
+collectors:
+  - changed-files:
+      - any-glob-to-any-file: 'src/scanners/**'
+
+security:
+  - changed-files:
+      - any-glob-to-any-file: 'src/scanners/security.rs'
+      - any-glob-to-any-file: 'src/scanners/network.rs'
+
+docker:
+  - changed-files:
+      - any-glob-to-any-file: 'src/scanners/docker.rs'
+
+reporting:
+  - changed-files:
+      - any-glob-to-any-file: 'src/xlsx.rs'
+      - any-glob-to-any-file: 'src/ui.rs'
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file: 'docs/**'
+      - any-glob-to-any-file: '*.md'
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: '.github/**'
+      - any-glob-to-any-file: 'Cargo.toml'
