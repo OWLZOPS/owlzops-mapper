@@ -1,4 +1,5 @@
 mod models;
+mod exporters;
 mod scanners;
 mod ui;
 
@@ -22,12 +23,27 @@ struct Args {
     /// Off by default — the agent stays fully offline unless you opt in.
     #[arg(long, default_value_t = false)]
     external_ip: bool,
+
+    /// Hard guarantee of no outbound network calls, regardless of other flags.
+    /// If combined with --external-ip or --refresh-packages, --offline wins and
+    /// those flags are ignored (with a warning), so this flag can be relied on
+    /// as a strict safety switch — e.g. on an air-gapped host or restricted network zone.
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
+    /// Refresh the local package manager cache (apt-get update / dnf makecache /
+    /// pacman -Sy) before checking for upgradable packages. This is an outbound
+    /// network call, so it's opt-in. Without this flag, upgradable packages are
+    /// computed from whatever is already in the local cache (may be stale).
+    #[arg(long, default_value_t = false)]
+    refresh_packages: bool,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum OutputFormat {
     Text,
-    Json
+    Json,
+    Xlsx
 }
 
 impl std::fmt::Display for OutputFormat {
@@ -35,6 +51,7 @@ impl std::fmt::Display for OutputFormat {
         match self {
             OutputFormat::Text => write!(f, "text"),
             OutputFormat::Json => write!(f, "json"),
+            OutputFormat::Xlsx => write!(f, "xlsx"),
         }
     }
 }
@@ -45,8 +62,10 @@ impl std::fmt::Display for OutputFormat {
 
 fn is_running_as_root() -> bool {
     if let Ok(output) = Command::new("id").arg("-u").output() {
-        let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return uid == "0";
+        // Take a byte slice using [..] and convert it to &str
+        if let Ok(uid_str) = std::str::from_utf8(&output.stdout[..]) {
+            return uid_str.trim() == "0";
+        }
     }
     false
 }
@@ -64,15 +83,33 @@ async fn main() {
         eprintln!("WARNING: Script is NOT running as root/sudo! JSON data will be incomplete.");
     }
 
+    // --offline — guarantees that no outbound network requests will be made.
+    // Overrides --external-ip and --refresh-packages when used together.
+    // This allows the flag to be treated as a reliable safety switch,
+    // regardless of any other options passed on the command line.
+    let want_external_ip = if args.offline && args.external_ip {
+        eprintln!("WARNING: --offline overrides --external-ip; no outbound request will be made.");
+        false
+    } else {
+        args.external_ip
+    };
+    let want_refresh_packages = if args.offline && args.refresh_packages {
+        eprintln!("WARNING: --offline overrides --refresh-packages; package cache will not be refreshed.");
+        false
+    } else {
+        args.refresh_packages
+    };
+
     let mut sys = sysinfo::System::new_all();
 
     // Triggering modular scanners
     let dbs = scanners::host::gather_databases_info();
-    let host_info = scanners::host::gather_host_info(&mut sys, args.external_ip);
+    let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
     let network_info = scanners::network::gather_network_info();
     let storage_info = scanners::storage::gather_storage_info();
     let security_info = scanners::security::gather_security_info();
     let topology_info = scanners::docker::gather_docker_topology().await;
+    let packages_info = scanners::packages::gather_packages_info(want_refresh_packages);
 
     let report = AgentReport {
         scan_id: uuid::Uuid::new_v4().to_string(),
@@ -84,6 +121,7 @@ async fn main() {
         storage: storage_info,
         topology: topology_info,
         security: security_info,
+        packages: packages_info,
     };
 
     match args.format {
@@ -95,6 +133,13 @@ async fn main() {
         }
         OutputFormat::Text => {
             ui::render_dashboard(&report);
+        }
+        OutputFormat::Xlsx => {
+            let filename = format!("owlzops-report-{}.xlsx", report.host.hostname);
+            match exporters::xlsx::write_report(&report, &filename) {
+                Ok(_) => println!("✅ Excel report successfully generated: {}", filename),
+                Err(e) => eprintln!("❌ Failed to generate Excel report: {}", e),
+            }
         }
     }
 }

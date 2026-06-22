@@ -4,9 +4,9 @@ use std::process::Command;
 use sysinfo::{ProcessStatus, System};
 
 fn get_dir_size_mb(path: &str) -> u64 {
-    // Прямой вызов du с аргументами вместо `sh -c "du -sm {path}"` —
-    // не зависим от особенностей экранирования в shell, path передаётся как есть,
-    // даже если в нём пробелы или спецсимволы.
+    // Directly invoke `du` with arguments instead of `sh -c "du -sm {path}"`.
+    // This avoids relying on shell escaping rules: `path` is passed as-is,
+    // even if it contains spaces or special characters.
     if let Ok(output) = Command::new("timeout").args(["10s", "du", "-sm", path]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if let Some(first_val) = stdout.split_whitespace().next() {
@@ -85,14 +85,16 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     sys.refresh_all();
     let reboot_required = std::path::Path::new("/var/run/reboot-required").exists();
 
-    // Внешний IP требует исходящего запроса к стороннему сервису (ifconfig.me).
-    // Это единственный сетевой вызов во всём сканере, поэтому он строго opt-in
-    // через --external-ip: по умолчанию агент остаётся полностью offline и не
-    // зависит от доступности интернета / не делает исходящих запросов без явного согласия.
+    // Retrieving the external IP requires an outbound request to a third-party
+    // service (ifconfig.me). This is the only network call in the entire scanner,
+    // so it is strictly opt-in via --external-ip. By default, the agent remains
+    // fully offline, does not depend on internet availability, and makes no
+    // outbound requests without explicit user consent.
     let mut external_ipv4 = "unknown (use --external-ip to detect)".to_string();
     if fetch_external_ip {
         external_ipv4 = "unknown".to_string();
-        // --max-time 5 — чтобы при недоступном интернете агент не зависал в ожидании curl.
+        // --max-time 5 prevents the agent from hanging while waiting for curl
+        // if internet connectivity is unavailable.
         if let Ok(output) = Command::new("curl").args(["-s", "-4", "--max-time", "5", "https://ifconfig.me"]).output() {
             let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !ip.is_empty() { external_ipv4 = ip; }

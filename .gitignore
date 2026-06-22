@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.xlsx
+*.json
+**/*.rs.bk
+.env
+.DS_Store

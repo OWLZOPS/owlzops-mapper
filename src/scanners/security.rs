@@ -2,10 +2,10 @@ use crate::models::{SecurityInfo, UserInfo};
 use std::fs;
 use std::process::Command;
 
-/// Достаём значение директивы из вывода `sshd -T` (формат: "directive value").
-/// Это эффективная конфигурация sshd — она уже учитывает все `Include`-файлы
-/// (например /etc/ssh/sshd_config.d/*.conf) и платформенные дефолты,
-/// так что не нужно самим парсить и собирать список конфигурационных файлов.
+/// Extract a directive value from `sshd -T` output (format: "directive value").
+/// This is the effective sshd configuration — it already accounts for all
+/// `Include` files (for example /etc/ssh/sshd_config.d/*.conf) and platform
+/// defaults, so there is no need to manually parse and merge configuration files.
 fn sshd_effective_config() -> Option<String> {
     let output = Command::new("sshd").arg("-T").output().ok()?;
     if !output.status.success() { return None; }
@@ -25,9 +25,9 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
     })
 }
 
-/// Fallback на случай, если `sshd -T` недоступен (не root, бинарник не в PATH и т.п.):
-/// читаем только основной файл — это менее точно (не видит Include-файлы и дефолты),
-/// но лучше, чем ничего.
+/// Fallback used when `sshd -T` is unavailable (no root access, binary not in PATH, etc.).
+/// In this case, we read only the main config file — this is less accurate (it does not
+/// include `Include` files or platform defaults), but better than nothing.
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     if let Ok(sshd_config) = fs::read_to_string("/etc/ssh/sshd_config") {
         for line in sshd_config.lines() {

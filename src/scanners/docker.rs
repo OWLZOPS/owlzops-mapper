@@ -48,8 +48,8 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         }
                     }
 
-                    // Один inspect на контейнер вместо двух — mounts и log_path берём
-                    // из одного и того же ответа, экономим round-trip к Docker daemon.
+                    // Use a single inspect call per container: both mounts and log_path come
+                    // from the same response, avoiding an extra round trip to the Docker daemon.
                     let mut mounts_vec = Vec::new();
                     let mut log_size_mb = 0;
                     if let Ok(inspect) = docker.inspect_container(&name, None).await {

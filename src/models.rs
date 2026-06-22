@@ -11,6 +11,7 @@ pub struct AgentReport {
     pub storage: StorageInfo,
     pub topology: TopologyInfo,
     pub security: SecurityInfo,
+    pub packages: PackagesInfo,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -69,6 +70,13 @@ pub struct NetworkInfo {
 pub struct SslCertInfo {
     pub domain: String,
     pub expiry_date: String,
+    /// None if the expiration date could not be parsed
+    /// (for example, if OpenSSL is unavailable or failed).
+    pub days_remaining: Option<i64>,
+    /// Less than 7 days until expiration.
+    pub is_critical: bool,
+    /// Less than 30 days until expiration (and not critical).
+    pub is_warning: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -134,4 +142,32 @@ pub struct UserInfo {
     pub last_login: String,
     pub last_ssh_login: String,
     pub authorized_keys_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum PackageManager {
+    Apt,
+    Dnf,
+    Yum,
+    Pacman,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UpgradablePackage {
+    pub name: String,
+    pub current_version: String,
+    pub new_version: String,
+    pub is_security: bool,
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PackagesInfo {
+    pub manager: PackageManager,
+    pub installed_count: usize,
+    pub upgradable: Vec<UpgradablePackage>,
+    /// Whether the local repository cache was refreshed before checking
+    /// for updates (via --refresh-packages). If false, `upgradable` was
+    /// calculated using whatever data was already present in the cache at
+    /// scan time, so the results may be outdated.
+    pub cache_refreshed: bool,
 }

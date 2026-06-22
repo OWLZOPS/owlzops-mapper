@@ -1,6 +1,19 @@
 use crate::models::{NetworkInfo, PortInfo, SslCertInfo};
+use chrono::{NaiveDateTime, Utc};
 use std::fs;
 use std::process::Command;
+
+/// openssl `-enddate` always returns dates in the format
+/// "MMM D HH:MM:SS YYYY GMT", for example:
+/// "Sep 15 12:00:00 2026 GMT".
+/// The timezone is always GMT, so we parse it as a naive datetime
+/// and treat it directly as UTC.
+fn parse_openssl_enddate(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim().trim_end_matches("GMT").trim();
+    let naive = NaiveDateTime::parse_from_str(trimmed, "%b %e %H:%M:%S %Y").ok()?;
+    let expiry_utc = naive.and_utc();
+    Some((expiry_utc - Utc::now()).num_days())
+}
 
 pub fn gather_network_info() -> NetworkInfo {
     let mut listening_ports = Vec::new();
@@ -54,13 +67,20 @@ pub fn gather_network_info() -> NetworkInfo {
                 let domain = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let cert_path = path.join("cert.pem");
                 let mut expiry_date = "unknown".to_string();
+                let mut days_remaining = None;
                 if cert_path.exists() {
                     if let Ok(output) = Command::new("openssl").args(["x509", "-enddate", "-noout", "-in", cert_path.to_str().unwrap_or("")]).output() {
                         let out_str = String::from_utf8_lossy(&output.stdout);
-                        if out_str.starts_with("notAfter=") { expiry_date = out_str.replace("notAfter=", "").trim().to_string(); }
+                        if out_str.starts_with("notAfter=") {
+                            let date_part = out_str.replace("notAfter=", "").trim().to_string();
+                            days_remaining = parse_openssl_enddate(&date_part);
+                            expiry_date = date_part;
+                        }
                     }
                 }
-                ssl_certificates.push(SslCertInfo { domain, expiry_date });
+                let is_critical = days_remaining.map(|d| d < 7).unwrap_or(false);
+                let is_warning = !is_critical && days_remaining.map(|d| d < 30).unwrap_or(false);
+                ssl_certificates.push(SslCertInfo { domain, expiry_date, days_remaining, is_critical, is_warning });
             }
         }
     }
