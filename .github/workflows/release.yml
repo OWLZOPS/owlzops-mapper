@@ -9,84 +9,72 @@ permissions:
   contents: write
 
 jobs:
-  build-x86_64:
-    name: Build x86_64
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: owlzops-mapper-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: owlzops-mapper-linux-arm64.tar.gz
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build
-        run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: Package
-        run: |
-          cd target/x86_64-unknown-linux-musl/release
-          tar czf ../../../../owlzops-mapper-linux-x86_64.tar.gz owlzops-mapper
-          cd ../../../..
-          sha256sum owlzops-mapper-linux-x86_64.tar.gz > owlzops-mapper-linux-x86_64.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: x86_64-artifacts
-          path: |
-            owlzops-mapper-linux-x86_64.tar.gz
-            owlzops-mapper-linux-x86_64.tar.gz.sha256
 
-  build-aarch64:
-    name: Build aarch64
-    runs-on: ubuntu-24.04-arm   # нативный ARM64 раннер (публичный репозиторий)
-    steps:
-      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
+
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        run: cargo build --release --target ${{ matrix.target }}
+
       - name: Package
         run: |
-          cd target/aarch64-unknown-linux-musl/release
-          tar czf ../../../../owlzops-mapper-linux-arm64.tar.gz owlzops-mapper
-          cd ../../../..
-          sha256sum owlzops-mapper-linux-arm64.tar.gz > owlzops-mapper-linux-arm64.tar.gz.sha256
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.archive }} owlzops-mapper
+          cd ../../..
+          sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
+
       - uses: actions/upload-artifact@v4
         with:
-          name: aarch64-artifacts
+          name: ${{ matrix.archive }}
           path: |
-            owlzops-mapper-linux-arm64.tar.gz
-            owlzops-mapper-linux-arm64.tar.gz.sha256
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
 
   sign:
     name: Sign artifacts
-    needs: [build-x86_64, build-aarch64]
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download x86_64 artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: x86_64-artifacts
-      - name: Download aarch64 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: aarch64-artifacts
+          merge-multiple: true
+
       - name: Import GPG key
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
           echo "trusted-key $(gpg --list-keys --with-colons | grep '^pub' | cut -d: -f5)" >> ~/.gnupg/gpg.conf
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-      - name: Sign checksums and archives
+
+      - name: Sign all archives and checksums
         run: |
           for file in *.tar.gz *.sha256; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --detach-sign --armor "$file"
           done
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: signed-artifacts
@@ -97,22 +85,26 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [sign]
+    needs: sign
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Download signed artifacts
         uses: actions/download-artifact@v4
         with:
           name: signed-artifacts
+
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
         with:
           tool: git-cliff
+
       - name: Generate changelog
         run: git-cliff --latest --strip header -o RELEASE_NOTES.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
