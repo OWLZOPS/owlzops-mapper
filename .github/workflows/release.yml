@@ -19,7 +19,6 @@ jobs:
             archive: owlzops-mapper-linux-x86_64.tar.gz
           - target: aarch64-unknown-linux-musl
             archive: owlzops-mapper-linux-arm64.tar.gz
-
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +28,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build with cross (for non-x86_64 targets)
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build native (for x86_64-unknown-linux-musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
