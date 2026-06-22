@@ -56,11 +56,17 @@ jobs:
       matrix:
         container:
           - debian:stable
-          - centos:7
+          - almalinux:8
           - almalinux:9
+          - redhat/ubi8:latest
+          - redhat/ubi9:latest
+          - fedora:latest
+          - opensuse/leap:latest
+          - rockylinux:8
+          - rockylinux:9
 
     env:
-      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # смягчает ошибки Node.js в старых контейнерах
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # подавляет warning Node.js в старых контейнерах
 
     steps:
       - uses: actions/checkout@v4
@@ -70,9 +76,15 @@ jobs:
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update && apt-get install -y curl gcc make
           elif command -v dnf >/dev/null 2>&1; then
-            # AlmaLinux: curl-minimal уже есть, пробуем поставить полный curl, иначе просто gcc/make
+            # Fedora, AlmaLinux, Rocky Linux, RHEL UBI 8/9 с dnf
             dnf install -y --allowerasing gcc make curl 2>/dev/null || \
             dnf install -y gcc make
+          elif command -v microdnf >/dev/null 2>&1; then
+            # Red Hat UBI с microdnf
+            microdnf install -y gcc make curl
+          elif command -v zypper >/dev/null 2>&1; then
+            # openSUSE
+            zypper --non-interactive install gcc make curl
           elif command -v yum >/dev/null 2>&1; then
             yum install -y curl gcc make
           fi
