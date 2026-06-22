@@ -5,3 +5,6 @@ Cargo.lock
 **/*.rs.bk
 .env
 .DS_Store
+# GPG private keys
+*.asc
+!gpg-public-key.asc

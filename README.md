@@ -9,15 +9,21 @@ Linux server audit in seconds and exports the result to Excel, JSON or
 terminal. No internet required. No data leaves the server.
 
 For sysadmins it's instant inventory. For CTOs it's technical debt visibility. For CEOs it's
-risk and and cost optimization.
+risk and cost optimization.
 
 ---
 
 ## Quick Start
 
+**Option 1 – direct download:**
 ```bash
-# Download the latest binary
 curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzops-mapper-linux-x86_64.tar.gz | tar xz
+sudo ./owlzops-mapper
+```
+
+**Option 2 – install script (verifies SHA256):**
+```bash
+curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
 sudo ./owlzops-mapper
 ```
 
@@ -71,6 +77,17 @@ sudo ./target/release/owlzops-mapper
 ```
 
 Requires: Rust 1.75+, Linux target.
+
+## Verifying Releases
+
+All release artifacts are GPG-signed and SHA256 checksums are published.
+The project public key is [`gpg-public-key.asc`](gpg-public-key.asc).
+To verify:
+
+```bash
+gpg --import gpg-public-key.asc
+gpg --verify owlzops-mapper-linux-x86_64.tar.gz.asc owlzops-mapper-linux-x86_64.tar.gz
+```
 
 ## License
 
