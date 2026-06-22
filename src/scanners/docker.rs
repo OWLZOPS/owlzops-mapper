@@ -95,10 +95,10 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                                 }
                             }
                         }
-                        if let Some(log_path) = inspect.log_path {
-                            if let Ok(meta) = fs::metadata(&log_path) {
-                                log_size_mb = meta.len() / (1024 * 1024);
-                            }
+                        if let Some(log_path) = inspect.log_path
+                            && let Ok(meta) = fs::metadata(&log_path)
+                        {
+                            log_size_mb = meta.len() / (1024 * 1024);
                         }
                     }
 
@@ -125,10 +125,9 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             if let Ok(volumes_resp) = docker
                 .list_volumes(Some(ListVolumesOptions { filters: filter }))
                 .await
+                && let Some(vols) = volumes_resp.volumes
             {
-                if let Some(vols) = volumes_resp.volumes {
-                    dangling_volumes_count = vols.len();
-                }
+                dangling_volumes_count = vols.len();
             }
             TopologyInfo {
                 docker_active: true,

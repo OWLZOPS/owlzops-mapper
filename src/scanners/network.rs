@@ -25,12 +25,10 @@ pub fn gather_network_info() -> NetworkInfo {
             firewall_active = true;
         }
     }
-    if !firewall_active {
-        if let Ok(output) = Command::new("firewall-cmd").arg("--state").output() {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            if stdout.contains("running") {
-                firewall_active = true;
-            }
+    if !firewall_active && let Ok(output) = Command::new("firewall-cmd").arg("--state").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        if stdout.contains("running") {
+            firewall_active = true;
         }
     }
 
@@ -83,8 +81,8 @@ pub fn gather_network_info() -> NetworkInfo {
                 let cert_path = path.join("cert.pem");
                 let mut expiry_date = "unknown".to_string();
                 let mut days_remaining = None;
-                if cert_path.exists() {
-                    if let Ok(output) = Command::new("openssl")
+                if cert_path.exists()
+                    && let Ok(output) = Command::new("openssl")
                         .args([
                             "x509",
                             "-enddate",
@@ -93,13 +91,12 @@ pub fn gather_network_info() -> NetworkInfo {
                             cert_path.to_str().unwrap_or(""),
                         ])
                         .output()
-                    {
-                        let out_str = String::from_utf8_lossy(&output.stdout);
-                        if out_str.starts_with("notAfter=") {
-                            let date_part = out_str.replace("notAfter=", "").trim().to_string();
-                            days_remaining = parse_openssl_enddate(&date_part);
-                            expiry_date = date_part;
-                        }
+                {
+                    let out_str = String::from_utf8_lossy(&output.stdout);
+                    if out_str.starts_with("notAfter=") {
+                        let date_part = out_str.replace("notAfter=", "").trim().to_string();
+                        days_remaining = parse_openssl_enddate(&date_part);
+                        expiry_date = date_part;
                     }
                 }
                 let is_critical = days_remaining.map(|d| d < 7).unwrap_or(false);
@@ -128,7 +125,7 @@ pub fn gather_network_info() -> NetworkInfo {
                 };
                 let port = local_addr_col
                     .split(':')
-                    .last()
+                    .next_back()
                     .unwrap_or("unknown")
                     .to_string();
                 let mut process_name = "unknown".to_string();

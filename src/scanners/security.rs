@@ -66,7 +66,7 @@ pub fn gather_security_info() -> SecurityInfo {
     }
 
     if let Ok(contents) = fs::read_to_string("/etc/passwd") {
-        let valid_shells = vec!["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/ash"];
+        let valid_shells = ["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/ash"];
         for line in contents.lines() {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() == 7 {

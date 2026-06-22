@@ -211,10 +211,10 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     if let Ok(vendor) = fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
         hosting_provider = vendor.trim().to_string();
     }
-    if hosting_provider == "unknown" || hosting_provider == "QEMU" || hosting_provider.is_empty() {
-        if let Ok(product) = fs::read_to_string("/sys/class/dmi/id/product_name") {
-            hosting_provider = product.trim().to_string();
-        }
+    if (hosting_provider == "unknown" || hosting_provider == "QEMU" || hosting_provider.is_empty())
+        && let Ok(product) = fs::read_to_string("/sys/class/dmi/id/product_name")
+    {
+        hosting_provider = product.trim().to_string();
     }
 
     let mut os_install_date = "unknown".to_string();
@@ -224,17 +224,16 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
             os_install_date = date;
         }
     }
-    if os_install_date == "unknown" || os_install_date == "-" {
-        if let Ok(output) = Command::new("stat")
+    if (os_install_date == "unknown" || os_install_date == "-")
+        && let Ok(output) = Command::new("stat")
             .arg("-c")
             .arg("%y")
             .arg("/etc/machine-id")
             .output()
-        {
-            let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !date.is_empty() && date != "-" {
-                os_install_date = date;
-            }
+    {
+        let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !date.is_empty() && date != "-" {
+            os_install_date = date;
         }
     }
 
