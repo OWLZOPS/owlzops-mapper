@@ -21,27 +21,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
-
       - name: Check formatting
         run: cargo fmt --all -- --check
-
       - name: Clippy (warnings as errors)
         run: cargo clippy --all-targets -- -D warnings
-
       - name: Build
         run: cargo build
-
       - name: Run tests
         run: cargo test
-
       - name: Security audit
         uses: rustsec/audit-check@v1
         with:
@@ -61,41 +54,51 @@ jobs:
           - redhat/ubi8:latest
           - redhat/ubi9:latest
           - fedora:latest
-          - opensuse/leap:latest
           - rockylinux:8
           - rockylinux:9
-
+          - quay.io/centos/centos:stream9   # CentOS Stream 9
     env:
-      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # подавляет warning Node.js в старых контейнерах
-
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - uses: actions/checkout@v4
-
       - name: Install system dependencies (build-only)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update && apt-get install -y curl gcc make
           elif command -v dnf >/dev/null 2>&1; then
-            # Fedora, AlmaLinux, Rocky Linux, RHEL UBI 8/9 с dnf
-            dnf install -y --allowerasing gcc make curl 2>/dev/null || \
-            dnf install -y gcc make
+            dnf install -y --allowerasing gcc make curl 2>/dev/null || dnf install -y gcc make
           elif command -v microdnf >/dev/null 2>&1; then
-            # Red Hat UBI с microdnf
             microdnf install -y gcc make curl
-          elif command -v zypper >/dev/null 2>&1; then
-            # openSUSE
-            zypper --non-interactive install gcc make curl
           elif command -v yum >/dev/null 2>&1; then
             yum install -y curl gcc make
           fi
-
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Build
         run: cargo build
+      - name: Run tests
+        run: cargo test
 
+  test-opensuse:
+    name: Test in openSUSE Leap
+    runs-on: ubuntu-latest
+    container:
+      image: opensuse/leap:latest
+      options: --entrypoint /bin/bash   # исправляет отсутствие sh
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          zypper --non-interactive install gcc make curl
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Build
+        run: cargo build
       - name: Run tests
         run: cargo test
