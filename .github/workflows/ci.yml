@@ -60,17 +60,19 @@ jobs:
           - almalinux:9
 
     env:
-      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # для CentOS 7, чтобы избежать warning при cleanup
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true   # смягчает ошибки Node.js в старых контейнерах
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (only needed for build)
+      - name: Install system dependencies (build-only)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update && apt-get install -y curl gcc make
           elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y curl gcc make
+            # AlmaLinux: curl-minimal уже есть, пробуем поставить полный curl, иначе просто gcc/make
+            dnf install -y --allowerasing gcc make curl 2>/dev/null || \
+            dnf install -y gcc make
           elif command -v yum >/dev/null 2>&1; then
             yum install -y curl gcc make
           fi

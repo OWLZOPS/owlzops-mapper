@@ -1,7 +1,7 @@
 # owlzops-mapper
 [![CI](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml/badge.svg)](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
-[![License](https://img.shields.io/github/license/OWLZOPS/owlzops-mapper?style=flat)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 > One binary. One command. Full picture of your server.
 
 **owlzops-mapper** is a self-contained Rust binary that performs a complete
