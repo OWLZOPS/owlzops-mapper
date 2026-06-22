@@ -52,19 +52,52 @@ jobs:
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
 
+  sign:
+    name: Sign artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Import GPG key
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "trusted-key $(gpg --list-keys --with-colons | grep '^pub' | cut -d: -f5)" >> ~/.gnupg/gpg.conf
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Sign checksums and archives
+        run: |
+          for file in *.tar.gz *.sha256; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --detach-sign --armor "$file"
+          done
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-artifacts
+          path: |
+            *.tar.gz
+            *.sha256
+            *.asc
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, sign]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download artifacts
+      - name: Download signed artifacts
         uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
+          name: signed-artifacts
 
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
@@ -81,5 +114,6 @@ jobs:
           files: |
             *.tar.gz
             *.sha256
+            *.asc
           draft: false
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}

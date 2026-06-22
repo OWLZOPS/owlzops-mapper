@@ -1,0 +1,44 @@
+# git-cliff configuration for owlzops-mapper
+[changelog]
+header = "# Changelog\n"
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+## {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+footer = """
+{% if github.release %}
+**Full Changelog:** {{ github.release_url }}
+{% endif %}
+"""
+postprocessors = [
+    { pattern = 'feat', replace = 'Features' },
+    { pattern = 'fix', replace = 'Bug Fixes' },
+    { pattern = 'perf', replace = 'Performance Improvements' },
+    { pattern = 'refactor', replace = 'Refactoring' },
+    { pattern = 'docs', replace = 'Documentation' },
+    { pattern = 'test', replace = 'Testing' },
+    { pattern = 'ci', replace = 'CI/CD' },
+    { pattern = 'build', replace = 'Build System' },
+    { pattern = 'chore', replace = 'Miscellaneous' },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+commit_parsers = [
+    { message = "^feat", group = "feat" },
+    { message = "^fix", group = "fix" },
+    { message = "^perf", group = "perf" },
+    { message = "^refactor", group = "refactor" },
+    { message = "^docs", group = "docs" },
+    { message = "^test", group = "test" },
+    { message = "^ci", group = "ci" },
+    { message = "^build", group = "build" },
+    { message = "^chore", group = "chore" },
+    { message = "^revert", group = "revert" },
+]
