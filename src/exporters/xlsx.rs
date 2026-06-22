@@ -10,7 +10,9 @@ fn header_format() -> Format {
 }
 
 fn critical_format() -> Format {
-    Format::new().set_font_color(Color::RGB(0xC00000)).set_bold()
+    Format::new()
+        .set_font_color(Color::RGB(0xC00000))
+        .set_bold()
 }
 
 fn warning_format() -> Format {
@@ -22,7 +24,10 @@ fn ok_format() -> Format {
 }
 /// Writes the header row and automatically expands columns to fit their length
 /// (minimum width).
-fn write_headers(sheet: &mut rust_xlsxwriter::Worksheet, headers: &[&str]) -> Result<(), XlsxError> {
+fn write_headers(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    headers: &[&str],
+) -> Result<(), XlsxError> {
     let fmt = header_format();
     for (col, h) in headers.iter().enumerate() {
         sheet.write_string_with_format(0, col as u16, *h, &fmt)?;
@@ -48,12 +53,27 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         ("Uptime (days)", report.host.uptime_days.to_string()),
         ("Reboot required", report.host.reboot_required.to_string()),
         ("CPU cores", report.host.cpu_cores.to_string()),
-        ("RAM total (GB)", format!("{:.2}", report.host.total_ram_mb as f64 / 1024.0)),
-        ("Swap total (GB)", format!("{:.2}", report.host.swap_total_mb as f64 / 1024.0)),
-        ("Load average", format!("{:.2}, {:.2}, {:.2}", report.host.load_average.0, report.host.load_average.1, report.host.load_average.2)),
+        (
+            "RAM total (GB)",
+            format!("{:.2}", report.host.total_ram_mb as f64 / 1024.0),
+        ),
+        (
+            "Swap total (GB)",
+            format!("{:.2}", report.host.swap_total_mb as f64 / 1024.0),
+        ),
+        (
+            "Load average",
+            format!(
+                "{:.2}, {:.2}, {:.2}",
+                report.host.load_average.0, report.host.load_average.1, report.host.load_average.2
+            ),
+        ),
         ("OOM kills", report.host.oom_kills.to_string()),
         ("Zombie processes", report.host.zombie_processes.to_string()),
-        ("Security modules (LSM)", report.host.security_modules.join(", ")),
+        (
+            "Security modules (LSM)",
+            report.host.security_modules.join(", "),
+        ),
         ("Tech stack", report.host.tech_stack.join(", ")),
     ];
     for (i, (label, value)) in rows.iter().enumerate() {
@@ -107,8 +127,12 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
         sheet.write_string(row, 0, &cert.domain)?;
         sheet.write_string(row, 1, &cert.expiry_date)?;
         match cert.days_remaining {
-            Some(d) if cert.is_critical => sheet.write_number_with_format(row, 2, d as f64, &critical)?,
-            Some(d) if cert.is_warning => sheet.write_number_with_format(row, 2, d as f64, &warning)?,
+            Some(d) if cert.is_critical => {
+                sheet.write_number_with_format(row, 2, d as f64, &critical)?
+            }
+            Some(d) if cert.is_warning => {
+                sheet.write_number_with_format(row, 2, d as f64, &warning)?
+            }
             Some(d) => sheet.write_number_with_format(row, 2, d as f64, &ok)?,
             None => sheet.write_string(row, 2, "unknown")?,
         };
@@ -116,7 +140,12 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
 
     // Custom /etc/hosts overrides
     let hosts_start = ssl_start + report.network.ssl_certificates.len() as u32 + 3;
-    sheet.write_string_with_format(hosts_start, 0, "Custom /etc/hosts Overrides", &header_format())?;
+    sheet.write_string_with_format(
+        hosts_start,
+        0,
+        "Custom /etc/hosts Overrides",
+        &header_format(),
+    )?;
     for (i, h) in report.network.custom_host_overrides.iter().enumerate() {
         sheet.write_string(hosts_start + 1 + i as u32, 0, h)?;
     }
@@ -135,15 +164,37 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     let safe = ok_format();
 
     sheet.write_string_with_format(0, 0, "SSH Password Auth Enabled", &header_format())?;
-    let pa_fmt = if report.security.ssh_password_auth_enabled { &risky } else { &safe };
-    sheet.write_string_with_format(0, 1, report.security.ssh_password_auth_enabled.to_string(), pa_fmt)?;
+    let pa_fmt = if report.security.ssh_password_auth_enabled {
+        &risky
+    } else {
+        &safe
+    };
+    sheet.write_string_with_format(
+        0,
+        1,
+        report.security.ssh_password_auth_enabled.to_string(),
+        pa_fmt,
+    )?;
 
     sheet.write_string_with_format(1, 0, "SSH Root Login Enabled", &header_format())?;
-    let rl_fmt = if report.security.ssh_root_login_enabled { &risky } else { &safe };
-    sheet.write_string_with_format(1, 1, report.security.ssh_root_login_enabled.to_string(), rl_fmt)?;
+    let rl_fmt = if report.security.ssh_root_login_enabled {
+        &risky
+    } else {
+        &safe
+    };
+    sheet.write_string_with_format(
+        1,
+        1,
+        report.security.ssh_root_login_enabled.to_string(),
+        rl_fmt,
+    )?;
 
     let users_start = 3u32;
-    write_headers_at(&mut sheet, users_start, &["User", "Last Login", "Last Remote SSH", "Authorized Keys"])?;
+    write_headers_at(
+        &mut sheet,
+        users_start,
+        &["User", "Last Login", "Last Remote SSH", "Authorized Keys"],
+    )?;
     for (i, u) in report.security.shell_users.iter().enumerate() {
         let row = users_start + 1 + i as u32;
         sheet.write_string(row, 0, &u.username)?;
@@ -173,7 +224,19 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
     sheet.write_number(3, 1, report.topology.total_dangling_size_mb as f64 / 1024.0)?;
 
     let containers_start = 5u32;
-    write_headers_at(&mut sheet, containers_start, &["Name", "Image", "State", "Status", "Size (GB)", "Log Size (GB)", "Mounts"])?;
+    write_headers_at(
+        &mut sheet,
+        containers_start,
+        &[
+            "Name",
+            "Image",
+            "State",
+            "Status",
+            "Size (GB)",
+            "Log Size (GB)",
+            "Mounts",
+        ],
+    )?;
     for (i, c) in report.topology.containers.iter().enumerate() {
         let row = containers_start + 1 + i as u32;
         sheet.write_string(row, 0, &c.name)?;
@@ -210,7 +273,11 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string(2, 1, report.packages.cache_refreshed.to_string())?;
 
     let upg_start = 4u32;
-    write_headers_at(&mut sheet, upg_start, &["Package", "Current", "Available", "Security"])?;
+    write_headers_at(
+        &mut sheet,
+        upg_start,
+        &["Package", "Current", "Available", "Security"],
+    )?;
     let critical = critical_format();
     let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
     sorted.sort_by(|a, b| b.is_security.cmp(&a.is_security));
@@ -234,7 +301,11 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
 
 /// Same logic as `write_headers`, but starting from an arbitrary row —
 /// needed for sheets where multiple tables are placed one after another under a single heading.
-fn write_headers_at(sheet: &mut rust_xlsxwriter::Worksheet, row: u32, headers: &[&str]) -> Result<(), XlsxError> {
+fn write_headers_at(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    row: u32,
+    headers: &[&str],
+) -> Result<(), XlsxError> {
     let fmt = header_format();
     for (col, h) in headers.iter().enumerate() {
         sheet.write_string_with_format(row, col as u16, *h, &fmt)?;

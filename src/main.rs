@@ -1,19 +1,23 @@
-mod models;
 mod exporters;
+mod models;
 mod scanners;
 mod ui;
 
-use clap::{Parser, ValueEnum};
 use chrono::Utc;
-use std::process::Command;
+use clap::{Parser, ValueEnum};
 use models::AgentReport;
+use std::process::Command;
 
 // =====================================================================
 // CLI Arguments Setup
 // =====================================================================
 
 #[derive(Parser, Debug)]
-#[command(author = "Owlzops", version = "0.1.1", about = "Infrastructure Discovery Agent")]
+#[command(
+    author = "Owlzops",
+    version = "0.1.1",
+    about = "Infrastructure Discovery Agent"
+)]
 struct Args {
     /// Format of the output report
     #[arg(short, long, default_value_t = OutputFormat::Text)]
@@ -43,7 +47,7 @@ struct Args {
 enum OutputFormat {
     Text,
     Json,
-    Xlsx
+    Xlsx,
 }
 
 impl std::fmt::Display for OutputFormat {
@@ -94,7 +98,9 @@ async fn main() {
         args.external_ip
     };
     let want_refresh_packages = if args.offline && args.refresh_packages {
-        eprintln!("WARNING: --offline overrides --refresh-packages; package cache will not be refreshed.");
+        eprintln!(
+            "WARNING: --offline overrides --refresh-packages; package cache will not be refreshed."
+        );
         false
     } else {
         args.refresh_packages
@@ -125,12 +131,10 @@ async fn main() {
     };
 
     match args.format {
-        OutputFormat::Json => {
-            match serde_json::to_string_pretty(&report) {
-                Ok(json) => println!("{}", json),
-                Err(e) => eprintln!("Error serializing Owlzops report: {}", e),
-            }
-        }
+        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Error serializing Owlzops report: {}", e),
+        },
         OutputFormat::Text => {
             ui::render_dashboard(&report);
         }

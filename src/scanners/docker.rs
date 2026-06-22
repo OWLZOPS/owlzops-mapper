@@ -1,8 +1,8 @@
 use crate::models::{ContainerInfo, DanglingImageInfo, TopologyInfo};
+use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::image::ListImagesOptions;
 use bollard::volume::ListVolumesOptions;
-use bollard::Docker;
 use std::default::Default;
 use std::fs;
 
@@ -16,35 +16,70 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             let mut total_dangling_size_mb = 0;
             let mut dangling_images = Vec::new();
 
-            if let Ok(images) = docker.list_images(Some(ListImagesOptions::<String> { all: true, ..Default::default() })).await {
+            if let Ok(images) = docker
+                .list_images(Some(ListImagesOptions::<String> {
+                    all: true,
+                    ..Default::default()
+                }))
+                .await
+            {
                 for img in images {
                     images_count += 1;
                     let size_mb = (img.size / (1024 * 1024)) as u64;
                     total_images_size_mb += size_mb;
 
-                    if img.repo_tags.is_empty() || img.repo_tags.contains(&"<none>:<none>".to_string()) {
+                    if img.repo_tags.is_empty()
+                        || img.repo_tags.contains(&"<none>:<none>".to_string())
+                    {
                         dangling_images_count += 1;
                         total_dangling_size_mb += size_mb;
                         let raw_id = img.id.replace("sha256:", "");
-                        let short_id = if raw_id.len() > 12 { raw_id[..12].to_string() } else { raw_id };
-                        dangling_images.push(DanglingImageInfo { id: short_id, size_mb });
+                        let short_id = if raw_id.len() > 12 {
+                            raw_id[..12].to_string()
+                        } else {
+                            raw_id
+                        };
+                        dangling_images.push(DanglingImageInfo {
+                            id: short_id,
+                            size_mb,
+                        });
                     }
                 }
             }
             dangling_images.sort_by(|a, b| b.size_mb.cmp(&a.size_mb));
 
-            if let Ok(containers) = docker.list_containers(Some(ListContainersOptions::<String> { all: true, size: true, ..Default::default() })).await {
+            if let Ok(containers) = docker
+                .list_containers(Some(ListContainersOptions::<String> {
+                    all: true,
+                    size: true,
+                    ..Default::default()
+                }))
+                .await
+            {
                 for c in containers {
-                    let name = c.names.and_then(|mut n| n.pop()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_else(|| "unknown".to_string());
+                    let name = c
+                        .names
+                        .and_then(|mut n| n.pop())
+                        .map(|n| n.trim_start_matches('/').to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
                     let mut ports_vec = Vec::new();
                     if let Some(ports) = c.ports {
                         for p in ports {
-                            let public = p.public_port.map(|port| port.to_string()).unwrap_or_default();
+                            let public = p
+                                .public_port
+                                .map(|port| port.to_string())
+                                .unwrap_or_default();
                             let private = p.private_port.to_string();
                             let ip = p.ip.unwrap_or_else(|| "".to_string());
-                            let typ = p.typ.map(|t| t.to_string()).unwrap_or_else(|| "tcp".to_string());
-                            if !public.is_empty() && !ip.is_empty() { ports_vec.push(format!("{}:{}->{}/{}", ip, public, private, typ)); }
-                            else { ports_vec.push(format!("{}/{}", private, typ)); }
+                            let typ = p
+                                .typ
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "tcp".to_string());
+                            if !public.is_empty() && !ip.is_empty() {
+                                ports_vec.push(format!("{}:{}->{}/{}", ip, public, private, typ));
+                            } else {
+                                ports_vec.push(format!("{}/{}", private, typ));
+                            }
                         }
                     }
 
@@ -61,11 +96,14 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                             }
                         }
                         if let Some(log_path) = inspect.log_path {
-                            if let Ok(meta) = fs::metadata(&log_path) { log_size_mb = meta.len() / (1024 * 1024); }
+                            if let Ok(meta) = fs::metadata(&log_path) {
+                                log_size_mb = meta.len() / (1024 * 1024);
+                            }
                         }
                     }
 
-                    let size_mb = (c.size_rw.unwrap_or(0) + c.size_root_fs.unwrap_or(0)) as u64 / (1024 * 1024);
+                    let size_mb = (c.size_rw.unwrap_or(0) + c.size_root_fs.unwrap_or(0)) as u64
+                        / (1024 * 1024);
 
                     let status = c.status.unwrap_or_else(|| "unknown".to_string());
 
@@ -77,21 +115,41 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         size_mb,
                         log_size_mb,
                         ports: ports_vec,
-                        mounts: mounts_vec
+                        mounts: mounts_vec,
                     });
                 }
             }
             let mut dangling_volumes_count = 0;
-            let mut filter = std::collections::HashMap::new(); filter.insert("dangling".to_string(), vec!["true".to_string()]);
-            if let Ok(volumes_resp) = docker.list_volumes(Some(ListVolumesOptions { filters: filter })).await {
-                if let Some(vols) = volumes_resp.volumes { dangling_volumes_count = vols.len(); }
+            let mut filter = std::collections::HashMap::new();
+            filter.insert("dangling".to_string(), vec!["true".to_string()]);
+            if let Ok(volumes_resp) = docker
+                .list_volumes(Some(ListVolumesOptions { filters: filter }))
+                .await
+            {
+                if let Some(vols) = volumes_resp.volumes {
+                    dangling_volumes_count = vols.len();
+                }
             }
             TopologyInfo {
-                docker_active: true, images_count, dangling_images_count,
-                total_images_size_mb, total_dangling_size_mb, dangling_volumes_count,
-                dangling_images, containers: container_list
+                docker_active: true,
+                images_count,
+                dangling_images_count,
+                total_images_size_mb,
+                total_dangling_size_mb,
+                dangling_volumes_count,
+                dangling_images,
+                containers: container_list,
             }
         }
-        Err(_) => TopologyInfo { docker_active: false, images_count: 0, dangling_images_count: 0, total_images_size_mb: 0, total_dangling_size_mb: 0, dangling_volumes_count: 0, dangling_images: vec![], containers: vec![] }
+        Err(_) => TopologyInfo {
+            docker_active: false,
+            images_count: 0,
+            dangling_images_count: 0,
+            total_images_size_mb: 0,
+            total_dangling_size_mb: 0,
+            dangling_volumes_count: 0,
+            dangling_images: vec![],
+            containers: vec![],
+        },
     }
 }

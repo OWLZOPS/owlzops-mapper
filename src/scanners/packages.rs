@@ -2,14 +2,26 @@ use crate::models::{PackageManager, PackagesInfo, UpgradablePackage};
 use std::process::Command;
 
 fn command_exists(bin: &str) -> bool {
-    Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("which")
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn detect_package_manager() -> PackageManager {
-    if command_exists("apt-get") { return PackageManager::Apt; }
-    if command_exists("dnf") { return PackageManager::Dnf; }
-    if command_exists("yum") { return PackageManager::Yum; }
-    if command_exists("pacman") { return PackageManager::Pacman; }
+    if command_exists("apt-get") {
+        return PackageManager::Apt;
+    }
+    if command_exists("dnf") {
+        return PackageManager::Dnf;
+    }
+    if command_exists("yum") {
+        return PackageManager::Yum;
+    }
+    if command_exists("pacman") {
+        return PackageManager::Pacman;
+    }
     PackageManager::Unknown
 }
 
@@ -18,8 +30,14 @@ fn detect_package_manager() -> PackageManager {
 // =====================================================================
 
 fn apt_installed_count() -> usize {
-    if let Ok(output) = Command::new("dpkg-query").args(["-f", "${binary:Package}\n", "-W"]).output() {
-        return String::from_utf8_lossy(&output.stdout).lines().filter(|l| !l.trim().is_empty()).count();
+    if let Ok(output) = Command::new("dpkg-query")
+        .args(["-f", "${binary:Package}\n", "-W"])
+        .output()
+    {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
     }
     0
 }
@@ -28,7 +46,11 @@ fn apt_refresh_cache() -> bool {
     // Requires root. Network call — only runs when explicitly requested via
     // --refresh-packages (see main.rs); packages.rs itself doesn't decide
     // whether network access is allowed, it just executes when asked to.
-    Command::new("apt-get").args(["update", "-qq"]).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("apt-get")
+        .args(["update", "-qq"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn apt_upgradable() -> Vec<UpgradablePackage> {
@@ -37,10 +59,20 @@ fn apt_upgradable() -> Vec<UpgradablePackage> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             // Format: "pkgname/repo,repo2 newversion arch [upgradable from: oldversion]"
-            if line.starts_with("Listing...") || line.trim().is_empty() { continue; }
-            let Some((name_repo, rest)) = line.split_once(' ') else { continue };
-            let Some((name, repo_part)) = name_repo.split_once('/') else { continue };
-            let new_version = rest.split_whitespace().next().unwrap_or("unknown").to_string();
+            if line.starts_with("Listing...") || line.trim().is_empty() {
+                continue;
+            }
+            let Some((name_repo, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((name, repo_part)) = name_repo.split_once('/') else {
+                continue;
+            };
+            let new_version = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("unknown")
+                .to_string();
             let current_version = line
                 .find("upgradable from: ")
                 .map(|idx| {
@@ -66,13 +98,20 @@ fn apt_upgradable() -> Vec<UpgradablePackage> {
 
 fn rpm_installed_count() -> usize {
     if let Ok(output) = Command::new("rpm").arg("-qa").output() {
-        return String::from_utf8_lossy(&output.stdout).lines().filter(|l| !l.trim().is_empty()).count();
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
     }
     0
 }
 
 fn dnf_like_refresh_cache(bin: &str) -> bool {
-    Command::new(bin).args(["makecache", "-q"]).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new(bin)
+        .args(["makecache", "-q"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
@@ -84,7 +123,11 @@ fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
             let cols: Vec<&str> = line.split_whitespace().collect();
             // Line format: "pkgname.arch  new-version  repo"
             if cols.len() == 3 && cols[0].contains('.') {
-                let name = cols[0].rsplit_once('.').map(|(n, _)| n).unwrap_or(cols[0]).to_string();
+                let name = cols[0]
+                    .rsplit_once('.')
+                    .map(|(n, _)| n)
+                    .unwrap_or(cols[0])
+                    .to_string();
                 result.push(UpgradablePackage {
                     name,
                     current_version: "unknown".to_string(),
@@ -103,13 +146,20 @@ fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
 
 fn pacman_installed_count() -> usize {
     if let Ok(output) = Command::new("pacman").arg("-Q").output() {
-        return String::from_utf8_lossy(&output.stdout).lines().filter(|l| !l.trim().is_empty()).count();
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
     }
     0
 }
 
 fn pacman_refresh_cache() -> bool {
-    Command::new("pacman").args(["-Sy", "--noconfirm"]).output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new("pacman")
+        .args(["-Sy", "--noconfirm"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn pacman_upgradable() -> Vec<UpgradablePackage> {
@@ -146,23 +196,36 @@ pub fn gather_packages_info(refresh_cache: bool) -> PackagesInfo {
 
     let (installed_count, upgradable) = match manager {
         PackageManager::Apt => {
-            if refresh_cache { cache_refreshed = apt_refresh_cache(); }
+            if refresh_cache {
+                cache_refreshed = apt_refresh_cache();
+            }
             (apt_installed_count(), apt_upgradable())
         }
         PackageManager::Dnf => {
-            if refresh_cache { cache_refreshed = dnf_like_refresh_cache("dnf"); }
+            if refresh_cache {
+                cache_refreshed = dnf_like_refresh_cache("dnf");
+            }
             (rpm_installed_count(), dnf_like_upgradable("dnf"))
         }
         PackageManager::Yum => {
-            if refresh_cache { cache_refreshed = dnf_like_refresh_cache("yum"); }
+            if refresh_cache {
+                cache_refreshed = dnf_like_refresh_cache("yum");
+            }
             (rpm_installed_count(), dnf_like_upgradable("yum"))
         }
         PackageManager::Pacman => {
-            if refresh_cache { cache_refreshed = pacman_refresh_cache(); }
+            if refresh_cache {
+                cache_refreshed = pacman_refresh_cache();
+            }
             (pacman_installed_count(), pacman_upgradable())
         }
         PackageManager::Unknown => (0, Vec::new()),
     };
 
-    PackagesInfo { manager, installed_count, upgradable, cache_refreshed }
+    PackagesInfo {
+        manager,
+        installed_count,
+        upgradable,
+        cache_refreshed,
+    }
 }
