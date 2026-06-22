@@ -444,7 +444,7 @@ pub fn render_dashboard(report: &AgentReport) {
             ]);
             // Security-апдейты сверху — это то, что важно увидеть в первую очередь.
             let mut sorted_upgradable: Vec<_> = report.packages.upgradable.iter().collect();
-            sorted_upgradable.sort_by(|a, b| b.is_security.cmp(&a.is_security));
+            sorted_upgradable.sort_by_key(|b| std::cmp::Reverse(b.is_security));
             for pkg in sorted_upgradable.iter().take(20) {
                 let sec_cell = if pkg.is_security {
                     Cell::new("YES")

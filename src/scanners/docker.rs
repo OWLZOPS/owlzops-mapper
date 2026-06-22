@@ -46,7 +46,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                     }
                 }
             }
-            dangling_images.sort_by(|a, b| b.size_mb.cmp(&a.size_mb));
+            dangling_images.sort_by_key(|b| std::cmp::Reverse(b.size_mb));
 
             if let Ok(containers) = docker
                 .list_containers(Some(ListContainersOptions::<String> {

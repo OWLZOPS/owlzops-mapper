@@ -280,7 +280,7 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     )?;
     let critical = critical_format();
     let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
-    sorted.sort_by(|a, b| b.is_security.cmp(&a.is_security));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.is_security));
     for (i, p) in sorted.iter().enumerate() {
         let row = upg_start + 1 + i as u32;
         sheet.write_string(row, 0, &p.name)?;

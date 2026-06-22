@@ -333,7 +333,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         });
     }
     tech_stack.sort();
-    process_list.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
+    process_list.sort_by_key(|b| std::cmp::Reverse(b.memory_mb));
     process_list.truncate(5);
 
     let load = System::load_average();
