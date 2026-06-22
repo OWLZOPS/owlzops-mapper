@@ -82,23 +82,26 @@ jobs:
         run: cargo test
 
   test-opensuse:
-    name: Test in openSUSE Leap
+    name: Test in openSUSE Tumbleweed
     runs-on: ubuntu-latest
     container:
-      image: opensuse/leap:latest
-      options: --entrypoint /bin/bash
+      image: opensuse/tumbleweed:latest
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
+        shell: bash
         run: |
           zypper --non-interactive install gcc make curl
       - name: Install Rust
+        shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Build
+        shell: bash
         run: cargo build
       - name: Run tests
+        shell: bash
         run: cargo test
