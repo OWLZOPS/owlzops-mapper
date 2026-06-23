@@ -26,7 +26,7 @@ fn parse_bind_address(local_addr: &str, port: &str) -> String {
         let addr_part = &local_addr[..local_addr.len() - port.len() - 1];
         let addr_part = addr_part.trim();
         if addr_part.starts_with('[') && addr_part.ends_with(']') {
-            addr_part[1..addr_part.len()-1].to_string()
+            addr_part[1..addr_part.len() - 1].to_string()
         } else {
             addr_part.to_string()
         }
@@ -35,7 +35,7 @@ fn parse_bind_address(local_addr: &str, port: &str) -> String {
         if let Some((addr, _)) = local_addr.rsplit_once(':') {
             let addr = addr.trim();
             if addr.starts_with('[') && addr.ends_with(']') {
-                addr[1..addr.len()-1].to_string()
+                addr[1..addr.len() - 1].to_string()
             } else {
                 addr.to_string()
             }
@@ -114,14 +114,14 @@ pub fn gather_network_info() -> NetworkInfo {
                 let mut days_remaining = None;
                 if cert_path.exists()
                     && let Ok(output) = Command::new("openssl")
-                    .args([
-                        "x509",
-                        "-enddate",
-                        "-noout",
-                        "-in",
-                        cert_path.to_str().unwrap_or(""),
-                    ])
-                    .output()
+                        .args([
+                            "x509",
+                            "-enddate",
+                            "-noout",
+                            "-in",
+                            cert_path.to_str().unwrap_or(""),
+                        ])
+                        .output()
                 {
                     let out_str = String::from_utf8_lossy(&output.stdout);
                     if out_str.starts_with("notAfter=") {
