@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct AgentReport {
     pub scan_id: String,
     pub timestamp: String,
+    pub version: String,
+    pub duration_secs: f64,
     pub is_root_execution: bool,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,

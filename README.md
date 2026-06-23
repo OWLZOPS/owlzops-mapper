@@ -49,6 +49,18 @@ sudo ./owlzops-mapper --refresh-packages
 sudo ./owlzops-mapper --offline
 ```
 
+## Command-Line Options
+
+| Flag | Description |
+|------|-------------|
+| `-f, --format` | Output format: `text` (default), `json`, `xlsx` (or `excel`) |
+| `-o, --output` | Output file for Excel reports (default: `owlzops-report-<hostname>.xlsx`) |
+| `--external-ip` | Fetch public IP via outbound request (off by default) |
+| `--refresh-packages` | Update package cache before scanning (off by default) |
+| `--offline` | Disable **all** network calls. Overrides other flags if combined |
+| `-h, --help` | Print help |
+| `-V, --version` | Print version |
+
 ## What It Scans
 
 | Category | Details |
@@ -91,5 +103,5 @@ gpg --verify owlzops-mapper-linux-x86_64.tar.gz.asc owlzops-mapper-linux-x86_64.
 
 ## License
 
-Apache-2.0 with Commons Clause — free to use, not to resell.
+Apache-2.0 with Commons Clause - free to use, not to resell.
 See [LICENSE](LICENSE) for details.

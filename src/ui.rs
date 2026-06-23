@@ -4,7 +4,8 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, Table};
 
 pub fn render_dashboard(report: &AgentReport) {
-    println!("\n🦉 \x1b[1;36mOwlzops Infrastructure Røentgen\x1b[0m\n");
+    println!("🦉 Owlzops Mapper v{}", report.version);
+    println!("Scan completed in {:.2}s\n", report.duration_secs);
 
     if !report.is_root_execution {
         println!(
