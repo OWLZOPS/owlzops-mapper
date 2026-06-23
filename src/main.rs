@@ -13,11 +13,7 @@ use std::process::Command;
 // =====================================================================
 
 #[derive(Parser, Debug)]
-#[command(
-    author = "Owlzops",
-    version,
-    about = "Infrastructure Discovery Agent"
-)]
+#[command(author = "Owlzops", version, about = "Infrastructure Discovery Agent")]
 struct Args {
     /// Format of the output report
     #[arg(short, long, default_value_t = OutputFormat::Text)]
