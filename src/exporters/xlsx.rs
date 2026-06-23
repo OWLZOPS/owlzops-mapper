@@ -83,9 +83,7 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
             "Load average",
             format!(
                 "{:.2}, {:.2}, {:.2}",
-                report.host.load_average.0,
-                report.host.load_average.1,
-                report.host.load_average.2
+                report.host.load_average.0, report.host.load_average.1, report.host.load_average.2
             ),
         ),
         ("OOM kills", report.host.oom_kills.to_string()),
@@ -123,7 +121,13 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
 
     write_headers(
         &mut sheet,
-        &["Mount Point", "Total (GB)", "Used (GB)", "Usage %", "Inodes %"],
+        &[
+            "Mount Point",
+            "Total (GB)",
+            "Used (GB)",
+            "Usage %",
+            "Inodes %",
+        ],
     )?;
 
     let critical = critical_format();
@@ -190,7 +194,11 @@ fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, X
     // Totals row
     if !report.databases.is_empty() {
         let total_row = report.databases.len() as u32 + 2;
-        let total_gb: f64 = report.databases.iter().map(|d| d.size_mb as f64 / 1024.0).sum();
+        let total_gb: f64 = report
+            .databases
+            .iter()
+            .map(|d| d.size_mb as f64 / 1024.0)
+            .sum();
         sheet.write_string_with_format(total_row, 2, "Total", &header_format())?;
         sheet.write_number_with_format(total_row, 3, total_gb, &num_fmt)?;
     }

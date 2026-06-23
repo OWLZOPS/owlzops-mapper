@@ -304,8 +304,8 @@ fn zypper_upgradable() -> Vec<UpgradablePackage> {
         let new_version = cols[4].trim().to_string();
         // Fall back to repo-name heuristic when the patch expansion didn't
         // return this package (e.g. cap reached, or SLES security repo name).
-        let is_security = security_pkgs.contains(&name)
-            || cols[1].trim().to_lowercase().contains("security");
+        let is_security =
+            security_pkgs.contains(&name) || cols[1].trim().to_lowercase().contains("security");
         result.push(UpgradablePackage {
             name,
             current_version,

@@ -97,7 +97,11 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
         // Security updates are pending — unpatched CVEs present.
         report.packages.upgradable.iter().any(|p| p.is_security),
         // An SSL certificate expires in < 7 days — imminent service disruption.
-        report.network.ssl_certificates.iter().any(|c| c.is_critical),
+        report
+            .network
+            .ssl_certificates
+            .iter()
+            .any(|c| c.is_critical),
     ];
 
     if conditions.iter().any(|&c| c) { 1 } else { 0 }
