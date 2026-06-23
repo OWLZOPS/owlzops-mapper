@@ -13,7 +13,7 @@ docker:
 
 reporting:
   - changed-files:
-      - any-glob-to-any-file: 'src/xlsx.rs'
+      - any-glob-to-any-file: 'src/exporters/xlsx.rs'
       - any-glob-to-any-file: 'src/ui.rs'
 
 docs:
