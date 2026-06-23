@@ -121,10 +121,6 @@ async fn main() {
         eprintln!("WARNING: Script is NOT running as root/sudo! JSON data will be incomplete.");
     }
 
-    // --offline — guarantees that no outbound network requests will be made.
-    // Overrides --external-ip and --refresh-packages when used together.
-    // This allows the flag to be treated as a reliable safety switch,
-    // regardless of any other options passed on the command line.
     let want_external_ip = if args.offline && args.external_ip {
         eprintln!("WARNING: --offline overrides --external-ip; no outbound request will be made.");
         false
@@ -142,14 +138,18 @@ async fn main() {
 
     let mut sys = sysinfo::System::new_all();
 
-    // Triggering modular scanners
-    let dbs = scanners::host::gather_databases_info();
+    // Host info first (requires mutable sys)
     let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
-    let network_info = scanners::network::gather_network_info();
-    let storage_info = scanners::storage::gather_storage_info();
-    let security_info = scanners::security::gather_security_info();
-    let topology_info = scanners::docker::gather_docker_topology().await;
-    let packages_info = scanners::packages::gather_packages_info(want_refresh_packages);
+
+    // Run all other scanners in parallel
+    let (dbs, network_info, storage_info, security_info, topology_info, packages_info) = tokio::join!(
+        async { scanners::host::gather_databases_info() },
+        async { scanners::network::gather_network_info() },
+        async { scanners::storage::gather_storage_info() },
+        async { scanners::security::gather_security_info() },
+        scanners::docker::gather_docker_topology(),
+        async { scanners::packages::gather_packages_info(want_refresh_packages) },
+    );
 
     let duration_secs = start.elapsed().as_secs_f64();
 
