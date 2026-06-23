@@ -241,6 +241,7 @@ pub fn render_dashboard(report: &AgentReport) {
             Cell::new("Proto")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
+            Cell::new("Bind Address").add_attribute(Attribute::Bold),
             Cell::new("Port").add_attribute(Attribute::Bold),
             Cell::new("Process").add_attribute(Attribute::Bold),
         ]);
@@ -250,11 +251,24 @@ pub fn render_dashboard(report: &AgentReport) {
             if p.port == "0" || p.port == "*" {
                 continue;
             }
-            t_ports.add_row(vec![&p.protocol, &p.port, &p.process]);
+            let exposed = p.bind_address == "0.0.0.0" || p.bind_address == "::";
+            let mut addr_cell = Cell::new(&p.bind_address);
+            let mut port_cell = Cell::new(&p.port);
+            let mut proto_cell = Cell::new(&p.protocol);
+            let mut proc_cell = Cell::new(&p.process);
+
+            if exposed {
+                addr_cell = addr_cell.fg(Color::Red);
+                port_cell = port_cell.fg(Color::Red);
+                proto_cell = proto_cell.fg(Color::Red);
+                proc_cell = proc_cell.fg(Color::Red);
+            }
+
+            t_ports.add_row(vec![proto_cell, addr_cell, port_cell, proc_cell]);
             port_count += 1;
         }
         if port_count > 0 {
-            println!("Active Network Listeners:");
+            println!("Active Network Listeners (red = exposed on 0.0.0.0/::):");
             println!("{t_ports}\n");
         }
     }

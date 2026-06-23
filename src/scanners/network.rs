@@ -12,7 +12,38 @@ fn parse_openssl_enddate(raw: &str) -> Option<i64> {
     let trimmed = raw.trim().trim_end_matches("GMT").trim();
     let naive = NaiveDateTime::parse_from_str(trimmed, "%b %e %H:%M:%S %Y").ok()?;
     let expiry_utc = naive.and_utc();
-    Some((expiry_utc - Utc::now()).num_days())
+    // Разница может быть отрицательной, но chrono возвращает i64 без паники, если не переполнен i64.
+    // Переполнение маловероятно, но оставим безопасное вычисление через signed duration.
+    let diff = expiry_utc.signed_duration_since(Utc::now());
+    Some(diff.num_days())
+}
+
+/// Extract bind address from the "Local Address:Port" column of `ss`.
+fn parse_bind_address(local_addr: &str, port: &str) -> String {
+    // Если local_addr заканчивается на ":port", то адрес — всё, что до последнего двоеточия.
+    // Для IPv6 в скобках: "[::1]:80" — адрес "[::1]" после удаления скобок.
+    if local_addr.ends_with(&format!(":{}", port)) {
+        let addr_part = &local_addr[..local_addr.len() - port.len() - 1];
+        let addr_part = addr_part.trim();
+        if addr_part.starts_with('[') && addr_part.ends_with(']') {
+            addr_part[1..addr_part.len()-1].to_string()
+        } else {
+            addr_part.to_string()
+        }
+    } else {
+        // Если по какой-то причине не заканчивается на ":port", пробуем rsplit_once(':')
+        if let Some((addr, _)) = local_addr.rsplit_once(':') {
+            let addr = addr.trim();
+            if addr.starts_with('[') && addr.ends_with(']') {
+                addr[1..addr.len()-1].to_string()
+            } else {
+                addr.to_string()
+            }
+        } else {
+            // Совсем нет двоеточия — возвращаем "unknown"
+            "unknown".to_string()
+        }
+    }
 }
 
 pub fn gather_network_info() -> NetworkInfo {
@@ -83,14 +114,14 @@ pub fn gather_network_info() -> NetworkInfo {
                 let mut days_remaining = None;
                 if cert_path.exists()
                     && let Ok(output) = Command::new("openssl")
-                        .args([
-                            "x509",
-                            "-enddate",
-                            "-noout",
-                            "-in",
-                            cert_path.to_str().unwrap_or(""),
-                        ])
-                        .output()
+                    .args([
+                        "x509",
+                        "-enddate",
+                        "-noout",
+                        "-in",
+                        cert_path.to_str().unwrap_or(""),
+                    ])
+                    .output()
                 {
                     let out_str = String::from_utf8_lossy(&output.stdout);
                     if out_str.starts_with("notAfter=") {
@@ -118,9 +149,12 @@ pub fn gather_network_info() -> NetworkInfo {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 5 {
                 let protocol = parts[0].to_string();
+                // ss output: columns are Netid, State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port, Process
+                // For udp, the port column might be one column earlier? We handle both tcp and udp.
                 let local_addr_col = if protocol.starts_with("tcp") {
                     parts[4]
                 } else {
+                    // udp: column index 3 (parts[3]) – ss uses slightly different layout for UDP
                     parts[3]
                 };
                 let port = local_addr_col
@@ -128,6 +162,8 @@ pub fn gather_network_info() -> NetworkInfo {
                     .next_back()
                     .unwrap_or("unknown")
                     .to_string();
+                let bind_address = parse_bind_address(local_addr_col, &port);
+
                 let mut process_name = "unknown".to_string();
                 if let Some(start) = line.find("users:((\"") {
                     let proc_str = &line[start + 9..];
@@ -143,6 +179,7 @@ pub fn gather_network_info() -> NetworkInfo {
                         protocol,
                         port,
                         process: process_name,
+                        bind_address,
                     });
                 }
             }

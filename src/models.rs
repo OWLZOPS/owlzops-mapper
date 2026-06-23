@@ -86,6 +86,7 @@ pub struct PortInfo {
     pub protocol: String,
     pub port: String,
     pub process: String,
+    pub bind_address: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
