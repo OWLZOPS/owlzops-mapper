@@ -68,10 +68,10 @@ impl std::fmt::Display for OutputFormat {
 // =====================================================================
 
 fn is_running_as_root() -> bool {
-    if let Ok(output) = Command::new("id").arg("-u").output() {
-        if let Ok(uid_str) = std::str::from_utf8(&output.stdout[..]) {
-            return uid_str.trim() == "0";
-        }
+    if let Ok(output) = Command::new("id").arg("-u").output()
+        && let Ok(uid_str) = std::str::from_utf8(&output.stdout[..])
+    {
+        return uid_str.trim() == "0";
     }
     false
 }
