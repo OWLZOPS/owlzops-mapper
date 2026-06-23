@@ -374,6 +374,7 @@ pub fn render_dashboard(report: &AgentReport) {
         PackageManager::Dnf => "dnf (Fedora/RHEL)",
         PackageManager::Yum => "yum (RHEL/CentOS)",
         PackageManager::Pacman => "pacman (Arch)",
+        PackageManager::Zypper => "zypper (openSUSE/SLES)",
         PackageManager::Unknown => "Unknown",
     };
     if report.packages.manager != PackageManager::Unknown {

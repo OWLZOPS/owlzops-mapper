@@ -22,8 +22,12 @@ fn warning_format() -> Format {
 fn ok_format() -> Format {
     Format::new().set_font_color(Color::RGB(0x375623))
 }
-/// Writes the header row and automatically expands columns to fit their length
-/// (minimum width).
+
+fn number_format() -> Format {
+    Format::new().set_num_format("0.00")
+}
+
+/// Writes the header row starting at row 0 and sets minimum column widths.
 fn write_headers(
     sheet: &mut rust_xlsxwriter::Worksheet,
     headers: &[&str],
@@ -32,6 +36,20 @@ fn write_headers(
     for (col, h) in headers.iter().enumerate() {
         sheet.write_string_with_format(0, col as u16, *h, &fmt)?;
         sheet.set_column_width(col as u16, (h.len() as f64 + 4.0).max(12.0))?;
+    }
+    Ok(())
+}
+
+/// Same as `write_headers` but starting from an arbitrary row —
+/// needed for sheets where multiple tables are stacked under a single heading.
+fn write_headers_at(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    row: u32,
+    headers: &[&str],
+) -> Result<(), XlsxError> {
+    let fmt = header_format();
+    for (col, h) in headers.iter().enumerate() {
+        sheet.write_string_with_format(row, col as u16, *h, &fmt)?;
     }
     Ok(())
 }
@@ -65,7 +83,9 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
             "Load average",
             format!(
                 "{:.2}, {:.2}, {:.2}",
-                report.host.load_average.0, report.host.load_average.1, report.host.load_average.2
+                report.host.load_average.0,
+                report.host.load_average.1,
+                report.host.load_average.2
             ),
         ),
         ("OOM kills", report.host.oom_kills.to_string()),
@@ -82,7 +102,7 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         sheet.write_string(row, 1, value)?;
     }
 
-    // Top 5 memory-consuming processes are displayed in a separate block below.
+    // Top 5 memory-consuming processes in a separate block below.
     let start = rows.len() as u32 + 3;
     sheet.write_string_with_format(start, 0, "Top Memory Processes", &header_format())?;
     sheet.write_string_with_format(start, 1, "PID", &header_format())?;
@@ -97,14 +117,99 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     Ok(sheet)
 }
 
+fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    let mut sheet = rust_xlsxwriter::Worksheet::new();
+    sheet.set_name("Storage")?;
+
+    write_headers(
+        &mut sheet,
+        &["Mount Point", "Total (GB)", "Used (GB)", "Usage %", "Inodes %"],
+    )?;
+
+    let critical = critical_format();
+    let warning = warning_format();
+    let ok = ok_format();
+    let num_fmt = number_format();
+
+    let mut row = 1u32;
+    for disk in &report.storage.disks {
+        if disk.total_gb == 0 {
+            continue;
+        }
+        let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
+
+        sheet.write_string(row, 0, &disk.mount_point)?;
+        sheet.write_number_with_format(row, 1, disk.total_gb as f64, &num_fmt)?;
+        sheet.write_number_with_format(row, 2, disk.used_gb as f64, &num_fmt)?;
+
+        let usage_fmt = if usage_pct > 90.0 {
+            &critical
+        } else if usage_pct > 75.0 {
+            &warning
+        } else {
+            &ok
+        };
+        sheet.write_number_with_format(row, 3, usage_pct, usage_fmt)?;
+
+        let inode_str = disk
+            .inode_usage_percent
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        sheet.write_string(row, 4, &inode_str)?;
+
+        row += 1;
+    }
+
+    sheet.set_column_width(0, 28.0)?;
+    sheet.set_column_width(1, 14.0)?;
+    sheet.set_column_width(2, 14.0)?;
+    sheet.set_column_width(3, 14.0)?;
+    sheet.set_column_width(4, 14.0)?;
+    Ok(sheet)
+}
+
+fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    let mut sheet = rust_xlsxwriter::Worksheet::new();
+    sheet.set_name("Databases")?;
+
+    write_headers(
+        &mut sheet,
+        &["Engine", "Version", "Data Directory", "Size (GB)"],
+    )?;
+
+    let num_fmt = number_format();
+
+    for (i, db) in report.databases.iter().enumerate() {
+        let row = (i + 1) as u32;
+        sheet.write_string(row, 0, &db.engine)?;
+        sheet.write_string(row, 1, &db.version)?;
+        sheet.write_string(row, 2, &db.data_dir)?;
+        sheet.write_number_with_format(row, 3, db.size_mb as f64 / 1024.0, &num_fmt)?;
+    }
+
+    // Totals row
+    if !report.databases.is_empty() {
+        let total_row = report.databases.len() as u32 + 2;
+        let total_gb: f64 = report.databases.iter().map(|d| d.size_mb as f64 / 1024.0).sum();
+        sheet.write_string_with_format(total_row, 2, "Total", &header_format())?;
+        sheet.write_number_with_format(total_row, 3, total_gb, &num_fmt)?;
+    }
+
+    sheet.set_column_width(0, 18.0)?;
+    sheet.set_column_width(1, 32.0)?;
+    sheet.set_column_width(2, 30.0)?;
+    sheet.set_column_width(3, 14.0)?;
+    Ok(sheet)
+}
+
 fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Network")?;
 
     sheet.write_string_with_format(0, 0, "Firewall Active", &header_format())?;
-    sheet.write_string(0, 1, report.network.firewall_active.to_string())?;
+    sheet.write_string(0, 1, &report.network.firewall_active.to_string())?;
     sheet.write_string_with_format(1, 0, "DNS Resolvers", &header_format())?;
-    sheet.write_string(1, 1, report.network.dns_resolvers.join(", "))?;
+    sheet.write_string(1, 1, &report.network.dns_resolvers.join(", "))?;
 
     // Listening ports
     let port_start = 3u32;
@@ -116,7 +221,7 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
         sheet.write_string(row, 2, &p.process)?;
     }
 
-    // SSL certificates, below the ports table with indentation.
+    // SSL certificates
     let ssl_start = port_start + report.network.listening_ports.len() as u32 + 3;
     write_headers_at(&mut sheet, ssl_start, &["Domain", "Expires", "Days Left"])?;
     let critical = critical_format();
@@ -172,7 +277,7 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(
         0,
         1,
-        report.security.ssh_password_auth_enabled.to_string(),
+        &report.security.ssh_password_auth_enabled.to_string(),
         pa_fmt,
     )?;
 
@@ -185,7 +290,7 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(
         1,
         1,
-        report.security.ssh_root_login_enabled.to_string(),
+        &report.security.ssh_root_login_enabled.to_string(),
         rl_fmt,
     )?;
 
@@ -215,7 +320,7 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
     sheet.set_name("Docker")?;
 
     sheet.write_string_with_format(0, 0, "Docker Active", &header_format())?;
-    sheet.write_string(0, 1, report.topology.docker_active.to_string())?;
+    sheet.write_string(0, 1, &report.topology.docker_active.to_string())?;
     sheet.write_string_with_format(1, 0, "Total Images", &header_format())?;
     sheet.write_number(1, 1, report.topology.images_count as f64)?;
     sheet.write_string_with_format(2, 0, "Dangling Images", &header_format())?;
@@ -245,7 +350,7 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
         sheet.write_string(row, 3, &c.status)?;
         sheet.write_number(row, 4, c.size_mb as f64 / 1024.0)?;
         sheet.write_number(row, 5, c.log_size_mb as f64 / 1024.0)?;
-        sheet.write_string(row, 6, c.mounts.join(" | "))?;
+        sheet.write_string(row, 6, &c.mounts.join(" | "))?;
     }
 
     sheet.set_column_width(0, 22.0)?;
@@ -263,6 +368,7 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         PackageManager::Dnf => "dnf (Fedora/RHEL)",
         PackageManager::Yum => "yum (RHEL/CentOS)",
         PackageManager::Pacman => "pacman (Arch)",
+        PackageManager::Zypper => "zypper (openSUSE/SLES)",
         PackageManager::Unknown => "Unknown",
     };
     sheet.write_string_with_format(0, 0, "Package Manager", &header_format())?;
@@ -270,7 +376,7 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(1, 0, "Installed Packages", &header_format())?;
     sheet.write_number(1, 1, report.packages.installed_count as f64)?;
     sheet.write_string_with_format(2, 0, "Cache Freshly Refreshed", &header_format())?;
-    sheet.write_string(2, 1, report.packages.cache_refreshed.to_string())?;
+    sheet.write_string(2, 1, &report.packages.cache_refreshed.to_string())?;
 
     let upg_start = 4u32;
     write_headers_at(
@@ -299,25 +405,14 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     Ok(sheet)
 }
 
-/// Same logic as `write_headers`, but starting from an arbitrary row —
-/// needed for sheets where multiple tables are placed one after another under a single heading.
-fn write_headers_at(
-    sheet: &mut rust_xlsxwriter::Worksheet,
-    row: u32,
-    headers: &[&str],
-) -> Result<(), XlsxError> {
-    let fmt = header_format();
-    for (col, h) in headers.iter().enumerate() {
-        sheet.write_string_with_format(row, col as u16, *h, &fmt)?;
-    }
-    Ok(())
-}
-
 /// Builds the complete xlsx report and saves it to the specified path.
+/// Sheet order: Overview → Storage → Databases → Network → Security → Docker → Packages
 pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
     let mut workbook = Workbook::new();
 
     workbook.push_worksheet(sheet_overview(report)?);
+    workbook.push_worksheet(sheet_storage(report)?);
+    workbook.push_worksheet(sheet_databases(report)?);
     workbook.push_worksheet(sheet_network(report)?);
     workbook.push_worksheet(sheet_security(report)?);
     workbook.push_worksheet(sheet_docker(report)?);

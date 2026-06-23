@@ -152,6 +152,7 @@ pub enum PackageManager {
     Dnf,
     Yum,
     Pacman,
+    Zypper, // openSUSE / SLES
     Unknown,
 }
 
@@ -162,6 +163,7 @@ pub struct UpgradablePackage {
     pub new_version: String,
     pub is_security: bool,
 }
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PackagesInfo {
     pub manager: PackageManager,

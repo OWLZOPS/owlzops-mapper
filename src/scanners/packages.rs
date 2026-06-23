@@ -13,6 +13,10 @@ fn detect_package_manager() -> PackageManager {
     if command_exists("apt-get") {
         return PackageManager::Apt;
     }
+    // Check zypper before dnf: some SLES systems ship both, zypper is authoritative.
+    if command_exists("zypper") {
+        return PackageManager::Zypper;
+    }
     if command_exists("dnf") {
         return PackageManager::Dnf;
     }
@@ -183,6 +187,137 @@ fn pacman_upgradable() -> Vec<UpgradablePackage> {
 }
 
 // =====================================================================
+// Zypper (openSUSE / SLES)
+// =====================================================================
+
+fn zypper_installed_count() -> usize {
+    // zypper is RPM-based — rpm -qa works on all zypper systems.
+    rpm_installed_count()
+}
+
+fn zypper_refresh_cache() -> bool {
+    // -n = non-interactive, -q = quiet. Requires root.
+    Command::new("zypper")
+        .args(["-n", "-q", "refresh"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Returns the set of package names covered by pending security patches.
+///
+/// `zypper list-patches --category security` lists patches, not packages.
+/// We use `zypper info -t patch <name>` to expand each patch into its
+/// constituent packages, but that is one subprocess per patch and can be
+/// slow on systems with many pending patches.  For performance we cap the
+/// expansion at 50 patches — enough to correctly flag the overwhelming
+/// majority of real-world cases.
+fn zypper_security_package_names() -> std::collections::HashSet<String> {
+    let mut pkg_names = std::collections::HashSet::new();
+
+    let Ok(output) = Command::new("zypper")
+        .args(["-n", "-q", "list-patches", "--category", "security"])
+        .output()
+    else {
+        return pkg_names;
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut patch_names: Vec<String> = Vec::new();
+
+    for line in stdout.lines() {
+        // Patch rows look like:
+        //   security | important | SUSE-openSUSE-2024-1234 | 1 | --- | needed
+        // Filter lines where the first non-space field is "security".
+        let trimmed = line.trim();
+        if !trimmed.starts_with("security") {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.splitn(6, '|').collect();
+        if cols.len() >= 3 {
+            let patch = cols[2].trim().to_string();
+            if !patch.is_empty() {
+                patch_names.push(patch);
+            }
+        }
+    }
+
+    for patch in patch_names.into_iter().take(50) {
+        let Ok(info_out) = Command::new("zypper")
+            .args(["-q", "info", "-t", "patch", &patch])
+            .output()
+        else {
+            continue;
+        };
+        // The "Provides:" block lists the affected packages.
+        // Format:   Provides: packagename = version
+        for line in String::from_utf8_lossy(&info_out.stdout).lines() {
+            let l = line.trim();
+            if l.starts_with("Provides:") || l.starts_with("package:") {
+                if let Some(pkg) = l.split_whitespace().nth(1) {
+                    pkg_names.insert(pkg.to_string());
+                }
+            }
+        }
+    }
+
+    pkg_names
+}
+
+fn zypper_upgradable() -> Vec<UpgradablePackage> {
+    let mut result = Vec::new();
+
+    // Build the security package set before iterating updates so we don't
+    // call zypper twice for the common case where there are no pending updates.
+    let Ok(upd_output) = Command::new("zypper")
+        .args(["-n", "-q", "list-updates"])
+        .output()
+    else {
+        return result;
+    };
+
+    let stdout = String::from_utf8_lossy(&upd_output.stdout);
+
+    // Fast-path: if there are no updatable lines at all, skip the expensive
+    // security-patch expansion entirely.
+    let has_updates = stdout.lines().any(|l| l.trim().starts_with('v'));
+    if !has_updates {
+        return result;
+    }
+
+    let security_pkgs = zypper_security_package_names();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Updatable package rows start with 'v' (update available).
+        // Header, separator, and informational lines are skipped.
+        if !trimmed.starts_with('v') {
+            continue;
+        }
+        // Format: v | Repository | Name | Current Version | Available Version | Arch
+        let cols: Vec<&str> = trimmed.splitn(7, '|').collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        let name = cols[2].trim().to_string();
+        let current_version = cols[3].trim().to_string();
+        let new_version = cols[4].trim().to_string();
+        // Fall back to repo-name heuristic when the patch expansion didn't
+        // return this package (e.g. cap reached, or SLES security repo name).
+        let is_security = security_pkgs.contains(&name)
+            || cols[1].trim().to_lowercase().contains("security");
+        result.push(UpgradablePackage {
+            name,
+            current_version,
+            new_version,
+            is_security,
+        });
+    }
+
+    result
+}
+
+// =====================================================================
 // Entry point
 // =====================================================================
 
@@ -218,6 +353,12 @@ pub fn gather_packages_info(refresh_cache: bool) -> PackagesInfo {
                 cache_refreshed = pacman_refresh_cache();
             }
             (pacman_installed_count(), pacman_upgradable())
+        }
+        PackageManager::Zypper => {
+            if refresh_cache {
+                cache_refreshed = zypper_refresh_cache();
+            }
+            (zypper_installed_count(), zypper_upgradable())
         }
         PackageManager::Unknown => (0, Vec::new()),
     };

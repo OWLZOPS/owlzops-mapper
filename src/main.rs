@@ -36,9 +36,10 @@ struct Args {
     offline: bool,
 
     /// Refresh the local package manager cache (apt-get update / dnf makecache /
-    /// pacman -Sy) before checking for upgradable packages. This is an outbound
-    /// network call, so it's opt-in. Without this flag, upgradable packages are
-    /// computed from whatever is already in the local cache (may be stale).
+    /// zypper refresh / pacman -Sy) before checking for upgradable packages.
+    /// This is an outbound network call, so it's opt-in. Without this flag,
+    /// upgradable packages are computed from whatever is already in the local
+    /// cache (may be stale).
     #[arg(long, default_value_t = false)]
     refresh_packages: bool,
 }
@@ -74,6 +75,32 @@ fn is_running_as_root() -> bool {
         return uid_str.trim() == "0";
     }
     false
+}
+
+/// Returns exit code based on critical security and health findings.
+///
+/// Exit 0 — no critical findings detected.
+/// Exit 1 — one or more critical conditions found (suitable for CI/CD pipelines
+///           to catch regressions automatically: firewall down, SSH root login
+///           permitted, pending security updates, or a certificate about to expire).
+///
+/// The exit code is intentionally conservative — only clear, actionable issues
+/// trigger a non-zero result.  Informational findings (OOM history, zombie count,
+/// reboot required) are surfaced in the report but do not affect the exit code
+/// to avoid false-positive failures in automated pipelines.
+fn compute_exit_code(report: &AgentReport) -> i32 {
+    let conditions: &[bool] = &[
+        // Host firewall is completely disabled — all ports exposed.
+        !report.network.firewall_active,
+        // Root SSH login is permitted — critical on any internet-facing host.
+        report.security.ssh_root_login_enabled,
+        // Security updates are pending — unpatched CVEs present.
+        report.packages.upgradable.iter().any(|p| p.is_security),
+        // An SSL certificate expires in < 7 days — imminent service disruption.
+        report.network.ssl_certificates.iter().any(|c| c.is_critical),
+    ];
+
+    if conditions.iter().any(|&c| c) { 1 } else { 0 }
 }
 
 // =====================================================================
@@ -137,6 +164,8 @@ async fn main() {
         packages: packages_info,
     };
 
+    let exit_code = compute_exit_code(&report);
+
     match args.format {
         OutputFormat::Json => match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{}", json),
@@ -155,4 +184,6 @@ async fn main() {
             }
         }
     }
+
+    std::process::exit(exit_code);
 }
