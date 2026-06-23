@@ -215,9 +215,9 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
     sheet.set_name("Network")?;
 
     sheet.write_string_with_format(0, 0, "Firewall Active", &header_format())?;
-    sheet.write_string(0, 1, &report.network.firewall_active.to_string())?;
+    sheet.write_string(0, 1, report.network.firewall_active.to_string())?;
     sheet.write_string_with_format(1, 0, "DNS Resolvers", &header_format())?;
-    sheet.write_string(1, 1, &report.network.dns_resolvers.join(", "))?;
+    sheet.write_string(1, 1, report.network.dns_resolvers.join(", "))?;
 
     // Listening ports
     let port_start = 3u32;
@@ -285,7 +285,7 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(
         0,
         1,
-        &report.security.ssh_password_auth_enabled.to_string(),
+        report.security.ssh_password_auth_enabled.to_string(),
         pa_fmt,
     )?;
 
@@ -298,7 +298,7 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(
         1,
         1,
-        &report.security.ssh_root_login_enabled.to_string(),
+        report.security.ssh_root_login_enabled.to_string(),
         rl_fmt,
     )?;
 
@@ -328,7 +328,7 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
     sheet.set_name("Docker")?;
 
     sheet.write_string_with_format(0, 0, "Docker Active", &header_format())?;
-    sheet.write_string(0, 1, &report.topology.docker_active.to_string())?;
+    sheet.write_string(0, 1, report.topology.docker_active.to_string())?;
     sheet.write_string_with_format(1, 0, "Total Images", &header_format())?;
     sheet.write_number(1, 1, report.topology.images_count as f64)?;
     sheet.write_string_with_format(2, 0, "Dangling Images", &header_format())?;
@@ -358,7 +358,7 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
         sheet.write_string(row, 3, &c.status)?;
         sheet.write_number(row, 4, c.size_mb as f64 / 1024.0)?;
         sheet.write_number(row, 5, c.log_size_mb as f64 / 1024.0)?;
-        sheet.write_string(row, 6, &c.mounts.join(" | "))?;
+        sheet.write_string(row, 6, c.mounts.join(" | "))?;
     }
 
     sheet.set_column_width(0, 22.0)?;
@@ -384,7 +384,7 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(1, 0, "Installed Packages", &header_format())?;
     sheet.write_number(1, 1, report.packages.installed_count as f64)?;
     sheet.write_string_with_format(2, 0, "Cache Freshly Refreshed", &header_format())?;
-    sheet.write_string(2, 1, &report.packages.cache_refreshed.to_string())?;
+    sheet.write_string(2, 1, report.packages.cache_refreshed.to_string())?;
 
     let upg_start = 4u32;
     write_headers_at(

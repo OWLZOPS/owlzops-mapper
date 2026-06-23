@@ -178,7 +178,7 @@ fn pacman_upgradable() -> Vec<UpgradablePackage> {
                     name: cols[0].to_string(),
                     current_version: cols[1].to_string(),
                     new_version: cols[3].to_string(),
-                    is_security: false, // pacman не маркирует security-апдейты отдельно
+                    is_security: false,
                 });
             }
         }
@@ -205,13 +205,6 @@ fn zypper_refresh_cache() -> bool {
 }
 
 /// Returns the set of package names covered by pending security patches.
-///
-/// `zypper list-patches --category security` lists patches, not packages.
-/// We use `zypper info -t patch <name>` to expand each patch into its
-/// constituent packages, but that is one subprocess per patch and can be
-/// slow on systems with many pending patches.  For performance we cap the
-/// expansion at 50 patches — enough to correctly flag the overwhelming
-/// majority of real-world cases.
 fn zypper_security_package_names() -> std::collections::HashSet<String> {
     let mut pkg_names = std::collections::HashSet::new();
 
@@ -226,9 +219,6 @@ fn zypper_security_package_names() -> std::collections::HashSet<String> {
     let mut patch_names: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
-        // Patch rows look like:
-        //   security | important | SUSE-openSUSE-2024-1234 | 1 | --- | needed
-        // Filter lines where the first non-space field is "security".
         let trimmed = line.trim();
         if !trimmed.starts_with("security") {
             continue;
@@ -250,13 +240,12 @@ fn zypper_security_package_names() -> std::collections::HashSet<String> {
             continue;
         };
         // The "Provides:" block lists the affected packages.
-        // Format:   Provides: packagename = version
         for line in String::from_utf8_lossy(&info_out.stdout).lines() {
             let l = line.trim();
-            if l.starts_with("Provides:") || l.starts_with("package:") {
-                if let Some(pkg) = l.split_whitespace().nth(1) {
-                    pkg_names.insert(pkg.to_string());
-                }
+            if (l.starts_with("Provides:") || l.starts_with("package:"))
+                && let Some(pkg) = l.split_whitespace().nth(1)
+            {
+                pkg_names.insert(pkg.to_string());
             }
         }
     }
@@ -267,8 +256,6 @@ fn zypper_security_package_names() -> std::collections::HashSet<String> {
 fn zypper_upgradable() -> Vec<UpgradablePackage> {
     let mut result = Vec::new();
 
-    // Build the security package set before iterating updates so we don't
-    // call zypper twice for the common case where there are no pending updates.
     let Ok(upd_output) = Command::new("zypper")
         .args(["-n", "-q", "list-updates"])
         .output()
@@ -278,8 +265,6 @@ fn zypper_upgradable() -> Vec<UpgradablePackage> {
 
     let stdout = String::from_utf8_lossy(&upd_output.stdout);
 
-    // Fast-path: if there are no updatable lines at all, skip the expensive
-    // security-patch expansion entirely.
     let has_updates = stdout.lines().any(|l| l.trim().starts_with('v'));
     if !has_updates {
         return result;
@@ -289,12 +274,9 @@ fn zypper_upgradable() -> Vec<UpgradablePackage> {
 
     for line in stdout.lines() {
         let trimmed = line.trim();
-        // Updatable package rows start with 'v' (update available).
-        // Header, separator, and informational lines are skipped.
         if !trimmed.starts_with('v') {
             continue;
         }
-        // Format: v | Repository | Name | Current Version | Available Version | Arch
         let cols: Vec<&str> = trimmed.splitn(7, '|').collect();
         if cols.len() < 5 {
             continue;
@@ -302,8 +284,6 @@ fn zypper_upgradable() -> Vec<UpgradablePackage> {
         let name = cols[2].trim().to_string();
         let current_version = cols[3].trim().to_string();
         let new_version = cols[4].trim().to_string();
-        // Fall back to repo-name heuristic when the patch expansion didn't
-        // return this package (e.g. cap reached, or SLES security repo name).
         let is_security =
             security_pkgs.contains(&name) || cols[1].trim().to_lowercase().contains("security");
         result.push(UpgradablePackage {
@@ -321,10 +301,6 @@ fn zypper_upgradable() -> Vec<UpgradablePackage> {
 // Entry point
 // =====================================================================
 
-/// `refresh_cache` - refresh the repository's local cache before checking for updates.
-/// This is the only potentially network-related call in this module, and it is
-/// performed only when explicitly requested by the caller (see the
-/// --refresh-packages flag and its interaction with --offline in main.rs).
 pub fn gather_packages_info(refresh_cache: bool) -> PackagesInfo {
     let manager = detect_package_manager();
     let mut cache_refreshed = false;
