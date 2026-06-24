@@ -210,7 +210,7 @@ async fn main() {
                 format!(
                     "owlzops-report-{}-{}.xlsx",
                     report.host.hostname,
-                    chrono::Local::now().format("%Y-%m-%d")
+                    chrono::Local::now().format("%Y-%m-%d_%M-%S")
                 )
             });
             match exporters::xlsx::write_report(&report, &filename) {
