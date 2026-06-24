@@ -18,7 +18,7 @@ fn parse_openssl_enddate(raw: &str) -> Option<i64> {
 }
 
 /// Extract bind address from the "Local Address:Port" column of `ss`.
-/// Examples: "0.0.0.0:22" -> "0.0.0.0", "[::1]:80" -> "::1", "*:80" -> "*"
+/// Examples: "0.0.0.0:22" -> "0.0.0.0", "[/::1]:80" -> "::1", "*:80" -> "*"
 fn parse_bind_address(local_addr: &str, port: &str) -> String {
     if local_addr.ends_with(&format!(":{}", port)) {
         let addr_part = &local_addr[..local_addr.len() - port.len() - 1];

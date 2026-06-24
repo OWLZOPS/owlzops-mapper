@@ -4,9 +4,6 @@ use std::process::Command;
 use sysinfo::{ProcessStatus, System};
 
 fn get_dir_size_mb(path: &str) -> u64 {
-    // Directly invoke `du` with arguments instead of `sh -c "du -sm {path}"`.
-    // This avoids relying on shell escaping rules: `path` is passed as-is,
-    // even if it contains spaces or special characters.
     if let Ok(output) = Command::new("timeout")
         .args(["10s", "du", "-sm", path])
         .output()
@@ -108,20 +105,38 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
     dbs
 }
 
+fn get_failed_systemd_services() -> Vec<String> {
+    let output = Command::new("systemctl")
+        .args(["--failed", "--no-pager", "--no-legend", "--plain"])
+        .output();
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut services = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // output format: "  unit.service   loaded failed failed ..."
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if !parts.is_empty() {
+                services.push(parts[0].to_string());
+            }
+        }
+        return services;
+    }
+    Vec::new()
+}
+
 pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     sys.refresh_all();
     let reboot_required = std::path::Path::new("/var/run/reboot-required").exists();
 
-    // Retrieving the external IP requires an outbound request to a third-party
-    // service (ifconfig.me). This is the only network call in the entire scanner,
-    // so it is strictly opt-in via --external-ip. By default, the agent remains
-    // fully offline, does not depend on internet availability, and makes no
-    // outbound requests without explicit user consent.
     let mut external_ipv4 = "unknown (use --external-ip to detect)".to_string();
     if fetch_external_ip {
         external_ipv4 = "unknown".to_string();
-        // --max-time 5 prevents the agent from hanging while waiting for curl
-        // if internet connectivity is unavailable.
         if let Ok(output) = Command::new("curl")
             .args(["-s", "-4", "--max-time", "5", "https://ifconfig.me"])
             .output()
@@ -276,7 +291,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     systemd_timers.sort();
     systemd_timers.dedup();
 
-    // Linux Security Modules (LSM)
     let mut security_modules = Vec::new();
     if let Ok(lsm) = fs::read_to_string("/sys/kernel/security/lsm") {
         for mod_name in lsm.trim().split(',') {
@@ -289,27 +303,37 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         security_modules.push("selinux".to_string());
     }
 
+    // -----------------------------------------------------------------
+    // Tech stack detection with precise matching
+    // -----------------------------------------------------------------
     let mut tech_stack = Vec::new();
-    let targets = vec![
+
+    // starts_with — catches versioned binaries: python3.11, php-fpm8.2, ruby3.2, etc.
+    let prefix_targets: &[(&str, &str)] = &[
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
         ("redis-server", "Redis"),
         ("mongod", "MongoDB"),
         ("mongos", "MongoDB"),
-        ("node", "Node.js"),
         ("python", "Python"),
-        ("java", "Java"),
         ("ruby", "Ruby"),
         ("php-fpm", "PHP"),
-        ("go", "Go Binary"),
-        ("rust", "Rust Binary"),
         ("nginx", "Nginx"),
         ("apache2", "Apache"),
         ("httpd", "Apache"),
         ("etcd", "Etcd"),
         ("memcached", "Memcached"),
         ("rabbitmq", "RabbitMQ"),
+        ("rust", "Rust Binary"),
     ];
+
+    // Exact match only — names too short or common for prefix/contains matching.
+    // "go" via contains hits mongod (m-o-n-[g-o]-d at index 3-4) and cargo.
+    // "go" via starts_with hits golang, google-fluentd, etc.
+    // "node" via starts_with hits node_exporter, nodemon, nodelay.
+    // "java" via starts_with is fine but can also be exact — launchers are named "java".
+    let exact_targets: &[(&str, &str)] =
+        &[("go", "Go Binary"), ("node", "Node.js"), ("java", "Java")];
 
     let mut process_list: Vec<ProcessInfo> = Vec::new();
     let mut zombie_processes = 0;
@@ -320,8 +344,13 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         }
 
         let name = proc.name().to_lowercase();
-        for (process_name, display_name) in &targets {
-            if name.contains(process_name) && !tech_stack.contains(&display_name.to_string()) {
+        for &(process_name, display_name) in prefix_targets {
+            if name.starts_with(process_name) && !tech_stack.contains(&display_name.to_string()) {
+                tech_stack.push(display_name.to_string());
+            }
+        }
+        for &(process_name, display_name) in exact_targets {
+            if name == process_name && !tech_stack.contains(&display_name.to_string()) {
                 tech_stack.push(display_name.to_string());
             }
         }
@@ -337,6 +366,8 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     process_list.truncate(5);
 
     let load = System::load_average();
+
+    let failed_services = get_failed_systemd_services();
 
     HostInfo {
         hostname: System::host_name().unwrap_or_else(|| "unknown".to_string()),
@@ -363,5 +394,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         systemd_timers,
         tech_stack,
         top_memory_processes: process_list,
+        failed_services,
     }
 }

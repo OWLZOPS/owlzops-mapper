@@ -46,25 +46,28 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
 
 pub fn gather_security_info() -> SecurityInfo {
     let mut shell_users = Vec::new();
-    let mut ssh_password_auth_enabled = true;
-    let mut ssh_root_login_enabled = true;
 
-    match sshd_effective_config() {
-        Some(config) => {
-            if let Some(val) = parse_sshd_directive(&config, "passwordauthentication") {
-                ssh_password_auth_enabled = val.eq_ignore_ascii_case("yes");
+    // --- SSH config parsing ------------------------------------------------
+    let (ssh_password_auth_enabled, ssh_root_login_enabled, ssh_config_source) =
+        match sshd_effective_config() {
+            Some(config) => {
+                let pwd = parse_sshd_directive(&config, "passwordauthentication")
+                    .map(|v| v.eq_ignore_ascii_case("yes"))
+                    .unwrap_or(true);
+                let root = parse_sshd_directive(&config, "permitrootlogin")
+                    .map(|v| !v.eq_ignore_ascii_case("no"))
+                    .unwrap_or(true);
+                (pwd, root, "sshd -T (effective)".to_string())
             }
-            if let Some(val) = parse_sshd_directive(&config, "permitrootlogin") {
-                // Реальные значения sshd: "yes", "no", "prohibit-password", "forced-commands-only".
-                // Только "no" по-настоящему запрещает root login — остальное так или иначе разрешает.
-                ssh_root_login_enabled = !val.eq_ignore_ascii_case("no");
+            None => {
+                let mut pwd = true;
+                let mut root = true;
+                fallback_parse_main_config(&mut pwd, &mut root);
+                (pwd, root, "fallback (/etc/ssh/sshd_config)".to_string())
             }
-        }
-        None => {
-            fallback_parse_main_config(&mut ssh_password_auth_enabled, &mut ssh_root_login_enabled)
-        }
-    }
+        };
 
+    // --- Shell users -------------------------------------------------------
     if let Ok(contents) = fs::read_to_string("/etc/passwd") {
         let valid_shells = ["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/ash"];
         for line in contents.lines() {
@@ -122,9 +125,26 @@ pub fn gather_security_info() -> SecurityInfo {
             }
         }
     }
+
+    // --- Fail2Ban and Auditd -----------------------------------------------
+    let fail2ban_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "fail2ban"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let auditd_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "auditd"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
         shell_users,
+        fail2ban_active,
+        auditd_active,
+        ssh_config_source,
     }
 }

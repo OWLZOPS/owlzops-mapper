@@ -83,11 +83,18 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         }
                     }
 
-                    // Use a single inspect call per container: both mounts and log_path come
-                    // from the same response, avoiding an extra round trip to the Docker daemon.
+                    // Use a single inspect call per container: mounts, log_path, and
+                    // security-related host config are obtained from the same response,
+                    // avoiding extra round trips to the Docker daemon.
                     let mut mounts_vec = Vec::new();
                     let mut log_size_mb = 0;
+                    let mut privileged = false;
+                    let mut memory_limit_mb = None;
+                    let mut cpu_limit = None;
+                    let mut cap_add = Vec::new();
+
                     if let Ok(inspect) = docker.inspect_container(&name, None).await {
+                        // Mounts
                         if let Some(mounts) = inspect.mounts {
                             for m in mounts {
                                 if let (Some(src), Some(dst)) = (m.source, m.destination) {
@@ -95,10 +102,28 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                                 }
                             }
                         }
+                        // Log size
                         if let Some(log_path) = inspect.log_path
                             && let Ok(meta) = fs::metadata(&log_path)
                         {
                             log_size_mb = meta.len() / (1024 * 1024);
+                        }
+
+                        // Docker security checks (collapsed ifs)
+                        if let Some(host_config) = inspect.host_config {
+                            privileged = host_config.privileged.unwrap_or(false);
+                            if let Some(mem) = host_config.memory
+                                && mem > 0
+                            {
+                                memory_limit_mb = Some((mem / 1024 / 1024) as u64);
+                            }
+                            if let Some(quota) = host_config.cpu_quota
+                                && quota > 0
+                            {
+                                let period = host_config.cpu_period.unwrap_or(100_000);
+                                cpu_limit = Some(quota as f64 / period as f64);
+                            }
+                            cap_add = host_config.cap_add.unwrap_or_default();
                         }
                     }
 
@@ -116,6 +141,10 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         log_size_mb,
                         ports: ports_vec,
                         mounts: mounts_vec,
+                        privileged,
+                        memory_limit_mb,
+                        cpu_limit,
+                        cap_add,
                     });
                 }
             }

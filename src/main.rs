@@ -15,31 +15,18 @@ use std::process::Command;
 #[derive(Parser, Debug)]
 #[command(author = "Owlzops", version, about = "Infrastructure Discovery Agent")]
 struct Args {
-    /// Format of the output report
     #[arg(short, long, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
-    /// Output file path for xlsx reports (default: owlzops-report-<hostname>.xlsx)
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Detect external/public IP via an outbound request to ifconfig.me.
-    /// Off by default — the agent stays fully offline unless you opt in.
     #[arg(long, default_value_t = false)]
     external_ip: bool,
 
-    /// Hard guarantee of no outbound network calls, regardless of other flags.
-    /// If combined with --external-ip or --refresh-packages, --offline wins and
-    /// those flags are ignored (with a warning), so this flag can be relied on
-    /// as a strict safety switch — e.g. on an air-gapped host or restricted network zone.
     #[arg(long, default_value_t = false)]
     offline: bool,
 
-    /// Refresh the local package manager cache (apt-get update / dnf makecache /
-    /// zypper refresh / pacman -Sy) before checking for upgradable packages.
-    /// This is an outbound network call, so it's opt-in. Without this flag,
-    /// upgradable packages are computed from whatever is already in the local
-    /// cache (may be stale).
     #[arg(long, default_value_t = false)]
     refresh_packages: bool,
 }
@@ -49,7 +36,6 @@ enum OutputFormat {
     Text,
     Json,
     Xlsx,
-    /// Alias for xlsx — accepted as --format excel
     #[value(alias = "excel")]
     Xlsx2,
 }
@@ -77,33 +63,57 @@ fn is_running_as_root() -> bool {
     false
 }
 
-/// Returns exit code based on critical security and health findings.
-///
-/// Exit 0 — no critical findings detected.
-/// Exit 1 — one or more critical conditions found (suitable for CI/CD pipelines
-///           to catch regressions automatically: firewall down, SSH root login
-///           permitted, pending security updates, or a certificate about to expire).
-///
-/// The exit code is intentionally conservative — only clear, actionable issues
-/// trigger a non-zero result.  Informational findings (OOM history, zombie count,
-/// reboot required) are surfaced in the report but do not affect the exit code
-/// to avoid false-positive failures in automated pipelines.
+fn compute_risk_score(report: &AgentReport) -> u8 {
+    let mut score = 0u8;
+    if !report.network.firewall_active {
+        score += 30;
+    }
+    if report.security.ssh_root_login_enabled {
+        score += 25;
+    }
+    if report.packages.upgradable.iter().any(|p| p.is_security) {
+        score += 20;
+    }
+    let critical_certs = report
+        .network
+        .ssl_certificates
+        .iter()
+        .filter(|c| c.is_critical)
+        .count() as u8;
+    score += std::cmp::min(critical_certs * 15, 15);
+    if report
+        .host
+        .failed_services
+        .iter()
+        .any(|s| s.contains(".service"))
+    {
+        score += 10;
+    }
+    if report.security.ssh_password_auth_enabled {
+        score += 10;
+    }
+    if report.host.oom_kills > 0 {
+        score += 10;
+    }
+    score = score.min(100);
+    score
+}
+
 fn compute_exit_code(report: &AgentReport) -> i32 {
+    if !report.is_root_execution {
+        eprintln!("WARNING: not running as root – results may be incomplete.");
+        return 2;
+    }
     let conditions: &[bool] = &[
-        // Host firewall is completely disabled — all ports exposed.
         !report.network.firewall_active,
-        // Root SSH login is permitted — critical on any internet-facing host.
         report.security.ssh_root_login_enabled,
-        // Security updates are pending — unpatched CVEs present.
         report.packages.upgradable.iter().any(|p| p.is_security),
-        // An SSL certificate expires in < 7 days — imminent service disruption.
         report
             .network
             .ssl_certificates
             .iter()
             .any(|c| c.is_critical),
     ];
-
     if conditions.iter().any(|&c| c) { 1 } else { 0 }
 }
 
@@ -141,23 +151,40 @@ async fn main() {
     // Host info first (requires mutable sys)
     let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
 
-    // Run all other scanners in parallel
-    let (dbs, network_info, storage_info, security_info, topology_info, packages_info) = tokio::join!(
-        async { scanners::host::gather_databases_info() },
-        async { scanners::network::gather_network_info() },
-        async { scanners::storage::gather_storage_info() },
-        async { scanners::security::gather_security_info() },
+    // Parallel execution of remaining scanners using spawn_blocking
+    // Functions without arguments are passed directly; packages_task requires a
+    // closure because it captures `want_refresh_packages`.
+    let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
+    let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
+    let storage_task = tokio::task::spawn_blocking(scanners::storage::gather_storage_info);
+    let security_task = tokio::task::spawn_blocking(scanners::security::gather_security_info);
+    let packages_task = tokio::task::spawn_blocking(move || {
+        scanners::packages::gather_packages_info(want_refresh_packages)
+    });
+
+    let (dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = tokio::join!(
+        dbs_task,
+        network_task,
+        storage_task,
+        security_task,
         scanners::docker::gather_docker_topology(),
-        async { scanners::packages::gather_packages_info(want_refresh_packages) },
+        packages_task,
     );
+
+    let dbs = dbs_res.expect("databases scanner panicked");
+    let network_info = network_res.expect("network scanner panicked");
+    let storage_info = storage_res.expect("storage scanner panicked");
+    let security_info = security_res.expect("security scanner panicked");
+    let packages_info = packages_res.expect("packages scanner panicked");
 
     let duration_secs = start.elapsed().as_secs_f64();
 
-    let report = AgentReport {
+    let mut report = AgentReport {
         scan_id: uuid::Uuid::new_v4().to_string(),
         timestamp: Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         duration_secs,
+        risk_score: 0, // placeholder, will be recalculated
         is_root_execution: is_root,
         host: host_info,
         databases: dbs,
@@ -167,7 +194,7 @@ async fn main() {
         security: security_info,
         packages: packages_info,
     };
-
+    report.risk_score = compute_risk_score(&report);
     let exit_code = compute_exit_code(&report);
 
     match args.format {
@@ -179,9 +206,13 @@ async fn main() {
             ui::render_dashboard(&report);
         }
         OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
-            let filename = args
-                .output
-                .unwrap_or_else(|| format!("owlzops-report-{}.xlsx", report.host.hostname));
+            let filename = args.output.unwrap_or_else(|| {
+                format!(
+                    "owlzops-report-{}-{}.xlsx",
+                    report.host.hostname,
+                    chrono::Local::now().format("%Y-%m-%d")
+                )
+            });
             match exporters::xlsx::write_report(&report, &filename) {
                 Ok(_) => println!("✅ Excel report successfully generated: {}", filename),
                 Err(e) => eprintln!("❌ Failed to generate Excel report: {}", e),

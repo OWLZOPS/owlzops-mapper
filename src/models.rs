@@ -6,6 +6,7 @@ pub struct AgentReport {
     pub timestamp: String,
     pub version: String,
     pub duration_secs: f64,
+    pub risk_score: u8,
     pub is_root_execution: bool,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,
@@ -42,6 +43,7 @@ pub struct HostInfo {
     pub systemd_timers: Vec<String>,
     pub tech_stack: Vec<String>,
     pub top_memory_processes: Vec<ProcessInfo>,
+    pub failed_services: Vec<String>, // new: systemd units in failed state
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -72,12 +74,8 @@ pub struct NetworkInfo {
 pub struct SslCertInfo {
     pub domain: String,
     pub expiry_date: String,
-    /// None if the expiration date could not be parsed
-    /// (for example, if OpenSSL is unavailable or failed).
     pub days_remaining: Option<i64>,
-    /// Less than 7 days until expiration.
     pub is_critical: bool,
-    /// Less than 30 days until expiration (and not critical).
     pub is_warning: bool,
 }
 
@@ -130,6 +128,11 @@ pub struct ContainerInfo {
     pub log_size_mb: u64,
     pub ports: Vec<String>,
     pub mounts: Vec<String>,
+    // --- New Docker security fields ---
+    pub privileged: bool,
+    pub memory_limit_mb: Option<u64>, // None = no limit
+    pub cpu_limit: Option<f64>,       // None = no limit (number of CPUs)
+    pub cap_add: Vec<String>,         // list of added capabilities
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -137,6 +140,9 @@ pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,
     pub shell_users: Vec<UserInfo>,
+    pub fail2ban_active: bool,
+    pub auditd_active: bool,
+    pub ssh_config_source: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -153,7 +159,7 @@ pub enum PackageManager {
     Dnf,
     Yum,
     Pacman,
-    Zypper, // openSUSE / SLES
+    Zypper,
     Unknown,
 }
 
@@ -170,9 +176,5 @@ pub struct PackagesInfo {
     pub manager: PackageManager,
     pub installed_count: usize,
     pub upgradable: Vec<UpgradablePackage>,
-    /// Whether the local repository cache was refreshed before checking
-    /// for updates (via --refresh-packages). If false, `upgradable` was
-    /// calculated using whatever data was already present in the cache at
-    /// scan time, so the results may be outdated.
     pub cache_refreshed: bool,
 }

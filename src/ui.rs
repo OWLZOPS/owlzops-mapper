@@ -5,7 +5,20 @@ use comfy_table::{Attribute, Cell, Color, Table};
 
 pub fn render_dashboard(report: &AgentReport) {
     println!("🦉 Owlzops Mapper v{}", report.version);
-    println!("Scan completed in {:.2}s\n", report.duration_secs);
+    println!("Scan completed in {:.2}s", report.duration_secs);
+
+    // ---- Risk Score (new) ----
+    let risk_color = if report.risk_score >= 70 {
+        "\x1b[1;31m" // red
+    } else if report.risk_score >= 40 {
+        "\x1b[1;33m" // yellow
+    } else {
+        "\x1b[1;32m" // green
+    };
+    println!(
+        "🛡️  Risk Score: {}{}/100\x1b[0m\n",
+        risk_color, report.risk_score
+    );
 
     if !report.is_root_execution {
         println!(
@@ -137,7 +150,7 @@ pub fn render_dashboard(report: &AgentReport) {
         println!("{t_dbs}\n");
     }
 
-    // 2. SECURITY & HEALTH
+    // 2. SECURITY & HEALTH (extended with new fields)
     let mut t_risk = Table::new();
     t_risk
         .load_preset(UTF8_FULL)
@@ -167,6 +180,27 @@ pub fn render_dashboard(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("SSH Root Login"), root_cell]);
 
+    // --- New rows for SSH source, Fail2ban, Auditd ---
+    t_risk.add_row(vec![
+        Cell::new("SSH Config Source"),
+        Cell::new(&report.security.ssh_config_source),
+    ]);
+
+    let f2b = if report.security.fail2ban_active {
+        Cell::new("Active").fg(Color::Green)
+    } else {
+        Cell::new("Inactive").fg(Color::Red)
+    };
+    t_risk.add_row(vec![Cell::new("Fail2Ban"), f2b]);
+
+    let audit = if report.security.auditd_active {
+        Cell::new("Active").fg(Color::Green)
+    } else {
+        Cell::new("Inactive").fg(Color::Red)
+    };
+    t_risk.add_row(vec![Cell::new("Auditd"), audit]);
+
+    // OOM Kills
     let oom_cell = if report.host.oom_kills > 0 {
         Cell::new(format!("{} Kills (HIGH RISK)", report.host.oom_kills)).fg(Color::Red)
     } else {
@@ -180,6 +214,14 @@ pub fn render_dashboard(report: &AgentReport) {
         Cell::new("0").fg(Color::Green)
     };
     t_risk.add_row(vec![Cell::new("Zombie Processes"), zombie_cell]);
+
+    // --- Failed systemd services (new) ---
+    if !report.host.failed_services.is_empty() {
+        t_risk.add_row(vec![
+            Cell::new("Failed Services"),
+            Cell::new(report.host.failed_services.join(", ")).fg(Color::Red),
+        ]);
+    }
 
     println!("{t_risk}\n");
 
@@ -458,7 +500,6 @@ pub fn render_dashboard(report: &AgentReport) {
                 Cell::new("Available").add_attribute(Attribute::Bold),
                 Cell::new("Security").add_attribute(Attribute::Bold),
             ]);
-            // Security-апдейты сверху — это то, что важно увидеть в первую очередь.
             let mut sorted_upgradable: Vec<_> = report.packages.upgradable.iter().collect();
             sorted_upgradable.sort_by_key(|b| std::cmp::Reverse(b.is_security));
             for pkg in sorted_upgradable.iter().take(20) {
@@ -487,7 +528,7 @@ pub fn render_dashboard(report: &AgentReport) {
         }
     }
 
-    // 7. DOCKER TOPOLOGY
+    // 7. DOCKER TOPOLOGY (with security issues)
     if report.topology.docker_active {
         let total_img_gb = report.topology.total_images_size_mb as f64 / 1024.0;
         let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
@@ -576,6 +617,7 @@ pub fn render_dashboard(report: &AgentReport) {
                 Cell::new("Uptime / Status").add_attribute(Attribute::Bold),
                 Cell::new("Size (GB)").add_attribute(Attribute::Bold),
                 Cell::new("Log Size (GB)").add_attribute(Attribute::Bold),
+                Cell::new("Security Issues").add_attribute(Attribute::Bold), // new column
                 Cell::new("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
             ]);
             for c in &report.topology.containers {
@@ -594,6 +636,36 @@ pub fn render_dashboard(report: &AgentReport) {
                     log_cell = log_cell.fg(Color::Red);
                 }
 
+                // --- Collect Docker security issues ---
+                let mut issues = Vec::new();
+                if c.privileged {
+                    issues.push("PRIVILEGED".to_string());
+                }
+                if c.memory_limit_mb.is_none() {
+                    issues.push("NoMemLimit".to_string());
+                }
+                if c.cpu_limit.is_none() {
+                    issues.push("NoCpuLimit".to_string());
+                }
+                if c.cap_add.iter().any(|cap| cap == "SYS_ADMIN") {
+                    issues.push("SYS_ADMIN".to_string());
+                }
+                if c.cap_add.iter().any(|cap| cap == "NET_ADMIN") {
+                    issues.push("NET_ADMIN".to_string());
+                }
+                let issue_str = if issues.is_empty() {
+                    "-".to_string()
+                } else {
+                    issues.join(", ")
+                };
+                let issue_cell = if issue_str == "-" {
+                    Cell::new(issue_str)
+                } else {
+                    Cell::new(issue_str)
+                        .fg(Color::Red)
+                        .add_attribute(Attribute::Bold)
+                };
+
                 let mounts_str = if c.mounts.is_empty() {
                     "None (Stateless)".to_string()
                 } else {
@@ -606,6 +678,7 @@ pub fn render_dashboard(report: &AgentReport) {
                     status_cell,
                     Cell::new(format!("{:.2}", c_size_gb)),
                     log_cell,
+                    issue_cell,
                     mounts_cell,
                 ]);
             }
