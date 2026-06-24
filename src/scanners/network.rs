@@ -12,16 +12,14 @@ fn parse_openssl_enddate(raw: &str) -> Option<i64> {
     let trimmed = raw.trim().trim_end_matches("GMT").trim();
     let naive = NaiveDateTime::parse_from_str(trimmed, "%b %e %H:%M:%S %Y").ok()?;
     let expiry_utc = naive.and_utc();
-    // Разница может быть отрицательной, но chrono возвращает i64 без паники, если не переполнен i64.
-    // Переполнение маловероятно, но оставим безопасное вычисление через signed duration.
+    // signed_duration_since avoids overflow when the certificate is already expired
     let diff = expiry_utc.signed_duration_since(Utc::now());
     Some(diff.num_days())
 }
 
 /// Extract bind address from the "Local Address:Port" column of `ss`.
+/// Examples: "0.0.0.0:22" -> "0.0.0.0", "[::1]:80" -> "::1", "*:80" -> "*"
 fn parse_bind_address(local_addr: &str, port: &str) -> String {
-    // Если local_addr заканчивается на ":port", то адрес — всё, что до последнего двоеточия.
-    // Для IPv6 в скобках: "[::1]:80" — адрес "[::1]" после удаления скобок.
     if local_addr.ends_with(&format!(":{}", port)) {
         let addr_part = &local_addr[..local_addr.len() - port.len() - 1];
         let addr_part = addr_part.trim();
@@ -31,7 +29,7 @@ fn parse_bind_address(local_addr: &str, port: &str) -> String {
             addr_part.to_string()
         }
     } else {
-        // Если по какой-то причине не заканчивается на ":port", пробуем rsplit_once(':')
+        // Fallback: attempt to split at the last ':'
         if let Some((addr, _)) = local_addr.rsplit_once(':') {
             let addr = addr.trim();
             if addr.starts_with('[') && addr.ends_with(']') {
@@ -40,7 +38,6 @@ fn parse_bind_address(local_addr: &str, port: &str) -> String {
                 addr.to_string()
             }
         } else {
-            // Совсем нет двоеточия — возвращаем "unknown"
             "unknown".to_string()
         }
     }
@@ -143,20 +140,16 @@ pub fn gather_network_info() -> NetworkInfo {
         }
     }
 
+    // ========== FIXED BLOCK (bug 1 + bug 2) ==========
     if let Ok(output) = Command::new("ss").arg("-tulnp").output() {
         let stdout_str = String::from_utf8_lossy(&output.stdout);
         for line in stdout_str.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 5 {
                 let protocol = parts[0].to_string();
-                // ss output: columns are Netid, State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port, Process
-                // For udp, the port column might be one column earlier? We handle both tcp and udp.
-                let local_addr_col = if protocol.starts_with("tcp") {
-                    parts[4]
-                } else {
-                    // udp: column index 3 (parts[3]) – ss uses slightly different layout for UDP
-                    parts[3]
-                };
+                // ss -tulnp: column layout is identical for TCP and UDP.
+                // Netid(0)  State(1)  Recv-Q(2)  Send-Q(3)  Local Address:Port(4)  Peer(5)  Process(6+)
+                let local_addr_col = parts[4];
                 let port = local_addr_col
                     .split(':')
                     .next_back()
@@ -171,10 +164,11 @@ pub fn gather_network_info() -> NetworkInfo {
                         process_name = proc_str[..end].to_string();
                     }
                 }
-                if !listening_ports
-                    .iter()
-                    .any(|p: &PortInfo| p.port == port && p.protocol == protocol)
-                {
+                // bind_address is part of the deduplication key:
+                // a service may listen on both 127.0.0.1:5432 and 0.0.0.0:5432 simultaneously
+                if !listening_ports.iter().any(|p: &PortInfo| {
+                    p.port == port && p.protocol == protocol && p.bind_address == bind_address
+                }) {
                     listening_ports.push(PortInfo {
                         protocol,
                         port,
