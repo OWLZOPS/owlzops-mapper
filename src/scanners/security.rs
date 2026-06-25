@@ -1,5 +1,6 @@
 use crate::models::{SecurityInfo, UserInfo};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 /// Extract a directive value from `sshd -T` output (format: "directive value").
@@ -44,6 +45,90 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Sudo audit
+// ---------------------------------------------------------------------
+fn gather_sudo_nopasswd() -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut files = vec!["/etc/sudoers".to_string()];
+    if let Ok(dir) = fs::read_dir("/etc/sudoers.d") {
+        for entry in dir.flatten() {
+            if entry.path().is_file() && !entry.file_name().to_string_lossy().starts_with('.') {
+                files.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+
+    for file in files {
+        if let Ok(contents) = fs::read_to_string(&file) {
+            for line in contents.lines() {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    continue;
+                }
+                if l.to_lowercase().contains("nopasswd") {
+                    entries.push(format!("{}: {}", file, l));
+                }
+            }
+        }
+    }
+    entries
+}
+
+fn get_sudoers_mode() -> Option<u32> {
+    let path = "/etc/sudoers";
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        Some(mode & 0o777)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------
+// Sysctl audit
+// ---------------------------------------------------------------------
+fn gather_sysctl_issues() -> Vec<String> {
+    let mut issues = Vec::new();
+    let checks: &[(&str, &str, &str)] = &[
+        (
+            "/proc/sys/kernel/randomize_va_space",
+            "2",
+            "kernel.randomize_va_space",
+        ),
+        ("/proc/sys/net/ipv4/ip_forward", "0", "net.ipv4.ip_forward"),
+        (
+            "/proc/sys/net/ipv4/tcp_syncookies",
+            "1",
+            "net.ipv4.tcp_syncookies",
+        ),
+        ("/proc/sys/fs/suid_dumpable", "0", "fs.suid_dumpable"),
+        (
+            "/proc/sys/kernel/dmesg_restrict",
+            "1",
+            "kernel.dmesg_restrict",
+        ),
+        (
+            "/proc/sys/net/ipv4/conf/all/accept_redirects",
+            "0",
+            "net.ipv4.conf.all.accept_redirects",
+        ),
+    ];
+
+    for &(path, expected, name) in checks {
+        if let Ok(value) = fs::read_to_string(path) {
+            let value = value.trim();
+            if value != expected {
+                issues.push(format!("{}={} (expected {})", name, value, expected));
+            }
+        }
+    }
+    issues
+}
+
+// ---------------------------------------------------------------------
+// Main gather function
+// ---------------------------------------------------------------------
 pub fn gather_security_info() -> SecurityInfo {
     let mut shell_users = Vec::new();
 
@@ -139,6 +224,11 @@ pub fn gather_security_info() -> SecurityInfo {
         .map(|s| s.success())
         .unwrap_or(false);
 
+    // --- Sudo and Sysctl audits --------------------------------------------
+    let sudo_nopasswd_entries = gather_sudo_nopasswd();
+    let sudoers_mode = get_sudoers_mode();
+    let sysctl_issues = gather_sysctl_issues();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -146,5 +236,8 @@ pub fn gather_security_info() -> SecurityInfo {
         fail2ban_active,
         auditd_active,
         ssh_config_source,
+        sudo_nopasswd_entries,
+        sudoers_mode,
+        sysctl_issues,
     }
 }

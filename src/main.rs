@@ -101,6 +101,19 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
     if !report.host.ntp_synchronized {
         score += 10;
     }
+    // Sudo audit
+    if !report.security.sudo_nopasswd_entries.is_empty() {
+        score += 10;
+    }
+    if let Some(mode) = report.security.sudoers_mode
+        && mode != 0o440
+    {
+        score += 5;
+    }
+
+    // Sysctl audit – cap at +15
+    let sysctl_penalty = std::cmp::min(report.security.sysctl_issues.len() as u8 * 5, 15);
+    score += sysctl_penalty;
     score = score.min(100);
     score
 }

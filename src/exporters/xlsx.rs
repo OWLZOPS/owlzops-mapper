@@ -605,6 +605,52 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         dyn_row += 1;
     }
 
+    // Sudo NOPASSWD (banded)
+    if !report.security.sudo_nopasswd_entries.is_empty() {
+        sheet.write_string_with_format(dyn_row, 0, "Sudo NOPASSWD", &header_format())?;
+        sheet.write_string_with_format(
+            dyn_row,
+            1,
+            report.security.sudo_nopasswd_entries.join("; "),
+            &critical_band(dyn_row),
+        )?;
+        data.push(vec![
+            "Sudo NOPASSWD".to_string(),
+            report.security.sudo_nopasswd_entries.join("; "),
+        ]);
+        dyn_row += 1;
+    }
+    if let Some(mode) = report.security.sudoers_mode {
+        sheet.write_string_with_format(dyn_row, 0, "Sudoers Permissions", &header_format())?;
+        let (text, fmt) = if mode != 0o440 {
+            (
+                format!("{:o} (expected 0440)", mode),
+                critical_band(dyn_row),
+            )
+        } else {
+            (format!("{:o}", mode), ok_band(dyn_row))
+        };
+        sheet.write_string_with_format(dyn_row, 1, &text, &fmt)?;
+        data.push(vec!["Sudoers Permissions".to_string(), text]);
+        dyn_row += 1;
+    }
+
+    // Sysctl issues (banded)
+    if !report.security.sysctl_issues.is_empty() {
+        sheet.write_string_with_format(dyn_row, 0, "Sysctl Issues", &header_format())?;
+        sheet.write_string_with_format(
+            dyn_row,
+            1,
+            report.security.sysctl_issues.join("; "),
+            &critical_band(dyn_row),
+        )?;
+        data.push(vec![
+            "Sysctl Issues".to_string(),
+            report.security.sysctl_issues.join("; "),
+        ]);
+        dyn_row += 1;
+    }
+
     let users_start = dyn_row + 1;
     write_headers_at(
         &mut sheet,

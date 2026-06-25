@@ -219,6 +219,38 @@ pub fn render_dashboard(report: &AgentReport) {
         };
         t_risk.add_row(vec![Cell::new("NTP / Time Sync"), ntp_cell]);
     }
+    // Sudo NOPASSWD
+    if !report.security.sudo_nopasswd_entries.is_empty() {
+        t_risk.add_row(vec![
+            Cell::new("Sudo NOPASSWD"),
+            Cell::new(format!(
+                "{} entries",
+                report.security.sudo_nopasswd_entries.len()
+            ))
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold),
+        ]);
+    }
+    if let Some(mode) = report.security.sudoers_mode {
+        let sudo_perm = if mode != 0o440 {
+            Cell::new(format!("{:o} (expected 0440)", mode))
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        } else {
+            Cell::new(format!("{:o}", mode)).fg(Color::Green)
+        };
+        t_risk.add_row(vec![Cell::new("Sudoers Permissions"), sudo_perm]);
+    }
+
+    // Sysctl issues
+    if !report.security.sysctl_issues.is_empty() {
+        t_risk.add_row(vec![
+            Cell::new("Sysctl Issues"),
+            Cell::new(report.security.sysctl_issues.join("; "))
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold),
+        ]);
+    }
 
     // OOM Kills
     let oom_cell = if report.host.oom_kills > 0 {

@@ -146,6 +146,9 @@ pub struct SecurityInfo {
     pub fail2ban_active: bool,
     pub auditd_active: bool,
     pub ssh_config_source: String,
+    pub sudo_nopasswd_entries: Vec<String>,
+    pub sudoers_mode: Option<u32>,
+    pub sysctl_issues: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
