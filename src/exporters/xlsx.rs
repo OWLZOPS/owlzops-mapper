@@ -1,32 +1,95 @@
 use crate::models::{AgentReport, PackageManager};
-use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook, XlsxError};
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
 
+// ---------- basic formats (thin borders) ----------
 fn header_format() -> Format {
     Format::new()
         .set_bold()
         .set_background_color(Color::RGB(0x1F4E78))
         .set_font_color(Color::White)
         .set_align(FormatAlign::Left)
+        .set_border(FormatBorder::Thin)
 }
 
 fn critical_format() -> Format {
     Format::new()
         .set_font_color(Color::RGB(0xC00000))
         .set_bold()
-}
-
-fn warning_format() -> Format {
-    Format::new().set_font_color(Color::RGB(0xBF8F00))
+        .set_border(FormatBorder::Thin)
 }
 
 fn ok_format() -> Format {
-    Format::new().set_font_color(Color::RGB(0x375623))
+    Format::new()
+        .set_font_color(Color::RGB(0x375623))
+        .set_border(FormatBorder::Thin)
 }
 
 fn number_format() -> Format {
-    Format::new().set_num_format("0.00")
+    Format::new()
+        .set_num_format("0.00")
+        .set_border(FormatBorder::Thin)
 }
 
+// ---------- row banding (background + borders) ----------
+fn even_row_fmt() -> Format {
+    Format::new()
+        .set_background_color(Color::RGB(0xF2F2F2))
+        .set_border(FormatBorder::Thin)
+}
+
+fn odd_row_fmt() -> Format {
+    Format::new()
+        .set_background_color(Color::White)
+        .set_border(FormatBorder::Thin)
+}
+
+fn row_band(row: u32) -> Format {
+    if row.is_multiple_of(2) {
+        even_row_fmt()
+    } else {
+        odd_row_fmt()
+    }
+}
+
+// --- critical/warning/ok that inherit the row background ---
+fn critical_band(row: u32) -> Format {
+    let bg = if row.is_multiple_of(2) {
+        Color::RGB(0xF2F2F2)
+    } else {
+        Color::White
+    };
+    Format::new()
+        .set_background_color(bg)
+        .set_font_color(Color::RGB(0xC00000))
+        .set_bold()
+        .set_border(FormatBorder::Thin)
+}
+
+fn warning_band(row: u32) -> Format {
+    let bg = if row.is_multiple_of(2) {
+        Color::RGB(0xF2F2F2)
+    } else {
+        Color::White
+    };
+    Format::new()
+        .set_background_color(bg)
+        .set_font_color(Color::RGB(0xBF8F00))
+        .set_border(FormatBorder::Thin)
+}
+
+fn ok_band(row: u32) -> Format {
+    let bg = if row.is_multiple_of(2) {
+        Color::RGB(0xF2F2F2)
+    } else {
+        Color::White
+    };
+    Format::new()
+        .set_background_color(bg)
+        .set_font_color(Color::RGB(0x375623))
+        .set_border(FormatBorder::Thin)
+}
+
+// ---------- header helpers ----------
 fn write_headers(
     sheet: &mut rust_xlsxwriter::Worksheet,
     headers: &[&str],
@@ -51,19 +114,37 @@ fn write_headers_at(
     Ok(())
 }
 
-// ============ SHEET: OVERVIEW ============
+fn auto_fit_columns(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    data: &[Vec<String>],
+    min_widths: &[f64],
+) -> Result<(), XlsxError> {
+    let col_count = data.iter().map(|row| row.len()).max().unwrap_or(0);
+    let mut max_widths = vec![0.0f64; col_count];
+
+    for row in data {
+        for (col, cell) in row.iter().enumerate() {
+            let len = cell.len() as f64;
+            if len > max_widths[col] {
+                max_widths[col] = len;
+            }
+        }
+    }
+
+    for (col, &mw) in max_widths.iter().enumerate() {
+        let min_w = min_widths.get(col).copied().unwrap_or(8.0);
+        sheet.set_column_width(col as u16, (mw + 2.0).max(min_w))?;
+    }
+    Ok(())
+}
+
+// =====================================================================
+// SHEET: OVERVIEW
+// =====================================================================
 fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Overview")?;
     write_headers(&mut sheet, &["Field", "Value"])?;
-
-    let score_fmt = if report.risk_score >= 70 {
-        critical_format()
-    } else if report.risk_score >= 40 {
-        warning_format()
-    } else {
-        ok_format()
-    };
 
     let backup_str = if report.host.backup_tools.is_empty() {
         "None (CRITICAL)".to_string()
@@ -111,18 +192,27 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
 
     for (i, (label, value)) in rows.iter().enumerate() {
         let row = (i + 1) as u32;
-        sheet.write_string(row, 0, *label)?;
+        let band = row_band(row);
+
+        sheet.write_string_with_format(row, 0, *label, &band)?;
         if *label == "Risk Score" {
+            let score_fmt = if report.risk_score >= 70 {
+                critical_band(row)
+            } else if report.risk_score >= 40 {
+                warning_band(row)
+            } else {
+                ok_band(row)
+            };
             sheet.write_string_with_format(row, 1, value, &score_fmt)?;
         } else if *label == "Backup tools" {
-            let fmt = if report.host.backup_tools.is_empty() {
-                critical_format()
+            let bk_fmt = if report.host.backup_tools.is_empty() {
+                critical_band(row)
             } else {
-                ok_format()
+                ok_band(row)
             };
-            sheet.write_string_with_format(row, 1, value, &fmt)?;
+            sheet.write_string_with_format(row, 1, value, &bk_fmt)?;
         } else {
-            sheet.write_string(row, 1, value)?;
+            sheet.write_string_with_format(row, 1, value, &band)?;
         }
     }
 
@@ -146,24 +236,31 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         &subtle,
     )?;
 
-    // Top 5 memory-consuming processes
+    // Top 5 memory‑consuming processes
     let start = branding_row + 3;
     sheet.write_string_with_format(start, 0, "Top Memory Processes", &header_format())?;
     sheet.write_string_with_format(start, 1, "PID", &header_format())?;
     sheet.write_string_with_format(start, 2, "RAM (MB)", &header_format())?;
     for (i, p) in report.host.top_memory_processes.iter().enumerate() {
         let row = start + 1 + i as u32;
-        sheet.write_string(row, 0, &p.name)?;
-        sheet.write_number(row, 1, p.pid as f64)?;
-        sheet.write_number(row, 2, p.memory_mb as f64)?;
+        let band = row_band(row);
+        sheet.write_string_with_format(row, 0, &p.name, &band)?;
+        sheet.write_number_with_format(row, 1, p.pid as f64, &number_format())?;
+        sheet.write_number_with_format(row, 2, p.memory_mb as f64, &number_format())?;
     }
 
-    sheet.set_column_width(0, 45.0)?;
+    let mut data: Vec<Vec<String>> = vec![vec!["Field".to_string(), "Value".to_string()]];
+    for (label, value) in &rows {
+        data.push(vec![label.to_string(), value.clone()]);
+    }
+    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0])?;
 
     Ok(sheet)
 }
 
-// ============ SHEET: STORAGE ============
+// =====================================================================
+// SHEET: STORAGE
+// =====================================================================
 fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Storage")?;
@@ -179,10 +276,15 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
         ],
     )?;
 
-    let critical = critical_format();
-    let warning = warning_format();
-    let ok = ok_format();
     let num_fmt = number_format();
+
+    let mut data: Vec<Vec<String>> = vec![vec![
+        "Mount Point".to_string(),
+        "Total (GB)".to_string(),
+        "Used (GB)".to_string(),
+        "Usage %".to_string(),
+        "Inodes %".to_string(),
+    ]];
 
     let mut row = 1u32;
     for disk in &report.storage.disks {
@@ -190,38 +292,45 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
             continue;
         }
         let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
+        let band = row_band(row);
 
-        sheet.write_string(row, 0, &disk.mount_point)?;
+        sheet.write_string_with_format(row, 0, &disk.mount_point, &band)?;
         sheet.write_number_with_format(row, 1, disk.total_gb as f64, &num_fmt)?;
         sheet.write_number_with_format(row, 2, disk.used_gb as f64, &num_fmt)?;
 
         let usage_fmt = if usage_pct > 90.0 {
-            &critical
+            critical_band(row)
         } else if usage_pct > 75.0 {
-            &warning
+            warning_band(row)
         } else {
-            &ok
+            ok_band(row)
         };
-        sheet.write_number_with_format(row, 3, usage_pct, usage_fmt)?;
+        sheet.write_number_with_format(row, 3, usage_pct, &usage_fmt)?;
 
         let inode_str = disk
             .inode_usage_percent
             .clone()
             .unwrap_or_else(|| "-".to_string());
-        sheet.write_string(row, 4, &inode_str)?;
+        sheet.write_string_with_format(row, 4, &inode_str, &band)?;
+
+        data.push(vec![
+            disk.mount_point.clone(),
+            format!("{:.2}", disk.total_gb),
+            format!("{:.2}", disk.used_gb),
+            format!("{:.1}", usage_pct),
+            inode_str,
+        ]);
 
         row += 1;
     }
 
-    sheet.set_column_width(0, 28.0)?;
-    sheet.set_column_width(1, 14.0)?;
-    sheet.set_column_width(2, 14.0)?;
-    sheet.set_column_width(3, 14.0)?;
-    sheet.set_column_width(4, 14.0)?;
+    auto_fit_columns(&mut sheet, &data, &[12.0, 10.0, 10.0, 10.0, 10.0])?;
     Ok(sheet)
 }
 
-// ============ SHEET: DATABASES ============
+// =====================================================================
+// SHEET: DATABASES
+// =====================================================================
 fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Databases")?;
@@ -232,13 +341,27 @@ fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, X
     )?;
 
     let num_fmt = number_format();
+    let mut data: Vec<Vec<String>> = vec![vec![
+        "Engine".to_string(),
+        "Version".to_string(),
+        "Data Directory".to_string(),
+        "Size (GB)".to_string(),
+    ]];
 
     for (i, db) in report.databases.iter().enumerate() {
         let row = (i + 1) as u32;
-        sheet.write_string(row, 0, &db.engine)?;
-        sheet.write_string(row, 1, &db.version)?;
-        sheet.write_string(row, 2, &db.data_dir)?;
+        let band = row_band(row);
+        sheet.write_string_with_format(row, 0, &db.engine, &band)?;
+        sheet.write_string_with_format(row, 1, &db.version, &band)?;
+        sheet.write_string_with_format(row, 2, &db.data_dir, &band)?;
         sheet.write_number_with_format(row, 3, db.size_mb as f64 / 1024.0, &num_fmt)?;
+
+        data.push(vec![
+            db.engine.clone(),
+            db.version.clone(),
+            db.data_dir.clone(),
+            format!("{:.2}", db.size_mb as f64 / 1024.0),
+        ]);
     }
 
     if !report.databases.is_empty() {
@@ -250,24 +373,46 @@ fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, X
             .sum();
         sheet.write_string_with_format(total_row, 2, "Total", &header_format())?;
         sheet.write_number_with_format(total_row, 3, total_gb, &num_fmt)?;
+
+        data.push(vec![
+            String::new(),
+            String::new(),
+            "Total".to_string(),
+            format!("{:.2}", total_gb),
+        ]);
     }
 
-    sheet.set_column_width(0, 18.0)?;
-    sheet.set_column_width(1, 32.0)?;
-    sheet.set_column_width(2, 30.0)?;
-    sheet.set_column_width(3, 14.0)?;
+    auto_fit_columns(&mut sheet, &data, &[10.0, 20.0, 20.0, 10.0])?;
     Ok(sheet)
 }
 
-// ============ SHEET: NETWORK ============
+// =====================================================================
+// SHEET: NETWORK
+// =====================================================================
 fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Network")?;
 
     sheet.write_string_with_format(0, 0, "Firewall Active", &header_format())?;
-    sheet.write_string(0, 1, report.network.firewall_active.to_string())?;
+    sheet.write_string_with_format(
+        0,
+        1,
+        report.network.firewall_active.to_string(),
+        &row_band(0),
+    )?;
     sheet.write_string_with_format(1, 0, "DNS Resolvers", &header_format())?;
-    sheet.write_string(1, 1, report.network.dns_resolvers.join(", "))?;
+    sheet.write_string_with_format(1, 1, report.network.dns_resolvers.join(", "), &row_band(1))?;
+
+    let mut data = vec![
+        vec![
+            "Firewall Active".to_string(),
+            report.network.firewall_active.to_string(),
+        ],
+        vec![
+            "DNS Resolvers".to_string(),
+            report.network.dns_resolvers.join(", "),
+        ],
+    ];
 
     // Listening ports
     let port_start = 3u32;
@@ -276,41 +421,55 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
         port_start,
         &["Protocol", "Port", "Process", "Bind Address"],
     )?;
-    let critical_addr = critical_format();
-    let ok_addr = ok_format();
     for (i, p) in report.network.listening_ports.iter().enumerate() {
         let row = port_start + 1 + i as u32;
-        sheet.write_string(row, 0, &p.protocol)?;
-        sheet.write_string(row, 1, &p.port)?;
-        sheet.write_string(row, 2, &p.process)?;
+        let band = row_band(row);
+
+        sheet.write_string_with_format(row, 0, &p.protocol, &band)?;
+        sheet.write_string_with_format(row, 1, &p.port, &band)?;
+        sheet.write_string_with_format(row, 2, &p.process, &band)?;
         let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
-            &critical_addr
+            critical_band(row)
         } else {
-            &ok_addr
+            ok_band(row)
         };
-        sheet.write_string_with_format(row, 3, &p.bind_address, addr_fmt)?;
+        sheet.write_string_with_format(row, 3, &p.bind_address, &addr_fmt)?;
+
+        data.push(vec![
+            p.protocol.clone(),
+            p.port.clone(),
+            p.process.clone(),
+            p.bind_address.clone(),
+        ]);
     }
 
     // SSL certificates
     let ssl_start = port_start + report.network.listening_ports.len() as u32 + 3;
     write_headers_at(&mut sheet, ssl_start, &["Domain", "Expires", "Days Left"])?;
-    let critical = critical_format();
-    let warning = warning_format();
-    let ok = ok_format();
     for (i, cert) in report.network.ssl_certificates.iter().enumerate() {
         let row = ssl_start + 1 + i as u32;
-        sheet.write_string(row, 0, &cert.domain)?;
-        sheet.write_string(row, 1, &cert.expiry_date)?;
+        let band = row_band(row);
+        sheet.write_string_with_format(row, 0, &cert.domain, &band)?;
+        sheet.write_string_with_format(row, 1, &cert.expiry_date, &band)?;
         match cert.days_remaining {
             Some(d) if cert.is_critical => {
-                sheet.write_number_with_format(row, 2, d as f64, &critical)?
+                sheet.write_number_with_format(row, 2, d as f64, &critical_band(row))?
             }
             Some(d) if cert.is_warning => {
-                sheet.write_number_with_format(row, 2, d as f64, &warning)?
+                sheet.write_number_with_format(row, 2, d as f64, &warning_band(row))?
             }
-            Some(d) => sheet.write_number_with_format(row, 2, d as f64, &ok)?,
-            None => sheet.write_string(row, 2, "unknown")?,
+            Some(d) => sheet.write_number_with_format(row, 2, d as f64, &ok_band(row))?,
+            None => sheet.write_string_with_format(row, 2, "unknown", &band)?,
         };
+
+        data.push(vec![
+            cert.domain.clone(),
+            cert.expiry_date.clone(),
+            cert.days_remaining
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            String::new(),
+        ]);
     }
 
     // Custom /etc/hosts overrides
@@ -322,21 +481,24 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
         &header_format(),
     )?;
     for (i, h) in report.network.custom_host_overrides.iter().enumerate() {
-        sheet.write_string(hosts_start + 1 + i as u32, 0, h)?;
+        let row = hosts_start + 1 + i as u32;
+        let band = row_band(row);
+        sheet.write_string_with_format(row, 0, h, &band)?;
+        data.push(vec![h.clone(), String::new(), String::new(), String::new()]);
     }
 
-    sheet.set_column_width(0, 30.0)?;
-    sheet.set_column_width(1, 30.0)?;
-    sheet.set_column_width(2, 16.0)?;
+    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 12.0])?;
     Ok(sheet)
 }
 
-// ============ SHEET: SECURITY ============
+// =====================================================================
+// SHEET: SECURITY
+// =====================================================================
 fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Security")?;
 
-    let risky = critical_format();
+    let risky = critical_format(); // for non‑banded rows
     let safe = ok_format();
 
     sheet.write_string_with_format(0, 0, "SSH Password Auth Enabled", &header_format())?;
@@ -366,7 +528,7 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     )?;
 
     sheet.write_string_with_format(2, 0, "SSH Config Source", &header_format())?;
-    sheet.write_string(2, 1, &report.security.ssh_config_source)?;
+    sheet.write_string_with_format(2, 1, &report.security.ssh_config_source, &row_band(2))?;
 
     sheet.write_string_with_format(3, 0, "Fail2Ban Active", &header_format())?;
     let f2b_fmt = if report.security.fail2ban_active {
@@ -385,20 +547,46 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.write_string_with_format(4, 1, report.security.auditd_active.to_string(), audit_fmt)?;
 
     let mut dyn_row = 5u32;
+    let mut data = vec![
+        vec![
+            "SSH Password Auth Enabled".to_string(),
+            report.security.ssh_password_auth_enabled.to_string(),
+        ],
+        vec![
+            "SSH Root Login Enabled".to_string(),
+            report.security.ssh_root_login_enabled.to_string(),
+        ],
+        vec![
+            "SSH Config Source".to_string(),
+            report.security.ssh_config_source.clone(),
+        ],
+        vec![
+            "Fail2Ban Active".to_string(),
+            report.security.fail2ban_active.to_string(),
+        ],
+        vec![
+            "Auditd Active".to_string(),
+            report.security.auditd_active.to_string(),
+        ],
+    ];
 
-    // Failed services (optional)
+    // Failed services (banded)
     if !report.host.failed_services.is_empty() {
         sheet.write_string_with_format(dyn_row, 0, "Failed Services", &header_format())?;
         sheet.write_string_with_format(
             dyn_row,
             1,
             report.host.failed_services.join(", "),
-            &risky,
+            &critical_band(dyn_row),
         )?;
+        data.push(vec![
+            "Failed Services".to_string(),
+            report.host.failed_services.join(", "),
+        ]);
         dyn_row += 1;
     }
 
-    // NTP Synchronized (when data is available)
+    // NTP (banded)
     if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
         sheet.write_string_with_format(dyn_row, 0, "NTP Synchronized", &header_format())?;
         let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
@@ -408,49 +596,94 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
             (false, None) => "no".to_string(),
         };
         let ntp_fmt = if report.host.ntp_synchronized {
-            &safe
+            ok_band(dyn_row)
         } else {
-            &risky
+            critical_band(dyn_row)
         };
-        sheet.write_string_with_format(dyn_row, 1, &ntp_value, ntp_fmt)?;
+        sheet.write_string_with_format(dyn_row, 1, &ntp_value, &ntp_fmt)?;
+        data.push(vec!["NTP Synchronized".to_string(), ntp_value]);
         dyn_row += 1;
     }
 
     let users_start = dyn_row + 1;
-
     write_headers_at(
         &mut sheet,
         users_start,
         &["User", "Last Login", "Last Remote SSH", "Authorized Keys"],
     )?;
+
     for (i, u) in report.security.shell_users.iter().enumerate() {
         let row = users_start + 1 + i as u32;
-        sheet.write_string(row, 0, &u.username)?;
-        sheet.write_string(row, 1, &u.last_login)?;
-        sheet.write_string(row, 2, &u.last_ssh_login)?;
-        sheet.write_number(row, 3, u.authorized_keys_count as f64)?;
+        let band = row_band(row);
+        sheet.write_string_with_format(row, 0, &u.username, &band)?;
+        sheet.write_string_with_format(row, 1, &u.last_login, &band)?;
+        sheet.write_string_with_format(row, 2, &u.last_ssh_login, &band)?;
+        sheet.write_number_with_format(row, 3, u.authorized_keys_count as f64, &number_format())?;
+
+        data.push(vec![
+            u.username.clone(),
+            u.last_login.clone(),
+            u.last_ssh_login.clone(),
+            u.authorized_keys_count.to_string(),
+        ]);
     }
 
-    sheet.set_column_width(0, 18.0)?;
-    sheet.set_column_width(1, 45.0)?;
-    sheet.set_column_width(2, 30.0)?;
-    sheet.set_column_width(3, 18.0)?;
+    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 12.0])?;
     Ok(sheet)
 }
 
-// ============ SHEET: DOCKER ============
+// =====================================================================
+// SHEET: DOCKER
+// =====================================================================
 fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Docker")?;
 
     sheet.write_string_with_format(0, 0, "Docker Active", &header_format())?;
-    sheet.write_string(0, 1, report.topology.docker_active.to_string())?;
+    sheet.write_string_with_format(
+        0,
+        1,
+        report.topology.docker_active.to_string(),
+        &row_band(0),
+    )?;
     sheet.write_string_with_format(1, 0, "Total Images", &header_format())?;
-    sheet.write_number(1, 1, report.topology.images_count as f64)?;
+    sheet.write_number_with_format(1, 1, report.topology.images_count as f64, &number_format())?;
     sheet.write_string_with_format(2, 0, "Dangling Images", &header_format())?;
-    sheet.write_number(2, 1, report.topology.dangling_images_count as f64)?;
+    sheet.write_number_with_format(
+        2,
+        1,
+        report.topology.dangling_images_count as f64,
+        &number_format(),
+    )?;
     sheet.write_string_with_format(3, 0, "Dangling Wasted Space (GB)", &header_format())?;
-    sheet.write_number(3, 1, report.topology.total_dangling_size_mb as f64 / 1024.0)?;
+    sheet.write_number_with_format(
+        3,
+        1,
+        report.topology.total_dangling_size_mb as f64 / 1024.0,
+        &number_format(),
+    )?;
+
+    let mut data = vec![
+        vec![
+            "Docker Active".to_string(),
+            report.topology.docker_active.to_string(),
+        ],
+        vec![
+            "Total Images".to_string(),
+            report.topology.images_count.to_string(),
+        ],
+        vec![
+            "Dangling Images".to_string(),
+            report.topology.dangling_images_count.to_string(),
+        ],
+        vec![
+            "Dangling Wasted Space (GB)".to_string(),
+            format!(
+                "{:.2}",
+                report.topology.total_dangling_size_mb as f64 / 1024.0
+            ),
+        ],
+    ];
 
     let containers_start = 5u32;
     write_headers_at(
@@ -467,16 +700,17 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
             "Security Issues",
         ],
     )?;
-    let critical = critical_format();
     for (i, c) in report.topology.containers.iter().enumerate() {
         let row = containers_start + 1 + i as u32;
-        sheet.write_string(row, 0, &c.name)?;
-        sheet.write_string(row, 1, &c.image)?;
-        sheet.write_string(row, 2, &c.state)?;
-        sheet.write_string(row, 3, &c.status)?;
-        sheet.write_number(row, 4, c.size_mb as f64 / 1024.0)?;
-        sheet.write_number(row, 5, c.log_size_mb as f64 / 1024.0)?;
-        sheet.write_string(row, 6, c.mounts.join(" | "))?;
+        let band = row_band(row);
+
+        sheet.write_string_with_format(row, 0, &c.name, &band)?;
+        sheet.write_string_with_format(row, 1, &c.image, &band)?;
+        sheet.write_string_with_format(row, 2, &c.state, &band)?;
+        sheet.write_string_with_format(row, 3, &c.status, &band)?;
+        sheet.write_number_with_format(row, 4, c.size_mb as f64 / 1024.0, &number_format())?;
+        sheet.write_number_with_format(row, 5, c.log_size_mb as f64 / 1024.0, &number_format())?;
+        sheet.write_string_with_format(row, 6, c.mounts.join(" | "), &band)?;
 
         let mut issues = Vec::new();
         if c.privileged {
@@ -500,20 +734,34 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
             issues.join(", ")
         };
         if issue_str != "-" {
-            sheet.write_string_with_format(row, 7, &issue_str, &critical)?;
+            sheet.write_string_with_format(row, 7, &issue_str, &critical_band(row))?;
         } else {
-            sheet.write_string(row, 7, &issue_str)?;
+            sheet.write_string_with_format(row, 7, &issue_str, &band)?;
         }
+
+        data.push(vec![
+            c.name.clone(),
+            c.image.clone(),
+            c.state.clone(),
+            c.status.clone(),
+            format!("{:.2}", c.size_mb as f64 / 1024.0),
+            format!("{:.2}", c.log_size_mb as f64 / 1024.0),
+            c.mounts.join(" | "),
+            issue_str,
+        ]);
     }
 
-    sheet.set_column_width(0, 22.0)?;
-    sheet.set_column_width(1, 30.0)?;
-    sheet.set_column_width(6, 60.0)?;
-    sheet.set_column_width(7, 25.0)?;
+    auto_fit_columns(
+        &mut sheet,
+        &data,
+        &[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0],
+    )?;
     Ok(sheet)
 }
 
-// ============ SHEET: PACKAGES ============
+// =====================================================================
+// SHEET: PACKAGES
+// =====================================================================
 fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Packages")?;
@@ -527,11 +775,33 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         PackageManager::Unknown => "Unknown",
     };
     sheet.write_string_with_format(0, 0, "Package Manager", &header_format())?;
-    sheet.write_string(0, 1, manager_str)?;
+    sheet.write_string_with_format(0, 1, manager_str, &row_band(0))?;
     sheet.write_string_with_format(1, 0, "Installed Packages", &header_format())?;
-    sheet.write_number(1, 1, report.packages.installed_count as f64)?;
+    sheet.write_number_with_format(
+        1,
+        1,
+        report.packages.installed_count as f64,
+        &number_format(),
+    )?;
     sheet.write_string_with_format(2, 0, "Cache Freshly Refreshed", &header_format())?;
-    sheet.write_string(2, 1, report.packages.cache_refreshed.to_string())?;
+    sheet.write_string_with_format(
+        2,
+        1,
+        report.packages.cache_refreshed.to_string(),
+        &row_band(2),
+    )?;
+
+    let mut data = vec![
+        vec!["Package Manager".to_string(), manager_str.to_string()],
+        vec![
+            "Installed Packages".to_string(),
+            report.packages.installed_count.to_string(),
+        ],
+        vec![
+            "Cache Freshly Refreshed".to_string(),
+            report.packages.cache_refreshed.to_string(),
+        ],
+    ];
 
     let upg_start = 4u32;
     write_headers_at(
@@ -539,28 +809,40 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         upg_start,
         &["Package", "Current", "Available", "Security"],
     )?;
-    let critical = critical_format();
     let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.is_security));
     for (i, p) in sorted.iter().enumerate() {
         let row = upg_start + 1 + i as u32;
-        sheet.write_string(row, 0, &p.name)?;
-        sheet.write_string(row, 1, &p.current_version)?;
-        sheet.write_string(row, 2, &p.new_version)?;
+        let band = row_band(row);
+
+        sheet.write_string_with_format(row, 0, &p.name, &band)?;
+        sheet.write_string_with_format(row, 1, &p.current_version, &band)?;
+        sheet.write_string_with_format(row, 2, &p.new_version, &band)?;
         if p.is_security {
-            sheet.write_string_with_format(row, 3, "YES", &critical)?;
+            sheet.write_string_with_format(row, 3, "YES", &critical_band(row))?;
         } else {
-            sheet.write_string(row, 3, "-")?;
+            sheet.write_string_with_format(row, 3, "-", &band)?;
         }
+
+        data.push(vec![
+            p.name.clone(),
+            p.current_version.clone(),
+            p.new_version.clone(),
+            if p.is_security {
+                "YES".to_string()
+            } else {
+                "-".to_string()
+            },
+        ]);
     }
 
-    sheet.set_column_width(0, 30.0)?;
-    sheet.set_column_width(1, 18.0)?;
-    sheet.set_column_width(2, 18.0)?;
+    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 10.0])?;
     Ok(sheet)
 }
 
-// ============ WRITE REPORT ============
+// =====================================================================
+// WRITE REPORT
+// =====================================================================
 pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
     let mut workbook = Workbook::new();
 
