@@ -153,8 +153,16 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     });
 
     if tools.contains(&"restic".to_string())
-        && let Ok(output) = Command::new("restic")
-            .args(["snapshots", "--json", "--last", "1"])
+        && let Ok(output) = Command::new("timeout")
+            .args([
+                "5s",
+                "restic",
+                "snapshots",
+                "--json",
+                "--last",
+                "1",
+                "--no-cache",
+            ])
             .output()
         && output.status.success()
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
@@ -402,6 +410,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     // -----------------------------------------------------------------
     let mut tech_stack = Vec::new();
 
+    // starts_with — catches versioned binaries: python3.11, php-fpm8.2, ruby3.2, etc.
     let prefix_targets: &[(&str, &str)] = &[
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
@@ -418,11 +427,12 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         ("memcached", "Memcached"),
     ];
 
+    // Exact match only — names too short or common for prefix/contains matching.
     let exact_targets: &[(&str, &str)] = &[
         ("go", "Go Binary"),
         ("node", "Node.js"),
         ("java", "Java"),
-        ("rust", "Rust Binary"),
+        ("rust", "Rust Binary"), // now exact match, rustc/rustup won't match
     ];
 
     let mut process_list: Vec<ProcessInfo> = Vec::new();

@@ -171,7 +171,7 @@ fn pacman_upgradable() -> Vec<UpgradablePackage> {
     if let Ok(output) = Command::new("pacman").arg("-Qu").output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
-            // Формат: "pkgname oldversion -> newversion"
+            // Format: "pkgname oldversion -> newversion"
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() >= 4 && cols[2] == "->" {
                 result.push(UpgradablePackage {

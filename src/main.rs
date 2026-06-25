@@ -131,7 +131,10 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
             .host
             .failed_services
             .iter()
-            .any(|s| s.contains(".service"));
+            .any(|s| s.contains(".service"))
+        || report.host.backup_tools.is_empty()
+        || !report.security.sudo_nopasswd_entries.is_empty()
+        || !report.host.ntp_synchronized;
 
     if !report.is_root_execution {
         if has_critical {
