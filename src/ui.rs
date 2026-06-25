@@ -215,6 +215,19 @@ pub fn render_dashboard(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("Zombie Processes"), zombie_cell]);
 
+    let backup_status = if report.host.backup_tools.is_empty() {
+        Cell::new("None (CRITICAL)")
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold)
+    } else {
+        let mut status = report.host.backup_tools.join(", ");
+        if let Some(ref snap) = report.host.last_restic_snapshot {
+            status.push_str(&format!(" (last: {})", snap));
+        }
+        Cell::new(status).fg(Color::Green)
+    };
+    t_risk.add_row(vec![Cell::new("Backup Tools"), backup_status]);
+
     // --- Failed systemd services (new) ---
     if !report.host.failed_services.is_empty() {
         t_risk.add_row(vec![

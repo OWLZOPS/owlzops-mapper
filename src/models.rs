@@ -44,6 +44,8 @@ pub struct HostInfo {
     pub tech_stack: Vec<String>,
     pub top_memory_processes: Vec<ProcessInfo>,
     pub failed_services: Vec<String>, // new: systemd units in failed state
+    pub backup_tools: Vec<String>,
+    pub last_restic_snapshot: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

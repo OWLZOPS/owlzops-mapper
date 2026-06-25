@@ -95,6 +95,9 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
     if report.host.oom_kills > 0 {
         score += 10;
     }
+    if report.host.backup_tools.is_empty() {
+        score += 20;
+    }
     score = score.min(100);
     score
 }

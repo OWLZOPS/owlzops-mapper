@@ -66,6 +66,13 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         ok_format()
     };
 
+    // Build the backup tools value with appropriate formatting later
+    let backup_str = if report.host.backup_tools.is_empty() {
+        "None (CRITICAL)".to_string()
+    } else {
+        report.host.backup_tools.join(", ")
+    };
+
     let rows: Vec<(&str, String)> = vec![
         ("Risk Score", format!("{}/100", report.risk_score)),
         ("Scan ID", report.scan_id.clone()),
@@ -76,6 +83,7 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         ("External IP", report.host.external_ipv4.clone()),
         ("OS", report.host.os_version.clone()),
         ("Kernel", report.host.kernel.clone()),
+        ("Backup tools", backup_str),
         ("Uptime (days)", report.host.uptime_days.to_string()),
         ("Reboot required", report.host.reboot_required.to_string()),
         ("CPU cores", report.host.cpu_cores.to_string()),
@@ -107,8 +115,14 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         let row = (i + 1) as u32;
         sheet.write_string(row, 0, *label)?;
         if *label == "Risk Score" {
-            // Colour the score cell
             sheet.write_string_with_format(row, 1, value, &score_fmt)?;
+        } else if *label == "Backup tools" {
+            let fmt = if report.host.backup_tools.is_empty() {
+                critical_format()
+            } else {
+                ok_format()
+            };
+            sheet.write_string_with_format(row, 1, value, &fmt)?;
         } else {
             sheet.write_string(row, 1, value)?;
         }

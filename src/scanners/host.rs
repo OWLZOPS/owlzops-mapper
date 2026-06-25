@@ -129,6 +129,55 @@ fn get_failed_systemd_services() -> Vec<String> {
     Vec::new()
 }
 
+// ---------------------------------------------------------------------
+// Backup detection
+// ---------------------------------------------------------------------
+fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
+    let mut tools = Vec::new();
+    let mut last_restic = None;
+
+    // Detect installed backup tools
+    for &tool in &["restic", "borg", "duplicati"] {
+        if Command::new("which")
+            .arg(tool)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            tools.push(tool.to_string());
+        }
+    }
+
+    // Check if any backup-related string appears in cron jobs
+    let backup_in_cron = cron_jobs.iter().any(|job| {
+        let l = job.to_lowercase();
+        l.contains("restic") || l.contains("borg") || l.contains("rsync") || l.contains("backup")
+    });
+
+    // If restic is present, try to get the last snapshot
+    if tools.contains(&"restic".to_string())
+        && let Ok(output) = Command::new("restic")
+            .args(["snapshots", "--json", "--last", "1"])
+            .output()
+        && output.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(snapshots) = json.as_array()
+        && let Some(snap) = snapshots.first()
+    {
+        last_restic = snap
+            .get("time")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string());
+    }
+
+    // Add generic cron-based detection as a synthetic tool if no specific tool found
+    if backup_in_cron && tools.is_empty() {
+        tools.push("cron (rsync/backup)".to_string());
+    }
+
+    (tools, last_restic)
+}
+
 pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     sys.refresh_all();
     let reboot_required = std::path::Path::new("/var/run/reboot-required").exists();
@@ -307,7 +356,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     // -----------------------------------------------------------------
     let mut tech_stack = Vec::new();
 
-    // starts_with — catches versioned binaries: python3.11, php-fpm8.2, ruby3.2, etc.
     let prefix_targets: &[(&str, &str)] = &[
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
@@ -324,12 +372,11 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         ("memcached", "Memcached"),
     ];
 
-    // Exact match only — names too short or common for prefix/contains matching.
     let exact_targets: &[(&str, &str)] = &[
         ("go", "Go Binary"),
         ("node", "Node.js"),
         ("java", "Java"),
-        ("rust", "Rust Binary"), // now exact match, rustc/rustup won't match
+        ("rust", "Rust Binary"),
     ];
 
     let mut process_list: Vec<ProcessInfo> = Vec::new();
@@ -374,6 +421,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     let load = System::load_average();
 
     let failed_services = get_failed_systemd_services();
+    let (backup_tools, last_restic_snapshot) = gather_backup_info(&cron_jobs);
 
     HostInfo {
         hostname: System::host_name().unwrap_or_else(|| "unknown".to_string()),
@@ -401,5 +449,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         tech_stack,
         top_memory_processes: process_list,
         failed_services,
+        backup_tools,
+        last_restic_snapshot,
     }
 }
