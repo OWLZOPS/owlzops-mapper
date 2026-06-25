@@ -119,7 +119,6 @@ fn get_failed_systemd_services() -> Vec<String> {
             if trimmed.is_empty() {
                 continue;
             }
-            // output format: "  unit.service   loaded failed failed ..."
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if !parts.is_empty() {
                 services.push(parts[0].to_string());
@@ -323,17 +322,15 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         ("httpd", "Apache"),
         ("etcd", "Etcd"),
         ("memcached", "Memcached"),
-        ("rabbitmq", "RabbitMQ"),
-        ("rust", "Rust Binary"),
     ];
 
     // Exact match only — names too short or common for prefix/contains matching.
-    // "go" via contains hits mongod (m-o-n-[g-o]-d at index 3-4) and cargo.
-    // "go" via starts_with hits golang, google-fluentd, etc.
-    // "node" via starts_with hits node_exporter, nodemon, nodelay.
-    // "java" via starts_with is fine but can also be exact — launchers are named "java".
-    let exact_targets: &[(&str, &str)] =
-        &[("go", "Go Binary"), ("node", "Node.js"), ("java", "Java")];
+    let exact_targets: &[(&str, &str)] = &[
+        ("go", "Go Binary"),
+        ("node", "Node.js"),
+        ("java", "Java"),
+        ("rust", "Rust Binary"), // now exact match, rustc/rustup won't match
+    ];
 
     let mut process_list: Vec<ProcessInfo> = Vec::new();
     let mut zombie_processes = 0;
@@ -361,6 +358,15 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
             memory_mb: proc.memory() / (1024 * 1024),
         });
     }
+
+    // RabbitMQ runs under beam.smp; detect by known data directory
+    if (std::path::Path::new("/var/lib/rabbitmq").exists()
+        || std::path::Path::new("/etc/rabbitmq").exists())
+        && !tech_stack.contains(&"RabbitMQ".to_string())
+    {
+        tech_stack.push("RabbitMQ".to_string());
+    }
+
     tech_stack.sort();
     process_list.sort_by_key(|b| std::cmp::Reverse(b.memory_mb));
     process_list.truncate(5);

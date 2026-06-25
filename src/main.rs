@@ -100,21 +100,33 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
 }
 
 fn compute_exit_code(report: &AgentReport) -> i32 {
-    if !report.is_root_execution {
-        eprintln!("WARNING: not running as root – results may be incomplete.");
-        return 2;
-    }
-    let conditions: &[bool] = &[
-        !report.network.firewall_active,
-        report.security.ssh_root_login_enabled,
-        report.packages.upgradable.iter().any(|p| p.is_security),
-        report
+    let has_critical = !report.network.firewall_active
+        || report.security.ssh_root_login_enabled
+        || report.packages.upgradable.iter().any(|p| p.is_security)
+        || report
             .network
             .ssl_certificates
             .iter()
-            .any(|c| c.is_critical),
-    ];
-    if conditions.iter().any(|&c| c) { 1 } else { 0 }
+            .any(|c| c.is_critical)
+        || report
+            .host
+            .failed_services
+            .iter()
+            .any(|s| s.contains(".service"));
+
+    if !report.is_root_execution {
+        if has_critical {
+            eprintln!(
+                "WARNING: not running as root AND critical issues detected – \
+                 results may be incomplete, re-run with sudo."
+            );
+        } else {
+            eprintln!("WARNING: not running as root – results may be incomplete.");
+        }
+        return 2;
+    }
+
+    if has_critical { 1 } else { 0 }
 }
 
 // =====================================================================
@@ -152,8 +164,6 @@ async fn main() {
     let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
 
     // Parallel execution of remaining scanners using spawn_blocking
-    // Functions without arguments are passed directly; packages_task requires a
-    // closure because it captures `want_refresh_packages`.
     let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
     let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
     let storage_task = tokio::task::spawn_blocking(scanners::storage::gather_storage_info);
@@ -210,7 +220,7 @@ async fn main() {
                 format!(
                     "owlzops-report-{}-{}.xlsx",
                     report.host.hostname,
-                    chrono::Local::now().format("%Y-%m-%d_%M-%S")
+                    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
                 )
             });
             match exporters::xlsx::write_report(&report, &filename) {

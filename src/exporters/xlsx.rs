@@ -265,15 +265,17 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
         port_start,
         &["Protocol", "Port", "Process", "Bind Address"],
     )?;
+    let critical_addr = critical_format();
+    let ok_addr = ok_format();
     for (i, p) in report.network.listening_ports.iter().enumerate() {
         let row = port_start + 1 + i as u32;
         sheet.write_string(row, 0, &p.protocol)?;
         sheet.write_string(row, 1, &p.port)?;
         sheet.write_string(row, 2, &p.process)?;
         let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
-            &critical_format()
+            &critical_addr
         } else {
-            &ok_format()
+            &ok_addr
         };
         sheet.write_string_with_format(row, 3, &p.bind_address, addr_fmt)?;
     }
