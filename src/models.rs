@@ -43,9 +43,11 @@ pub struct HostInfo {
     pub systemd_timers: Vec<String>,
     pub tech_stack: Vec<String>,
     pub top_memory_processes: Vec<ProcessInfo>,
-    pub failed_services: Vec<String>, // new: systemd units in failed state
+    pub failed_services: Vec<String>,
     pub backup_tools: Vec<String>,
     pub last_restic_snapshot: Option<String>,
+    pub ntp_synchronized: bool,
+    pub time_offset_ms: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -130,11 +132,10 @@ pub struct ContainerInfo {
     pub log_size_mb: u64,
     pub ports: Vec<String>,
     pub mounts: Vec<String>,
-    // --- New Docker security fields ---
     pub privileged: bool,
-    pub memory_limit_mb: Option<u64>, // None = no limit
-    pub cpu_limit: Option<f64>,       // None = no limit (number of CPUs)
-    pub cap_add: Vec<String>,         // list of added capabilities
+    pub memory_limit_mb: Option<u64>,
+    pub cpu_limit: Option<f64>,
+    pub cap_add: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

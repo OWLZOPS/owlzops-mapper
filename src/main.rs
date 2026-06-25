@@ -98,6 +98,9 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
     if report.host.backup_tools.is_empty() {
         score += 20;
     }
+    if !report.host.ntp_synchronized {
+        score += 10;
+    }
     score = score.min(100);
     score
 }
@@ -197,7 +200,7 @@ async fn main() {
         timestamp: Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         duration_secs,
-        risk_score: 0, // placeholder, will be recalculated
+        risk_score: 0,
         is_root_execution: is_root,
         host: host_info,
         databases: dbs,

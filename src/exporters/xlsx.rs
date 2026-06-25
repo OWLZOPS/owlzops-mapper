@@ -57,7 +57,6 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     sheet.set_name("Overview")?;
     write_headers(&mut sheet, &["Field", "Value"])?;
 
-    // Prepare the colour for the Risk Score cell
     let score_fmt = if report.risk_score >= 70 {
         critical_format()
     } else if report.risk_score >= 40 {
@@ -66,7 +65,6 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         ok_format()
     };
 
-    // Build the backup tools value with appropriate formatting later
     let backup_str = if report.host.backup_tools.is_empty() {
         "None (CRITICAL)".to_string()
     } else {
@@ -160,7 +158,6 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
         sheet.write_number(row, 2, p.memory_mb as f64)?;
     }
 
-    // Widen column A so hyperlinks and long texts are fully visible
     sheet.set_column_width(0, 45.0)?;
 
     Ok(sheet)
@@ -387,7 +384,40 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     };
     sheet.write_string_with_format(4, 1, report.security.auditd_active.to_string(), audit_fmt)?;
 
-    let users_start = 6u32;
+    let mut dyn_row = 5u32;
+
+    // Failed services (optional)
+    if !report.host.failed_services.is_empty() {
+        sheet.write_string_with_format(dyn_row, 0, "Failed Services", &header_format())?;
+        sheet.write_string_with_format(
+            dyn_row,
+            1,
+            report.host.failed_services.join(", "),
+            &risky,
+        )?;
+        dyn_row += 1;
+    }
+
+    // NTP Synchronized (when data is available)
+    if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
+        sheet.write_string_with_format(dyn_row, 0, "NTP Synchronized", &header_format())?;
+        let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
+            (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
+            (true, None) => "yes".to_string(),
+            (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
+            (false, None) => "no".to_string(),
+        };
+        let ntp_fmt = if report.host.ntp_synchronized {
+            &safe
+        } else {
+            &risky
+        };
+        sheet.write_string_with_format(dyn_row, 1, &ntp_value, ntp_fmt)?;
+        dyn_row += 1;
+    }
+
+    let users_start = dyn_row + 1;
+
     write_headers_at(
         &mut sheet,
         users_start,

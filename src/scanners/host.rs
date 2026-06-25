@@ -136,7 +136,6 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
     let mut last_restic = None;
 
-    // Detect installed backup tools
     for &tool in &["restic", "borg", "duplicati"] {
         if Command::new("which")
             .arg(tool)
@@ -148,13 +147,11 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
         }
     }
 
-    // Check if any backup-related string appears in cron jobs
     let backup_in_cron = cron_jobs.iter().any(|job| {
         let l = job.to_lowercase();
         l.contains("restic") || l.contains("borg") || l.contains("rsync") || l.contains("backup")
     });
 
-    // If restic is present, try to get the last snapshot
     if tools.contains(&"restic".to_string())
         && let Ok(output) = Command::new("restic")
             .args(["snapshots", "--json", "--last", "1"])
@@ -170,12 +167,61 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
             .map(|s| s.to_string());
     }
 
-    // Add generic cron-based detection as a synthetic tool if no specific tool found
     if backup_in_cron && tools.is_empty() {
         tools.push("cron (rsync/backup)".to_string());
     }
 
     (tools, last_restic)
+}
+
+// ---------------------------------------------------------------------
+// NTP / time drift detection
+// ---------------------------------------------------------------------
+fn gather_ntp_info() -> (bool, Option<f64>) {
+    let Ok(td_out) = Command::new("timedatectl").arg("status").output() else {
+        return (true, None);
+    };
+    if !td_out.status.success() {
+        return (true, None);
+    }
+
+    let text = String::from_utf8_lossy(&td_out.stdout);
+    let synchronized = text.lines().any(|l| {
+        (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
+    });
+
+    // Primary offset source: chronyc tracking (seconds → ms)
+    if let Ok(out) = Command::new("chronyc").arg("tracking").output()
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.contains("System time")
+                && let Some(after) = line.split_once(':').map(|x| x.1)
+                && let Some(num_str) = after.split_whitespace().next()
+                && let Ok(secs) = num_str.parse::<f64>()
+            {
+                return (synchronized, Some(secs.abs() * 1000.0));
+            }
+        }
+    }
+
+    // Fallback: ntpq -p (offset column is already in ms)
+    if let Ok(out) = Command::new("ntpq").args(["-p", "-n"]).output()
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.starts_with('*') {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() >= 9
+                    && let Ok(offset_ms) = cols[8].parse::<f64>()
+                {
+                    return (synchronized, Some(offset_ms.abs()));
+                }
+            }
+        }
+    }
+
+    (synchronized, None)
 }
 
 pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
@@ -422,6 +468,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
 
     let failed_services = get_failed_systemd_services();
     let (backup_tools, last_restic_snapshot) = gather_backup_info(&cron_jobs);
+    let (ntp_synchronized, time_offset_ms) = gather_ntp_info();
 
     HostInfo {
         hostname: System::host_name().unwrap_or_else(|| "unknown".to_string()),
@@ -451,5 +498,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         failed_services,
         backup_tools,
         last_restic_snapshot,
+        ntp_synchronized,
+        time_offset_ms,
     }
 }

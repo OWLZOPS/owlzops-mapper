@@ -7,7 +7,7 @@ pub fn render_dashboard(report: &AgentReport) {
     println!("🦉 Owlzops Mapper v{}", report.version);
     println!("Scan completed in {:.2}s", report.duration_secs);
 
-    // ---- Risk Score (new) ----
+    // ---- Risk Score ----
     let risk_color = if report.risk_score >= 70 {
         "\x1b[1;31m" // red
     } else if report.risk_score >= 40 {
@@ -150,7 +150,7 @@ pub fn render_dashboard(report: &AgentReport) {
         println!("{t_dbs}\n");
     }
 
-    // 2. SECURITY & HEALTH (extended with new fields)
+    // 2. SECURITY & HEALTH (extended with NTP)
     let mut t_risk = Table::new();
     t_risk
         .load_preset(UTF8_FULL)
@@ -180,7 +180,6 @@ pub fn render_dashboard(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("SSH Root Login"), root_cell]);
 
-    // --- New rows for SSH source, Fail2ban, Auditd ---
     t_risk.add_row(vec![
         Cell::new("SSH Config Source"),
         Cell::new(&report.security.ssh_config_source),
@@ -200,6 +199,27 @@ pub fn render_dashboard(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("Auditd"), audit]);
 
+    // NTP / Time Sync row
+    if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
+        let ntp_cell = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
+            (true, Some(ms)) if ms > 100.0 => {
+                Cell::new(format!("Synced ({:.1}ms — high offset)", ms)).fg(Color::Yellow)
+            }
+            (true, Some(ms)) => Cell::new(format!("Synced ({:.1}ms)", ms)).fg(Color::Green),
+            (true, None) => Cell::new("Synced").fg(Color::Green),
+            (false, Some(ms)) if ms > 1000.0 => {
+                Cell::new(format!("NOT SYNCED ({:.0}ms — CRITICAL)", ms))
+                    .fg(Color::Red)
+                    .add_attribute(Attribute::Bold)
+            }
+            (false, Some(ms)) => Cell::new(format!("NOT SYNCED ({:.1}ms)", ms)).fg(Color::Red),
+            (false, None) => Cell::new("NOT SYNCED")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold),
+        };
+        t_risk.add_row(vec![Cell::new("NTP / Time Sync"), ntp_cell]);
+    }
+
     // OOM Kills
     let oom_cell = if report.host.oom_kills > 0 {
         Cell::new(format!("{} Kills (HIGH RISK)", report.host.oom_kills)).fg(Color::Red)
@@ -215,6 +235,7 @@ pub fn render_dashboard(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("Zombie Processes"), zombie_cell]);
 
+    // Backup Tools
     let backup_status = if report.host.backup_tools.is_empty() {
         Cell::new("None (CRITICAL)")
             .fg(Color::Red)
@@ -228,7 +249,7 @@ pub fn render_dashboard(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("Backup Tools"), backup_status]);
 
-    // --- Failed systemd services (new) ---
+    // Failed systemd services
     if !report.host.failed_services.is_empty() {
         t_risk.add_row(vec![
             Cell::new("Failed Services"),
@@ -630,7 +651,7 @@ pub fn render_dashboard(report: &AgentReport) {
                 Cell::new("Uptime / Status").add_attribute(Attribute::Bold),
                 Cell::new("Size (GB)").add_attribute(Attribute::Bold),
                 Cell::new("Log Size (GB)").add_attribute(Attribute::Bold),
-                Cell::new("Security Issues").add_attribute(Attribute::Bold), // new column
+                Cell::new("Security Issues").add_attribute(Attribute::Bold),
                 Cell::new("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
             ]);
             for c in &report.topology.containers {
@@ -649,7 +670,7 @@ pub fn render_dashboard(report: &AgentReport) {
                     log_cell = log_cell.fg(Color::Red);
                 }
 
-                // --- Collect Docker security issues ---
+                // Collect Docker security issues
                 let mut issues = Vec::new();
                 if c.privileged {
                     issues.push("PRIVILEGED".to_string());
