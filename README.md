@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 
-> One binary. One command. Full picture of your server – now with a built‑in **Risk Score** for instant security assessment.
+> One binary. One command. Full picture of your server – now with **Risk Score** and **multi‑host remote audit**.
 
 **owlzops-mapper** is a self-contained Rust binary that performs a complete
 Linux server audit in seconds and exports the result to Excel, JSON or
@@ -28,8 +28,11 @@ curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.
 sudo ./owlzops-mapper
 ```
 
+---
+
 ## Usage
 
+### Local audit
 ```bash
 # Terminal dashboard (default, fully offline)
 sudo ./owlzops-mapper
@@ -43,31 +46,54 @@ sudo ./owlzops-mapper --format json > snapshot.json
 # Detect external IP (opt-in outbound request)
 sudo ./owlzops-mapper --external-ip
 
-# Refresh package cache before checking updates (apt/dnf/pacman)
+# Refresh package cache before checking updates
 sudo ./owlzops-mapper --refresh-packages
 
 # Air-gapped / restricted network — guarantees zero outbound calls
 sudo ./owlzops-mapper --offline
 ```
 
+### Remote audit (via SSH)
+```bash
+# Scan a single remote host (binary must be present at /tmp/owlzops-mapper)
+sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root
+
+# Automatically copy the local static binary to the remote host first
+sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root --copy-binary
+
+# Scan multiple hosts from a file (one per line)
+sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --copy-binary
+```
+
+---
+
 ## Command-Line Options
 
 | Flag | Description |
 |------|-------------|
 | `-f, --format` | Output format: `text` (default), `json`, `xlsx` (or `excel`) |
-| `-o, --output` | Output file for Excel reports (default: `owlzops-report-<hostname>-YYYY-MM-DD.xlsx`) |
+| `-o, --output` | Output file for Excel reports (default: `owlzops-report-<hostname>-YYYY-MM-DD_HH-MM-SS.xlsx`) |
 | `--external-ip` | Fetch public IP via outbound request (off by default) |
 | `--refresh-packages` | Update package cache before scanning (off by default) |
 | `--offline` | Disable **all** network calls. Overrides other flags if combined |
+| `--host <HOST>` | Single hostname/IP for remote scanning |
+| `--hosts <FILE>` | File with one hostname/IP per line for remote scanning |
+| `--ssh-user <USER>` | SSH user for remote connections (default: `root`) |
+| `--ssh-key <PATH>` | Path to SSH private key (default: `~/.ssh/id_rsa`) |
+| `--copy-binary` | Copy the local binary to remote hosts before scanning (requires static musl build) |
+| `--remote-path <PATH>` | Path where the binary is placed on remote hosts (default: `/tmp/owlzops-mapper`) |
+| `--local-binary <PATH>` | Path to a local static binary to copy (overrides `/proc/self/exe`) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
+
+---
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | `0`  | No critical issues found |
-| `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, or SSL certificate about to expire) |
+| `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries) |
 | `2`  | Not running as root – results may be incomplete |
 
 You can use these codes directly in CI/CD pipelines:
@@ -75,39 +101,56 @@ You can use these codes directly in CI/CD pipelines:
 sudo ./owlzops-mapper || echo "Security scan failed – check the report"
 ```
 
+---
+
 ## Risk Score
 
-The dashboard and Excel report now include a **Risk Score (0–100)** calculated
+The dashboard and Excel report include a **Risk Score (0–100)** calculated
 from real findings:
 
-- Firewall inactive (+30)
-- SSH root login allowed (+25)
-- Pending security updates (+20)
-- SSL certificate expires within 7 days (+15)
-- Failed systemd services (+10)
-- SSH password authentication enabled (+10)
-- OOM kills present (+10)
+| Finding | Penalty |
+|---|---|
+| Firewall inactive | +30 |
+| SSH root login allowed | +25 |
+| Pending security updates | +20 |
+| SSL certificate expires within 7 days | +15 (max) |
+| Failed systemd services | +10 |
+| SSH password authentication enabled | +10 |
+| OOM kills present | +10 |
+| No backup tools detected | +20 |
+| NTP not synchronized | +10 |
+| Sudo NOPASSWD entries found | +10 |
+| Sudoers permissions not 0440 | +5 |
+| Sysctl security issues | +5 per issue (max +15) |
 
 Lower scores are better. The score is displayed in colour (green < 40, yellow 40–69, red ≥ 70)
 and placed prominently at the top of every report.
+
+---
 
 ## What It Scans
 
 | Category | Details |
 |---|---|
 | System | OS, kernel, uptime, CPU, RAM, load average, LSM modules |
-| Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, **fail2ban & auditd presence** |
-| Network | Listening ports with **bind address** (red = exposed on 0.0.0.0/::), firewall, DNS, SSL certificates with expiry |
+| Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, sudo NOPASSWD entries, sudoers permissions, sysctl security audit |
+| Network | Listening ports with bind address (red = exposed on 0.0.0.0/::), firewall, DNS, SSL certificates with expiry |
 | Storage | Disk usage, inode usage per mount |
-| Docker | Images, dangling layers, containers, mounts, log sizes, **privileged flag, memory/CPU limits, dangerous capabilities** |
-| Packages | Installed count, upgradable, security updates (apt/dnf/yum/pacman) |
+| Docker | Images, dangling layers, containers, mounts, log sizes, privileged flag, memory/CPU limits, dangerous capabilities |
+| Packages | Installed count, upgradable, security updates (apt/dnf/yum/pacman/zypper) |
 | Databases | PostgreSQL, MySQL, Redis, MongoDB — versions and data sizes |
-| Internals | Cron jobs, systemd timers, /etc/hosts overrides, kernel errors, **failed systemd units** |
+| Internals | Cron jobs, systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
+| Backups | Detection of restic, borg, duplicati, rsync/backup in cron |
+| NTP | Time synchronization status and offset |
+
+---
 
 ## Why Rust?
 
 Single static binary. No runtime, no Python, no dependencies to install on
 the target server. Copy it, run it, done.
+
+---
 
 ## Building from Source
 
@@ -118,7 +161,15 @@ cargo build --release
 sudo ./target/release/owlzops-mapper
 ```
 
+For static musl build (recommended for remote scanning):
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
 Requires: Rust 1.75+, Linux target.
+
+---
 
 ## Verifying Releases
 
@@ -130,6 +181,8 @@ To verify:
 gpg --import gpg-public-key.asc
 gpg --verify owlzops-mapper-linux-x86_64.tar.gz.asc owlzops-mapper-linux-x86_64.tar.gz
 ```
+
+---
 
 ## License
 

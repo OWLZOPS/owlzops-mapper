@@ -43,11 +43,17 @@ struct Args {
     #[arg(long, default_value = "~/.ssh/id_rsa")]
     ssh_key: String,
 
+    /// Copy the local binary to the remote host before scanning.
+    /// Requires a statically linked (musl) build. Release binaries are static.
     #[arg(long, default_value_t = false)]
     copy_binary: bool,
 
     #[arg(long, default_value = "/tmp/owlzops-mapper")]
     remote_path: String,
+
+    /// Path to a local static (musl) binary to copy instead of /proc/self/exe.
+    #[arg(long)]
+    local_binary: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
@@ -170,13 +176,15 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
 
     if args.copy_binary {
+        // Determine which local binary to copy
+        let local_bin = args.local_binary.as_deref().unwrap_or("/proc/self/exe");
         let status = Command::new("scp")
             .args([
                 "-i",
                 &ssh_key,
                 "-o",
                 "StrictHostKeyChecking=accept-new",
-                "/proc/self/exe",
+                local_bin,
                 &format!("{}@{}:{}", ssh_user, host, remote_path),
             ])
             .status()
@@ -187,8 +195,6 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
         }
     }
 
-    // Exactly the same string that works manually:
-    //   ssh ... drobot@host "sudo /tmp/owlzops-mapper --format json --offline"
     let remote_cmd = format!("sudo {} --format json --offline", remote_path);
 
     let output = Command::new("ssh")
@@ -198,13 +204,11 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
             "-o",
             "StrictHostKeyChecking=accept-new",
             &format!("{}@{}", ssh_user, host),
-            &remote_cmd, // <-- one argument = the whole command
+            &remote_cmd,
         ])
         .output()
         .ok()?;
 
-    // ssh may exit non-zero because the mapper returns 1 on critical findings.
-    // We rely solely on parsing the JSON output.
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Ok(report) = serde_json::from_str::<AgentReport>(&stdout) {
         return Some(report);
@@ -262,6 +266,7 @@ async fn main() {
                 ssh_key: args.ssh_key.clone(),
                 copy_binary: args.copy_binary,
                 remote_path: args.remote_path.clone(),
+                local_binary: args.local_binary.clone(),
             };
             handles.push(tokio::task::spawn_blocking(move || {
                 run_remote_scan(&host, &args_owned)
@@ -277,7 +282,11 @@ async fn main() {
 
         match args.format {
             OutputFormat::Text => {
-                ui::render_multi_host_summary(&reports);
+                if reports.len() == 1 {
+                    ui::render_dashboard(&reports[0]);
+                } else {
+                    ui::render_multi_host_summary(&reports);
+                }
             }
             OutputFormat::Json => {
                 if let Ok(json) = serde_json::to_string_pretty(&reports) {
