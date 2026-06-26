@@ -165,8 +165,6 @@ pub fn sheet_executive_summary(
     sheet.write_string_with_format(1, 0, "Infrastructure Health Report", &subtitle_fmt)?;
 
     let mut current_row = 3u32;
-
-    // Data collection for auto‑fit
     let mut data: Vec<Vec<String>> = Vec::new();
 
     if !multi_host && reports.len() == 1 {
@@ -332,14 +330,12 @@ pub fn sheet_executive_summary(
         ]);
         current_row += 1;
 
-        // Format for the hostname cell – slightly darker background and bold
         let host_cell_fmt = Format::new()
             .set_bold()
             .set_background_color(Color::RGB(0xE0E0E0))
             .set_border(FormatBorder::Thin);
 
         for (idx, report) in reports.iter().enumerate() {
-            // Separator line between hosts (except before the first one)
             if idx > 0 {
                 let sep_fmt = Format::new().set_border(FormatBorder::Thin);
                 sheet.write_string_with_format(current_row, 0, "", &sep_fmt)?;
@@ -351,8 +347,6 @@ pub fn sheet_executive_summary(
             }
 
             let band = row_band(current_row);
-
-            // Hostname – highlighted
             sheet.write_string_with_format(
                 current_row,
                 0,
@@ -360,7 +354,6 @@ pub fn sheet_executive_summary(
                 &host_cell_fmt,
             )?;
 
-            // Risk Score
             let score_fmt = if report.risk_score >= 70 {
                 critical_band(current_row)
             } else if report.risk_score >= 40 {
@@ -477,11 +470,9 @@ pub fn sheet_executive_summary(
         &legend_fmt,
     )?;
 
-    // Auto‑fit columns based on collected data
     let col_count = data.iter().map(|row| row.len()).max().unwrap_or(2);
     auto_fit_columns(&mut sheet, &data, &vec![12.0; col_count])?;
 
-    // Print scaling: fit to 1 page wide by 1 page tall
     sheet.set_print_fit_to_pages(1, 1);
     sheet.set_print_area(0, 0, current_row, col_count as u16 - 1)?;
 
@@ -489,11 +480,20 @@ pub fn sheet_executive_summary(
 }
 
 // =====================================================================
-// SHEET: OVERVIEW (wrapper)
+// Helper: truncate hostname to fit Excel sheet name limit (31 chars)
 // =====================================================================
-fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_overview_named(report, "Overview")
+fn truncate_hostname(name: &str, prefix: &str) -> String {
+    let max_len = 31 - prefix.len() - 1; // -1 for the hyphen
+    if name.len() > max_len {
+        format!("{}-{}", prefix, &name[..max_len])
+    } else {
+        format!("{}-{}", prefix, name)
+    }
 }
+
+// =====================================================================
+// Named versions of all sheets (for multi‑host mode)
+// =====================================================================
 
 fn sheet_overview_named(
     report: &AgentReport,
@@ -550,7 +550,6 @@ fn sheet_overview_named(
     for (i, (label, value)) in rows.iter().enumerate() {
         let row = (i + 1) as u32;
         let band = row_band(row);
-
         sheet.write_string_with_format(row, 0, *label, &band)?;
         if *label == "Risk Score" {
             let score_fmt = if report.risk_score >= 70 {
@@ -615,12 +614,17 @@ fn sheet_overview_named(
     Ok(sheet)
 }
 
-// =====================================================================
-// SHEET: STORAGE (unchanged)
-// =====================================================================
-fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_overview_named(report, "Overview")
+}
+
+// ---- Storage ----
+fn sheet_storage_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Storage")?;
+    sheet.set_name(sheet_name)?;
 
     write_headers(
         &mut sheet,
@@ -634,7 +638,6 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
     )?;
 
     let num_fmt = number_format();
-
     let mut data: Vec<Vec<String>> = vec![vec![
         "Mount Point".to_string(),
         "Total (GB)".to_string(),
@@ -677,7 +680,6 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
             format!("{:.1}", usage_pct),
             inode_str,
         ]);
-
         row += 1;
     }
 
@@ -685,12 +687,17 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
     Ok(sheet)
 }
 
-// =====================================================================
-// SHEET: DATABASES (unchanged)
-// =====================================================================
-fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_storage_named(report, "Storage")
+}
+
+// ---- Databases ----
+fn sheet_databases_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Databases")?;
+    sheet.set_name(sheet_name)?;
 
     write_headers(
         &mut sheet,
@@ -743,12 +750,17 @@ fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, X
     Ok(sheet)
 }
 
-// =====================================================================
-// SHEET: NETWORK (unchanged)
-// =====================================================================
-fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_databases_named(report, "Databases")
+}
+
+// ---- Network ----
+fn sheet_network_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Network")?;
+    sheet.set_name(sheet_name)?;
 
     sheet.write_string_with_format(0, 0, "Firewall Active", &header_format())?;
     sheet.write_string_with_format(
@@ -781,7 +793,6 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
     for (i, p) in report.network.listening_ports.iter().enumerate() {
         let row = port_start + 1 + i as u32;
         let band = row_band(row);
-
         sheet.write_string_with_format(row, 0, &p.protocol, &band)?;
         sheet.write_string_with_format(row, 1, &p.port, &band)?;
         sheet.write_string_with_format(row, 2, &p.process, &band)?;
@@ -848,12 +859,17 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
     Ok(sheet)
 }
 
-// =====================================================================
-// SHEET: SECURITY (unchanged)
-// =====================================================================
-fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_network_named(report, "Network")
+}
+
+// ---- Security ----
+fn sheet_security_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Security")?;
+    sheet.set_name(sheet_name)?;
 
     let risky = critical_format();
     let safe = ok_format();
@@ -1035,12 +1051,17 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     Ok(sheet)
 }
 
-// =====================================================================
-// SHEET: DOCKER (unchanged)
-// =====================================================================
-fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_security_named(report, "Security")
+}
+
+// ---- Docker ----
+fn sheet_docker_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Docker")?;
+    sheet.set_name(sheet_name)?;
 
     sheet.write_string_with_format(0, 0, "Docker Active", &header_format())?;
     sheet.write_string_with_format(
@@ -1106,7 +1127,6 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
     for (i, c) in report.topology.containers.iter().enumerate() {
         let row = containers_start + 1 + i as u32;
         let band = row_band(row);
-
         sheet.write_string_with_format(row, 0, &c.name, &band)?;
         sheet.write_string_with_format(row, 1, &c.image, &band)?;
         sheet.write_string_with_format(row, 2, &c.state, &band)?;
@@ -1162,12 +1182,17 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
     Ok(sheet)
 }
 
-// =====================================================================
-// SHEET: PACKAGES (unchanged)
-// =====================================================================
-fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_docker_named(report, "Docker")
+}
+
+// ---- Packages ----
+fn sheet_packages_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Packages")?;
+    sheet.set_name(sheet_name)?;
 
     let manager_str = match report.packages.manager {
         PackageManager::Apt => "apt (Debian/Ubuntu)",
@@ -1217,7 +1242,6 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     for (i, p) in sorted.iter().enumerate() {
         let row = upg_start + 1 + i as u32;
         let band = row_band(row);
-
         sheet.write_string_with_format(row, 0, &p.name, &band)?;
         sheet.write_string_with_format(row, 1, &p.current_version, &band)?;
         sheet.write_string_with_format(row, 2, &p.new_version, &band)?;
@@ -1241,6 +1265,10 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
 
     auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 10.0])?;
     Ok(sheet)
+}
+
+fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_packages_named(report, "Packages")
 }
 
 // =====================================================================
@@ -1271,18 +1299,41 @@ pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
 pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<(), XlsxError> {
     let mut workbook = Workbook::new();
 
+    // 1. Executive Summary
     workbook.push_worksheet(sheet_executive_summary(reports, true)?);
 
-    for r in reports {
-        // Create a unique sheet name for each host (limit to 31 characters)
-        let mut name = format!("Overview-{}", r.host.hostname);
-        if name.len() > 31 {
-            name = format!(
-                "Ov-{}",
-                &r.host.hostname[..(31 - 3).min(r.host.hostname.len())]
-            );
-        }
-        workbook.push_worksheet(sheet_overview_named(r, &name)?);
+    // 2. For each host – full set of sheets with unique names
+    for report in reports {
+        let hostname = &report.host.hostname;
+
+        workbook.push_worksheet(sheet_overview_named(
+            report,
+            &truncate_hostname(hostname, "Overview"),
+        )?);
+        workbook.push_worksheet(sheet_storage_named(
+            report,
+            &truncate_hostname(hostname, "Storage"),
+        )?);
+        workbook.push_worksheet(sheet_databases_named(
+            report,
+            &truncate_hostname(hostname, "Databases"),
+        )?);
+        workbook.push_worksheet(sheet_network_named(
+            report,
+            &truncate_hostname(hostname, "Network"),
+        )?);
+        workbook.push_worksheet(sheet_security_named(
+            report,
+            &truncate_hostname(hostname, "Security"),
+        )?);
+        workbook.push_worksheet(sheet_docker_named(
+            report,
+            &truncate_hostname(hostname, "Docker"),
+        )?);
+        workbook.push_worksheet(sheet_packages_named(
+            report,
+            &truncate_hostname(hostname, "Packages"),
+        )?);
     }
 
     workbook.save(path)?;

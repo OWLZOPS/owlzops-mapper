@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_NET_RETRY: 10
 
 jobs:
   test-native:
@@ -64,7 +65,7 @@ jobs:
       - name: Install system dependencies (build-only)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y curl gcc make
+            apt-get update && apt-get install -y curl build-essential
           elif command -v dnf >/dev/null 2>&1; then
             dnf install -y --allowerasing curl gcc make || {
               dnf install -y gcc make
