@@ -219,6 +219,7 @@ pub fn render_dashboard(report: &AgentReport) {
         };
         t_risk.add_row(vec![Cell::new("NTP / Time Sync"), ntp_cell]);
     }
+
     // Sudo NOPASSWD
     if !report.security.sudo_nopasswd_entries.is_empty() {
         t_risk.add_row(vec![
@@ -756,4 +757,59 @@ pub fn render_dashboard(report: &AgentReport) {
     println!(
         "\x1b[3mRun `owlzops-mapper --format json` to export full payload for Blueprint Engine.\x1b[0m\n"
     );
+}
+
+// =====================================================================
+// Multi‑host summary table
+// =====================================================================
+pub fn render_multi_host_summary(reports: &[AgentReport]) {
+    if reports.is_empty() {
+        println!("No reports to display.");
+        return;
+    }
+
+    let mut t = Table::new();
+    t.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
+    t.set_header(vec![
+        Cell::new("Host")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Risk Score").add_attribute(Attribute::Bold),
+        Cell::new("Firewall").add_attribute(Attribute::Bold),
+        Cell::new("SSH Root").add_attribute(Attribute::Bold),
+        Cell::new("Security Updates").add_attribute(Attribute::Bold),
+    ]);
+
+    for r in reports {
+        let score_cell = if r.risk_score >= 70 {
+            Cell::new(r.risk_score.to_string()).fg(Color::Red)
+        } else if r.risk_score >= 40 {
+            Cell::new(r.risk_score.to_string()).fg(Color::Yellow)
+        } else {
+            Cell::new(r.risk_score.to_string()).fg(Color::Green)
+        };
+
+        t.add_row(vec![
+            Cell::new(&r.host.hostname),
+            score_cell,
+            Cell::new(if r.network.firewall_active {
+                "on"
+            } else {
+                "OFF"
+            }),
+            Cell::new(if r.security.ssh_root_login_enabled {
+                "OPEN"
+            } else {
+                "disabled"
+            }),
+            Cell::new(if r.packages.upgradable.iter().any(|p| p.is_security) {
+                "YES"
+            } else {
+                "no"
+            }),
+        ]);
+    }
+
+    println!("🦉 Owlzops Multi‑Host Audit Summary\n");
+    println!("{t}\n");
 }

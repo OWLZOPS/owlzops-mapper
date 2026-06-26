@@ -886,6 +886,67 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     Ok(sheet)
 }
 
+pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<(), XlsxError> {
+    let mut workbook = Workbook::new();
+
+    // Summary sheet
+    {
+        let mut sheet = rust_xlsxwriter::Worksheet::new();
+        sheet.set_name("Summary")?;
+        write_headers(
+            &mut sheet,
+            &[
+                "Host",
+                "Risk Score",
+                "Firewall",
+                "SSH Root",
+                "Security Updates",
+            ],
+        )?;
+        for (i, r) in reports.iter().enumerate() {
+            let row = (i + 1) as u32;
+            sheet.write_string(row, 0, &r.host.hostname)?;
+            sheet.write_number(row, 1, r.risk_score as f64)?;
+            sheet.write_string(
+                row,
+                2,
+                if r.network.firewall_active {
+                    "on"
+                } else {
+                    "OFF"
+                },
+            )?;
+            sheet.write_string(
+                row,
+                3,
+                if r.security.ssh_root_login_enabled {
+                    "OPEN"
+                } else {
+                    "disabled"
+                },
+            )?;
+            sheet.write_string(
+                row,
+                4,
+                if r.packages.upgradable.iter().any(|p| p.is_security) {
+                    "YES"
+                } else {
+                    "no"
+                },
+            )?;
+        }
+        workbook.push_worksheet(sheet);
+    }
+
+    // One sheet per host
+    for r in reports {
+        workbook.push_worksheet(sheet_overview(r)?);
+    }
+
+    workbook.save(path)?;
+    Ok(())
+}
+
 // =====================================================================
 // WRITE REPORT
 // =====================================================================

@@ -29,6 +29,25 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     refresh_packages: bool,
+
+    // ---- remote scan options -------------------------------------------------
+    #[arg(long)]
+    hosts: Option<String>,
+
+    #[arg(long)]
+    host: Option<String>,
+
+    #[arg(long, default_value = "root")]
+    ssh_user: String,
+
+    #[arg(long, default_value = "~/.ssh/id_rsa")]
+    ssh_key: String,
+
+    #[arg(long, default_value_t = false)]
+    copy_binary: bool,
+
+    #[arg(long, default_value = "/tmp/owlzops-mapper")]
+    remote_path: String,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
@@ -101,7 +120,6 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
     if !report.host.ntp_synchronized {
         score += 10;
     }
-    // Sudo audit
     if !report.security.sudo_nopasswd_entries.is_empty() {
         score += 10;
     }
@@ -110,12 +128,9 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
     {
         score += 5;
     }
-
-    // Sysctl audit – cap at +15
     let sysctl_penalty = std::cmp::min(report.security.sysctl_issues.len() as u8 * 5, 15);
     score += sysctl_penalty;
-    score = score.min(100);
-    score
+    score.min(100)
 }
 
 fn compute_exit_code(report: &AgentReport) -> i32 {
@@ -139,16 +154,73 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if !report.is_root_execution {
         if has_critical {
             eprintln!(
-                "WARNING: not running as root AND critical issues detected – \
-                 results may be incomplete, re-run with sudo."
+                "WARNING: not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
             );
         } else {
             eprintln!("WARNING: not running as root – results may be incomplete.");
         }
         return 2;
     }
-
     if has_critical { 1 } else { 0 }
+}
+
+fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
+    let remote_path = &args.remote_path;
+    let ssh_user = &args.ssh_user;
+    let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
+
+    if args.copy_binary {
+        let status = Command::new("scp")
+            .args([
+                "-i",
+                &ssh_key,
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "/proc/self/exe",
+                &format!("{}@{}:{}", ssh_user, host, remote_path),
+            ])
+            .status()
+            .ok()?;
+        if !status.success() {
+            eprintln!("[!] Failed to copy binary to {host}");
+            return None;
+        }
+    }
+
+    // Exactly the same string that works manually:
+    //   ssh ... drobot@host "sudo /tmp/owlzops-mapper --format json --offline"
+    let remote_cmd = format!("sudo {} --format json --offline", remote_path);
+
+    let output = Command::new("ssh")
+        .args([
+            "-i",
+            &ssh_key,
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            &format!("{}@{}", ssh_user, host),
+            &remote_cmd, // <-- one argument = the whole command
+        ])
+        .output()
+        .ok()?;
+
+    // ssh may exit non-zero because the mapper returns 1 on critical findings.
+    // We rely solely on parsing the JSON output.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(report) = serde_json::from_str::<AgentReport>(&stdout) {
+        return Some(report);
+    }
+
+    eprintln!("[!] Remote scan failed on {host}");
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !stderr_str.trim().is_empty() {
+        eprintln!("    stderr: {}", stderr_str.trim());
+    } else if !stdout.trim().is_empty() {
+        eprintln!(
+            "    stdout (truncated): {}",
+            &stdout.trim()[..stdout.trim().len().min(200)]
+        );
+    }
+    None
 }
 
 // =====================================================================
@@ -158,6 +230,79 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // --- remote multi‑host mode ----------------------------------------
+    let mut remote_hosts: Vec<String> = Vec::new();
+    if let Some(ref h) = args.host {
+        remote_hosts.push(h.clone());
+    }
+    if let Some(ref path) = args.hosts
+        && let Ok(contents) = std::fs::read_to_string(path)
+    {
+        for line in contents.lines() {
+            let h = line.trim();
+            if !h.is_empty() && !h.starts_with('#') {
+                remote_hosts.push(h.to_string());
+            }
+        }
+    }
+
+    if !remote_hosts.is_empty() {
+        let mut handles = Vec::new();
+        for host in remote_hosts {
+            let args_owned = Args {
+                format: args.format.clone(),
+                output: args.output.clone(),
+                external_ip: args.external_ip,
+                offline: args.offline,
+                refresh_packages: args.refresh_packages,
+                hosts: None,
+                host: None,
+                ssh_user: args.ssh_user.clone(),
+                ssh_key: args.ssh_key.clone(),
+                copy_binary: args.copy_binary,
+                remote_path: args.remote_path.clone(),
+            };
+            handles.push(tokio::task::spawn_blocking(move || {
+                run_remote_scan(&host, &args_owned)
+            }));
+        }
+
+        let mut reports = Vec::new();
+        for handle in handles {
+            if let Ok(Some(report)) = handle.await {
+                reports.push(report);
+            }
+        }
+
+        match args.format {
+            OutputFormat::Text => {
+                ui::render_multi_host_summary(&reports);
+            }
+            OutputFormat::Json => {
+                if let Ok(json) = serde_json::to_string_pretty(&reports) {
+                    println!("{json}");
+                } else {
+                    eprintln!("Error serializing multi‑host report");
+                }
+            }
+            OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
+                let filename = args.output.unwrap_or_else(|| {
+                    format!(
+                        "owlzops-multi-{}.xlsx",
+                        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+                    )
+                });
+                match exporters::xlsx::write_multi_host_report(&reports, &filename) {
+                    Ok(_) => println!("✅ Multi‑host Excel report: {filename}"),
+                    Err(e) => eprintln!("❌ Failed to generate Excel report: {e}"),
+                }
+            }
+        }
+        return;
+    }
+
+    // --- local single‑host mode ----------------------------------------
     let start = std::time::Instant::now();
     let is_root = is_running_as_root();
 
@@ -166,26 +311,19 @@ async fn main() {
     }
 
     let want_external_ip = if args.offline && args.external_ip {
-        eprintln!("WARNING: --offline overrides --external-ip; no outbound request will be made.");
         false
     } else {
         args.external_ip
     };
     let want_refresh_packages = if args.offline && args.refresh_packages {
-        eprintln!(
-            "WARNING: --offline overrides --refresh-packages; package cache will not be refreshed."
-        );
         false
     } else {
         args.refresh_packages
     };
 
     let mut sys = sysinfo::System::new_all();
-
-    // Host info first (requires mutable sys)
     let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
 
-    // Parallel execution of remaining scanners using spawn_blocking
     let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
     let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
     let storage_task = tokio::task::spawn_blocking(scanners::storage::gather_storage_info);
@@ -246,8 +384,8 @@ async fn main() {
                 )
             });
             match exporters::xlsx::write_report(&report, &filename) {
-                Ok(_) => println!("✅ Excel report successfully generated: {}", filename),
-                Err(e) => eprintln!("❌ Failed to generate Excel report: {}", e),
+                Ok(_) => println!("✅ Excel report successfully generated: {filename}"),
+                Err(e) => eprintln!("❌ Failed to generate Excel report: {e}"),
             }
         }
     }
