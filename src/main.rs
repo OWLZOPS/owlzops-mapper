@@ -31,11 +31,15 @@ struct Args {
     refresh_packages: bool,
 
     // ---- remote scan options -------------------------------------------------
+    /// Single hostname/IP, or comma-separated list, for remote scanning.
+    /// Use "localhost" or "127.0.0.1" to scan the local machine without SSH.
+    /// Can be specified multiple times.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    host: Vec<String>,
+
+    /// File with one hostname/IP per line for remote scanning.
     #[arg(long)]
     hosts: Option<String>,
-
-    #[arg(long)]
-    host: Option<String>,
 
     #[arg(long, default_value = "root")]
     ssh_user: String,
@@ -170,13 +174,100 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if has_critical { 1 } else { 0 }
 }
 
+/// Return `true` if the given host string refers to the local machine.
+fn is_local_host(host: &str) -> bool {
+    let host_lower = host.to_lowercase();
+    if host_lower == "localhost" || host_lower == "127.0.0.1" || host_lower == "::1" {
+        return true;
+    }
+    // Also check the system's hostname using sysinfo
+    if let Some(system_hostname) = sysinfo::System::host_name()
+        && host_lower == system_hostname.to_lowercase()
+    {
+        return true;
+    }
+    false
+}
+
+/// Perform a local scan (used when `--host` points to the local machine).
+fn run_local_scan(args: &Args) -> AgentReport {
+    let start = std::time::Instant::now();
+    let is_root = is_running_as_root();
+
+    let want_external_ip = if args.offline && args.external_ip {
+        false
+    } else {
+        args.external_ip
+    };
+    let want_refresh_packages = if args.offline && args.refresh_packages {
+        false
+    } else {
+        args.refresh_packages
+    };
+
+    let mut sys = sysinfo::System::new_all();
+    let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
+
+    // Run scanners in parallel (use a small Tokio runtime for blocking tasks)
+    let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
+    let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
+    let storage_task = tokio::task::spawn_blocking(scanners::storage::gather_storage_info);
+    let security_task = tokio::task::spawn_blocking(scanners::security::gather_security_info);
+    let packages_task = tokio::task::spawn_blocking(move || {
+        scanners::packages::gather_packages_info(want_refresh_packages)
+    });
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = rt
+        .block_on(async {
+            tokio::join!(
+                dbs_task,
+                network_task,
+                storage_task,
+                security_task,
+                scanners::docker::gather_docker_topology(),
+                packages_task,
+            )
+        });
+
+    let dbs = dbs_res.expect("databases scanner panicked");
+    let network_info = network_res.expect("network scanner panicked");
+    let storage_info = storage_res.expect("storage scanner panicked");
+    let security_info = security_res.expect("security scanner panicked");
+    let packages_info = packages_res.expect("packages scanner panicked");
+
+    let duration_secs = start.elapsed().as_secs_f64();
+
+    let mut report = AgentReport {
+        scan_id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Utc::now().to_rfc3339(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        duration_secs,
+        risk_score: 0,
+        is_root_execution: is_root,
+        host: host_info,
+        databases: dbs,
+        network: network_info,
+        storage: storage_info,
+        topology: topology_info,
+        security: security_info,
+        packages: packages_info,
+    };
+    report.risk_score = compute_risk_score(&report);
+    report
+}
+
 fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
+    // If the host is local, just perform a local scan.
+    if is_local_host(host) {
+        return Some(run_local_scan(args));
+    }
+
     let remote_path = &args.remote_path;
     let ssh_user = &args.ssh_user;
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
 
     if args.copy_binary {
-        // Determine which local binary to copy
         let local_bin = args.local_binary.as_deref().unwrap_or("/proc/self/exe");
         let status = Command::new("scp")
             .args([
@@ -235,9 +326,9 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
 async fn main() {
     let args = Args::parse();
 
-    // --- remote multi‑host mode ----------------------------------------
+    // --- collect all remote (and local) hosts ---------------------------------
     let mut remote_hosts: Vec<String> = Vec::new();
-    if let Some(ref h) = args.host {
+    for h in &args.host {
         remote_hosts.push(h.clone());
     }
     if let Some(ref path) = args.hosts
@@ -261,7 +352,7 @@ async fn main() {
                 offline: args.offline,
                 refresh_packages: args.refresh_packages,
                 hosts: None,
-                host: None,
+                host: Vec::new(),
                 ssh_user: args.ssh_user.clone(),
                 ssh_key: args.ssh_key.clone(),
                 copy_binary: args.copy_binary,
@@ -311,75 +402,14 @@ async fn main() {
         return;
     }
 
-    // --- local single‑host mode ----------------------------------------
-    let start = std::time::Instant::now();
-    let is_root = is_running_as_root();
-
-    if args.format == OutputFormat::Json && !is_root {
-        eprintln!("WARNING: Script is NOT running as root/sudo! JSON data will be incomplete.");
-    }
-
-    let want_external_ip = if args.offline && args.external_ip {
-        false
-    } else {
-        args.external_ip
-    };
-    let want_refresh_packages = if args.offline && args.refresh_packages {
-        false
-    } else {
-        args.refresh_packages
-    };
-
-    let mut sys = sysinfo::System::new_all();
-    let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
-
-    let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
-    let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
-    let storage_task = tokio::task::spawn_blocking(scanners::storage::gather_storage_info);
-    let security_task = tokio::task::spawn_blocking(scanners::security::gather_security_info);
-    let packages_task = tokio::task::spawn_blocking(move || {
-        scanners::packages::gather_packages_info(want_refresh_packages)
-    });
-
-    let (dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = tokio::join!(
-        dbs_task,
-        network_task,
-        storage_task,
-        security_task,
-        scanners::docker::gather_docker_topology(),
-        packages_task,
-    );
-
-    let dbs = dbs_res.expect("databases scanner panicked");
-    let network_info = network_res.expect("network scanner panicked");
-    let storage_info = storage_res.expect("storage scanner panicked");
-    let security_info = security_res.expect("security scanner panicked");
-    let packages_info = packages_res.expect("packages scanner panicked");
-
-    let duration_secs = start.elapsed().as_secs_f64();
-
-    let mut report = AgentReport {
-        scan_id: uuid::Uuid::new_v4().to_string(),
-        timestamp: Utc::now().to_rfc3339(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        duration_secs,
-        risk_score: 0,
-        is_root_execution: is_root,
-        host: host_info,
-        databases: dbs,
-        network: network_info,
-        storage: storage_info,
-        topology: topology_info,
-        security: security_info,
-        packages: packages_info,
-    };
-    report.risk_score = compute_risk_score(&report);
+    // --- local single‑host mode (no remote hosts specified) ----------------
+    let report = run_local_scan(&args);
     let exit_code = compute_exit_code(&report);
 
     match args.format {
         OutputFormat::Json => match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => eprintln!("Error serializing Owlzops report: {}", e),
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Error serializing Owlzops report: {e}"),
         },
         OutputFormat::Text => {
             ui::render_dashboard(&report);

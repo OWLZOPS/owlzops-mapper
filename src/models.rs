@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentReport {
     pub scan_id: String,
     pub timestamp: String,
@@ -17,7 +17,7 @@ pub struct AgentReport {
     pub packages: PackagesInfo,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HostInfo {
     pub hostname: String,
     pub external_ipv4: String,
@@ -50,14 +50,14 @@ pub struct HostInfo {
     pub time_offset_ms: Option<f64>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProcessInfo {
     pub name: String,
     pub pid: u32,
     pub memory_mb: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DatabaseInfo {
     pub engine: String,
     pub version: String,
@@ -65,7 +65,7 @@ pub struct DatabaseInfo {
     pub size_mb: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetworkInfo {
     pub firewall_active: bool,
     pub dns_resolvers: Vec<String>,
@@ -74,7 +74,7 @@ pub struct NetworkInfo {
     pub listening_ports: Vec<PortInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SslCertInfo {
     pub domain: String,
     pub expiry_date: String,
@@ -83,7 +83,7 @@ pub struct SslCertInfo {
     pub is_warning: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PortInfo {
     pub protocol: String,
     pub port: String,
@@ -91,12 +91,12 @@ pub struct PortInfo {
     pub bind_address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StorageInfo {
     pub disks: Vec<DiskInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DiskInfo {
     pub mount_point: String,
     pub total_gb: u64,
@@ -104,7 +104,7 @@ pub struct DiskInfo {
     pub inode_usage_percent: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TopologyInfo {
     pub docker_active: bool,
     pub images_count: usize,
@@ -116,13 +116,13 @@ pub struct TopologyInfo {
     pub containers: Vec<ContainerInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DanglingImageInfo {
     pub id: String,
     pub size_mb: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ContainerInfo {
     pub name: String,
     pub image: String,
@@ -138,7 +138,7 @@ pub struct ContainerInfo {
     pub cap_add: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,
@@ -151,7 +151,7 @@ pub struct SecurityInfo {
     pub sysctl_issues: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UserInfo {
     pub username: String,
     pub last_login: String,
@@ -169,7 +169,7 @@ pub enum PackageManager {
     Unknown,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UpgradablePackage {
     pub name: String,
     pub current_version: String,
@@ -177,7 +177,7 @@ pub struct UpgradablePackage {
     pub is_security: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PackagesInfo {
     pub manager: PackageManager,
     pub installed_count: usize,

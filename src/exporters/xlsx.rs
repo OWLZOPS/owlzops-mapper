@@ -51,7 +51,6 @@ fn row_band(row: u32) -> Format {
     }
 }
 
-// --- critical/warning/ok that inherit the row background ---
 fn critical_band(row: u32) -> Format {
     let bg = if row.is_multiple_of(2) {
         Color::RGB(0xF2F2F2)
@@ -121,7 +120,6 @@ fn auto_fit_columns(
 ) -> Result<(), XlsxError> {
     let col_count = data.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut max_widths = vec![0.0f64; col_count];
-
     for row in data {
         for (col, cell) in row.iter().enumerate() {
             let len = cell.len() as f64;
@@ -130,7 +128,6 @@ fn auto_fit_columns(
             }
         }
     }
-
     for (col, &mw) in max_widths.iter().enumerate() {
         let min_w = min_widths.get(col).copied().unwrap_or(8.0);
         sheet.set_column_width(col as u16, (mw + 2.0).max(min_w))?;
@@ -139,11 +136,371 @@ fn auto_fit_columns(
 }
 
 // =====================================================================
-// SHEET: OVERVIEW
+// EXECUTIVE SUMMARY sheet
+// =====================================================================
+pub fn sheet_executive_summary(
+    reports: &[AgentReport],
+    multi_host: bool,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    let mut sheet = rust_xlsxwriter::Worksheet::new();
+    sheet.set_name("Executive Summary")?;
+
+    let title_fmt = Format::new()
+        .set_bold()
+        .set_font_size(20.0)
+        .set_font_color(Color::RGB(0x1F4E78));
+    let subtitle_fmt = Format::new()
+        .set_font_size(12.0)
+        .set_font_color(Color::RGB(0x808080));
+    let large_score_fmt = Format::new()
+        .set_bold()
+        .set_font_size(40.0)
+        .set_font_color(Color::RGB(0xC00000));
+    let legend_fmt = Format::new()
+        .set_font_size(9.0)
+        .set_italic()
+        .set_font_color(Color::RGB(0x808080));
+
+    sheet.write_string_with_format(0, 0, "Owlzops Mapper", &title_fmt)?;
+    sheet.write_string_with_format(1, 0, "Infrastructure Health Report", &subtitle_fmt)?;
+
+    let mut current_row = 3u32;
+
+    // Data collection for auto‑fit
+    let mut data: Vec<Vec<String>> = Vec::new();
+
+    if !multi_host && reports.len() == 1 {
+        let report = &reports[0];
+
+        // Large Risk Score
+        sheet.write_string_with_format(current_row, 0, "Risk Score", &header_format())?;
+        sheet.write_string_with_format(
+            current_row,
+            1,
+            format!("{}/100", report.risk_score),
+            &large_score_fmt,
+        )?;
+        data.push(vec![
+            "Risk Score".to_string(),
+            format!("{}/100", report.risk_score),
+        ]);
+        current_row += 2;
+
+        // Key metrics
+        let metrics: Vec<(&str, String, bool)> = vec![
+            (
+                "Firewall Active",
+                report.network.firewall_active.to_string(),
+                report.network.firewall_active,
+            ),
+            (
+                "SSH Root Login",
+                report.security.ssh_root_login_enabled.to_string(),
+                !report.security.ssh_root_login_enabled,
+            ),
+            (
+                "Security Updates Pending",
+                report
+                    .packages
+                    .upgradable
+                    .iter()
+                    .any(|p| p.is_security)
+                    .to_string(),
+                !report.packages.upgradable.iter().any(|p| p.is_security),
+            ),
+            (
+                "Backup Detected",
+                (!report.host.backup_tools.is_empty()).to_string(),
+                !report.host.backup_tools.is_empty(),
+            ),
+            (
+                "NTP Synchronized",
+                report.host.ntp_synchronized.to_string(),
+                report.host.ntp_synchronized,
+            ),
+            (
+                "Fail2Ban Active",
+                report.security.fail2ban_active.to_string(),
+                report.security.fail2ban_active,
+            ),
+            (
+                "Sudo NOPASSWD Entries",
+                report.security.sudo_nopasswd_entries.len().to_string(),
+                report.security.sudo_nopasswd_entries.is_empty(),
+            ),
+        ];
+
+        write_headers_at(&mut sheet, current_row, &["Check", "Status"])?;
+        data.push(vec!["Check".to_string(), "Status".to_string()]);
+        current_row += 1;
+
+        for (label, value, ok) in &metrics {
+            let band = row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, *label, &band)?;
+            let status_fmt = if *ok {
+                ok_band(current_row)
+            } else {
+                critical_band(current_row)
+            };
+            sheet.write_string_with_format(current_row, 1, value, &status_fmt)?;
+            data.push(vec![label.to_string(), value.clone()]);
+            current_row += 1;
+        }
+
+        current_row += 1;
+
+        // Critical findings list
+        let mut criticals = Vec::new();
+        if !report.network.firewall_active {
+            criticals.push("Firewall is disabled");
+        }
+        if report.security.ssh_root_login_enabled {
+            criticals.push("SSH root login is permitted");
+        }
+        if report.packages.upgradable.iter().any(|p| p.is_security) {
+            criticals.push("Security updates are pending");
+        }
+        if report
+            .network
+            .ssl_certificates
+            .iter()
+            .any(|c| c.is_critical)
+        {
+            criticals.push("SSL certificate expiring within 7 days");
+        }
+        if report
+            .host
+            .failed_services
+            .iter()
+            .any(|s| s.contains(".service"))
+        {
+            criticals.push("Failed systemd services detected");
+        }
+        if report.host.backup_tools.is_empty() {
+            criticals.push("No backup tools detected");
+        }
+        if !report.security.sudo_nopasswd_entries.is_empty() {
+            criticals.push("Sudo NOPASSWD entries found");
+        }
+        if !report.host.ntp_synchronized {
+            criticals.push("NTP is not synchronized");
+        }
+
+        if !criticals.is_empty() {
+            sheet.write_string_with_format(
+                current_row,
+                0,
+                "Critical Findings",
+                &header_format(),
+            )?;
+            data.push(vec!["Critical Findings".to_string(), String::new()]);
+            current_row += 1;
+            for c in &criticals {
+                let band = row_band(current_row);
+                sheet.write_string_with_format(current_row, 0, *c, &band)?;
+                data.push(vec![c.to_string(), String::new()]);
+                current_row += 1;
+            }
+        }
+    } else {
+        // Multi-host summary table
+        write_headers_at(
+            &mut sheet,
+            current_row,
+            &[
+                "Host",
+                "Risk",
+                "Firewall",
+                "SSH Root",
+                "Security Updates",
+                "Backup",
+                "NTP",
+                "Sudo NOPASSWD",
+                "Sysctl Issues",
+            ],
+        )?;
+        data.push(vec![
+            "Host".to_string(),
+            "Risk".to_string(),
+            "Firewall".to_string(),
+            "SSH Root".to_string(),
+            "Security Updates".to_string(),
+            "Backup".to_string(),
+            "NTP".to_string(),
+            "Sudo NOPASSWD".to_string(),
+            "Sysctl Issues".to_string(),
+        ]);
+        current_row += 1;
+
+        // Format for the hostname cell – slightly darker background and bold
+        let host_cell_fmt = Format::new()
+            .set_bold()
+            .set_background_color(Color::RGB(0xE0E0E0))
+            .set_border(FormatBorder::Thin);
+
+        for (idx, report) in reports.iter().enumerate() {
+            // Separator line between hosts (except before the first one)
+            if idx > 0 {
+                let sep_fmt = Format::new().set_border(FormatBorder::Thin);
+                sheet.write_string_with_format(current_row, 0, "", &sep_fmt)?;
+                for col in 1..9 {
+                    sheet.write_string_with_format(current_row, col, "", &sep_fmt)?;
+                }
+                data.push(vec![String::new(); 9]);
+                current_row += 1;
+            }
+
+            let band = row_band(current_row);
+
+            // Hostname – highlighted
+            sheet.write_string_with_format(
+                current_row,
+                0,
+                &report.host.hostname,
+                &host_cell_fmt,
+            )?;
+
+            // Risk Score
+            let score_fmt = if report.risk_score >= 70 {
+                critical_band(current_row)
+            } else if report.risk_score >= 40 {
+                warning_band(current_row)
+            } else {
+                ok_band(current_row)
+            };
+            sheet.write_number_with_format(current_row, 1, report.risk_score as f64, &score_fmt)?;
+
+            sheet.write_string_with_format(
+                current_row,
+                2,
+                if report.network.firewall_active {
+                    "on"
+                } else {
+                    "OFF"
+                },
+                &band,
+            )?;
+            sheet.write_string_with_format(
+                current_row,
+                3,
+                if report.security.ssh_root_login_enabled {
+                    "OPEN"
+                } else {
+                    "disabled"
+                },
+                &band,
+            )?;
+            sheet.write_string_with_format(
+                current_row,
+                4,
+                if report.packages.upgradable.iter().any(|p| p.is_security) {
+                    "YES"
+                } else {
+                    "no"
+                },
+                &band,
+            )?;
+            sheet.write_string_with_format(
+                current_row,
+                5,
+                if report.host.backup_tools.is_empty() {
+                    "MISSING"
+                } else {
+                    "found"
+                },
+                &band,
+            )?;
+            sheet.write_string_with_format(
+                current_row,
+                6,
+                if report.host.ntp_synchronized {
+                    "synced"
+                } else {
+                    "NO"
+                },
+                &band,
+            )?;
+            sheet.write_string_with_format(
+                current_row,
+                7,
+                report.security.sudo_nopasswd_entries.len().to_string(),
+                &band,
+            )?;
+            sheet.write_string_with_format(
+                current_row,
+                8,
+                report.security.sysctl_issues.len().to_string(),
+                &band,
+            )?;
+
+            data.push(vec![
+                report.host.hostname.clone(),
+                report.risk_score.to_string(),
+                if report.network.firewall_active {
+                    "on".into()
+                } else {
+                    "OFF".into()
+                },
+                if report.security.ssh_root_login_enabled {
+                    "OPEN".into()
+                } else {
+                    "disabled".into()
+                },
+                if report.packages.upgradable.iter().any(|p| p.is_security) {
+                    "YES".into()
+                } else {
+                    "no".into()
+                },
+                if report.host.backup_tools.is_empty() {
+                    "MISSING".into()
+                } else {
+                    "found".into()
+                },
+                if report.host.ntp_synchronized {
+                    "synced".into()
+                } else {
+                    "NO".into()
+                },
+                report.security.sudo_nopasswd_entries.len().to_string(),
+                report.security.sysctl_issues.len().to_string(),
+            ]);
+            current_row += 1;
+        }
+    }
+
+    // --- Legend ---
+    current_row += 2;
+    sheet.write_string_with_format(
+        current_row,
+        0,
+        "Risk Score is calculated from firewall, SSH, updates, certificates, services, backups, NTP, sudo and sysctl checks. 0 = best, 100 = worst.",
+        &legend_fmt,
+    )?;
+
+    // Auto‑fit columns based on collected data
+    let col_count = data.iter().map(|row| row.len()).max().unwrap_or(2);
+    auto_fit_columns(&mut sheet, &data, &vec![12.0; col_count])?;
+
+    // Print scaling: fit to 1 page wide by 1 page tall
+    sheet.set_print_fit_to_pages(1, 1);
+    sheet.set_print_area(0, 0, current_row, col_count as u16 - 1)?;
+
+    Ok(sheet)
+}
+
+// =====================================================================
+// SHEET: OVERVIEW (wrapper)
 // =====================================================================
 fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_overview_named(report, "Overview")
+}
+
+fn sheet_overview_named(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name("Overview")?;
+    sheet.set_name(sheet_name)?;
     write_headers(&mut sheet, &["Field", "Value"])?;
 
     let backup_str = if report.host.backup_tools.is_empty() {
@@ -259,7 +616,7 @@ fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
 }
 
 // =====================================================================
-// SHEET: STORAGE
+// SHEET: STORAGE (unchanged)
 // =====================================================================
 fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
@@ -329,7 +686,7 @@ fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
 }
 
 // =====================================================================
-// SHEET: DATABASES
+// SHEET: DATABASES (unchanged)
 // =====================================================================
 fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
@@ -387,7 +744,7 @@ fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, X
 }
 
 // =====================================================================
-// SHEET: NETWORK
+// SHEET: NETWORK (unchanged)
 // =====================================================================
 fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
@@ -492,13 +849,13 @@ fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xls
 }
 
 // =====================================================================
-// SHEET: SECURITY
+// SHEET: SECURITY (unchanged)
 // =====================================================================
 fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Security")?;
 
-    let risky = critical_format(); // for non‑banded rows
+    let risky = critical_format();
     let safe = ok_format();
 
     sheet.write_string_with_format(0, 0, "SSH Password Auth Enabled", &header_format())?;
@@ -679,7 +1036,7 @@ fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
 }
 
 // =====================================================================
-// SHEET: DOCKER
+// SHEET: DOCKER (unchanged)
 // =====================================================================
 fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
@@ -806,7 +1163,7 @@ fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xlsx
 }
 
 // =====================================================================
-// SHEET: PACKAGES
+// SHEET: PACKAGES (unchanged)
 // =====================================================================
 fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
@@ -886,73 +1243,16 @@ fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, Xl
     Ok(sheet)
 }
 
-pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<(), XlsxError> {
-    let mut workbook = Workbook::new();
-
-    // Summary sheet
-    {
-        let mut sheet = rust_xlsxwriter::Worksheet::new();
-        sheet.set_name("Summary")?;
-        write_headers(
-            &mut sheet,
-            &[
-                "Host",
-                "Risk Score",
-                "Firewall",
-                "SSH Root",
-                "Security Updates",
-            ],
-        )?;
-        for (i, r) in reports.iter().enumerate() {
-            let row = (i + 1) as u32;
-            sheet.write_string(row, 0, &r.host.hostname)?;
-            sheet.write_number(row, 1, r.risk_score as f64)?;
-            sheet.write_string(
-                row,
-                2,
-                if r.network.firewall_active {
-                    "on"
-                } else {
-                    "OFF"
-                },
-            )?;
-            sheet.write_string(
-                row,
-                3,
-                if r.security.ssh_root_login_enabled {
-                    "OPEN"
-                } else {
-                    "disabled"
-                },
-            )?;
-            sheet.write_string(
-                row,
-                4,
-                if r.packages.upgradable.iter().any(|p| p.is_security) {
-                    "YES"
-                } else {
-                    "no"
-                },
-            )?;
-        }
-        workbook.push_worksheet(sheet);
-    }
-
-    // One sheet per host
-    for r in reports {
-        workbook.push_worksheet(sheet_overview(r)?);
-    }
-
-    workbook.save(path)?;
-    Ok(())
-}
-
 // =====================================================================
-// WRITE REPORT
+// WRITE REPORT (single host)
 // =====================================================================
 pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
     let mut workbook = Workbook::new();
 
+    workbook.push_worksheet(sheet_executive_summary(
+        std::slice::from_ref(report),
+        false,
+    )?);
     workbook.push_worksheet(sheet_overview(report)?);
     workbook.push_worksheet(sheet_storage(report)?);
     workbook.push_worksheet(sheet_databases(report)?);
@@ -960,6 +1260,30 @@ pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
     workbook.push_worksheet(sheet_security(report)?);
     workbook.push_worksheet(sheet_docker(report)?);
     workbook.push_worksheet(sheet_packages(report)?);
+
+    workbook.save(path)?;
+    Ok(())
+}
+
+// =====================================================================
+// WRITE MULTI-HOST REPORT
+// =====================================================================
+pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<(), XlsxError> {
+    let mut workbook = Workbook::new();
+
+    workbook.push_worksheet(sheet_executive_summary(reports, true)?);
+
+    for r in reports {
+        // Create a unique sheet name for each host (limit to 31 characters)
+        let mut name = format!("Overview-{}", r.host.hostname);
+        if name.len() > 31 {
+            name = format!(
+                "Ov-{}",
+                &r.host.hostname[..(31 - 3).min(r.host.hostname.len())]
+            );
+        }
+        workbook.push_worksheet(sheet_overview_named(r, &name)?);
+    }
 
     workbook.save(path)?;
     Ok(())
