@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use models::AgentReport;
 use std::process::Command;
+use tracing::warn;
 
 // =====================================================================
 // CLI Arguments Setup
@@ -151,11 +152,11 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
 
     if !report.is_root_execution {
         if has_critical {
-            eprintln!(
-                "WARNING: not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
+            warn!(
+                "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
             );
         } else {
-            eprintln!("WARNING: not running as root – results may be incomplete.");
+            warn!("not running as root – results may be incomplete.");
         }
         return 2;
     }
@@ -190,7 +191,6 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         args.refresh_packages
     };
 
-    // H-1: host scanner now runs in spawn_blocking
     let host_task = tokio::task::spawn_blocking(move || {
         let mut sys = sysinfo::System::new_all();
         scanners::host::gather_host_info(&mut sys, want_external_ip)
@@ -214,32 +214,31 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         packages_task,
     );
 
-    // H-6: graceful degradation
     let host_info = host_res.unwrap_or_else(|e| {
-        eprintln!("[!] host scanner panicked: {:?}", e);
+        warn!("host scanner panicked: {:?}", e);
         models::HostInfo {
             hostname: "unknown".to_string(),
             ..Default::default()
         }
     });
     let dbs = dbs_res.unwrap_or_else(|e| {
-        eprintln!("[!] databases scanner panicked: {:?}", e);
+        warn!("databases scanner panicked: {:?}", e);
         vec![]
     });
     let network_info = network_res.unwrap_or_else(|e| {
-        eprintln!("[!] network scanner panicked: {:?}", e);
+        warn!("network scanner panicked: {:?}", e);
         models::NetworkInfo::default()
     });
     let storage_info = storage_res.unwrap_or_else(|e| {
-        eprintln!("[!] storage scanner panicked: {:?}", e);
+        warn!("storage scanner panicked: {:?}", e);
         models::StorageInfo::default()
     });
     let security_info = security_res.unwrap_or_else(|e| {
-        eprintln!("[!] security scanner panicked: {:?}", e);
+        warn!("security scanner panicked: {:?}", e);
         models::SecurityInfo::default()
     });
     let packages_info = packages_res.unwrap_or_else(|e| {
-        eprintln!("[!] packages scanner panicked: {:?}", e);
+        warn!("packages scanner panicked: {:?}", e);
         models::PackagesInfo::default()
     });
 
@@ -283,7 +282,7 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
             .status()
             .ok()?;
         if !status.success() {
-            eprintln!("[!] Failed to copy binary to {host}");
+            warn!("failed to copy binary to {host}");
             return None;
         }
     }
@@ -310,13 +309,13 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
         return Some(report);
     }
 
-    eprintln!("[!] Remote scan failed on {host}");
+    warn!("remote scan failed on {host}");
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     if !stderr_str.trim().is_empty() {
-        eprintln!("    stderr: {}", stderr_str.trim());
+        warn!("stderr: {}", stderr_str.trim());
     } else if !stdout.trim().is_empty() {
-        eprintln!(
-            "    stdout (truncated): {}",
+        warn!(
+            "stdout (truncated): {}",
             &stdout.trim()[..stdout.trim().len().min(200)]
         );
     }
@@ -329,6 +328,10 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let args = Args::parse();
 
     let mut hosts: Vec<String> = Vec::new();
@@ -403,7 +406,7 @@ async fn main() {
                 if let Ok(json) = serde_json::to_string_pretty(&reports) {
                     println!("{json}");
                 } else {
-                    eprintln!("Error serializing multi‑host report");
+                    warn!("error serializing multi‑host report");
                 }
             }
             OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
@@ -415,7 +418,7 @@ async fn main() {
                 });
                 match exporters::xlsx::write_multi_host_report(&reports, &filename) {
                     Ok(_) => println!("✅ Multi‑host Excel report: {filename}"),
-                    Err(e) => eprintln!("❌ Failed to generate Excel report: {e}"),
+                    Err(e) => warn!("failed to generate Excel report: {e}"),
                 }
             }
         }
@@ -428,7 +431,7 @@ async fn main() {
     match args.format {
         OutputFormat::Json => match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
-            Err(e) => eprintln!("Error serializing Owlzops report: {e}"),
+            Err(e) => warn!("error serializing Owlzops report: {e}"),
         },
         OutputFormat::Text => ui::render_dashboard(&report),
         OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
@@ -441,7 +444,7 @@ async fn main() {
             });
             match exporters::xlsx::write_report(&report, &filename) {
                 Ok(_) => println!("✅ Excel report successfully generated: {filename}"),
-                Err(e) => eprintln!("❌ Failed to generate Excel report: {e}"),
+                Err(e) => warn!("failed to generate Excel report: {e}"),
             }
         }
     }

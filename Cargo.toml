@@ -17,6 +17,8 @@ clap = { version = "4.6.1", features = ["derive"] }
 rust_xlsxwriter = "0.77.0"
 shellexpand = "3"
 libc = "0.2.186"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = 3

@@ -1,4 +1,5 @@
 use crate::models::{DatabaseInfo, HostInfo, ProcessInfo};
+use std::collections::BinaryHeap;
 use std::fs;
 use std::process::Command;
 use sysinfo::{ProcessStatus, System};
@@ -129,9 +130,6 @@ fn get_failed_systemd_services() -> Vec<String> {
     Vec::new()
 }
 
-// ---------------------------------------------------------------------
-// Backup detection
-// ---------------------------------------------------------------------
 fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
     let mut last_restic = None;
@@ -182,9 +180,6 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     (tools, last_restic)
 }
 
-// ---------------------------------------------------------------------
-// NTP / time drift detection
-// ---------------------------------------------------------------------
 fn gather_ntp_info() -> (bool, Option<f64>) {
     let Ok(td_out) = Command::new("timedatectl").arg("status").output() else {
         return (true, None);
@@ -198,7 +193,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
         (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
     });
 
-    // Primary offset source: chronyc tracking (seconds → ms)
     if let Ok(out) = Command::new("chronyc").arg("tracking").output()
         && out.status.success()
     {
@@ -213,7 +207,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
         }
     }
 
-    // Fallback: ntpq -p (offset column is already in ms)
     if let Ok(out) = Command::new("ntpq").args(["-p", "-n"]).output()
         && out.status.success()
     {
@@ -410,7 +403,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     // -----------------------------------------------------------------
     let mut tech_stack = Vec::new();
 
-    // starts_with — catches versioned binaries: python3.11, php-fpm8.2, ruby3.2, etc.
     let prefix_targets: &[(&str, &str)] = &[
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
@@ -427,15 +419,15 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         ("memcached", "Memcached"),
     ];
 
-    // Exact match only — names too short or common for prefix/contains matching.
     let exact_targets: &[(&str, &str)] = &[
         ("go", "Go Binary"),
         ("node", "Node.js"),
         ("java", "Java"),
-        ("rust", "Rust Binary"), // now exact match, rustc/rustup won't match
+        ("rust", "Rust Binary"),
     ];
 
-    let mut process_list: Vec<ProcessInfo> = Vec::new();
+    // H-7: use BinaryHeap for top-5 memory consumers
+    let mut top5: BinaryHeap<std::cmp::Reverse<(u64, u32, String)>> = BinaryHeap::with_capacity(6);
     let mut zombie_processes = 0;
 
     for (pid, proc) in sys.processes() {
@@ -455,12 +447,26 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
             }
         }
 
-        process_list.push(ProcessInfo {
-            name: proc.name().to_string(),
-            pid: pid.as_u32(),
-            memory_mb: proc.memory() / (1024 * 1024),
-        });
+        let mem = proc.memory() / (1024 * 1024);
+        top5.push(std::cmp::Reverse((
+            mem,
+            pid.as_u32(),
+            proc.name().to_string(),
+        )));
+        if top5.len() > 5 {
+            top5.pop();
+        }
     }
+
+    let process_list: Vec<ProcessInfo> = top5
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse((mem, pid, name))| ProcessInfo {
+            name,
+            pid,
+            memory_mb: mem,
+        })
+        .collect();
 
     // RabbitMQ runs under beam.smp; detect by known data directory
     if (std::path::Path::new("/var/lib/rabbitmq").exists()
@@ -471,8 +477,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     }
 
     tech_stack.sort();
-    process_list.sort_by_key(|b| std::cmp::Reverse(b.memory_mb));
-    process_list.truncate(5);
 
     let load = System::load_average();
 
