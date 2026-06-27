@@ -139,12 +139,10 @@ fn auto_fit_columns(
 // Helper to truncate hostname for sheet names
 // =====================================================================
 fn truncate_hostname(name: &str, prefix: &str) -> String {
-    let max_len = 31 - prefix.len() - 1;
-    if name.len() > max_len {
-        format!("{}-{}", prefix, &name[..max_len])
-    } else {
-        format!("{}-{}", prefix, name)
-    }
+    // Reserve space for prefix + one separator char
+    let max_chars = 31usize.saturating_sub(prefix.len() + 1);
+    let truncated: String = name.chars().take(max_chars).collect();
+    format!("{}-{}", prefix, truncated)
 }
 
 // =====================================================================

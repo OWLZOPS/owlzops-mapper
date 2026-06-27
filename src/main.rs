@@ -475,7 +475,13 @@ async fn main() {
                 }
             }
         }
-        return;
+        // Compute overall exit code for fleet scans
+        let exit_code = if reports.iter().any(|r| compute_exit_code(r) == 1) {
+            1
+        } else {
+            0
+        };
+        std::process::exit(exit_code);
     }
 
     let report = run_local_scan_async(&args).await;
