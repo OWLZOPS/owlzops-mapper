@@ -968,6 +968,7 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "libc",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
