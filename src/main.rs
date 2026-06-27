@@ -8,7 +8,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use models::AgentReport;
 use std::process::Command;
-use tracing::warn;
+use tracing::{info, warn};
 
 // =====================================================================
 // CLI Arguments Setup
@@ -59,7 +59,7 @@ struct Args {
 enum OutputFormat {
     Text,
     Json,
-    #[value(aliases = ["excel", "xlsx"])]
+    #[value(alias = "excel")]
     Xlsx,
 }
 
@@ -148,7 +148,8 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
             .any(|s| s.contains(".service"))
         || report.host.backup_tools.is_empty()
         || !report.security.sudo_nopasswd_entries.is_empty()
-        || !report.host.ntp_synchronized;
+        || !report.host.ntp_synchronized
+        || report.security.sysctl_issues.len() >= 3; // NEW: sysctl threshold
 
     if !report.is_root_execution {
         if has_critical {
@@ -191,7 +192,7 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         args.refresh_packages
     };
 
-    tracing::info!("scan started");
+    info!("scan started");
 
     let host_task = tokio::task::spawn_blocking(move || {
         let mut sys = sysinfo::System::new_all();
@@ -216,31 +217,32 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         packages_task,
     );
 
+    // Structured logging for scanner failures
     let host_info = host_res.unwrap_or_else(|e| {
-        warn!("host scanner panicked: {:?}", e);
+        warn!(scanner = "host", error = ?e, "scanner panicked");
         models::HostInfo {
             hostname: "unknown".to_string(),
             ..Default::default()
         }
     });
     let dbs = dbs_res.unwrap_or_else(|e| {
-        warn!("databases scanner panicked: {:?}", e);
+        warn!(scanner = "databases", error = ?e, "scanner panicked");
         vec![]
     });
     let network_info = network_res.unwrap_or_else(|e| {
-        warn!("network scanner panicked: {:?}", e);
+        warn!(scanner = "network", error = ?e, "scanner panicked");
         models::NetworkInfo::default()
     });
     let storage_info = storage_res.unwrap_or_else(|e| {
-        warn!("storage scanner panicked: {:?}", e);
+        warn!(scanner = "storage", error = ?e, "scanner panicked");
         models::StorageInfo::default()
     });
     let security_info = security_res.unwrap_or_else(|e| {
-        warn!("security scanner panicked: {:?}", e);
+        warn!(scanner = "security", error = ?e, "scanner panicked");
         models::SecurityInfo::default()
     });
     let packages_info = packages_res.unwrap_or_else(|e| {
-        warn!("packages scanner panicked: {:?}", e);
+        warn!(scanner = "packages", error = ?e, "scanner panicked");
         models::PackagesInfo::default()
     });
 
@@ -262,7 +264,7 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         packages: packages_info,
     };
     report.risk_score = compute_risk_score(&report);
-    tracing::info!(
+    info!(
         scan_id = %report.scan_id,
         duration_secs = report.duration_secs,
         risk_score = report.risk_score,

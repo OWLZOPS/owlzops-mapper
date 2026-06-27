@@ -149,12 +149,31 @@ pub fn gather_security_info() -> SecurityInfo {
 
     // --- Shell users -------------------------------------------------------
     if let Ok(contents) = fs::read_to_string("/etc/passwd") {
-        let valid_shells = ["/bin/bash", "/bin/sh", "/bin/zsh", "/bin/ash"];
+        // Expanded list that covers both /bin and /usr/bin paths as well
+        // as common shells on modern distributions (Fedora, Arch, Ubuntu).
+        const VALID_SHELLS: &[&str] = &[
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/sh",
+            "/usr/bin/sh",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "/bin/ash",
+            "/usr/bin/ash",
+            "/bin/fish",
+            "/usr/bin/fish",
+            "/bin/dash",
+            "/usr/bin/dash",
+            "/bin/ksh",
+            "/usr/bin/ksh",
+        ];
+        let valid_shells: std::collections::HashSet<&str> = VALID_SHELLS.iter().copied().collect();
+
         for line in contents.lines() {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() == 7 {
                 let username = parts[0].to_string();
-                if valid_shells.contains(&parts[6]) {
+                if valid_shells.contains(parts[6]) {
                     let mut last_login = "Never logged in".to_string();
                     let mut last_ssh_login = "No remote SSH login found".to_string();
 
