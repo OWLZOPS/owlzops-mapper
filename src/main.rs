@@ -58,9 +58,8 @@ struct Args {
 enum OutputFormat {
     Text,
     Json,
+    #[value(aliases = ["excel", "xlsx"])]
     Xlsx,
-    #[value(alias = "excel")]
-    Xlsx2,
 }
 
 impl std::fmt::Display for OutputFormat {
@@ -68,7 +67,7 @@ impl std::fmt::Display for OutputFormat {
         match self {
             OutputFormat::Text => write!(f, "text"),
             OutputFormat::Json => write!(f, "json"),
-            OutputFormat::Xlsx | OutputFormat::Xlsx2 => write!(f, "xlsx"),
+            OutputFormat::Xlsx => write!(f, "xlsx"),
         }
     }
 }
@@ -409,7 +408,7 @@ async fn main() {
                     warn!("error serializing multi‑host report");
                 }
             }
-            OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
+            OutputFormat::Xlsx => {
                 let filename = args.output.unwrap_or_else(|| {
                     format!(
                         "owlzops-multi-{}.xlsx",
@@ -434,7 +433,7 @@ async fn main() {
             Err(e) => warn!("error serializing Owlzops report: {e}"),
         },
         OutputFormat::Text => ui::render_dashboard(&report),
-        OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
+        OutputFormat::Xlsx => {
             let filename = args.output.unwrap_or_else(|| {
                 format!(
                     "owlzops-report-{}-{}.xlsx",

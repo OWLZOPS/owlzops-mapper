@@ -206,50 +206,57 @@ fn zypper_refresh_cache() -> bool {
 
 /// Returns the set of package names covered by pending security patches.
 fn zypper_security_package_names() -> std::collections::HashSet<String> {
-    let mut pkg_names = std::collections::HashSet::new();
+    use rayon::prelude::*;
 
     let Ok(output) = Command::new("zypper")
         .args(["-n", "-q", "list-patches", "--category", "security"])
         .output()
     else {
-        return pkg_names;
+        return std::collections::HashSet::new();
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut patch_names: Vec<String> = Vec::new();
-
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("security") {
-            continue;
-        }
-        let cols: Vec<&str> = trimmed.splitn(6, '|').collect();
-        if cols.len() >= 3 {
-            let patch = cols[2].trim().to_string();
-            if !patch.is_empty() {
-                patch_names.push(patch);
+    let patch_names: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.trim().starts_with("security"))
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.trim().splitn(6, '|').collect();
+            if cols.len() >= 3 {
+                let patch = cols[2].trim().to_string();
+                if !patch.is_empty() { Some(patch) } else { None }
+            } else {
+                None
             }
-        }
-    }
+        })
+        .collect();
 
-    for patch in patch_names.into_iter().take(50) {
-        let Ok(info_out) = Command::new("zypper")
-            .args(["-q", "info", "-t", "patch", &patch])
-            .output()
-        else {
-            continue;
-        };
-        // The "Provides:" block lists the affected packages.
-        for line in String::from_utf8_lossy(&info_out.stdout).lines() {
-            let l = line.trim();
-            if (l.starts_with("Provides:") || l.starts_with("package:"))
-                && let Some(pkg) = l.split_whitespace().nth(1)
-            {
-                pkg_names.insert(pkg.to_string());
+    let results: Vec<std::collections::HashSet<String>> = patch_names
+        .into_par_iter()
+        .take(50)
+        .map(|patch| {
+            let mut names = std::collections::HashSet::new();
+            let Ok(info_out) = Command::new("zypper")
+                .args(["-q", "info", "-t", "patch", &patch])
+                .output()
+            else {
+                return names;
+            };
+            for line in String::from_utf8_lossy(&info_out.stdout).lines() {
+                let l = line.trim();
+                if (l.starts_with("Provides:") || l.starts_with("package:"))
+                    && let Some(pkg) = l.split_whitespace().nth(1)
+                {
+                    names.insert(pkg.to_string());
+                }
             }
-        }
-    }
+            names
+        })
+        .collect();
 
+    let mut pkg_names = std::collections::HashSet::new();
+    for set in results {
+        pkg_names.extend(set);
+    }
     pkg_names
 }
 

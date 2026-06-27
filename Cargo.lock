@@ -1002,6 +1002,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "libc",
+ "rayon",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
