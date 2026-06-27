@@ -106,9 +106,12 @@ fn dnf_like_refresh_cache(bin: &str) -> bool {
 
 fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
     let mut result = Vec::new();
-    if let Some(stdout) = crate::utils::run_with_timeout(bin, &["check-update"], 30) {
+    // dnf check-update returns 0 when no updates, 100 when updates exist,
+    // and 1 on real errors. We must treat 100 as success.
+    if let Some(stdout) = crate::utils::run_with_timeout_any_exit(bin, &["check-update"], 30) {
         for line in stdout.lines() {
             let cols: Vec<&str> = line.split_whitespace().collect();
+            // Line format: "pkgname.arch  new-version  repo"
             if cols.len() == 3 && cols[0].contains('.') {
                 let name = cols[0]
                     .rsplit_once('.')
