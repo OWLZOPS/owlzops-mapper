@@ -2,6 +2,7 @@ mod exporters;
 mod models;
 mod scanners;
 mod ui;
+mod utils;
 
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
