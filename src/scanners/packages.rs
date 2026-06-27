@@ -13,7 +13,6 @@ fn detect_package_manager() -> PackageManager {
     if command_exists("apt-get") {
         return PackageManager::Apt;
     }
-    // Check zypper before dnf: some SLES systems ship both, zypper is authoritative.
     if command_exists("zypper") {
         return PackageManager::Zypper;
     }
@@ -47,22 +46,13 @@ fn apt_installed_count() -> usize {
 }
 
 fn apt_refresh_cache() -> bool {
-    // Requires root. Network call — only runs when explicitly requested via
-    // --refresh-packages (see main.rs); packages.rs itself doesn't decide
-    // whether network access is allowed, it just executes when asked to.
-    Command::new("apt-get")
-        .args(["update", "-qq"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::utils::run_with_timeout("apt-get", &["update", "-qq"], 30).is_some()
 }
 
 fn apt_upgradable() -> Vec<UpgradablePackage> {
     let mut result = Vec::new();
-    if let Ok(output) = Command::new("apt").arg("list").arg("--upgradable").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(stdout) = crate::utils::run_with_timeout("apt", &["list", "--upgradable"], 30) {
         for line in stdout.lines() {
-            // Format: "pkgname/repo,repo2 newversion arch [upgradable from: oldversion]"
             if line.starts_with("Listing...") || line.trim().is_empty() {
                 continue;
             }
@@ -111,21 +101,14 @@ fn rpm_installed_count() -> usize {
 }
 
 fn dnf_like_refresh_cache(bin: &str) -> bool {
-    Command::new(bin)
-        .args(["makecache", "-q"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::utils::run_with_timeout(bin, &["makecache", "-q"], 60).is_some()
 }
 
 fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
     let mut result = Vec::new();
-    // check-update returns exit code 100 when updates are available — not an execution error.
-    if let Ok(output) = Command::new(bin).arg("check-update").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(stdout) = crate::utils::run_with_timeout(bin, &["check-update"], 30) {
         for line in stdout.lines() {
             let cols: Vec<&str> = line.split_whitespace().collect();
-            // Line format: "pkgname.arch  new-version  repo"
             if cols.len() == 3 && cols[0].contains('.') {
                 let name = cols[0]
                     .rsplit_once('.')
@@ -159,19 +142,13 @@ fn pacman_installed_count() -> usize {
 }
 
 fn pacman_refresh_cache() -> bool {
-    Command::new("pacman")
-        .args(["-Sy", "--noconfirm"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::utils::run_with_timeout("pacman", &["-Sy", "--noconfirm"], 60).is_some()
 }
 
 fn pacman_upgradable() -> Vec<UpgradablePackage> {
     let mut result = Vec::new();
-    if let Ok(output) = Command::new("pacman").arg("-Qu").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(stdout) = crate::utils::run_with_timeout("pacman", &["-Qu"], 30) {
         for line in stdout.lines() {
-            // Format: "pkgname oldversion -> newversion"
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() >= 4 && cols[2] == "->" {
                 result.push(UpgradablePackage {
@@ -191,32 +168,26 @@ fn pacman_upgradable() -> Vec<UpgradablePackage> {
 // =====================================================================
 
 fn zypper_installed_count() -> usize {
-    // zypper is RPM-based — rpm -qa works on all zypper systems.
     rpm_installed_count()
 }
 
 fn zypper_refresh_cache() -> bool {
-    // -n = non-interactive, -q = quiet. Requires root.
-    Command::new("zypper")
-        .args(["-n", "-q", "refresh"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::utils::run_with_timeout("zypper", &["-n", "-q", "refresh"], 60).is_some()
 }
 
-/// Returns the set of package names covered by pending security patches.
 fn zypper_security_package_names() -> std::collections::HashSet<String> {
     use rayon::prelude::*;
 
-    let Ok(output) = Command::new("zypper")
-        .args(["-n", "-q", "list-patches", "--category", "security"])
-        .output()
-    else {
-        return std::collections::HashSet::new();
+    let output = match crate::utils::run_with_timeout(
+        "zypper",
+        &["-n", "-q", "list-patches", "--category", "security"],
+        30,
+    ) {
+        Some(stdout) => stdout,
+        None => return std::collections::HashSet::new(),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let patch_names: Vec<String> = stdout
+    let patch_names: Vec<String> = output
         .lines()
         .filter(|l| l.trim().starts_with("security"))
         .filter_map(|line| {
@@ -235,13 +206,14 @@ fn zypper_security_package_names() -> std::collections::HashSet<String> {
         .take(50)
         .map(|patch| {
             let mut names = std::collections::HashSet::new();
-            let Ok(info_out) = Command::new("zypper")
-                .args(["-q", "info", "-t", "patch", &patch])
-                .output()
-            else {
+            let Some(info_out) = crate::utils::run_with_timeout(
+                "zypper",
+                &["-q", "info", "-t", "patch", &patch],
+                10,
+            ) else {
                 return names;
             };
-            for line in String::from_utf8_lossy(&info_out.stdout).lines() {
+            for line in info_out.lines() {
                 let l = line.trim();
                 if (l.starts_with("Provides:") || l.starts_with("package:"))
                     && let Some(pkg) = l.split_whitespace().nth(1)
@@ -263,23 +235,20 @@ fn zypper_security_package_names() -> std::collections::HashSet<String> {
 fn zypper_upgradable() -> Vec<UpgradablePackage> {
     let mut result = Vec::new();
 
-    let Ok(upd_output) = Command::new("zypper")
-        .args(["-n", "-q", "list-updates"])
-        .output()
-    else {
-        return result;
-    };
+    let upd_output =
+        match crate::utils::run_with_timeout("zypper", &["-n", "-q", "list-updates"], 30) {
+            Some(stdout) => stdout,
+            None => return result,
+        };
 
-    let stdout = String::from_utf8_lossy(&upd_output.stdout);
-
-    let has_updates = stdout.lines().any(|l| l.trim().starts_with('v'));
+    let has_updates = upd_output.lines().any(|l| l.trim().starts_with('v'));
     if !has_updates {
         return result;
     }
 
     let security_pkgs = zypper_security_package_names();
 
-    for line in stdout.lines() {
+    for line in upd_output.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('v') {
             continue;
