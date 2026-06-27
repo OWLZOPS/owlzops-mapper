@@ -275,8 +275,6 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
         }
     }
 
-    let remote_cmd = format!("sudo {} --format json --offline", remote_path);
-
     let output = Command::new("ssh")
         .args([
             "-i",
@@ -284,7 +282,12 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
             "-o",
             "StrictHostKeyChecking=accept-new",
             &format!("{}@{}", ssh_user, host),
-            &remote_cmd,
+            "--",
+            "sudo",
+            remote_path,
+            "--format",
+            "json",
+            "--offline",
         ])
         .output()
         .ok()?;
