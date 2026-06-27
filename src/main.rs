@@ -12,7 +12,7 @@ use std::process::Command;
 // CLI Arguments Setup
 // =====================================================================
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author = "Owlzops", version, about = "Infrastructure Discovery Agent")]
 struct Args {
     #[arg(short, long, default_value_t = OutputFormat::Text)]
@@ -347,11 +347,6 @@ async fn main() {
         // Local scans (async)
         for _host in local {
             let a = Args {
-                format: args.format.clone(),
-                output: args.output.clone(),
-                external_ip: args.external_ip,
-                offline: args.offline,
-                refresh_packages: args.refresh_packages,
                 hosts: None,
                 host: Vec::new(),
                 ssh_user: String::new(),
@@ -359,6 +354,7 @@ async fn main() {
                 copy_binary: false,
                 remote_path: String::new(),
                 local_binary: None,
+                ..args.clone()
             };
             handles.push(tokio::spawn(
                 async move { Some(run_local_scan_async(&a).await) },
@@ -368,18 +364,9 @@ async fn main() {
         // Remote scans (spawn_blocking)
         for host in remote {
             let args_owned = Args {
-                format: args.format.clone(),
-                output: args.output.clone(),
-                external_ip: args.external_ip,
-                offline: args.offline,
-                refresh_packages: args.refresh_packages,
                 hosts: None,
                 host: Vec::new(),
-                ssh_user: args.ssh_user.clone(),
-                ssh_key: args.ssh_key.clone(),
-                copy_binary: args.copy_binary,
-                remote_path: args.remote_path.clone(),
-                local_binary: args.local_binary.clone(),
+                ..args.clone()
             };
             handles.push(tokio::task::spawn_blocking(move || {
                 run_remote_scan(&host, &args_owned)
