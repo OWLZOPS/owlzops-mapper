@@ -33,9 +33,9 @@ jobs:
       - name: Clippy (warnings as errors)
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
-        run: cargo build
+        run: cargo build --locked
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
       - name: Security audit
         uses: rustsec/audit-check@v1
         with:
@@ -65,7 +65,7 @@ jobs:
       - name: Install system dependencies (build-only)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y curl build-essential
+            apt-get update && apt-get install -y curl gcc make
           elif command -v dnf >/dev/null 2>&1; then
             dnf install -y --allowerasing curl gcc make || {
               dnf install -y gcc make
@@ -73,6 +73,7 @@ jobs:
             }
           elif command -v microdnf >/dev/null 2>&1; then
             microdnf install -y gcc make curl
+            update-ca-trust
           elif command -v yum >/dev/null 2>&1; then
             yum install -y curl gcc make
           fi
@@ -81,13 +82,15 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Build
-        run: cargo build
+        run: cargo build --locked
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
 
   test-opensuse:
     name: Test in openSUSE Tumbleweed
     runs-on: ubuntu-latest
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - uses: actions/checkout@v4
       - name: Run tests in openSUSE container
@@ -100,6 +103,6 @@ jobs:
               zypper --non-interactive install gcc make curl
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               source \$HOME/.cargo/env
-              cargo build
-              cargo test
+              cargo build --locked
+              cargo test --locked
             "
