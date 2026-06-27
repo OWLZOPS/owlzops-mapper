@@ -1,19 +1,14 @@
 use crate::models::{SecurityInfo, UserInfo};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 
 /// Extract a directive value from `sshd -T` output (format: "directive value").
 /// This is the effective sshd configuration — it already accounts for all
 /// `Include` files (for example /etc/ssh/sshd_config.d/*.conf) and platform
 /// defaults, so there is no need to manually parse and merge configuration files.
 fn sshd_effective_config() -> Option<String> {
-    let output = Command::new("sshd").arg("-T").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout).to_string();
-    if s.trim().is_empty() { None } else { Some(s) }
+    // Use the timeout wrapper to avoid hanging on a broken sshd
+    crate::utils::run_with_timeout("sshd", &["-T"], 5)
 }
 
 fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
@@ -163,11 +158,13 @@ pub fn gather_security_info() -> SecurityInfo {
                     let mut last_login = "Never logged in".to_string();
                     let mut last_ssh_login = "No remote SSH login found".to_string();
 
-                    if let Ok(output) = Command::new("last").arg("-i").arg(&username).output() {
+                    // Use timeout wrapper for the `last` command
+                    if let Some(last_output) =
+                        crate::utils::run_with_timeout("last", &["-i", &username], 5)
+                    {
                         let mut found_first = false;
                         let mut found_ssh = false;
-                        let stdout_str = String::from_utf8_lossy(&output.stdout);
-                        for l in stdout_str.lines() {
+                        for l in last_output.lines() {
                             let cl = l.trim();
                             if cl.is_empty() || cl.starts_with("wtmp") || !cl.starts_with(&username)
                             {
@@ -190,6 +187,7 @@ pub fn gather_security_info() -> SecurityInfo {
                             }
                         }
                     }
+
                     let auth_keys_path = if username == "root" {
                         "/root/.ssh/authorized_keys".to_string()
                     } else {
@@ -211,18 +209,14 @@ pub fn gather_security_info() -> SecurityInfo {
         }
     }
 
-    // --- Fail2Ban and Auditd -----------------------------------------------
-    let fail2ban_active = Command::new("systemctl")
-        .args(["is-active", "--quiet", "fail2ban"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // --- Fail2Ban and Auditd (with timeout wrapper) ------------------------
+    let fail2ban_active =
+        crate::utils::run_with_timeout("systemctl", &["is-active", "--quiet", "fail2ban"], 5)
+            .is_some();
 
-    let auditd_active = Command::new("systemctl")
-        .args(["is-active", "--quiet", "auditd"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let auditd_active =
+        crate::utils::run_with_timeout("systemctl", &["is-active", "--quiet", "auditd"], 5)
+            .is_some();
 
     // --- Sudo and Sysctl audits --------------------------------------------
     let sudo_nopasswd_entries = gather_sudo_nopasswd();
