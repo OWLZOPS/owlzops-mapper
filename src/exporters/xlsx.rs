@@ -136,6 +136,18 @@ fn auto_fit_columns(
 }
 
 // =====================================================================
+// Helper to truncate hostname for sheet names
+// =====================================================================
+fn truncate_hostname(name: &str, prefix: &str) -> String {
+    let max_len = 31 - prefix.len() - 1;
+    if name.len() > max_len {
+        format!("{}-{}", prefix, &name[..max_len])
+    } else {
+        format!("{}-{}", prefix, name)
+    }
+}
+
+// =====================================================================
 // EXECUTIVE SUMMARY sheet
 // =====================================================================
 pub fn sheet_executive_summary(
@@ -170,7 +182,6 @@ pub fn sheet_executive_summary(
     if !multi_host && reports.len() == 1 {
         let report = &reports[0];
 
-        // Large Risk Score
         sheet.write_string_with_format(current_row, 0, "Risk Score", &header_format())?;
         sheet.write_string_with_format(
             current_row,
@@ -184,7 +195,6 @@ pub fn sheet_executive_summary(
         ]);
         current_row += 2;
 
-        // Key metrics
         let metrics: Vec<(&str, String, bool)> = vec![
             (
                 "Firewall Active",
@@ -247,7 +257,6 @@ pub fn sheet_executive_summary(
 
         current_row += 1;
 
-        // Critical findings list
         let mut criticals = Vec::new();
         if !report.network.firewall_active {
             criticals.push("Firewall is disabled");
@@ -301,7 +310,6 @@ pub fn sheet_executive_summary(
             }
         }
     } else {
-        // Multi-host summary table
         write_headers_at(
             &mut sheet,
             current_row,
@@ -461,7 +469,6 @@ pub fn sheet_executive_summary(
         }
     }
 
-    // --- Legend ---
     current_row += 2;
     sheet.write_string_with_format(
         current_row,
@@ -480,20 +487,617 @@ pub fn sheet_executive_summary(
 }
 
 // =====================================================================
-// Helper: truncate hostname to fit Excel sheet name limit (31 chars)
+// COMBINED HOST SHEET (all sections on one sheet)
 // =====================================================================
-fn truncate_hostname(name: &str, prefix: &str) -> String {
-    let max_len = 31 - prefix.len() - 1; // -1 for the hyphen
-    if name.len() > max_len {
-        format!("{}-{}", prefix, &name[..max_len])
+pub fn sheet_host_combined(
+    report: &AgentReport,
+    sheet_name: &str,
+) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    let mut sheet = rust_xlsxwriter::Worksheet::new();
+    sheet.set_name(sheet_name)?;
+
+    let mut current_row = 0u32;
+
+    // ---------- Overview section ----------
+    write_headers_at(&mut sheet, current_row, &["Field", "Value"])?;
+    current_row += 1;
+
+    let backup_str = if report.host.backup_tools.is_empty() {
+        "None (CRITICAL)".to_string()
     } else {
-        format!("{}-{}", prefix, name)
+        report.host.backup_tools.join(", ")
+    };
+
+    let rows: Vec<(&str, String)> = vec![
+        ("Risk Score", format!("{}/100", report.risk_score)),
+        ("Scan ID", report.scan_id.clone()),
+        ("Timestamp", report.timestamp.clone()),
+        ("Ran as root", report.is_root_execution.to_string()),
+        ("Hostname", report.host.hostname.clone()),
+        ("Provider", report.host.hosting_provider.clone()),
+        ("External IP", report.host.external_ipv4.clone()),
+        ("OS", report.host.os_version.clone()),
+        ("Kernel", report.host.kernel.clone()),
+        ("Backup tools", backup_str),
+        ("Uptime (days)", report.host.uptime_days.to_string()),
+        ("Reboot required", report.host.reboot_required.to_string()),
+        ("CPU cores", report.host.cpu_cores.to_string()),
+        (
+            "RAM total (GB)",
+            format!("{:.2}", report.host.total_ram_mb as f64 / 1024.0),
+        ),
+        (
+            "Swap total (GB)",
+            format!("{:.2}", report.host.swap_total_mb as f64 / 1024.0),
+        ),
+        (
+            "Load average",
+            format!(
+                "{:.2}, {:.2}, {:.2}",
+                report.host.load_average.0, report.host.load_average.1, report.host.load_average.2
+            ),
+        ),
+        ("OOM kills", report.host.oom_kills.to_string()),
+        ("Zombie processes", report.host.zombie_processes.to_string()),
+        (
+            "Security modules (LSM)",
+            report.host.security_modules.join(", "),
+        ),
+        ("Tech stack", report.host.tech_stack.join(", ")),
+    ];
+
+    for (label, value) in &rows {
+        let band = row_band(current_row);
+        sheet.write_string_with_format(current_row, 0, *label, &band)?;
+        if *label == "Risk Score" {
+            let score_fmt = if report.risk_score >= 70 {
+                critical_band(current_row)
+            } else if report.risk_score >= 40 {
+                warning_band(current_row)
+            } else {
+                ok_band(current_row)
+            };
+            sheet.write_string_with_format(current_row, 1, value, &score_fmt)?;
+        } else if *label == "Backup tools" {
+            let bk_fmt = if report.host.backup_tools.is_empty() {
+                critical_band(current_row)
+            } else {
+                ok_band(current_row)
+            };
+            sheet.write_string_with_format(current_row, 1, value, &bk_fmt)?;
+        } else {
+            sheet.write_string_with_format(current_row, 1, value, &band)?;
+        }
+        current_row += 1;
     }
+
+    current_row += 1;
+    let subtle = Format::new()
+        .set_font_size(10)
+        .set_font_color(Color::RGB(0x808080))
+        .set_italic();
+    sheet.write_formula_with_format(
+        current_row,
+        0,
+        r#"=HYPERLINK("https://owlzops.com", "Generated by Owlzops Mapper")"#,
+        &subtle,
+    )?;
+    current_row += 1;
+    sheet.write_formula_with_format(
+        current_row,
+        0,
+        r#"=HYPERLINK("mailto:hello@owlzops.com", "Need help with server audit or migration? Contact us: hello@owlzops.com")"#,
+        &subtle,
+    )?;
+    current_row += 2;
+
+    sheet.write_string_with_format(current_row, 0, "Top Memory Processes", &header_format())?;
+    sheet.write_string_with_format(current_row, 1, "PID", &header_format())?;
+    sheet.write_string_with_format(current_row, 2, "RAM (MB)", &header_format())?;
+    current_row += 1;
+    for p in &report.host.top_memory_processes {
+        let band = row_band(current_row);
+        sheet.write_string_with_format(current_row, 0, &p.name, &band)?;
+        sheet.write_number_with_format(current_row, 1, p.pid as f64, &number_format())?;
+        sheet.write_number_with_format(current_row, 2, p.memory_mb as f64, &number_format())?;
+        current_row += 1;
+    }
+
+    current_row += 2;
+
+    // ---------- Storage section ----------
+    sheet.write_string_with_format(current_row, 0, "Storage", &header_format())?;
+    current_row += 1;
+    write_headers_at(
+        &mut sheet,
+        current_row,
+        &[
+            "Mount Point",
+            "Total (GB)",
+            "Used (GB)",
+            "Usage %",
+            "Inodes %",
+        ],
+    )?;
+    current_row += 1;
+
+    let num_fmt = number_format();
+    for disk in &report.storage.disks {
+        if disk.total_gb == 0 {
+            continue;
+        }
+        let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
+        let band = row_band(current_row);
+        sheet.write_string_with_format(current_row, 0, &disk.mount_point, &band)?;
+        sheet.write_number_with_format(current_row, 1, disk.total_gb as f64, &num_fmt)?;
+        sheet.write_number_with_format(current_row, 2, disk.used_gb as f64, &num_fmt)?;
+        let usage_fmt = if usage_pct > 90.0 {
+            critical_band(current_row)
+        } else if usage_pct > 75.0 {
+            warning_band(current_row)
+        } else {
+            ok_band(current_row)
+        };
+        sheet.write_number_with_format(current_row, 3, usage_pct, &usage_fmt)?;
+        let inode_str = disk
+            .inode_usage_percent
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        sheet.write_string_with_format(current_row, 4, &inode_str, &band)?;
+        current_row += 1;
+    }
+    current_row += 2;
+
+    // ---------- Databases section ----------
+    if !report.databases.is_empty() {
+        sheet.write_string_with_format(current_row, 0, "Databases", &header_format())?;
+        current_row += 1;
+        write_headers_at(
+            &mut sheet,
+            current_row,
+            &["Engine", "Version", "Data Directory", "Size (GB)"],
+        )?;
+        current_row += 1;
+        for db in &report.databases {
+            let band = row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, &db.engine, &band)?;
+            sheet.write_string_with_format(current_row, 1, &db.version, &band)?;
+            sheet.write_string_with_format(current_row, 2, &db.data_dir, &band)?;
+            sheet.write_number_with_format(current_row, 3, db.size_mb as f64 / 1024.0, &num_fmt)?;
+            current_row += 1;
+        }
+        current_row += 2;
+    }
+
+    // ---------- Network section ----------
+    sheet.write_string_with_format(current_row, 0, "Network", &header_format())?;
+    current_row += 1;
+
+    sheet.write_string_with_format(current_row, 0, "Firewall Active", &header_format())?;
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        report.network.firewall_active.to_string(),
+        &row_band(current_row),
+    )?;
+    current_row += 1;
+    sheet.write_string_with_format(current_row, 0, "DNS Resolvers", &header_format())?;
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        report.network.dns_resolvers.join(", "),
+        &row_band(current_row),
+    )?;
+    current_row += 2;
+
+    write_headers_at(
+        &mut sheet,
+        current_row,
+        &["Protocol", "Port", "Process", "Bind Address"],
+    )?;
+    current_row += 1;
+    for p in &report.network.listening_ports {
+        let band = row_band(current_row);
+        sheet.write_string_with_format(current_row, 0, &p.protocol, &band)?;
+        sheet.write_string_with_format(current_row, 1, &p.port, &band)?;
+        sheet.write_string_with_format(current_row, 2, &p.process, &band)?;
+        let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
+            critical_band(current_row)
+        } else {
+            ok_band(current_row)
+        };
+        sheet.write_string_with_format(current_row, 3, &p.bind_address, &addr_fmt)?;
+        current_row += 1;
+    }
+    current_row += 1;
+
+    if !report.network.ssl_certificates.is_empty() {
+        write_headers_at(&mut sheet, current_row, &["Domain", "Expires", "Days Left"])?;
+        current_row += 1;
+        for cert in &report.network.ssl_certificates {
+            let band = row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, &cert.domain, &band)?;
+            sheet.write_string_with_format(current_row, 1, &cert.expiry_date, &band)?;
+            match cert.days_remaining {
+                Some(d) if cert.is_critical => sheet.write_number_with_format(
+                    current_row,
+                    2,
+                    d as f64,
+                    &critical_band(current_row),
+                )?,
+                Some(d) if cert.is_warning => sheet.write_number_with_format(
+                    current_row,
+                    2,
+                    d as f64,
+                    &warning_band(current_row),
+                )?,
+                Some(d) => sheet.write_number_with_format(
+                    current_row,
+                    2,
+                    d as f64,
+                    &ok_band(current_row),
+                )?,
+                None => sheet.write_string_with_format(current_row, 2, "unknown", &band)?,
+            };
+            current_row += 1;
+        }
+        current_row += 1;
+    }
+
+    // ---------- Security section ----------
+    sheet.write_string_with_format(current_row, 0, "Security", &header_format())?;
+    current_row += 1;
+
+    let risky = critical_format();
+    let safe = ok_format();
+
+    sheet.write_string_with_format(
+        current_row,
+        0,
+        "SSH Password Auth Enabled",
+        &header_format(),
+    )?;
+    let pa_fmt = if report.security.ssh_password_auth_enabled {
+        &risky
+    } else {
+        &safe
+    };
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        report.security.ssh_password_auth_enabled.to_string(),
+        pa_fmt,
+    )?;
+    current_row += 1;
+
+    sheet.write_string_with_format(current_row, 0, "SSH Root Login Enabled", &header_format())?;
+    let rl_fmt = if report.security.ssh_root_login_enabled {
+        &risky
+    } else {
+        &safe
+    };
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        report.security.ssh_root_login_enabled.to_string(),
+        rl_fmt,
+    )?;
+    current_row += 1;
+
+    sheet.write_string_with_format(current_row, 0, "SSH Config Source", &header_format())?;
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        &report.security.ssh_config_source,
+        &row_band(current_row),
+    )?;
+    current_row += 1;
+
+    sheet.write_string_with_format(current_row, 0, "Fail2Ban Active", &header_format())?;
+    let f2b_fmt = if report.security.fail2ban_active {
+        &safe
+    } else {
+        &risky
+    };
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        report.security.fail2ban_active.to_string(),
+        f2b_fmt,
+    )?;
+    current_row += 1;
+
+    sheet.write_string_with_format(current_row, 0, "Auditd Active", &header_format())?;
+    let audit_fmt = if report.security.auditd_active {
+        &safe
+    } else {
+        &risky
+    };
+    sheet.write_string_with_format(
+        current_row,
+        1,
+        report.security.auditd_active.to_string(),
+        audit_fmt,
+    )?;
+    current_row += 1;
+
+    if !report.host.failed_services.is_empty() {
+        sheet.write_string_with_format(current_row, 0, "Failed Services", &header_format())?;
+        sheet.write_string_with_format(
+            current_row,
+            1,
+            report.host.failed_services.join(", "),
+            &critical_band(current_row),
+        )?;
+        current_row += 1;
+    }
+
+    if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
+        sheet.write_string_with_format(current_row, 0, "NTP Synchronized", &header_format())?;
+        let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
+            (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
+            (true, None) => "yes".to_string(),
+            (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
+            (false, None) => "no".to_string(),
+        };
+        let ntp_fmt = if report.host.ntp_synchronized {
+            ok_band(current_row)
+        } else {
+            critical_band(current_row)
+        };
+        sheet.write_string_with_format(current_row, 1, &ntp_value, &ntp_fmt)?;
+        current_row += 1;
+    }
+
+    if !report.security.sudo_nopasswd_entries.is_empty() {
+        sheet.write_string_with_format(current_row, 0, "Sudo NOPASSWD", &header_format())?;
+        sheet.write_string_with_format(
+            current_row,
+            1,
+            report.security.sudo_nopasswd_entries.join("; "),
+            &critical_band(current_row),
+        )?;
+        current_row += 1;
+    }
+    if let Some(mode) = report.security.sudoers_mode {
+        sheet.write_string_with_format(current_row, 0, "Sudoers Permissions", &header_format())?;
+        let (text, fmt) = if mode != 0o440 {
+            (
+                format!("{:o} (expected 0440)", mode),
+                critical_band(current_row),
+            )
+        } else {
+            (format!("{:o}", mode), ok_band(current_row))
+        };
+        sheet.write_string_with_format(current_row, 1, &text, &fmt)?;
+        current_row += 1;
+    }
+
+    if !report.security.sysctl_issues.is_empty() {
+        sheet.write_string_with_format(current_row, 0, "Sysctl Issues", &header_format())?;
+        sheet.write_string_with_format(
+            current_row,
+            1,
+            report.security.sysctl_issues.join("; "),
+            &critical_band(current_row),
+        )?;
+        current_row += 1;
+    }
+
+    current_row += 1;
+
+    if !report.security.shell_users.is_empty() {
+        write_headers_at(
+            &mut sheet,
+            current_row,
+            &["User", "Last Login", "Last Remote SSH", "Authorized Keys"],
+        )?;
+        current_row += 1;
+        for u in &report.security.shell_users {
+            let band = row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, &u.username, &band)?;
+            sheet.write_string_with_format(current_row, 1, &u.last_login, &band)?;
+            sheet.write_string_with_format(current_row, 2, &u.last_ssh_login, &band)?;
+            sheet.write_number_with_format(
+                current_row,
+                3,
+                u.authorized_keys_count as f64,
+                &num_fmt,
+            )?;
+            current_row += 1;
+        }
+        current_row += 1;
+    }
+
+    // ---------- Docker section ----------
+    if report.topology.docker_active {
+        sheet.write_string_with_format(current_row, 0, "Docker", &header_format())?;
+        current_row += 1;
+
+        sheet.write_string_with_format(current_row, 0, "Docker Active", &header_format())?;
+        sheet.write_string_with_format(
+            current_row,
+            1,
+            report.topology.docker_active.to_string(),
+            &row_band(current_row),
+        )?;
+        current_row += 1;
+        sheet.write_string_with_format(current_row, 0, "Total Images", &header_format())?;
+        sheet.write_number_with_format(
+            current_row,
+            1,
+            report.topology.images_count as f64,
+            &num_fmt,
+        )?;
+        current_row += 1;
+        sheet.write_string_with_format(current_row, 0, "Dangling Images", &header_format())?;
+        sheet.write_number_with_format(
+            current_row,
+            1,
+            report.topology.dangling_images_count as f64,
+            &num_fmt,
+        )?;
+        current_row += 1;
+        sheet.write_string_with_format(
+            current_row,
+            0,
+            "Dangling Wasted Space (GB)",
+            &header_format(),
+        )?;
+        sheet.write_number_with_format(
+            current_row,
+            1,
+            report.topology.total_dangling_size_mb as f64 / 1024.0,
+            &num_fmt,
+        )?;
+        current_row += 2;
+
+        write_headers_at(
+            &mut sheet,
+            current_row,
+            &[
+                "Name",
+                "Image",
+                "State",
+                "Status",
+                "Size (GB)",
+                "Log Size (GB)",
+                "Mounts",
+                "Security Issues",
+            ],
+        )?;
+        current_row += 1;
+        for c in &report.topology.containers {
+            let band = row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, &c.name, &band)?;
+            sheet.write_string_with_format(current_row, 1, &c.image, &band)?;
+            sheet.write_string_with_format(current_row, 2, &c.state, &band)?;
+            sheet.write_string_with_format(current_row, 3, &c.status, &band)?;
+            sheet.write_number_with_format(current_row, 4, c.size_mb as f64 / 1024.0, &num_fmt)?;
+            sheet.write_number_with_format(
+                current_row,
+                5,
+                c.log_size_mb as f64 / 1024.0,
+                &num_fmt,
+            )?;
+            sheet.write_string_with_format(current_row, 6, c.mounts.join(" | "), &band)?;
+
+            let mut issues = Vec::new();
+            if c.privileged {
+                issues.push("PRIVILEGED".to_string());
+            }
+            if c.memory_limit_mb.is_none() {
+                issues.push("NoMemLimit".to_string());
+            }
+            if c.cpu_limit.is_none() {
+                issues.push("NoCpuLimit".to_string());
+            }
+            if c.cap_add.contains(&"SYS_ADMIN".to_string()) {
+                issues.push("SYS_ADMIN".to_string());
+            }
+            if c.cap_add.contains(&"NET_ADMIN".to_string()) {
+                issues.push("NET_ADMIN".to_string());
+            }
+            let issue_str = if issues.is_empty() {
+                "-".to_string()
+            } else {
+                issues.join(", ")
+            };
+            if issue_str != "-" {
+                sheet.write_string_with_format(
+                    current_row,
+                    7,
+                    &issue_str,
+                    &critical_band(current_row),
+                )?;
+            } else {
+                sheet.write_string_with_format(current_row, 7, &issue_str, &band)?;
+            }
+            current_row += 1;
+        }
+        current_row += 1;
+    }
+
+    // ---------- Packages section ----------
+    if report.packages.manager != PackageManager::Unknown {
+        sheet.write_string_with_format(current_row, 0, "Packages", &header_format())?;
+        current_row += 1;
+
+        let manager_str = match report.packages.manager {
+            PackageManager::Apt => "apt (Debian/Ubuntu)",
+            PackageManager::Dnf => "dnf (Fedora/RHEL)",
+            PackageManager::Yum => "yum (RHEL/CentOS)",
+            PackageManager::Pacman => "pacman (Arch)",
+            PackageManager::Zypper => "zypper (openSUSE/SLES)",
+            PackageManager::Unknown => "Unknown",
+        };
+        sheet.write_string_with_format(current_row, 0, "Package Manager", &header_format())?;
+        sheet.write_string_with_format(current_row, 1, manager_str, &row_band(current_row))?;
+        current_row += 1;
+        sheet.write_string_with_format(current_row, 0, "Installed Packages", &header_format())?;
+        sheet.write_number_with_format(
+            current_row,
+            1,
+            report.packages.installed_count as f64,
+            &num_fmt,
+        )?;
+        current_row += 1;
+        sheet.write_string_with_format(
+            current_row,
+            0,
+            "Cache Freshly Refreshed",
+            &header_format(),
+        )?;
+        sheet.write_string_with_format(
+            current_row,
+            1,
+            report.packages.cache_refreshed.to_string(),
+            &row_band(current_row),
+        )?;
+        current_row += 2;
+
+        write_headers_at(
+            &mut sheet,
+            current_row,
+            &["Package", "Current", "Available", "Security"],
+        )?;
+        current_row += 1;
+        let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.is_security));
+        for p in &sorted {
+            let band = row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, &p.name, &band)?;
+            sheet.write_string_with_format(current_row, 1, &p.current_version, &band)?;
+            sheet.write_string_with_format(current_row, 2, &p.new_version, &band)?;
+            if p.is_security {
+                sheet.write_string_with_format(
+                    current_row,
+                    3,
+                    "YES",
+                    &critical_band(current_row),
+                )?;
+            } else {
+                sheet.write_string_with_format(current_row, 3, "-", &band)?;
+            }
+            current_row += 1;
+        }
+    }
+
+    sheet.set_column_width(0, 30.0)?;
+    sheet.set_column_width(1, 50.0)?;
+    sheet.set_column_width(2, 12.0)?;
+    sheet.set_column_width(3, 12.0)?;
+
+    Ok(sheet)
 }
 
 // =====================================================================
-// Named versions of all sheets (for multi‑host mode)
+// Wrappers for single‑host report (backward compatible)
 // =====================================================================
+
+fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_overview_named(report, "Overview")
+}
 
 fn sheet_overview_named(
     report: &AgentReport,
@@ -572,7 +1176,6 @@ fn sheet_overview_named(
         }
     }
 
-    // --- Branding / lead generation with clickable links ---
     let branding_row = rows.len() as u32 + 2;
     let subtle = Format::new()
         .set_font_size(10)
@@ -592,7 +1195,6 @@ fn sheet_overview_named(
         &subtle,
     )?;
 
-    // Top 5 memory‑consuming processes
     let start = branding_row + 3;
     sheet.write_string_with_format(start, 0, "Top Memory Processes", &header_format())?;
     sheet.write_string_with_format(start, 1, "PID", &header_format())?;
@@ -614,11 +1216,10 @@ fn sheet_overview_named(
     Ok(sheet)
 }
 
-fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_overview_named(report, "Overview")
+fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_storage_named(report, "Storage")
 }
 
-// ---- Storage ----
 fn sheet_storage_named(
     report: &AgentReport,
     sheet_name: &str,
@@ -680,6 +1281,7 @@ fn sheet_storage_named(
             format!("{:.1}", usage_pct),
             inode_str,
         ]);
+
         row += 1;
     }
 
@@ -687,11 +1289,10 @@ fn sheet_storage_named(
     Ok(sheet)
 }
 
-fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_storage_named(report, "Storage")
+fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_databases_named(report, "Databases")
 }
 
-// ---- Databases ----
 fn sheet_databases_named(
     report: &AgentReport,
     sheet_name: &str,
@@ -750,11 +1351,10 @@ fn sheet_databases_named(
     Ok(sheet)
 }
 
-fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_databases_named(report, "Databases")
+fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_network_named(report, "Network")
 }
 
-// ---- Network ----
 fn sheet_network_named(
     report: &AgentReport,
     sheet_name: &str,
@@ -783,7 +1383,6 @@ fn sheet_network_named(
         ],
     ];
 
-    // Listening ports
     let port_start = 3u32;
     write_headers_at(
         &mut sheet,
@@ -793,6 +1392,7 @@ fn sheet_network_named(
     for (i, p) in report.network.listening_ports.iter().enumerate() {
         let row = port_start + 1 + i as u32;
         let band = row_band(row);
+
         sheet.write_string_with_format(row, 0, &p.protocol, &band)?;
         sheet.write_string_with_format(row, 1, &p.port, &band)?;
         sheet.write_string_with_format(row, 2, &p.process, &band)?;
@@ -811,7 +1411,6 @@ fn sheet_network_named(
         ]);
     }
 
-    // SSL certificates
     let ssl_start = port_start + report.network.listening_ports.len() as u32 + 3;
     write_headers_at(&mut sheet, ssl_start, &["Domain", "Expires", "Days Left"])?;
     for (i, cert) in report.network.ssl_certificates.iter().enumerate() {
@@ -840,7 +1439,6 @@ fn sheet_network_named(
         ]);
     }
 
-    // Custom /etc/hosts overrides
     let hosts_start = ssl_start + report.network.ssl_certificates.len() as u32 + 3;
     sheet.write_string_with_format(
         hosts_start,
@@ -859,11 +1457,10 @@ fn sheet_network_named(
     Ok(sheet)
 }
 
-fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_network_named(report, "Network")
+fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_security_named(report, "Security")
 }
 
-// ---- Security ----
 fn sheet_security_named(
     report: &AgentReport,
     sheet_name: &str,
@@ -943,7 +1540,6 @@ fn sheet_security_named(
         ],
     ];
 
-    // Failed services (banded)
     if !report.host.failed_services.is_empty() {
         sheet.write_string_with_format(dyn_row, 0, "Failed Services", &header_format())?;
         sheet.write_string_with_format(
@@ -959,7 +1555,6 @@ fn sheet_security_named(
         dyn_row += 1;
     }
 
-    // NTP (banded)
     if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
         sheet.write_string_with_format(dyn_row, 0, "NTP Synchronized", &header_format())?;
         let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
@@ -978,7 +1573,6 @@ fn sheet_security_named(
         dyn_row += 1;
     }
 
-    // Sudo NOPASSWD (banded)
     if !report.security.sudo_nopasswd_entries.is_empty() {
         sheet.write_string_with_format(dyn_row, 0, "Sudo NOPASSWD", &header_format())?;
         sheet.write_string_with_format(
@@ -1008,7 +1602,6 @@ fn sheet_security_named(
         dyn_row += 1;
     }
 
-    // Sysctl issues (banded)
     if !report.security.sysctl_issues.is_empty() {
         sheet.write_string_with_format(dyn_row, 0, "Sysctl Issues", &header_format())?;
         sheet.write_string_with_format(
@@ -1051,11 +1644,10 @@ fn sheet_security_named(
     Ok(sheet)
 }
 
-fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_security_named(report, "Security")
+fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_docker_named(report, "Docker")
 }
 
-// ---- Docker ----
 fn sheet_docker_named(
     report: &AgentReport,
     sheet_name: &str,
@@ -1182,11 +1774,10 @@ fn sheet_docker_named(
     Ok(sheet)
 }
 
-fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_docker_named(report, "Docker")
+fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
+    sheet_packages_named(report, "Packages")
 }
 
-// ---- Packages ----
 fn sheet_packages_named(
     report: &AgentReport,
     sheet_name: &str,
@@ -1267,10 +1858,6 @@ fn sheet_packages_named(
     Ok(sheet)
 }
 
-fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_packages_named(report, "Packages")
-}
-
 // =====================================================================
 // WRITE REPORT (single host)
 // =====================================================================
@@ -1299,41 +1886,11 @@ pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
 pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<(), XlsxError> {
     let mut workbook = Workbook::new();
 
-    // 1. Executive Summary
     workbook.push_worksheet(sheet_executive_summary(reports, true)?);
 
-    // 2. For each host – full set of sheets with unique names
     for report in reports {
-        let hostname = &report.host.hostname;
-
-        workbook.push_worksheet(sheet_overview_named(
-            report,
-            &truncate_hostname(hostname, "Overview"),
-        )?);
-        workbook.push_worksheet(sheet_storage_named(
-            report,
-            &truncate_hostname(hostname, "Storage"),
-        )?);
-        workbook.push_worksheet(sheet_databases_named(
-            report,
-            &truncate_hostname(hostname, "Databases"),
-        )?);
-        workbook.push_worksheet(sheet_network_named(
-            report,
-            &truncate_hostname(hostname, "Network"),
-        )?);
-        workbook.push_worksheet(sheet_security_named(
-            report,
-            &truncate_hostname(hostname, "Security"),
-        )?);
-        workbook.push_worksheet(sheet_docker_named(
-            report,
-            &truncate_hostname(hostname, "Docker"),
-        )?);
-        workbook.push_worksheet(sheet_packages_named(
-            report,
-            &truncate_hostname(hostname, "Packages"),
-        )?);
+        let name = truncate_hostname(&report.host.hostname, "Overview");
+        workbook.push_worksheet(sheet_host_combined(report, &name)?);
     }
 
     workbook.save(path)?;

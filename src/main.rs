@@ -174,13 +174,11 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if has_critical { 1 } else { 0 }
 }
 
-/// Return `true` if the given host string refers to the local machine.
 fn is_local_host(host: &str) -> bool {
     let host_lower = host.to_lowercase();
     if host_lower == "localhost" || host_lower == "127.0.0.1" || host_lower == "::1" {
         return true;
     }
-    // Also check the system's hostname using sysinfo
     if let Some(system_hostname) = sysinfo::System::host_name()
         && host_lower == system_hostname.to_lowercase()
     {
@@ -189,8 +187,8 @@ fn is_local_host(host: &str) -> bool {
     false
 }
 
-/// Perform a local scan (used when `--host` points to the local machine).
-fn run_local_scan(args: &Args) -> AgentReport {
+/// Async local scan – used when no remote hosts are given or when `--host localhost` is present.
+async fn run_local_scan_async(args: &Args) -> AgentReport {
     let start = std::time::Instant::now();
     let is_root = is_running_as_root();
 
@@ -208,7 +206,6 @@ fn run_local_scan(args: &Args) -> AgentReport {
     let mut sys = sysinfo::System::new_all();
     let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
 
-    // Run scanners in parallel (use a small Tokio runtime for blocking tasks)
     let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
     let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
     let storage_task = tokio::task::spawn_blocking(scanners::storage::gather_storage_info);
@@ -217,18 +214,14 @@ fn run_local_scan(args: &Args) -> AgentReport {
         scanners::packages::gather_packages_info(want_refresh_packages)
     });
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let (dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = rt
-        .block_on(async {
-            tokio::join!(
-                dbs_task,
-                network_task,
-                storage_task,
-                security_task,
-                scanners::docker::gather_docker_topology(),
-                packages_task,
-            )
-        });
+    let (dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = tokio::join!(
+        dbs_task,
+        network_task,
+        storage_task,
+        security_task,
+        scanners::docker::gather_docker_topology(),
+        packages_task,
+    );
 
     let dbs = dbs_res.expect("databases scanner panicked");
     let network_info = network_res.expect("network scanner panicked");
@@ -257,12 +250,8 @@ fn run_local_scan(args: &Args) -> AgentReport {
     report
 }
 
+/// Remote scan – performs an actual SSH call, or returns None on failure.
 fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
-    // If the host is local, just perform a local scan.
-    if is_local_host(host) {
-        return Some(run_local_scan(args));
-    }
-
     let remote_path = &args.remote_path;
     let ssh_user = &args.ssh_user;
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
@@ -326,10 +315,10 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
 async fn main() {
     let args = Args::parse();
 
-    // --- collect all remote (and local) hosts ---------------------------------
-    let mut remote_hosts: Vec<String> = Vec::new();
+    // --- collect all hosts -------------------------------------------
+    let mut hosts: Vec<String> = Vec::new();
     for h in &args.host {
-        remote_hosts.push(h.clone());
+        hosts.push(h.clone());
     }
     if let Some(ref path) = args.hosts
         && let Ok(contents) = std::fs::read_to_string(path)
@@ -337,14 +326,48 @@ async fn main() {
         for line in contents.lines() {
             let h = line.trim();
             if !h.is_empty() && !h.starts_with('#') {
-                remote_hosts.push(h.to_string());
+                hosts.push(h.to_string());
             }
         }
     }
 
-    if !remote_hosts.is_empty() {
+    if !hosts.is_empty() {
+        let mut remote = Vec::new();
+        let mut local = Vec::new();
+
+        for h in hosts {
+            if is_local_host(&h) {
+                local.push(h);
+            } else {
+                remote.push(h);
+            }
+        }
+
         let mut handles = Vec::new();
-        for host in remote_hosts {
+
+        // Local scans (async)
+        for _host in local {
+            let a = Args {
+                format: args.format.clone(),
+                output: args.output.clone(),
+                external_ip: args.external_ip,
+                offline: args.offline,
+                refresh_packages: args.refresh_packages,
+                hosts: None,
+                host: Vec::new(),
+                ssh_user: String::new(),
+                ssh_key: String::new(),
+                copy_binary: false,
+                remote_path: String::new(),
+                local_binary: None,
+            };
+            handles.push(tokio::spawn(
+                async move { Some(run_local_scan_async(&a).await) },
+            ));
+        }
+
+        // Remote scans (spawn_blocking)
+        for host in remote {
             let args_owned = Args {
                 format: args.format.clone(),
                 output: args.output.clone(),
@@ -402,8 +425,8 @@ async fn main() {
         return;
     }
 
-    // --- local single‑host mode (no remote hosts specified) ----------------
-    let report = run_local_scan(&args);
+    // --- pure local scan (no hosts at all) --------------------------
+    let report = run_local_scan_async(&args).await;
     let exit_code = compute_exit_code(&report);
 
     match args.format {
@@ -411,9 +434,7 @@ async fn main() {
             Ok(json) => println!("{json}"),
             Err(e) => eprintln!("Error serializing Owlzops report: {e}"),
         },
-        OutputFormat::Text => {
-            ui::render_dashboard(&report);
-        }
+        OutputFormat::Text => ui::render_dashboard(&report),
         OutputFormat::Xlsx | OutputFormat::Xlsx2 => {
             let filename = args.output.unwrap_or_else(|| {
                 format!(
