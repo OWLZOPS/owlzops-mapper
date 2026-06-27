@@ -104,7 +104,7 @@ pub struct DiskInfo {
     pub inode_usage_percent: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TopologyInfo {
     pub docker_active: bool,
     pub images_count: usize,

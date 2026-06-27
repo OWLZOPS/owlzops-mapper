@@ -187,3 +187,34 @@ pub fn gather_network_info() -> NetworkInfo {
         listening_ports,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bind_ipv4_standard() {
+        assert_eq!(parse_bind_address("0.0.0.0:22", "22"), "0.0.0.0");
+        assert_eq!(parse_bind_address("127.0.0.1:5432", "5432"), "127.0.0.1");
+    }
+
+    #[test]
+    fn parse_bind_ipv6_bracketed() {
+        assert_eq!(parse_bind_address("[::1]:80", "80"), "::1");
+        assert_eq!(parse_bind_address("[::]:443", "443"), "::");
+    }
+
+    #[test]
+    fn parse_openssl_future_date() {
+        let days = parse_openssl_enddate("Sep 15 12:00:00 2099 GMT");
+        assert!(days.is_some());
+        assert!(days.unwrap() > 0);
+    }
+
+    #[test]
+    fn parse_openssl_expired() {
+        let days = parse_openssl_enddate("Jan  1 00:00:00 2020 GMT");
+        assert!(days.is_some());
+        assert!(days.unwrap() < 0);
+    }
+}

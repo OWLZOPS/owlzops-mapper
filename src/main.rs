@@ -190,6 +190,8 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         args.refresh_packages
     };
 
+    tracing::info!("scan started");
+
     let host_task = tokio::task::spawn_blocking(move || {
         let mut sys = sysinfo::System::new_all();
         scanners::host::gather_host_info(&mut sys, want_external_ip)
@@ -259,6 +261,12 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         packages: packages_info,
     };
     report.risk_score = compute_risk_score(&report);
+    tracing::info!(
+        scan_id = %report.scan_id,
+        duration_secs = report.duration_secs,
+        risk_score = report.risk_score,
+        "scan completed"
+    );
     report
 }
 
@@ -328,7 +336,11 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
+        )
+        .with_target(false)
         .init();
 
     let args = Args::parse();
@@ -448,4 +460,85 @@ async fn main() {
         }
     }
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::*;
+
+    fn minimal_report() -> AgentReport {
+        AgentReport {
+            scan_id: "test-id".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            version: "0.4.0".to_string(),
+            duration_secs: 1.0,
+            risk_score: 0,
+            is_root_execution: true,
+            host: HostInfo::default(),
+            databases: vec![],
+            network: NetworkInfo::default(),
+            storage: StorageInfo::default(),
+            topology: TopologyInfo::default(),
+            security: SecurityInfo::default(),
+            packages: PackagesInfo::default(),
+        }
+    }
+
+    #[test]
+    fn risk_score_never_exceeds_100() {
+        let mut r = minimal_report();
+        r.network.firewall_active = false;
+        r.security.ssh_root_login_enabled = true;
+        r.security.ssh_password_auth_enabled = true;
+        r.host.backup_tools = vec![];
+        r.host.oom_kills = 5;
+        r.host.ntp_synchronized = false;
+        r.security.sudo_nopasswd_entries = vec!["ALL".to_string()];
+        r.security.sysctl_issues = vec!["a".to_string(); 10];
+        for _ in 0..5 {
+            r.packages.upgradable.push(UpgradablePackage {
+                name: "pkg".to_string(),
+                current_version: "1.0".to_string(),
+                new_version: "1.1".to_string(),
+                is_security: true,
+            });
+        }
+        assert!(compute_risk_score(&r) <= 100);
+    }
+
+    #[test]
+    fn exit_code_2_when_not_root() {
+        let mut r = minimal_report();
+        r.is_root_execution = false;
+        assert_eq!(compute_exit_code(&r), 2);
+    }
+
+    #[test]
+    fn exit_code_0_when_clean() {
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.security.ssh_root_login_enabled = false;
+        r.host.backup_tools = vec!["restic".to_string()];
+        r.host.ntp_synchronized = true;
+        assert_eq!(compute_exit_code(&r), 0);
+    }
+
+    #[test]
+    fn exit_code_1_on_missing_firewall() {
+        let mut r = minimal_report();
+        r.network.firewall_active = false;
+        r.host.backup_tools = vec!["restic".to_string()];
+        r.host.ntp_synchronized = true;
+        assert_eq!(compute_exit_code(&r), 1);
+    }
+
+    #[test]
+    fn exit_code_1_on_missing_backup() {
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.host.backup_tools = vec![];
+        r.host.ntp_synchronized = true;
+        assert_eq!(compute_exit_code(&r), 1);
+    }
 }

@@ -18,7 +18,7 @@ rust_xlsxwriter = "0.77.0"
 shellexpand = "3"
 libc = "0.2.186"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rayon = "1"
 
 
