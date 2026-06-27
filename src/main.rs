@@ -164,6 +164,29 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if has_critical { 1 } else { 0 }
 }
 
+/// Validate that a remote path looks safe to pass to SSH exec.
+fn validate_remote_path(path: &str) -> Result<(), String> {
+    if path.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_./".contains(c)) {
+        return Err(format!(
+            "remote path contains unexpected characters: '{path}'"
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err("remote path must be absolute".to_string());
+    }
+    Ok(())
+}
+
+/// Validate that an SSH username looks safe.
+fn validate_ssh_user(user: &str) -> Result<(), String> {
+    if user.is_empty()
+        || user.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+    {
+        return Err(format!("invalid ssh user: '{user}'"));
+    }
+    Ok(())
+}
+
 fn is_local_host(host: &str) -> bool {
     let host_lower = host.to_lowercase();
     if host_lower == "localhost" || host_lower == "127.0.0.1" || host_lower == "::1" {
@@ -277,6 +300,16 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
     let remote_path = &args.remote_path;
     let ssh_user = &args.ssh_user;
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
+
+    // Validate inputs before using them in shell commands
+    if let Err(e) = validate_remote_path(remote_path) {
+        warn!("{e}");
+        return None;
+    }
+    if let Err(e) = validate_ssh_user(ssh_user) {
+        warn!("{e}");
+        return None;
+    }
 
     if args.copy_binary {
         let local_bin = args.local_binary.as_deref().unwrap_or("/proc/self/exe");

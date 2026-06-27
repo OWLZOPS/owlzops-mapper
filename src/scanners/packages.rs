@@ -179,59 +179,50 @@ fn zypper_refresh_cache() -> bool {
 }
 
 fn zypper_security_package_names() -> std::collections::HashSet<String> {
-    use rayon::prelude::*;
+    let mut pkg_names = std::collections::HashSet::new();
 
-    let output = match crate::utils::run_with_timeout(
-        "zypper",
-        &["-n", "-q", "list-patches", "--category", "security"],
-        30,
-    ) {
-        Some(stdout) => stdout,
-        None => return std::collections::HashSet::new(),
+    let Ok(output) = Command::new("zypper")
+        .args(["-n", "-q", "list-patches", "--category", "security"])
+        .output()
+    else {
+        return pkg_names;
     };
 
-    let patch_names: Vec<String> = output
-        .lines()
-        .filter(|l| l.trim().starts_with("security"))
-        .filter_map(|line| {
-            let cols: Vec<&str> = line.trim().splitn(6, '|').collect();
-            if cols.len() >= 3 {
-                let patch = cols[2].trim().to_string();
-                if !patch.is_empty() { Some(patch) } else { None }
-            } else {
-                None
-            }
-        })
-        .collect();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut patch_names: Vec<String> = Vec::new();
 
-    let results: Vec<std::collections::HashSet<String>> = patch_names
-        .into_par_iter()
-        .take(50)
-        .map(|patch| {
-            let mut names = std::collections::HashSet::new();
-            let Some(info_out) = crate::utils::run_with_timeout(
-                "zypper",
-                &["-q", "info", "-t", "patch", &patch],
-                10,
-            ) else {
-                return names;
-            };
-            for line in info_out.lines() {
-                let l = line.trim();
-                if (l.starts_with("Provides:") || l.starts_with("package:"))
-                    && let Some(pkg) = l.split_whitespace().nth(1)
-                {
-                    names.insert(pkg.to_string());
-                }
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("security") {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.splitn(6, '|').collect();
+        if cols.len() >= 3 {
+            let patch = cols[2].trim().to_string();
+            if !patch.is_empty() {
+                patch_names.push(patch);
             }
-            names
-        })
-        .collect();
-
-    let mut pkg_names = std::collections::HashSet::new();
-    for set in results {
-        pkg_names.extend(set);
+        }
     }
+
+    // Use sequential iterator – parallel zypper calls break RPM DB lock
+    for patch in patch_names.iter().take(20) {
+        let Ok(info_out) = Command::new("zypper")
+            .args(["-q", "info", "-t", "patch", patch])
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&info_out.stdout).lines() {
+            let l = line.trim();
+            if (l.starts_with("Provides:") || l.starts_with("package:"))
+                && let Some(pkg) = l.split_whitespace().nth(1)
+            {
+                pkg_names.insert(pkg.to_string());
+            }
+        }
+    }
+
     pkg_names
 }
 
