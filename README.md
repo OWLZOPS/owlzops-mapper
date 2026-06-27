@@ -37,7 +37,7 @@ sudo ./owlzops-mapper
 # Terminal dashboard (default, fully offline)
 sudo ./owlzops-mapper
 
-# Export to Excel
+# Export to Excel (with Executive Summary as first sheet)
 sudo ./owlzops-mapper --format excel --output report.xlsx
 
 # JSON for programmatic use
@@ -58,11 +58,19 @@ sudo ./owlzops-mapper --offline
 # Scan a single remote host (binary must be present at /tmp/owlzops-mapper)
 sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root
 
-# Automatically copy the local static binary to the remote host first
+# Automatically copy the local static binary to the remote host first.
+# Release binaries are static (musl), so --copy-binary works out of the box.
 sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root --copy-binary
+
+# If you built your own binary (e.g. debug build), point to the musl release:
+sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root --copy-binary \
+  --local-binary target/x86_64-unknown-linux-musl/release/owlzops-mapper
 
 # Scan multiple hosts from a file (one per line)
 sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --copy-binary
+
+# Multi-host Excel report with one sheet per host
+sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --format excel --output fleet-audit.xlsx
 ```
 
 ---
@@ -76,13 +84,13 @@ sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --copy-binary
 | `--external-ip` | Fetch public IP via outbound request (off by default) |
 | `--refresh-packages` | Update package cache before scanning (off by default) |
 | `--offline` | Disable **all** network calls. Overrides other flags if combined |
-| `--host <HOST>` | Single hostname/IP for remote scanning |
+| `--host <HOST>` | Single hostname/IP (or comma‑separated list) for remote scanning |
 | `--hosts <FILE>` | File with one hostname/IP per line for remote scanning |
 | `--ssh-user <USER>` | SSH user for remote connections (default: `root`) |
 | `--ssh-key <PATH>` | Path to SSH private key (default: `~/.ssh/id_rsa`) |
-| `--copy-binary` | Copy the local binary to remote hosts before scanning (requires static musl build) |
+| `--copy-binary` | Copy the local binary to remote hosts before scanning. The binary **must** be statically linked (musl). GitHub release binaries are static, so you can safely use this flag with them. |
+| `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you’re running a debug build locally but have a release build for remote hosts. |
 | `--remote-path <PATH>` | Path where the binary is placed on remote hosts (default: `/tmp/owlzops-mapper`) |
-| `--local-binary <PATH>` | Path to a local static binary to copy (overrides `/proc/self/exe`) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
@@ -133,7 +141,7 @@ and placed prominently at the top of every report.
 | Category | Details |
 |---|---|
 | System | OS, kernel, uptime, CPU, RAM, load average, LSM modules |
-| Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, sudo NOPASSWD entries, sudoers permissions, sysctl security audit |
+| Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, **sudo NOPASSWD entries, sudoers permissions, sysctl security audit** |
 | Network | Listening ports with bind address (red = exposed on 0.0.0.0/::), firewall, DNS, SSL certificates with expiry |
 | Storage | Disk usage, inode usage per mount |
 | Docker | Images, dangling layers, containers, mounts, log sizes, privileged flag, memory/CPU limits, dangerous capabilities |
@@ -167,7 +175,7 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Requires: Rust 1.75+, Linux target.
+Requires: Rust 1.85+, Linux target.
 
 ---
 
