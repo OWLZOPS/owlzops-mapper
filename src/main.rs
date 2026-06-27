@@ -31,13 +31,9 @@ struct Args {
     refresh_packages: bool,
 
     // ---- remote scan options -------------------------------------------------
-    /// Single hostname/IP, or comma-separated list, for remote scanning.
-    /// Use "localhost" or "127.0.0.1" to scan the local machine without SSH.
-    /// Can be specified multiple times.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     host: Vec<String>,
 
-    /// File with one hostname/IP per line for remote scanning.
     #[arg(long)]
     hosts: Option<String>,
 
@@ -47,15 +43,12 @@ struct Args {
     #[arg(long, default_value = "~/.ssh/id_rsa")]
     ssh_key: String,
 
-    /// Copy the local binary to the remote host before scanning.
-    /// Requires a statically linked (musl) build. Release binaries are static.
     #[arg(long, default_value_t = false)]
     copy_binary: bool,
 
     #[arg(long, default_value = "/tmp/owlzops-mapper")]
     remote_path: String,
 
-    /// Path to a local static (musl) binary to copy instead of /proc/self/exe.
     #[arg(long)]
     local_binary: Option<String>,
 }
@@ -84,7 +77,6 @@ impl std::fmt::Display for OutputFormat {
 // =====================================================================
 
 fn is_running_as_root() -> bool {
-    // Safety: getuid is always safe to call.
     unsafe { libc::getuid() == 0 }
 }
 
@@ -183,7 +175,6 @@ fn is_local_host(host: &str) -> bool {
     false
 }
 
-/// Async local scan – used when no remote hosts are given or when `--host localhost` is present.
 async fn run_local_scan_async(args: &Args) -> AgentReport {
     let start = std::time::Instant::now();
     let is_root = is_running_as_root();
@@ -199,8 +190,11 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         args.refresh_packages
     };
 
-    let mut sys = sysinfo::System::new_all();
-    let host_info = scanners::host::gather_host_info(&mut sys, want_external_ip);
+    // H-1: host scanner now runs in spawn_blocking
+    let host_task = tokio::task::spawn_blocking(move || {
+        let mut sys = sysinfo::System::new_all();
+        scanners::host::gather_host_info(&mut sys, want_external_ip)
+    });
 
     let dbs_task = tokio::task::spawn_blocking(scanners::host::gather_databases_info);
     let network_task = tokio::task::spawn_blocking(scanners::network::gather_network_info);
@@ -210,7 +204,8 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         scanners::packages::gather_packages_info(want_refresh_packages)
     });
 
-    let (dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = tokio::join!(
+    let (host_res, dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = tokio::join!(
+        host_task,
         dbs_task,
         network_task,
         storage_task,
@@ -219,11 +214,34 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
         packages_task,
     );
 
-    let dbs = dbs_res.expect("databases scanner panicked");
-    let network_info = network_res.expect("network scanner panicked");
-    let storage_info = storage_res.expect("storage scanner panicked");
-    let security_info = security_res.expect("security scanner panicked");
-    let packages_info = packages_res.expect("packages scanner panicked");
+    // H-6: graceful degradation
+    let host_info = host_res.unwrap_or_else(|e| {
+        eprintln!("[!] host scanner panicked: {:?}", e);
+        models::HostInfo {
+            hostname: "unknown".to_string(),
+            ..Default::default()
+        }
+    });
+    let dbs = dbs_res.unwrap_or_else(|e| {
+        eprintln!("[!] databases scanner panicked: {:?}", e);
+        vec![]
+    });
+    let network_info = network_res.unwrap_or_else(|e| {
+        eprintln!("[!] network scanner panicked: {:?}", e);
+        models::NetworkInfo::default()
+    });
+    let storage_info = storage_res.unwrap_or_else(|e| {
+        eprintln!("[!] storage scanner panicked: {:?}", e);
+        models::StorageInfo::default()
+    });
+    let security_info = security_res.unwrap_or_else(|e| {
+        eprintln!("[!] security scanner panicked: {:?}", e);
+        models::SecurityInfo::default()
+    });
+    let packages_info = packages_res.unwrap_or_else(|e| {
+        eprintln!("[!] packages scanner panicked: {:?}", e);
+        models::PackagesInfo::default()
+    });
 
     let duration_secs = start.elapsed().as_secs_f64();
 
@@ -246,7 +264,6 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
     report
 }
 
-/// Remote scan – performs an actual SSH call, or returns None on failure.
 fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
     let remote_path = &args.remote_path;
     let ssh_user = &args.ssh_user;
@@ -314,7 +331,6 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
 async fn main() {
     let args = Args::parse();
 
-    // --- collect all hosts -------------------------------------------
     let mut hosts: Vec<String> = Vec::new();
     for h in &args.host {
         hosts.push(h.clone());
@@ -333,7 +349,6 @@ async fn main() {
     if !hosts.is_empty() {
         let mut remote = Vec::new();
         let mut local = Vec::new();
-
         for h in hosts {
             if is_local_host(&h) {
                 local.push(h);
@@ -343,8 +358,6 @@ async fn main() {
         }
 
         let mut handles = Vec::new();
-
-        // Local scans (async)
         for _host in local {
             let a = Args {
                 hosts: None,
@@ -360,16 +373,14 @@ async fn main() {
                 async move { Some(run_local_scan_async(&a).await) },
             ));
         }
-
-        // Remote scans (spawn_blocking)
         for host in remote {
-            let args_owned = Args {
+            let a = Args {
                 hosts: None,
                 host: Vec::new(),
                 ..args.clone()
             };
             handles.push(tokio::task::spawn_blocking(move || {
-                run_remote_scan(&host, &args_owned)
+                run_remote_scan(&host, &a)
             }));
         }
 
@@ -411,7 +422,6 @@ async fn main() {
         return;
     }
 
-    // --- pure local scan (no hosts at all) --------------------------
     let report = run_local_scan_async(&args).await;
     let exit_code = compute_exit_code(&report);
 
@@ -435,6 +445,5 @@ async fn main() {
             }
         }
     }
-
     std::process::exit(exit_code);
 }

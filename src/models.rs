@@ -17,7 +17,7 @@ pub struct AgentReport {
     pub packages: PackagesInfo,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct HostInfo {
     pub hostname: String,
     pub external_ipv4: String,
@@ -65,7 +65,7 @@ pub struct DatabaseInfo {
     pub size_mb: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct NetworkInfo {
     pub firewall_active: bool,
     pub dns_resolvers: Vec<String>,
@@ -91,7 +91,7 @@ pub struct PortInfo {
     pub bind_address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct StorageInfo {
     pub disks: Vec<DiskInfo>,
 }
@@ -138,7 +138,7 @@ pub struct ContainerInfo {
     pub cap_add: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,
@@ -159,13 +159,14 @@ pub struct UserInfo {
     pub authorized_keys_count: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
 pub enum PackageManager {
     Apt,
     Dnf,
     Yum,
     Pacman,
     Zypper,
+    #[default]
     Unknown,
 }
 
@@ -177,7 +178,7 @@ pub struct UpgradablePackage {
     pub is_security: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct PackagesInfo {
     pub manager: PackageManager,
     pub installed_count: usize,
