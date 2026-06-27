@@ -3,6 +3,8 @@ use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::image::ListImagesOptions;
 use bollard::volume::ListVolumesOptions;
+use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::HashMap;
 use std::default::Default;
 use std::fs;
 
@@ -56,25 +58,58 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                 }))
                 .await
             {
+                // Collect all inspect futures in parallel
+                let mut inspect_futures: FuturesUnordered<_> = containers
+                    .iter()
+                    .filter_map(|c| {
+                        c.id.as_deref().map(|id| {
+                            let docker = docker.clone();
+                            let id = id.to_string();
+                            let c = c.clone();
+                            async move {
+                                let inspect = docker.inspect_container(&id, None).await;
+                                (c, inspect.ok())
+                            }
+                        })
+                    })
+                    .collect();
+
+                // Gather results
+                let mut inspects: HashMap<String, _> = HashMap::new();
+                while let Some((c, inspect_opt)) = inspect_futures.next().await {
+                    if let Some(inspect) = inspect_opt {
+                        let id = c.id.clone().unwrap_or_default();
+                        inspects.insert(id, (c, inspect));
+                    }
+                }
+
+                // Now process each container with its inspect data
                 for c in containers {
-                    let name = c
+                    let id = c.id.clone().unwrap_or_default();
+                    let Some((container, inspect)) = inspects.get(&id) else {
+                        continue;
+                    };
+                    let container = container.clone();
+                    let inspect = inspect.clone();
+
+                    let name = container
                         .names
+                        .clone()
                         .and_then(|mut n| n.pop())
                         .map(|n| n.trim_start_matches('/').to_string())
                         .unwrap_or_else(|| "unknown".to_string());
+
+                    // ports
                     let mut ports_vec = Vec::new();
-                    if let Some(ports) = c.ports {
+                    if let Some(ports) = &container.ports {
                         for p in ports {
-                            let public = p
-                                .public_port
-                                .map(|port| port.to_string())
-                                .unwrap_or_default();
+                            let public = p.public_port.map(|pp| pp.to_string()).unwrap_or_default();
                             let private = p.private_port.to_string();
-                            let ip = p.ip.unwrap_or_else(|| "".to_string());
+                            let ip = p.ip.clone().unwrap_or_default();
                             let typ = p
                                 .typ
                                 .map(|t| t.to_string())
-                                .unwrap_or_else(|| "tcp".to_string());
+                                .unwrap_or_else(|| "tcp".to_string()); // typ is Copy
                             if !public.is_empty() && !ip.is_empty() {
                                 ports_vec.push(format!("{}:{}->{}/{}", ip, public, private, typ));
                             } else {
@@ -83,9 +118,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         }
                     }
 
-                    // Use a single inspect call per container: mounts, log_path, and
-                    // security-related host config are obtained from the same response,
-                    // avoiding extra round trips to the Docker daemon.
+                    // Mounts, log size, security checks
                     let mut mounts_vec = Vec::new();
                     let mut log_size_mb = 0;
                     let mut privileged = false;
@@ -93,49 +126,47 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                     let mut cpu_limit = None;
                     let mut cap_add = Vec::new();
 
-                    if let Ok(inspect) = docker.inspect_container(&name, None).await {
-                        // Mounts
-                        if let Some(mounts) = inspect.mounts {
-                            for m in mounts {
-                                if let (Some(src), Some(dst)) = (m.source, m.destination) {
-                                    mounts_vec.push(format!("{} -> {}", src, dst));
-                                }
-                            }
-                        }
-                        // Log size
-                        if let Some(log_path) = inspect.log_path
-                            && let Ok(meta) = fs::metadata(&log_path)
-                        {
-                            log_size_mb = meta.len() / (1024 * 1024);
-                        }
-
-                        // Docker security checks (collapsed ifs)
-                        if let Some(host_config) = inspect.host_config {
-                            privileged = host_config.privileged.unwrap_or(false);
-                            if let Some(mem) = host_config.memory
-                                && mem > 0
+                    if let Some(mounts) = &inspect.mounts {
+                        for m in mounts {
+                            if let (Some(src), Some(dst)) =
+                                (m.source.clone(), m.destination.clone())
                             {
-                                memory_limit_mb = Some((mem / 1024 / 1024) as u64);
+                                mounts_vec.push(format!("{} -> {}", src, dst));
                             }
-                            if let Some(quota) = host_config.cpu_quota
-                                && quota > 0
-                            {
-                                let period = host_config.cpu_period.unwrap_or(100_000);
-                                cpu_limit = Some(quota as f64 / period as f64);
-                            }
-                            cap_add = host_config.cap_add.unwrap_or_default();
                         }
                     }
+                    if let Some(log_path) = &inspect.log_path
+                        && let Ok(meta) = fs::metadata(log_path)
+                    {
+                        log_size_mb = meta.len() / (1024 * 1024);
+                    }
+                    if let Some(host_config) = &inspect.host_config {
+                        privileged = host_config.privileged.unwrap_or(false);
+                        // Collapsed ifs to satisfy clippy
+                        if let Some(mem) = host_config.memory
+                            && mem > 0
+                        {
+                            memory_limit_mb = Some((mem / 1024 / 1024) as u64);
+                        }
+                        if let Some(quota) = host_config.cpu_quota
+                            && quota > 0
+                        {
+                            let period = host_config.cpu_period.unwrap_or(100_000);
+                            cpu_limit = Some(quota as f64 / period as f64);
+                        }
+                        cap_add = host_config.cap_add.clone().unwrap_or_default();
+                    }
 
-                    let size_mb = (c.size_rw.unwrap_or(0) + c.size_root_fs.unwrap_or(0)) as u64
+                    let size_mb = (container.size_rw.unwrap_or(0)
+                        + container.size_root_fs.unwrap_or(0))
+                        as u64
                         / (1024 * 1024);
-
-                    let status = c.status.unwrap_or_else(|| "unknown".to_string());
+                    let status = container.status.unwrap_or_else(|| "unknown".to_string());
 
                     container_list.push(ContainerInfo {
                         name,
-                        image: c.image.unwrap_or_else(|| "unknown".to_string()),
-                        state: c.state.unwrap_or_else(|| "unknown".to_string()),
+                        image: container.image.unwrap_or_else(|| "unknown".to_string()),
+                        state: container.state.unwrap_or_else(|| "unknown".to_string()),
                         status,
                         size_mb,
                         log_size_mb,
@@ -148,8 +179,9 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                     });
                 }
             }
+
             let mut dangling_volumes_count = 0;
-            let mut filter = std::collections::HashMap::new();
+            let mut filter = HashMap::new();
             filter.insert("dangling".to_string(), vec!["true".to_string()]);
             if let Ok(volumes_resp) = docker
                 .list_volumes(Some(ListVolumesOptions { filters: filter }))
@@ -158,6 +190,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             {
                 dangling_volumes_count = vols.len();
             }
+
             TopologyInfo {
                 docker_active: true,
                 images_count,
