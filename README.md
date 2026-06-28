@@ -22,7 +22,7 @@ curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzo
 sudo ./owlzops-mapper
 ```
 
-**Option 2 – install script (verifies SHA256):**
+**Option 2 – install script (verifies SHA256 + GPG):**
 ```bash
 curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
 sudo ./owlzops-mapper
@@ -57,6 +57,9 @@ sudo ./owlzops-mapper --offline
 ```bash
 # Scan a single remote host (binary must be present at /tmp/owlzops-mapper)
 sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root
+
+# Scan multiple comma-separated hosts
+sudo ./owlzops-mapper --host 192.168.1.10,192.168.1.11 --ssh-user root
 
 # Automatically copy the local static binary to the remote host first.
 # Release binaries are static (musl), so --copy-binary works out of the box.
@@ -101,7 +104,7 @@ sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --format excel --output 
 | Code | Meaning |
 |------|---------|
 | `0`  | No critical issues found |
-| `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries) |
+| `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) |
 | `2`  | Not running as root – results may be incomplete |
 
 You can use these codes directly in CI/CD pipelines:
@@ -142,7 +145,7 @@ and placed prominently at the top of every report.
 |---|---|
 | System | OS, kernel, uptime, CPU, RAM, load average, LSM modules |
 | Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, **sudo NOPASSWD entries, sudoers permissions, sysctl security audit** |
-| Network | Listening ports with bind address (red = exposed on 0.0.0.0/::), firewall, DNS, SSL certificates with expiry |
+| Network | Listening ports with bind address (red = exposed on 0.0.0.0/::), firewall (ufw, firewalld, nftables, iptables), DNS, SSL certificates with expiry |
 | Storage | Disk usage, inode usage per mount |
 | Docker | Images, dangling layers, containers, mounts, log sizes, privileged flag, memory/CPU limits, dangerous capabilities |
 | Packages | Installed count, upgradable, security updates (apt/dnf/yum/pacman/zypper) |
@@ -177,6 +180,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 Requires: Rust 1.85+, Linux target.
 
+Our CI pipeline pins all GitHub Actions by commit SHA, includes `cargo audit`, `cargo deny`, and generates an SBOM on every release – see the [workflows](.github/workflows) for details.
+
 ---
 
 ## Verifying Releases
@@ -189,6 +194,8 @@ To verify:
 gpg --import gpg-public-key.asc
 gpg --verify owlzops-mapper-linux-x86_64.tar.gz.asc owlzops-mapper-linux-x86_64.tar.gz
 ```
+
+The install script (`install.sh`) now performs GPG verification automatically if `gpg` is available.
 
 ---
 
