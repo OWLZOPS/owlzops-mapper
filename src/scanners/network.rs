@@ -26,17 +26,15 @@ fn parse_bind_address(local_addr: &str, port: &str) -> String {
         } else {
             addr_part.to_string()
         }
-    } else {
-        if let Some((addr, _)) = local_addr.rsplit_once(':') {
-            let addr = addr.trim();
-            if addr.starts_with('[') && addr.ends_with(']') {
-                addr[1..addr.len() - 1].to_string()
-            } else {
-                addr.to_string()
-            }
+    } else if let Some((addr, _)) = local_addr.rsplit_once(':') {
+        let addr = addr.trim();
+        if addr.starts_with('[') && addr.ends_with(']') {
+            addr[1..addr.len() - 1].to_string()
         } else {
-            "unknown".to_string()
+            addr.to_string()
         }
+    } else {
+        "unknown".to_string()
     }
 }
 
