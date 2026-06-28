@@ -12,7 +12,6 @@ use models::AgentReport;
 use std::process::Command;
 use tracing::{info, warn};
 
-const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 // =====================================================================
 // CLI Arguments Setup
 // =====================================================================
@@ -85,82 +84,14 @@ fn is_running_as_root() -> bool {
 }
 
 fn compute_risk_score(report: &AgentReport) -> u8 {
-    let mut score = 0u8;
-    if !report.network.firewall_active {
-        score += RISK_NO_FIREWALL;
-    }
-    if report.security.ssh_root_login_enabled {
-        score += RISK_SSH_ROOT_LOGIN;
-    }
-    if report.packages.upgradable.iter().any(|p| p.is_security) {
-        score += RISK_SECURITY_UPDATES;
-    }
-    let critical_certs = report
-        .network
-        .ssl_certificates
-        .iter()
-        .filter(|c| c.is_critical)
-        .count() as u8;
-    score += std::cmp::min(
-        critical_certs * RISK_CRITICAL_SSL_PER_CERT,
-        RISK_CRITICAL_SSL_MAX,
-    );
-    if report
-        .host
-        .failed_services
-        .iter()
-        .any(|s| s.contains(".service"))
-    {
-        score += RISK_FAILED_SERVICES;
-    }
-    if report.security.ssh_password_auth_enabled {
-        score += RISK_SSH_PASSWORD_AUTH;
-    }
-    if report.host.oom_kills > 0 {
-        score += RISK_OOM_KILLS;
-    }
-    if report.host.backup_tools.is_empty() {
-        score += RISK_NO_BACKUP;
-    }
-    if !report.host.ntp_synchronized {
-        score += RISK_NTP_NOT_SYNCED;
-    }
-    if !report.security.sudo_nopasswd_entries.is_empty() {
-        score += RISK_SUDO_NOPASSWD;
-    }
-    if let Some(mode) = report.security.sudoers_mode
-        && mode != 0o440
-    {
-        score += RISK_SUDOERS_MODE;
-    }
-    let sysctl_penalty = std::cmp::min(
-        report.security.sysctl_issues.len() as u8 * RISK_SYSCTL_PER_ISSUE,
-        RISK_SYSCTL_MAX,
-    );
-    score += sysctl_penalty;
-    score.min(100)
+    CriticalFlags::from_report(report).risk_penalty()
 }
 
 fn compute_exit_code(report: &AgentReport) -> i32 {
-    let has_critical = !report.network.firewall_active
-        || report.security.ssh_root_login_enabled
-        || report.packages.upgradable.iter().any(|p| p.is_security)
-        || report
-            .network
-            .ssl_certificates
-            .iter()
-            .any(|c| c.is_critical)
-        || report
-            .host
-            .failed_services
-            .iter()
-            .any(|s| s.contains(".service"))
-        || report.host.backup_tools.is_empty()
-        || !report.security.sudo_nopasswd_entries.is_empty()
-        || !report.host.ntp_synchronized
-        || report.security.sysctl_issues.len() >= SYSCTL_CRITICAL_THRESHOLD;
+    let flags = CriticalFlags::from_report(report);
+
     if !report.is_root_execution {
-        if has_critical {
+        if flags.has_critical() {
             warn!(
                 "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
             );
@@ -169,7 +100,8 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
         }
         return 2;
     }
-    if has_critical { 1 } else { 0 }
+
+    if flags.has_critical() { 1 } else { 0 }
 }
 
 /// Validate that a remote path looks safe to pass to SSH exec.
