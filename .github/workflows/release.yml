@@ -48,17 +48,13 @@ jobs:
           cargo install cargo-cyclonedx --locked
           cargo cyclonedx --format json --output sbom.json
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.archive }}-sbom
-          path: sbom.json
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92bf6d0647e5e8b7c  # v4.6.3
         with:
           name: ${{ matrix.archive }}
           path: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
+            sbom.json
 
   sign:
     name: Sign artifacts
@@ -92,6 +88,7 @@ jobs:
             *.tar.gz
             *.sha256
             *.asc
+            sbom.json
 
   release:
     name: Create GitHub Release
