@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        uses: dependabot/fetch-metadata@d7db5b2e2f5e6e5b6e7a9f8c9d0e1f2a3b4c5d6e  # v2.0.0
+        uses: dependabot/fetch-metadata@0fb21704c18a42ce5aa8d720ea4b912f5e6babef  # v2.0.0
       - name: Wait for CI checks
         run: |
           gh pr checks "$PR_URL" --watch --fail-fast

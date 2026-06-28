@@ -1,5 +1,5 @@
 [advisories]
-unmaintained = "all"
+unmaintained = "warn"
 yanked = "warn"
 
 [licenses]
