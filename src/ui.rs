@@ -200,25 +200,23 @@ pub fn render_dashboard(report: &AgentReport) {
     t_risk.add_row(vec![Cell::new("Auditd"), audit]);
 
     // NTP / Time Sync row
-    if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
-        let ntp_cell = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
-            (true, Some(ms)) if ms > 100.0 => {
-                Cell::new(format!("Synced ({:.1}ms — high offset)", ms)).fg(Color::Yellow)
-            }
-            (true, Some(ms)) => Cell::new(format!("Synced ({:.1}ms)", ms)).fg(Color::Green),
-            (true, None) => Cell::new("Synced").fg(Color::Green),
-            (false, Some(ms)) if ms > 1000.0 => {
-                Cell::new(format!("NOT SYNCED ({:.0}ms — CRITICAL)", ms))
-                    .fg(Color::Red)
-                    .add_attribute(Attribute::Bold)
-            }
-            (false, Some(ms)) => Cell::new(format!("NOT SYNCED ({:.1}ms)", ms)).fg(Color::Red),
-            (false, None) => Cell::new("NOT SYNCED")
+    let ntp_cell = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
+        (true, Some(ms)) if ms > 100.0 => {
+            Cell::new(format!("Synced ({:.1}ms — high offset)", ms)).fg(Color::Yellow)
+        }
+        (true, Some(ms)) => Cell::new(format!("Synced ({:.1}ms)", ms)).fg(Color::Green),
+        (true, None) => Cell::new("Synced").fg(Color::Green),
+        (false, Some(ms)) if ms > 1000.0 => {
+            Cell::new(format!("NOT SYNCED ({:.0}ms — CRITICAL)", ms))
                 .fg(Color::Red)
-                .add_attribute(Attribute::Bold),
-        };
-        t_risk.add_row(vec![Cell::new("NTP / Time Sync"), ntp_cell]);
-    }
+                .add_attribute(Attribute::Bold)
+        }
+        (false, Some(ms)) => Cell::new(format!("NOT SYNCED ({:.1}ms)", ms)).fg(Color::Red),
+        (false, None) => Cell::new("NOT SYNCED")
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold),
+    };
+    t_risk.add_row(vec![Cell::new("NTP / Time Sync"), ntp_cell]);
 
     // Sudo NOPASSWD
     if !report.security.sudo_nopasswd_entries.is_empty() {

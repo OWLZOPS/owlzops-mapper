@@ -1,8 +1,10 @@
 mod exporters;
 mod models;
 mod scanners;
+mod scoring;
 mod ui;
 mod utils;
+use scoring::*;
 
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
@@ -84,13 +86,13 @@ fn is_running_as_root() -> bool {
 fn compute_risk_score(report: &AgentReport) -> u8 {
     let mut score = 0u8;
     if !report.network.firewall_active {
-        score += 30;
+        score += RISK_NO_FIREWALL;
     }
     if report.security.ssh_root_login_enabled {
-        score += 25;
+        score += RISK_SSH_ROOT_LOGIN;
     }
     if report.packages.upgradable.iter().any(|p| p.is_security) {
-        score += 20;
+        score += RISK_SECURITY_UPDATES;
     }
     let critical_certs = report
         .network
@@ -98,36 +100,42 @@ fn compute_risk_score(report: &AgentReport) -> u8 {
         .iter()
         .filter(|c| c.is_critical)
         .count() as u8;
-    score += std::cmp::min(critical_certs * 15, 15);
+    score += std::cmp::min(
+        critical_certs * RISK_CRITICAL_SSL_PER_CERT,
+        RISK_CRITICAL_SSL_MAX,
+    );
     if report
         .host
         .failed_services
         .iter()
         .any(|s| s.contains(".service"))
     {
-        score += 10;
+        score += RISK_FAILED_SERVICES;
     }
     if report.security.ssh_password_auth_enabled {
-        score += 10;
+        score += RISK_SSH_PASSWORD_AUTH;
     }
     if report.host.oom_kills > 0 {
-        score += 10;
+        score += RISK_OOM_KILLS;
     }
     if report.host.backup_tools.is_empty() {
-        score += 20;
+        score += RISK_NO_BACKUP;
     }
     if !report.host.ntp_synchronized {
-        score += 10;
+        score += RISK_NTP_NOT_SYNCED;
     }
     if !report.security.sudo_nopasswd_entries.is_empty() {
-        score += 10;
+        score += RISK_SUDO_NOPASSWD;
     }
     if let Some(mode) = report.security.sudoers_mode
         && mode != 0o440
     {
-        score += 5;
+        score += RISK_SUDOERS_MODE;
     }
-    let sysctl_penalty = std::cmp::min(report.security.sysctl_issues.len() as u8 * 5, 15);
+    let sysctl_penalty = std::cmp::min(
+        report.security.sysctl_issues.len() as u8 * RISK_SYSCTL_PER_ISSUE,
+        RISK_SYSCTL_MAX,
+    );
     score += sysctl_penalty;
     score.min(100)
 }

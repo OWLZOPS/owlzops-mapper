@@ -830,22 +830,21 @@ pub fn sheet_host_combined(
         current_row += 1;
     }
 
-    if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
-        sheet.write_string_with_format(current_row, 0, "NTP Synchronized", &header_format())?;
-        let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
-            (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
-            (true, None) => "yes".to_string(),
-            (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
-            (false, None) => "no".to_string(),
-        };
-        let ntp_fmt = if report.host.ntp_synchronized {
-            ok_band(current_row)
-        } else {
-            critical_band(current_row)
-        };
-        sheet.write_string_with_format(current_row, 1, &ntp_value, &ntp_fmt)?;
-        current_row += 1;
-    }
+    // NTP – always shown (fixed: use current_row, no data push)
+    sheet.write_string_with_format(current_row, 0, "NTP Synchronized", &header_format())?;
+    let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
+        (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
+        (true, None) => "yes".to_string(),
+        (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
+        (false, None) => "no".to_string(),
+    };
+    let ntp_fmt = if report.host.ntp_synchronized {
+        ok_band(current_row)
+    } else {
+        critical_band(current_row)
+    };
+    sheet.write_string_with_format(current_row, 1, &ntp_value, &ntp_fmt)?;
+    current_row += 1;
 
     if !report.security.sudo_nopasswd_entries.is_empty() {
         sheet.write_string_with_format(current_row, 0, "Sudo NOPASSWD", &header_format())?;
@@ -1553,23 +1552,22 @@ fn sheet_security_named(
         dyn_row += 1;
     }
 
-    if !report.host.ntp_synchronized || report.host.time_offset_ms.is_some() {
-        sheet.write_string_with_format(dyn_row, 0, "NTP Synchronized", &header_format())?;
-        let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
-            (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
-            (true, None) => "yes".to_string(),
-            (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
-            (false, None) => "no".to_string(),
-        };
-        let ntp_fmt = if report.host.ntp_synchronized {
-            ok_band(dyn_row)
-        } else {
-            critical_band(dyn_row)
-        };
-        sheet.write_string_with_format(dyn_row, 1, &ntp_value, &ntp_fmt)?;
-        data.push(vec!["NTP Synchronized".to_string(), ntp_value]);
-        dyn_row += 1;
-    }
+    // NTP – always shown (fixed: use dyn_row, include data push)
+    sheet.write_string_with_format(dyn_row, 0, "NTP Synchronized", &header_format())?;
+    let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
+        (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
+        (true, None) => "yes".to_string(),
+        (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
+        (false, None) => "no".to_string(),
+    };
+    let ntp_fmt = if report.host.ntp_synchronized {
+        ok_band(dyn_row)
+    } else {
+        critical_band(dyn_row)
+    };
+    sheet.write_string_with_format(dyn_row, 1, &ntp_value, &ntp_fmt)?;
+    data.push(vec!["NTP Synchronized".to_string(), ntp_value]);
+    dyn_row += 1;
 
     if !report.security.sudo_nopasswd_entries.is_empty() {
         sheet.write_string_with_format(dyn_row, 0, "Sudo NOPASSWD", &header_format())?;

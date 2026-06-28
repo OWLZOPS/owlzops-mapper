@@ -167,6 +167,7 @@ pub fn gather_security_info() -> SecurityInfo {
             "/bin/ksh",
             "/usr/bin/ksh",
         ];
+
         let valid_shells: std::collections::HashSet<&str> = VALID_SHELLS.iter().copied().collect();
 
         for line in contents.lines() {
