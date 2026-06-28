@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 
-> One binary. One command. Full picture of your server – now with **Risk Score** and **multi‑host remote audit**.
+> One binary. One command. Full picture of your server - now with **Risk Score**, **multi‑host remote audit** and **snapshot diff**.
 
 **owlzops-mapper** is a self-contained Rust binary that performs a complete
 Linux server audit in seconds and exports the result to Excel, JSON or
@@ -19,13 +19,13 @@ risk and cost optimization.
 **Option 1 – direct download:**
 ```bash
 curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzops-mapper-linux-x86_64.tar.gz | tar xz
-sudo ./owlzops-mapper
+sudo ./owlzops-mapper audit
 ```
 
 **Option 2 – install script (verifies SHA256 + GPG):**
 ```bash
 curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
-sudo ./owlzops-mapper
+sudo ./owlzops-mapper audit
 ```
 
 ---
@@ -35,45 +35,57 @@ sudo ./owlzops-mapper
 ### Local audit
 ```bash
 # Terminal dashboard (default, fully offline)
-sudo ./owlzops-mapper
+sudo ./owlzops-mapper audit
 
 # Export to Excel (with Executive Summary as first sheet)
-sudo ./owlzops-mapper --format excel --output report.xlsx
+sudo ./owlzops-mapper audit --format excel --output report.xlsx
 
 # JSON for programmatic use
-sudo ./owlzops-mapper --format json > snapshot.json
+sudo ./owlzops-mapper audit --format json > snapshot.json
 
 # Detect external IP (opt-in outbound request)
-sudo ./owlzops-mapper --external-ip
+sudo ./owlzops-mapper audit --external-ip
 
 # Refresh package cache before checking updates
-sudo ./owlzops-mapper --refresh-packages
+sudo ./owlzops-mapper audit --refresh-packages
 
 # Air-gapped / restricted network — guarantees zero outbound calls
-sudo ./owlzops-mapper --offline
+sudo ./owlzops-mapper audit --offline
 ```
 
 ### Remote audit (via SSH)
 ```bash
 # Scan a single remote host (binary must be present at /tmp/owlzops-mapper)
-sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root
+sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user root
 
 # Scan multiple comma-separated hosts
-sudo ./owlzops-mapper --host 192.168.1.10,192.168.1.11 --ssh-user root
+sudo ./owlzops-mapper audit --host 192.168.1.10,192.168.1.11 --ssh-user root
 
 # Automatically copy the local static binary to the remote host first.
 # Release binaries are static (musl), so --copy-binary works out of the box.
-sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root --copy-binary
+sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user root --copy-binary
 
 # If you built your own binary (e.g. debug build), point to the musl release:
-sudo ./owlzops-mapper --host 192.168.1.10 --ssh-user root --copy-binary \
+sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user root --copy-binary \
   --local-binary target/x86_64-unknown-linux-musl/release/owlzops-mapper
 
 # Scan multiple hosts from a file (one per line)
-sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --copy-binary
+sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user root --copy-binary
 
 # Multi-host Excel report with one sheet per host
-sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --format excel --output fleet-audit.xlsx
+sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user root --format excel --output fleet-audit.xlsx
+```
+
+### Comparing snapshots (diff)
+```bash
+# Compare two JSON snapshots in terminal (colored table)
+./owlzops-mapper compare before.json after.json
+
+# Export diff to JSON
+./owlzops-mapper compare before.json after.json --format json > diff.json
+
+# Export diff to Excel (color-coded: green=improved, red=degraded, yellow=changed)
+./owlzops-mapper compare before.json after.json --format excel --output diff.xlsx
 ```
 
 ---
@@ -92,24 +104,31 @@ sudo ./owlzops-mapper --hosts hosts.txt --ssh-user root --format excel --output 
 | `--ssh-user <USER>` | SSH user for remote connections (default: `root`) |
 | `--ssh-key <PATH>` | Path to SSH private key (default: `~/.ssh/id_rsa`) |
 | `--copy-binary` | Copy the local binary to remote hosts before scanning. The binary **must** be statically linked (musl). GitHub release binaries are static, so you can safely use this flag with them. |
-| `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you’re running a debug build locally but have a release build for remote hosts. |
+| `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you're running a debug build locally but have a release build for remote hosts. |
 | `--remote-path <PATH>` | Path where the binary is placed on remote hosts (default: `/tmp/owlzops-mapper`) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
+
+### Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `audit` | Run an audit scan (local or remote) |
+| `compare <before> <after>` | Compare two JSON snapshots and show drift |
 
 ---
 
 ## Exit Codes
 
-| Code | Meaning |
-|------|---------|
-| `0`  | No critical issues found |
-| `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) |
-| `2`  | Not running as root – results may be incomplete |
+| Code | Single Host | Multi-Host (Fleet) |
+|------|-------------|---------------------|
+| `0`  | No critical issues found | All hosts clean |
+| `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) | Any host has critical issues |
+| `2`  | Not running as root – results may be incomplete | Any host not running as root |
 
 You can use these codes directly in CI/CD pipelines:
 ```bash
-sudo ./owlzops-mapper || echo "Security scan failed – check the report"
+sudo ./owlzops-mapper audit || echo "Security scan failed – check the report"
 ```
 
 ---
@@ -169,7 +188,7 @@ the target server. Copy it, run it, done.
 git clone https://github.com/OWLZOPS/owlzops-mapper
 cd owlzops-mapper
 cargo build --release
-sudo ./target/release/owlzops-mapper
+sudo ./target/release/owlzops-mapper audit
 ```
 
 For static musl build (recommended for remote scanning):
