@@ -979,26 +979,11 @@ pub fn sheet_host_combined(
             )?;
             sheet.write_string_with_format(current_row, 6, c.mounts.join(" | "), &band)?;
 
-            let mut issues = Vec::new();
-            if c.privileged {
-                issues.push("PRIVILEGED".to_string());
-            }
-            if c.memory_limit_mb.is_none() {
-                issues.push("NoMemLimit".to_string());
-            }
-            if c.cpu_limit.is_none() {
-                issues.push("NoCpuLimit".to_string());
-            }
-            if c.cap_add.contains(&"SYS_ADMIN".to_string()) {
-                issues.push("SYS_ADMIN".to_string());
-            }
-            if c.cap_add.contains(&"NET_ADMIN".to_string()) {
-                issues.push("NET_ADMIN".to_string());
-            }
-            let issue_str = if issues.is_empty() {
+            let issue_list: Vec<&str> = c.security_issues();
+            let issue_str = if issue_list.is_empty() {
                 "-".to_string()
             } else {
-                issues.join(", ")
+                issue_list.join(", ")
             };
             if issue_str != "-" {
                 sheet.write_string_with_format(
