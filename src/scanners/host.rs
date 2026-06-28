@@ -133,7 +133,52 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     let mut last_restic = None;
 
     for &tool in &["restic", "borg", "duplicati"] {
-        if crate::utils::run_with_timeout("which", &[tool], 2).is_some() {
+        // Check if binary exists (non-empty output from which)
+        let binary_found = crate::utils::run_with_timeout("which", &[tool], 2)
+            .map(|stdout| !stdout.trim().is_empty())
+            .unwrap_or(false);
+
+        if !binary_found {
+            continue;
+        }
+
+        // Binary exists, now verify actual usage
+        let has_data = match tool {
+            "restic" => {
+                let has_snapshots = crate::utils::run_with_timeout(
+                    "restic",
+                    &["snapshots", "--no-cache", "--json", "--last", "1"],
+                    5,
+                )
+                .map(|stdout| {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                        json.as_array().map(|arr| !arr.is_empty()).unwrap_or(false)
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+
+                has_snapshots
+                    || Path::new("/root/.restic").exists()
+                    || Path::new("/var/lib/restic").exists()
+            }
+            "borg" => {
+                let has_borg_data = crate::utils::run_with_timeout("borg", &["list", "::"], 5)
+                    .map(|stdout| !stdout.trim().is_empty())
+                    .unwrap_or(false);
+
+                has_borg_data
+                    || Path::new("/root/.borg").exists()
+                    || Path::new("/var/lib/borg").exists()
+            }
+            "duplicati" => ["/root/.duplicati", "/var/lib/duplicati", "/opt/duplicati"]
+                .iter()
+                .any(|dir| Path::new(dir).exists()),
+            _ => false,
+        };
+
+        if has_data {
             tools.push(tool.to_string());
         }
     }

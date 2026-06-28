@@ -103,7 +103,8 @@ jobs:
             -w /src \
             opensuse/tumbleweed:latest \
             bash -c "
-              zypper --non-interactive install gcc make curl
+              zypper --non-interactive install gcc gcc-c++ make curl
+              command -v cc &>/dev/null || ln -s /usr/bin/gcc /usr/bin/cc
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               source \$HOME/.cargo/env
               cargo build --locked
