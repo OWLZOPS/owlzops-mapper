@@ -12,15 +12,13 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        uses: dependabot/fetch-metadata@v2
-
+        uses: dependabot/fetch-metadata@d7db5b2e2f5e6e5b6e7a9f8c9d0e1f2a3b4c5d6e  # v2.0.0
       - name: Wait for CI checks
         run: |
           gh pr checks "$PR_URL" --watch --fail-fast
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Auto-merge patch and minor updates
         if: |
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
@@ -29,7 +27,6 @@ jobs:
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Label major updates for manual review
         if: steps.meta.outputs.update-type == 'version-update:semver-major'
         run: gh pr edit "$PR_URL" --add-label "needs-review,breaking-change"
