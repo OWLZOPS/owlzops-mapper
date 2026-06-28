@@ -1,5 +1,4 @@
 use crate::models::{DiskInfo, StorageInfo};
-use std::process::Command;
 use sysinfo::Disks;
 
 pub fn gather_storage_info() -> StorageInfo {
@@ -14,8 +13,8 @@ pub fn gather_storage_info() -> StorageInfo {
         let mount_point = disk.mount_point().to_string_lossy().to_string();
         let mut inode_usage = None;
 
-        if let Ok(output) = Command::new("df").arg("-i").arg(&mount_point).output() {
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
+        // Use run_with_timeout to avoid hanging on NFS or stuck mounts
+        if let Some(stdout_str) = crate::utils::run_with_timeout("df", &["-i", &mount_point], 5) {
             let lines: Vec<&str> = stdout_str.lines().collect();
             if lines.len() > 1 {
                 let parts: Vec<&str> = lines[1].split_whitespace().collect();
