@@ -12,6 +12,7 @@ use models::AgentReport;
 use std::process::Command;
 use tracing::{info, warn};
 
+const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 // =====================================================================
 // CLI Arguments Setup
 // =====================================================================
@@ -157,8 +158,7 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
         || report.host.backup_tools.is_empty()
         || !report.security.sudo_nopasswd_entries.is_empty()
         || !report.host.ntp_synchronized
-        || report.security.sysctl_issues.len() >= 3; // NEW: sysctl threshold
-
+        || report.security.sysctl_issues.len() >= SYSCTL_CRITICAL_THRESHOLD;
     if !report.is_root_execution {
         if has_critical {
             warn!(
