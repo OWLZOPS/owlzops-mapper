@@ -1,11 +1,9 @@
 use crate::models::{PackageManager, PackagesInfo, UpgradablePackage};
-use std::process::Command;
+use std::collections::HashSet;
 
 fn command_exists(bin: &str) -> bool {
-    Command::new("which")
-        .arg(bin)
-        .output()
-        .map(|o| o.status.success())
+    crate::utils::run_with_timeout("which", &[bin], 2)
+        .map(|stdout| !stdout.trim().is_empty())
         .unwrap_or(false)
 }
 
@@ -33,14 +31,10 @@ fn detect_package_manager() -> PackageManager {
 // =====================================================================
 
 fn apt_installed_count() -> usize {
-    if let Ok(output) = Command::new("dpkg-query")
-        .args(["-f", "${binary:Package}\n", "-W"])
-        .output()
+    if let Some(stdout) =
+        crate::utils::run_with_timeout("dpkg-query", &["-f", "${binary:Package}\n", "-W"], 10)
     {
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
+        return stdout.lines().filter(|l| !l.trim().is_empty()).count();
     }
     0
 }
@@ -91,11 +85,8 @@ fn apt_upgradable() -> Vec<UpgradablePackage> {
 // =====================================================================
 
 fn rpm_installed_count() -> usize {
-    if let Ok(output) = Command::new("rpm").arg("-qa").output() {
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
+    if let Some(stdout) = crate::utils::run_with_timeout("rpm", &["-qa"], 15) {
+        return stdout.lines().filter(|l| !l.trim().is_empty()).count();
     }
     0
 }
@@ -135,11 +126,8 @@ fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
 // =====================================================================
 
 fn pacman_installed_count() -> usize {
-    if let Ok(output) = Command::new("pacman").arg("-Q").output() {
-        return String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
+    if let Some(stdout) = crate::utils::run_with_timeout("pacman", &["-Q"], 10) {
+        return stdout.lines().filter(|l| !l.trim().is_empty()).count();
     }
     0
 }
@@ -178,17 +166,17 @@ fn zypper_refresh_cache() -> bool {
     crate::utils::run_with_timeout("zypper", &["-n", "-q", "refresh"], 60).is_some()
 }
 
-fn zypper_security_package_names() -> std::collections::HashSet<String> {
-    let mut pkg_names = std::collections::HashSet::new();
+fn zypper_security_package_names() -> HashSet<String> {
+    let mut pkg_names = HashSet::new();
 
-    let Ok(output) = Command::new("zypper")
-        .args(["-n", "-q", "list-patches", "--category", "security"])
-        .output()
-    else {
+    let Some(stdout) = crate::utils::run_with_timeout(
+        "zypper",
+        &["-n", "-q", "list-patches", "--category", "security"],
+        30,
+    ) else {
         return pkg_names;
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut patch_names: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
@@ -205,15 +193,15 @@ fn zypper_security_package_names() -> std::collections::HashSet<String> {
         }
     }
 
-    // Use sequential iterator – parallel zypper calls break RPM DB lock
+    // Use sequential iterator – parallel zypper calls break RPM DB lock.
+    // Each call wrapped in 15s timeout.
     for patch in patch_names.iter().take(20) {
-        let Ok(info_out) = Command::new("zypper")
-            .args(["-q", "info", "-t", "patch", patch])
-            .output()
+        let Some(info_out) =
+            crate::utils::run_with_timeout("zypper", &["-q", "info", "-t", "patch", patch], 15)
         else {
             continue;
         };
-        for line in String::from_utf8_lossy(&info_out.stdout).lines() {
+        for line in info_out.lines() {
             let l = line.trim();
             if (l.starts_with("Provides:") || l.starts_with("package:"))
                 && let Some(pkg) = l.split_whitespace().nth(1)

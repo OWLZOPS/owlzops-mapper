@@ -64,7 +64,7 @@ jobs:
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install system dependencies (build-only)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
@@ -95,7 +95,7 @@ jobs:
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Run tests in openSUSE container
         run: |
           docker run --rm \
@@ -103,8 +103,7 @@ jobs:
             -w /src \
             opensuse/tumbleweed:latest \
             bash -c "
-              zypper --non-interactive install gcc gcc-c++ make curl
-              command -v cc &>/dev/null || ln -s /usr/bin/gcc /usr/bin/cc
+              zypper --non-interactive install -y gcc gcc-c++ make curl glibc-devel
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               source \$HOME/.cargo/env
               cargo build --locked

@@ -50,14 +50,8 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             severity: sev,
         });
     }
-    changes.sort_unstable_by_key(|c| match c.severity {
-        Severity::Degraded => 0,
-        Severity::Changed => 1,
-        Severity::Improved => 2,
-    });
 
     // --- network.listening_ports (key: bind_address:port) ---
-    // port is a String in the model, so we keep it as String
     let before_ports: HashSet<(String, String)> = before
         .network
         .listening_ports
@@ -120,7 +114,6 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     }
 
     // --- security.shell_users (compare authorized_keys_count) ---
-    // authorized_keys_count is usize, we store as u64 for comparison
     let before_users: HashMap<&str, u64> = before
         .security
         .shell_users
@@ -276,6 +269,13 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             severity: Severity::Degraded,
         });
     }
+
+    // Sort by severity: Degraded first, then Changed, then Improved
+    changes.sort_unstable_by_key(|c| match c.severity {
+        Severity::Degraded => 0,
+        Severity::Changed => 1,
+        Severity::Improved => 2,
+    });
 
     DiffReport { changes }
 }
