@@ -1725,22 +1725,7 @@ fn sheet_docker_named(
         sheet.write_number_with_format(row, 5, c.log_size_mb as f64 / 1024.0, &number_format())?;
         sheet.write_string_with_format(row, 6, c.mounts.join(" | "), &band)?;
 
-        let mut issues = Vec::new();
-        if c.privileged {
-            issues.push("PRIVILEGED".to_string());
-        }
-        if c.memory_limit_mb.is_none() {
-            issues.push("NoMemLimit".to_string());
-        }
-        if c.cpu_limit.is_none() {
-            issues.push("NoCpuLimit".to_string());
-        }
-        if c.cap_add.contains(&"SYS_ADMIN".to_string()) {
-            issues.push("SYS_ADMIN".to_string());
-        }
-        if c.cap_add.contains(&"NET_ADMIN".to_string()) {
-            issues.push("NET_ADMIN".to_string());
-        }
+        let issues = c.security_issues();
         let issue_str = if issues.is_empty() {
             "-".to_string()
         } else {

@@ -704,22 +704,7 @@ pub fn render_dashboard(report: &AgentReport) {
                 }
 
                 // Collect Docker security issues
-                let mut issues = Vec::new();
-                if c.privileged {
-                    issues.push("PRIVILEGED".to_string());
-                }
-                if c.memory_limit_mb.is_none() {
-                    issues.push("NoMemLimit".to_string());
-                }
-                if c.cpu_limit.is_none() {
-                    issues.push("NoCpuLimit".to_string());
-                }
-                if c.cap_add.iter().any(|cap| cap == "SYS_ADMIN") {
-                    issues.push("SYS_ADMIN".to_string());
-                }
-                if c.cap_add.iter().any(|cap| cap == "NET_ADMIN") {
-                    issues.push("NET_ADMIN".to_string());
-                }
+                let issues = c.security_issues();
                 let issue_str = if issues.is_empty() {
                     "-".to_string()
                 } else {

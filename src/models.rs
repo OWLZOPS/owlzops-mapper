@@ -137,6 +137,27 @@ pub struct ContainerInfo {
     pub cpu_limit: Option<f64>,
     pub cap_add: Vec<String>,
 }
+impl ContainerInfo {
+    pub fn security_issues(&self) -> Vec<&'static str> {
+        let mut issues = Vec::new();
+        if self.privileged {
+            issues.push("PRIVILEGED");
+        }
+        if self.memory_limit_mb.is_none() {
+            issues.push("NoMemLimit");
+        }
+        if self.cpu_limit.is_none() {
+            issues.push("NoCpuLimit");
+        }
+        if self.cap_add.contains(&"SYS_ADMIN".to_string()) {
+            issues.push("SYS_ADMIN");
+        }
+        if self.cap_add.contains(&"NET_ADMIN".to_string()) {
+            issues.push("NET_ADMIN");
+        }
+        issues
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SecurityInfo {
