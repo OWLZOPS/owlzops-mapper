@@ -402,6 +402,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     // Tech stack detection with precise matching
     // -----------------------------------------------------------------
     let mut tech_stack = Vec::new();
+    let mut found_tech: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
 
     let prefix_targets: &[(&str, &str)] = &[
         ("postgres", "PostgreSQL"),
@@ -437,12 +438,12 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
 
         let name = proc.name().to_lowercase();
         for &(process_name, display_name) in prefix_targets {
-            if name.starts_with(process_name) && !tech_stack.contains(&display_name.to_string()) {
+            if name.starts_with(process_name) && found_tech.insert(display_name) {
                 tech_stack.push(display_name.to_string());
             }
         }
         for &(process_name, display_name) in exact_targets {
-            if name == process_name && !tech_stack.contains(&display_name.to_string()) {
+            if name == process_name && found_tech.insert(display_name) {
                 tech_stack.push(display_name.to_string());
             }
         }
@@ -471,7 +472,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     // RabbitMQ runs under beam.smp; detect by known data directory
     if (std::path::Path::new("/var/lib/rabbitmq").exists()
         || std::path::Path::new("/etc/rabbitmq").exists())
-        && !tech_stack.contains(&"RabbitMQ".to_string())
+        && found_tech.insert("RabbitMQ")
     {
         tech_stack.push("RabbitMQ".to_string());
     }
