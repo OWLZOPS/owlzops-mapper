@@ -14,13 +14,15 @@ esac
 
 TARBALL="${BIN}-linux-${SUFFIX}.tar.gz"
 CHECKSUM="${TARBALL}.sha256"
+SIGNATURE="${TARBALL}.asc"
 BASE_URL="https://github.com/${REPO}/releases/latest/download"
+GPG_KEY_URL="https://raw.githubusercontent.com/${REPO}/main/gpg-public-key.asc"
 
 echo "→ Downloading ${BIN} for ${SUFFIX}..."
 curl -sSLO "${BASE_URL}/${TARBALL}"
 curl -sSLO "${BASE_URL}/${CHECKSUM}"
 
-# Verify checksum
+# ---- SHA256 verification ----
 echo "→ Verifying SHA256..."
 EXPECTED=$(cut -d' ' -f1 "${CHECKSUM}")
 ACTUAL=$(sha256sum "${TARBALL}" | cut -d' ' -f1)
@@ -29,6 +31,24 @@ if [ "$EXPECTED" != "$ACTUAL" ]; then
     echo "  Expected: $EXPECTED"
     echo "  Got:      $ACTUAL"
     exit 1
+fi
+echo "✓ SHA256 checksum OK"
+
+# ---- Optional GPG verification ----
+if command -v gpg >/dev/null 2>&1; then
+    echo "→ GPG available – verifying signature..."
+    curl -sSLO "${BASE_URL}/${SIGNATURE}"
+    curl -sSL "$GPG_KEY_URL" | gpg --import >/dev/null 2>&1
+    if gpg --verify "${SIGNATURE}" "${TARBALL}" >/dev/null 2>&1; then
+        echo "✓ GPG signature verified"
+        rm "${SIGNATURE}"
+    else
+        echo "✗ GPG verification FAILED – the binary may have been tampered with!"
+        exit 1
+    fi
+else
+    echo "ℹ GPG not found – skipping signature verification"
+    echo "  Install gnupg to enable cryptographic verification"
 fi
 
 # Extract
