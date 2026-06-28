@@ -1,34 +1,31 @@
 use crate::models::{DatabaseInfo, HostInfo, ProcessInfo};
 use std::collections::BinaryHeap;
 use std::fs;
-use std::process::Command;
+use std::path::Path;
 use sysinfo::{ProcessStatus, System};
 
+/// Get directory size in MB using `du` with a 10-second timeout.
 fn get_dir_size_mb(path: &str) -> u64 {
-    if let Ok(output) = Command::new("timeout")
-        .args(["10s", "du", "-sm", path])
-        .output()
+    if let Some(stdout) = crate::utils::run_with_timeout("du", &["-sm", path], 10)
+        && let Some(first_val) = stdout.split_whitespace().next()
     {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(first_val) = stdout.split_whitespace().next() {
-            return first_val.parse::<u64>().unwrap_or(0);
-        }
+        return first_val.parse::<u64>().unwrap_or(0);
     }
     0
 }
 
+/// Gather database engine information.
 pub fn gather_databases_info() -> Vec<DatabaseInfo> {
     let mut dbs = Vec::new();
 
-    let mut pg_ver = String::new();
-    if let Ok(out) = Command::new("psql").arg("-V").output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.contains("PostgreSQL") {
-            pg_ver = s.lines().next().unwrap_or("").to_string();
-        }
-    }
+    // PostgreSQL
+    let pg_ver = if let Some(stdout) = crate::utils::run_with_timeout("psql", &["-V"], 5) {
+        stdout.lines().next().unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
     let pg_dir = "/var/lib/postgresql";
-    if !pg_ver.is_empty() || std::path::Path::new(pg_dir).exists() {
+    if !pg_ver.is_empty() || Path::new(pg_dir).exists() {
         dbs.push(DatabaseInfo {
             engine: "PostgreSQL".to_string(),
             version: if pg_ver.is_empty() {
@@ -41,15 +38,14 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
         });
     }
 
-    let mut mysql_ver = String::new();
-    if let Ok(out) = Command::new("mysql").arg("-V").output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.contains("Ver") {
-            mysql_ver = s.lines().next().unwrap_or("").to_string();
-        }
-    }
+    // MySQL / MariaDB
+    let mysql_ver = if let Some(stdout) = crate::utils::run_with_timeout("mysql", &["-V"], 5) {
+        stdout.lines().next().unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
     let mysql_dir = "/var/lib/mysql";
-    if !mysql_ver.is_empty() || std::path::Path::new(mysql_dir).exists() {
+    if !mysql_ver.is_empty() || Path::new(mysql_dir).exists() {
         dbs.push(DatabaseInfo {
             engine: "MySQL/MariaDB".to_string(),
             version: if mysql_ver.is_empty() {
@@ -62,15 +58,15 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
         });
     }
 
-    let mut redis_ver = String::new();
-    if let Ok(out) = Command::new("redis-server").arg("-v").output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.contains("Redis") {
-            redis_ver = s.lines().next().unwrap_or("").to_string();
-        }
-    }
+    // Redis
+    let redis_ver = if let Some(stdout) = crate::utils::run_with_timeout("redis-server", &["-v"], 5)
+    {
+        stdout.lines().next().unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
     let redis_dir = "/var/lib/redis";
-    if !redis_ver.is_empty() || std::path::Path::new(redis_dir).exists() {
+    if !redis_ver.is_empty() || Path::new(redis_dir).exists() {
         dbs.push(DatabaseInfo {
             engine: "Redis".to_string(),
             version: if redis_ver.is_empty() {
@@ -83,15 +79,15 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
         });
     }
 
-    let mut mongo_ver = String::new();
-    if let Ok(out) = Command::new("mongod").arg("--version").output() {
-        let s = String::from_utf8_lossy(&out.stdout);
-        if s.contains("db version") {
-            mongo_ver = s.lines().next().unwrap_or("").to_string();
-        }
-    }
+    // MongoDB
+    let mongo_ver =
+        if let Some(stdout) = crate::utils::run_with_timeout("mongod", &["--version"], 5) {
+            stdout.lines().next().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
     let mongo_dir = "/var/lib/mongodb";
-    if !mongo_ver.is_empty() || std::path::Path::new(mongo_dir).exists() {
+    if !mongo_ver.is_empty() || Path::new(mongo_dir).exists() {
         dbs.push(DatabaseInfo {
             engine: "MongoDB".to_string(),
             version: if mongo_ver.is_empty() {
@@ -103,17 +99,18 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
             size_mb: get_dir_size_mb(mongo_dir),
         });
     }
+
     dbs
 }
 
+/// Retrieve list of failed systemd services with a 10-second timeout.
 fn get_failed_systemd_services() -> Vec<String> {
-    let output = Command::new("systemctl")
-        .args(["--failed", "--no-pager", "--no-legend", "--plain"])
-        .output();
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
+    let out = crate::utils::run_with_timeout(
+        "systemctl",
+        &["--failed", "--no-pager", "--no-legend", "--plain"],
+        10,
+    );
+    if let Some(text) = out {
         let mut services = Vec::new();
         for line in text.lines() {
             let trimmed = line.trim();
@@ -130,17 +127,13 @@ fn get_failed_systemd_services() -> Vec<String> {
     Vec::new()
 }
 
+/// Detect backup tools and last Restic snapshot.
 fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
     let mut last_restic = None;
 
     for &tool in &["restic", "borg", "duplicati"] {
-        if Command::new("which")
-            .arg(tool)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
+        if crate::utils::run_with_timeout("which", &[tool], 2).is_some() {
             tools.push(tool.to_string());
         }
     }
@@ -151,19 +144,12 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     });
 
     if tools.contains(&"restic".to_string())
-        && let Ok(output) = Command::new("timeout")
-            .args([
-                "5s",
-                "restic",
-                "snapshots",
-                "--json",
-                "--last",
-                "1",
-                "--no-cache",
-            ])
-            .output()
-        && output.status.success()
-        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(stdout) = crate::utils::run_with_timeout(
+            "restic",
+            &["snapshots", "--json", "--last", "1", "--no-cache"],
+            5,
+        )
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout)
         && let Some(snapshots) = json.as_array()
         && let Some(snap) = snapshots.first()
     {
@@ -180,173 +166,189 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
     (tools, last_restic)
 }
 
+/// Determine NTP synchronization status and time offset.
+/// Handles containers without systemd gracefully.
 fn gather_ntp_info() -> (bool, Option<f64>) {
-    let Ok(td_out) = Command::new("timedatectl").arg("status").output() else {
-        return (true, None);
-    };
-    if !td_out.status.success() {
-        return (true, None);
-    }
+    let in_container = Path::new("/.dockerenv").exists()
+        || std::fs::read_to_string("/proc/1/comm")
+            .map(|s| s.trim() != "systemd")
+            .unwrap_or(false);
 
-    let text = String::from_utf8_lossy(&td_out.stdout);
-    let synchronized = text.lines().any(|l| {
-        (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
-    });
-
-    if let Ok(out) = Command::new("chronyc").arg("tracking").output()
-        && out.status.success()
-    {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if line.contains("System time")
-                && let Some(after) = line.split_once(':').map(|x| x.1)
-                && let Some(num_str) = after.split_whitespace().next()
-                && let Ok(secs) = num_str.parse::<f64>()
+    // 1. timedatectl
+    if let Some(td_out) = crate::utils::run_with_timeout("timedatectl", &["status"], 5) {
+        let synchronized = td_out.lines().any(|l| {
+            (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
+        });
+        let mut offset = None;
+        for line in td_out.lines() {
+            if let Some(rest) = line.strip_prefix("NTP offset:")
+                && let Some(ms) = rest.trim().strip_suffix("ms")
+                && let Ok(val) = ms.trim().parse::<f64>()
             {
-                return (synchronized, Some(secs.abs() * 1000.0));
+                offset = Some(val.abs());
+                break;
             }
+        }
+        if synchronized {
+            return (true, offset);
         }
     }
 
-    if let Ok(out) = Command::new("ntpq").args(["-p", "-n"]).output()
-        && out.status.success()
-    {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
+    // 2. chronyc tracking
+    if let Some(chrony_out) = crate::utils::run_with_timeout("chronyc", &["tracking"], 5) {
+        let synced = chrony_out
+            .lines()
+            .any(|l| l.contains("Reference ID") && !l.contains("7F000001"));
+        let mut offset = None;
+        for line in chrony_out.lines() {
+            if line.contains("System time") {
+                offset = line
+                    .split_whitespace()
+                    .nth(3)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|v| v.abs() * 1000.0);
+                break;
+            }
+        }
+        return (synced, offset);
+    }
+
+    // 3. ntpq
+    if let Some(ntpq_out) = crate::utils::run_with_timeout("ntpq", &["-p", "-n"], 5) {
+        for line in ntpq_out.lines() {
             if line.starts_with('*') {
                 let cols: Vec<&str> = line.split_whitespace().collect();
                 if cols.len() >= 9
-                    && let Ok(offset_ms) = cols[8].parse::<f64>()
+                    && let Ok(offset) = cols[8].parse::<f64>()
                 {
-                    return (synchronized, Some(offset_ms.abs()));
+                    return (true, Some(offset.abs()));
                 }
             }
         }
+        return (false, None);
     }
 
-    (synchronized, None)
+    // No NTP tools available: container → unknown (false), else assume OK
+    (!in_container, None)
 }
 
+/// Gather comprehensive host information.
 pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     sys.refresh_all();
-    let reboot_required = std::path::Path::new("/var/run/reboot-required").exists();
+    let reboot_required = Path::new("/var/run/reboot-required").exists();
 
+    // External IP
     let mut external_ipv4 = "unknown (use --external-ip to detect)".to_string();
     if fetch_external_ip {
         external_ipv4 = "unknown".to_string();
-        if let Ok(output) = Command::new("curl")
-            .args(["-s", "-4", "--max-time", "5", "https://ifconfig.me"])
-            .output()
-        {
-            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(stdout) = crate::utils::run_with_timeout(
+            "curl",
+            &["-s", "-4", "--max-time", "5", "https://ifconfig.me"],
+            6,
+        ) {
+            let ip = stdout.trim().to_string();
             if !ip.is_empty() {
                 external_ipv4 = ip;
             }
         }
     }
 
-    let mut open_files_limit = "unknown".to_string();
-    if let Ok(output) = Command::new("sh").arg("-c").arg("ulimit -n").output() {
-        let limit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !limit.is_empty() {
-            open_files_limit = limit;
-        }
-    }
+    // Open files limit
+    let open_files_limit = crate::utils::run_with_timeout("sh", &["-c", "ulimit -n"], 3)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
-    let mut oom_kills = 0;
-    if let Ok(output) = Command::new("sh")
-        .arg("-c")
-        .arg("dmesg 2>/dev/null | grep -i 'killed process' | wc -l")
-        .output()
-    {
-        oom_kills = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<usize>()
-            .unwrap_or(0);
-    }
+    // OOM kills
+    let oom_kills = crate::utils::run_with_timeout(
+        "sh",
+        &["-c", "dmesg 2>/dev/null | grep -i 'killed process' | wc -l"],
+        5,
+    )
+    .map(|s| s.trim().parse::<usize>().unwrap_or(0))
+    .unwrap_or(0);
 
-    let mut dmesg_errors = Vec::new();
-    if let Ok(output) = Command::new("sh")
-        .arg("-c")
-        .arg("dmesg -T 2>/dev/null | grep -iE 'error|critical|fail|segfault' | tail -n 5")
-        .output()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let clean = line.trim();
-            if !clean.is_empty() {
-                dmesg_errors.push(clean.to_string());
-            }
-        }
-    }
+    // Dmesg errors (last 5)
+    let dmesg_errors = crate::utils::run_with_timeout(
+        "sh",
+        &[
+            "-c",
+            "dmesg -T 2>/dev/null | grep -iE 'error|critical|fail|segfault' | tail -n 5",
+        ],
+        5,
+    )
+    .map(|s| {
+        s.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default();
 
-    let mut gpu_devices = Vec::new();
-    if let Ok(output) = Command::new("lspci").output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let lower = line.to_lowercase();
-            if (lower.contains("vga") || lower.contains("3d controller"))
-                && (lower.contains("nvidia") || lower.contains("amd") || lower.contains("intel"))
-            {
-                let parts: Vec<&str> = line.split(": ").collect();
-                if parts.len() > 1 {
-                    gpu_devices.push(parts[1].trim().to_string());
-                }
-            }
-        }
-    }
+    // GPU devices via lspci
+    let gpu_devices = crate::utils::run_with_timeout("lspci", &[], 5)
+        .map(|s| {
+            s.lines()
+                .filter(|line| {
+                    let lower = line.to_lowercase();
+                    (lower.contains("vga") || lower.contains("3d controller"))
+                        && (lower.contains("nvidia")
+                            || lower.contains("amd")
+                            || lower.contains("intel"))
+                })
+                .filter_map(|line| line.split(": ").nth(1).map(|s| s.trim().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let mut native_services = Vec::new();
-    if let Ok(output) = Command::new("systemctl")
-        .args([
+    // Running native services (systemd)
+    let native_services = crate::utils::run_with_timeout(
+        "systemctl",
+        &[
             "list-units",
             "--type=service",
             "--state=running",
             "--no-pager",
             "--no-legend",
-        ])
-        .output()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if !parts.is_empty() {
-                let s_name = parts[0].replace(".service", "");
-                if !s_name.starts_with("systemd-")
-                    && !s_name.starts_with("dbus")
-                    && !s_name.starts_with("polkit")
-                {
-                    native_services.push(s_name);
-                }
-            }
-        }
-    }
+        ],
+        10,
+    )
+    .map(|s| {
+        s.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                parts.first().map(|n| n.replace(".service", ""))
+            })
+            .filter(|n| {
+                !n.starts_with("systemd-") && !n.starts_with("dbus") && !n.starts_with("polkit")
+            })
+            .collect()
+    })
+    .unwrap_or_default();
 
-    let mut hosting_provider = "unknown".to_string();
-    if let Ok(vendor) = fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
-        hosting_provider = vendor.trim().to_string();
-    }
+    // Hosting provider from DMI
+    let mut hosting_provider = fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     if (hosting_provider == "unknown" || hosting_provider == "QEMU" || hosting_provider.is_empty())
         && let Ok(product) = fs::read_to_string("/sys/class/dmi/id/product_name")
     {
         hosting_provider = product.trim().to_string();
     }
 
-    let mut os_install_date = "unknown".to_string();
-    if let Ok(output) = Command::new("stat").arg("-c").arg("%w").arg("/").output() {
-        let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !date.is_empty() && date != "-" {
-            os_install_date = date;
-        }
-    }
-    if (os_install_date == "unknown" || os_install_date == "-")
-        && let Ok(output) = Command::new("stat")
-            .arg("-c")
-            .arg("%y")
-            .arg("/etc/machine-id")
-            .output()
-    {
-        let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !date.is_empty() && date != "-" {
-            os_install_date = date;
-        }
+    // OS install date
+    let mut os_install_date = crate::utils::run_with_timeout("stat", &["-c", "%w", "/"], 3)
+        .map(|s| s.trim().to_string())
+        .filter(|s| s != "-" && !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    if os_install_date == "unknown" || os_install_date == "-" {
+        os_install_date =
+            crate::utils::run_with_timeout("stat", &["-c", "%y", "/etc/machine-id"], 3)
+                .map(|s| s.trim().to_string())
+                .filter(|s| s != "-" && !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
     }
 
+    // Cron jobs
     let mut cron_jobs = Vec::new();
     if let Ok(crontab) = fs::read_to_string("/etc/crontab") {
         for line in crontab.lines() {
@@ -370,37 +372,39 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         }
     }
 
-    let mut systemd_timers = Vec::new();
-    if let Ok(output) = Command::new("systemctl")
-        .args(["list-timers", "--all", "--no-pager", "--no-legend"])
-        .output()
-    {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            for p in line.split_whitespace() {
-                if p.ends_with(".timer") {
-                    systemd_timers.push(p.to_string());
-                }
-            }
-        }
-    }
-    systemd_timers.sort();
-    systemd_timers.dedup();
+    // Systemd timers
+    let systemd_timers = crate::utils::run_with_timeout(
+        "systemctl",
+        &["list-timers", "--all", "--no-pager", "--no-legend"],
+        10,
+    )
+    .map(|s| {
+        let mut timers: Vec<String> = s
+            .lines()
+            .flat_map(|line| line.split_whitespace().map(|w| w.to_string()))
+            .filter(|w| w.ends_with(".timer"))
+            .collect();
+        timers.sort();
+        timers.dedup();
+        timers
+    })
+    .unwrap_or_default();
 
+    // Security modules
     let mut security_modules = Vec::new();
     if let Ok(lsm) = fs::read_to_string("/sys/kernel/security/lsm") {
         for mod_name in lsm.trim().split(',') {
-            if !mod_name.is_empty() && mod_name != "capability" && mod_name != "yama" {
-                security_modules.push(mod_name.to_string());
+            let name = mod_name.trim();
+            if !name.is_empty() && name != "capability" && name != "yama" {
+                security_modules.push(name.to_string());
             }
         }
     }
-    if security_modules.is_empty() && std::path::Path::new("/sys/fs/selinux").exists() {
+    if security_modules.is_empty() && Path::new("/sys/fs/selinux").exists() {
         security_modules.push("selinux".to_string());
     }
 
-    // -----------------------------------------------------------------
-    // Tech stack detection with precise matching
-    // -----------------------------------------------------------------
+    // Tech stack detection and top memory processes
     let mut tech_stack = Vec::new();
     let mut found_tech: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
 
@@ -427,7 +431,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         ("rust", "Rust Binary"),
     ];
 
-    // H-7: use BinaryHeap for top-5 memory consumers
     let mut top5: BinaryHeap<std::cmp::Reverse<(u64, u32, String)>> = BinaryHeap::with_capacity(6);
     let mut zombie_processes = 0;
 
@@ -459,6 +462,15 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         }
     }
 
+    // RabbitMQ detection by directory presence
+    if (Path::new("/var/lib/rabbitmq").exists() || Path::new("/etc/rabbitmq").exists())
+        && found_tech.insert("RabbitMQ")
+    {
+        tech_stack.push("RabbitMQ".to_string());
+    }
+
+    tech_stack.sort();
+
     let process_list: Vec<ProcessInfo> = top5
         .into_sorted_vec()
         .into_iter()
@@ -469,18 +481,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         })
         .collect();
 
-    // RabbitMQ runs under beam.smp; detect by known data directory
-    if (std::path::Path::new("/var/lib/rabbitmq").exists()
-        || std::path::Path::new("/etc/rabbitmq").exists())
-        && found_tech.insert("RabbitMQ")
-    {
-        tech_stack.push("RabbitMQ".to_string());
-    }
-
-    tech_stack.sort();
-
     let load = System::load_average();
-
     let failed_services = get_failed_systemd_services();
     let (backup_tools, last_restic_snapshot) = gather_backup_info(&cron_jobs);
     let (ntp_synchronized, time_offset_ms) = gather_ntp_info();

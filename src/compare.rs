@@ -50,6 +50,11 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             severity: sev,
         });
     }
+    changes.sort_unstable_by_key(|c| match c.severity {
+        Severity::Degraded => 0,
+        Severity::Changed => 1,
+        Severity::Improved => 2,
+    });
 
     // --- network.listening_ports (key: bind_address:port) ---
     // port is a String in the model, so we keep it as String

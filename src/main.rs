@@ -465,6 +465,8 @@ async fn main() {
                 // Compute overall exit code for fleet scans
                 let exit_code = if reports.iter().any(|r| compute_exit_code(r) == 1) {
                     1
+                } else if reports.iter().any(|r| !r.is_root_execution) {
+                    2
                 } else {
                     0
                 };

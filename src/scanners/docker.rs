@@ -3,10 +3,10 @@ use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::image::ListImagesOptions;
 use bollard::volume::ListVolumesOptions;
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::default::Default;
 use std::fs;
+use tokio::task::JoinSet;
 
 pub async fn gather_docker_topology() -> TopologyInfo {
     match Docker::connect_with_local_defaults() {
@@ -58,26 +58,28 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                 }))
                 .await
             {
-                // Collect all inspect futures in parallel
-                let mut inspect_futures: FuturesUnordered<_> = containers
-                    .iter()
-                    .filter_map(|c| {
-                        c.id.as_deref().map(|id| {
-                            let docker = docker.clone();
-                            let id = id.to_string();
-                            let c = c.clone();
-                            async move {
-                                let inspect = docker.inspect_container(&id, None).await;
-                                (c, inspect.ok())
-                            }
-                        })
-                    })
-                    .collect();
+                // Spawn inspect tasks using JoinSet (replaces FuturesUnordered)
+                let mut join_set: JoinSet<(
+                    bollard::models::ContainerSummary,
+                    Option<bollard::models::ContainerInspectResponse>,
+                )> = JoinSet::new();
+
+                for c in &containers {
+                    if let Some(id) = c.id.as_deref() {
+                        let docker = docker.clone();
+                        let id = id.to_string();
+                        let c = c.clone();
+                        join_set.spawn(async move {
+                            let inspect = docker.inspect_container(&id, None).await.ok();
+                            (c, inspect)
+                        });
+                    }
+                }
 
                 // Gather results
                 let mut inspects: HashMap<String, _> = HashMap::new();
-                while let Some((c, inspect_opt)) = inspect_futures.next().await {
-                    if let Some(inspect) = inspect_opt {
+                while let Some(result) = join_set.join_next().await {
+                    if let Ok((c, Some(inspect))) = result {
                         let id = c.id.clone().unwrap_or_default();
                         inspects.insert(id, (c, inspect));
                     }
@@ -109,7 +111,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                             let typ = p
                                 .typ
                                 .map(|t| t.to_string())
-                                .unwrap_or_else(|| "tcp".to_string()); // typ is Copy
+                                .unwrap_or_else(|| "tcp".to_string());
                             if !public.is_empty() && !ip.is_empty() {
                                 ports_vec.push(format!("{}:{}->{}/{}", ip, public, private, typ));
                             } else {
