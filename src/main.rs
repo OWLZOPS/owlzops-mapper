@@ -1,26 +1,43 @@
+mod compare;
 mod exporters;
 mod models;
 mod scanners;
 mod scoring;
 mod ui;
 mod utils;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use scoring::*;
 
 use chrono::Utc;
-use clap::{Parser, ValueEnum};
 use models::AgentReport;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 // =====================================================================
-// CLI Arguments Setup
+// CLI structure with subcommands
 // =====================================================================
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug)]
 #[command(author = "Owlzops", version, about = "Infrastructure Discovery Agent")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run an audit scan (local or remote)
+    Audit(AuditArgs),
+    /// Compare two audit snapshots
+    Compare(CompareArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct AuditArgs {
     #[arg(short, long, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
@@ -59,6 +76,20 @@ struct Args {
     local_binary: Option<String>,
 }
 
+#[derive(Args, Debug)]
+struct CompareArgs {
+    /// Path to the earlier JSON report
+    before: PathBuf,
+    /// Path to the later JSON report
+    after: PathBuf,
+    /// Output format: terminal (default), json, excel
+    #[arg(short, long, default_value = "terminal")]
+    format: String,
+    /// Output file for json/excel (optional)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum OutputFormat {
     Text,
@@ -78,7 +109,7 @@ impl std::fmt::Display for OutputFormat {
 }
 
 // =====================================================================
-// Helper Functions
+// Helper Functions (unchanged)
 // =====================================================================
 
 fn is_running_as_root() -> bool {
@@ -142,7 +173,7 @@ fn is_local_host(host: &str) -> bool {
     false
 }
 
-async fn run_local_scan_async(args: &Args) -> AgentReport {
+async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let start = std::time::Instant::now();
     let is_root = is_running_as_root();
 
@@ -238,7 +269,7 @@ async fn run_local_scan_async(args: &Args) -> AgentReport {
     report
 }
 
-fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
+fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     let remote_path = &args.remote_path;
     let ssh_user = &args.ssh_user;
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
@@ -288,6 +319,7 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
             "--",
             "sudo",
             remote_path,
+            "audit",
             "--format",
             "json",
             "--offline",
@@ -314,7 +346,7 @@ fn run_remote_scan(host: &str, args: &Args) -> Option<AgentReport> {
 }
 
 // =====================================================================
-// Main Coordination
+// Main coordination
 // =====================================================================
 
 #[tokio::main]
@@ -327,140 +359,217 @@ async fn main() {
         .with_target(false)
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    let mut hosts: Vec<String> = Vec::new();
-    for h in &args.host {
-        hosts.push(h.clone());
-    }
-    if let Some(ref path) = args.hosts
-        && let Ok(contents) = std::fs::read_to_string(path)
-    {
-        for line in contents.lines() {
-            let h = line.trim();
-            if !h.is_empty() && !h.starts_with('#') {
-                hosts.push(h.to_string());
+    match cli.command {
+        Commands::Audit(args) => {
+            let mut hosts: Vec<String> = Vec::new();
+            for h in &args.host {
+                hosts.push(h.clone());
             }
-        }
-    }
-
-    if !hosts.is_empty() {
-        let mut remote = Vec::new();
-        let mut local = Vec::new();
-        for h in hosts {
-            if is_local_host(&h) {
-                local.push(h);
-            } else {
-                remote.push(h);
+            if let Some(ref path) = args.hosts
+                && let Ok(contents) = std::fs::read_to_string(path)
+            {
+                for line in contents.lines() {
+                    let h = line.trim();
+                    if !h.is_empty() && !h.starts_with('#') {
+                        hosts.push(h.to_string());
+                    }
+                }
             }
-        }
 
-        let mut handles = Vec::new();
-        for _host in local {
-            let a = Args {
-                hosts: None,
-                host: Vec::new(),
-                ssh_user: String::new(),
-                ssh_key: String::new(),
-                copy_binary: false,
-                remote_path: String::new(),
-                local_binary: None,
-                ..args.clone()
-            };
-            handles.push(tokio::spawn(async move {
-                Ok(Some(run_local_scan_async(&a).await))
-            }));
-        }
-        const MAX_CONCURRENT_SCANS: usize = 10;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS));
+            if !hosts.is_empty() {
+                let mut remote = Vec::new();
+                let mut local = Vec::new();
+                for h in hosts {
+                    if is_local_host(&h) {
+                        local.push(h);
+                    } else {
+                        remote.push(h);
+                    }
+                }
 
-        for host in remote {
-            let sem = semaphore.clone();
-            let a = Args {
-                hosts: None,
-                host: Vec::new(),
-                ..args.clone()
-            };
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                tokio::task::spawn_blocking(move || run_remote_scan(&host, &a)).await
-            }));
-        }
+                let mut handles = Vec::new();
+                for _host in local {
+                    let a = AuditArgs {
+                        hosts: None,
+                        host: Vec::new(),
+                        ssh_user: String::new(),
+                        ssh_key: String::new(),
+                        copy_binary: false,
+                        remote_path: String::new(),
+                        local_binary: None,
+                        ..args.clone()
+                    };
+                    handles.push(tokio::spawn(async move {
+                        Ok(Some(run_local_scan_async(&a).await))
+                    }));
+                }
+                const MAX_CONCURRENT_SCANS: usize = 10;
+                let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS));
 
-        let mut reports = Vec::new();
-        for (i, handle) in handles.into_iter().enumerate() {
-            match handle.await {
-                Ok(inner_result) => match inner_result {
-                    Ok(Some(report)) => reports.push(report),
-                    Ok(None) => warn!(host_index = i, "scan returned no data"),
-                    Err(e) => warn!(host_index = i, "scan task failed: {e}"),
+                for host in remote {
+                    let sem = semaphore.clone();
+                    let a = AuditArgs {
+                        hosts: None,
+                        host: Vec::new(),
+                        ..args.clone()
+                    };
+                    handles.push(tokio::spawn(async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        tokio::task::spawn_blocking(move || run_remote_scan(&host, &a)).await
+                    }));
+                }
+
+                let mut reports = Vec::new();
+                for (i, handle) in handles.into_iter().enumerate() {
+                    match handle.await {
+                        Ok(inner_result) => match inner_result {
+                            Ok(Some(report)) => reports.push(report),
+                            Ok(None) => warn!(host_index = i, "scan returned no data"),
+                            Err(e) => warn!(host_index = i, "scan task failed: {e}"),
+                        },
+                        Err(e) if e.is_panic() => warn!(host_index = i, "scan task panicked: {e}"),
+                        Err(e) => warn!(host_index = i, "scan task failed: {e}"),
+                    }
+                }
+
+                match args.format {
+                    OutputFormat::Text => {
+                        if reports.len() == 1 {
+                            ui::render_dashboard(&reports[0]);
+                        } else {
+                            ui::render_multi_host_summary(&reports);
+                        }
+                    }
+                    OutputFormat::Json => {
+                        if let Ok(json) = serde_json::to_string_pretty(&reports) {
+                            println!("{json}");
+                        } else {
+                            warn!("error serializing multi‑host report");
+                        }
+                    }
+                    OutputFormat::Xlsx => {
+                        let filename = args.output.unwrap_or_else(|| {
+                            format!(
+                                "owlzops-multi-{}.xlsx",
+                                chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+                            )
+                        });
+                        match exporters::xlsx::write_multi_host_report(&reports, &filename) {
+                            Ok(_) => println!("✅ Multi‑host Excel report: {filename}"),
+                            Err(e) => warn!("failed to generate Excel report: {e}"),
+                        }
+                    }
+                }
+                // Compute overall exit code for fleet scans
+                let exit_code = if reports.iter().any(|r| compute_exit_code(r) == 1) {
+                    1
+                } else {
+                    0
+                };
+                std::process::exit(exit_code);
+            }
+
+            // Single local scan
+            let report = run_local_scan_async(&args).await;
+            let exit_code = compute_exit_code(&report);
+
+            match args.format {
+                OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => warn!("error serializing Owlzops report: {e}"),
                 },
-                Err(e) if e.is_panic() => warn!(host_index = i, "scan task panicked: {e}"),
-                Err(e) => warn!(host_index = i, "scan task failed: {e}"),
+                OutputFormat::Text => ui::render_dashboard(&report),
+                OutputFormat::Xlsx => {
+                    let filename = args.output.unwrap_or_else(|| {
+                        format!(
+                            "owlzops-report-{}-{}.xlsx",
+                            report.host.hostname,
+                            chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+                        )
+                    });
+                    match exporters::xlsx::write_report(&report, &filename) {
+                        Ok(_) => println!("✅ Excel report successfully generated: {filename}"),
+                        Err(e) => warn!("failed to generate Excel report: {e}"),
+                    }
+                }
             }
+            std::process::exit(exit_code);
         }
 
-        match args.format {
-            OutputFormat::Text => {
-                if reports.len() == 1 {
-                    ui::render_dashboard(&reports[0]);
-                } else {
-                    ui::render_multi_host_summary(&reports);
-                }
-            }
-            OutputFormat::Json => {
-                if let Ok(json) = serde_json::to_string_pretty(&reports) {
-                    println!("{json}");
-                } else {
-                    warn!("error serializing multi‑host report");
-                }
-            }
-            OutputFormat::Xlsx => {
-                let filename = args.output.unwrap_or_else(|| {
-                    format!(
-                        "owlzops-multi-{}.xlsx",
-                        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-                    )
-                });
-                match exporters::xlsx::write_multi_host_report(&reports, &filename) {
-                    Ok(_) => println!("✅ Multi‑host Excel report: {filename}"),
-                    Err(e) => warn!("failed to generate Excel report: {e}"),
-                }
-            }
-        }
-        // Compute overall exit code for fleet scans
-        let exit_code = if reports.iter().any(|r| compute_exit_code(r) == 1) {
-            1
-        } else {
-            0
-        };
-        std::process::exit(exit_code);
-    }
-
-    let report = run_local_scan_async(&args).await;
-    let exit_code = compute_exit_code(&report);
-
-    match args.format {
-        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{json}"),
-            Err(e) => warn!("error serializing Owlzops report: {e}"),
-        },
-        OutputFormat::Text => ui::render_dashboard(&report),
-        OutputFormat::Xlsx => {
-            let filename = args.output.unwrap_or_else(|| {
-                format!(
-                    "owlzops-report-{}-{}.xlsx",
-                    report.host.hostname,
-                    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-                )
+        Commands::Compare(cmp_args) => {
+            // Read both JSON reports
+            let before_data = std::fs::read_to_string(&cmp_args.before).unwrap_or_else(|e| {
+                eprintln!("Failed to read 'before' file: {e}");
+                std::process::exit(1);
             });
-            match exporters::xlsx::write_report(&report, &filename) {
-                Ok(_) => println!("✅ Excel report successfully generated: {filename}"),
-                Err(e) => warn!("failed to generate Excel report: {e}"),
+            let after_data = std::fs::read_to_string(&cmp_args.after).unwrap_or_else(|e| {
+                eprintln!("Failed to read 'after' file: {e}");
+                std::process::exit(1);
+            });
+
+            // Accept either a single AgentReport or an array of them (take the first)
+            let parse_report = |data: &str, label: &str| -> AgentReport {
+                // Try to parse as a single object
+                if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
+                    return report;
+                }
+                // If that fails, try as a Vec<AgentReport>
+                if let Ok(mut reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
+                    if reports.is_empty() {
+                        eprintln!("Error: '{}' file contains an empty array", label);
+                        std::process::exit(1);
+                    }
+                    return reports.remove(0);
+                }
+                eprintln!("Invalid JSON in '{}' file", label);
+                std::process::exit(1);
+            };
+
+            let before_report = parse_report(&before_data, "before");
+            let after_report = parse_report(&after_data, "after");
+
+            let diff = compare::compare_reports(&before_report, &after_report);
+
+            match cmp_args.format.as_str() {
+                "terminal" => compare::print_diff_terminal(&diff),
+                "json" => {
+                    let json = compare::diff_to_json(&diff).unwrap_or_else(|e| {
+                        eprintln!("Failed to serialize diff JSON: {e}");
+                        std::process::exit(1);
+                    });
+                    if let Some(path) = cmp_args.output {
+                        std::fs::write(&path, json).unwrap_or_else(|e| {
+                            eprintln!("Failed to write JSON output: {e}");
+                            std::process::exit(1);
+                        });
+                        println!("Diff JSON written to {}", path.display());
+                    } else {
+                        println!("{}", json);
+                    }
+                }
+                "excel" => {
+                    let path = cmp_args.output.unwrap_or_else(|| {
+                        eprintln!("Error: --output is required for Excel format");
+                        std::process::exit(1);
+                    });
+                    compare::write_diff_xlsx(&diff, path.to_str().unwrap()).unwrap_or_else(|e| {
+                        eprintln!("Failed to write Excel diff: {e}");
+                        std::process::exit(1);
+                    });
+                    println!("Diff Excel written to {}", path.display());
+                }
+                other => {
+                    eprintln!(
+                        "Unknown format '{}'. Supported: terminal, json, excel",
+                        other
+                    );
+                    std::process::exit(1);
+                }
             }
         }
     }
-    std::process::exit(exit_code);
 }
 
 #[cfg(test)]

@@ -206,3 +206,23 @@ pub struct PackagesInfo {
     pub upgradable: Vec<UpgradablePackage>,
     pub cache_refreshed: bool,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffReport {
+    pub changes: Vec<Change>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Change {
+    pub field: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub severity: Severity,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum Severity {
+    Improved,
+    Degraded,
+    Changed,
+}

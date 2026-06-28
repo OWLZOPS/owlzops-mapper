@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, PackageManager};
+use crate::models::{AgentReport, DiffReport, PackageManager, Severity};
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
 
 // ---------- basic formats (thin borders) ----------
@@ -1860,5 +1860,41 @@ pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<()
     }
 
     workbook.save(path)?;
+    Ok(())
+}
+
+pub fn write_diff_sheet(
+    report: &DiffReport,
+    file_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet().set_name("Changes")?;
+
+    let header_fmt = Format::new().set_bold().set_background_color(Color::Gray);
+
+    sheet.write_with_format(0, 0, "Field", &header_fmt)?;
+    sheet.write_with_format(0, 1, "Before", &header_fmt)?;
+    sheet.write_with_format(0, 2, "After", &header_fmt)?;
+    sheet.write_with_format(0, 3, "Severity", &header_fmt)?;
+
+    let green = Format::new().set_font_color(Color::Green);
+    let red = Format::new().set_font_color(Color::Red);
+    let yellow = Format::new().set_font_color(Color::RGB(0xCCAA00));
+
+    for (i, change) in report.changes.iter().enumerate() {
+        let row = (i + 1) as u32;
+        sheet.write(row, 0, &change.field)?;
+        sheet.write(row, 1, change.before.as_deref().unwrap_or("-"))?;
+        sheet.write(row, 2, change.after.as_deref().unwrap_or("-"))?;
+
+        let (sev_text, fmt) = match change.severity {
+            Severity::Improved => ("Improved", &green),
+            Severity::Degraded => ("Degraded", &red),
+            Severity::Changed => ("Changed", &yellow),
+        };
+        sheet.write_with_format(row, 3, sev_text, fmt)?;
+    }
+
+    workbook.save(file_path)?;
     Ok(())
 }
