@@ -58,6 +58,23 @@ pub fn gather_network_info() -> NetworkInfo {
     {
         firewall_active = true;
     }
+    // nftables – consider firewall active if there are rules beyond empty tables
+    if !firewall_active && let Some(out) = run_with_timeout("nft", &["list", "ruleset"], 5) {
+        let meaningful = out
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("table"))
+            .count();
+        firewall_active = meaningful > 0;
+    }
+
+    // iptables – presence of rules (beyond standard chains) indicates a working firewall
+    if !firewall_active && let Some(out) = run_with_timeout("iptables-save", &[], 5) {
+        let rules = out
+            .lines()
+            .filter(|l| l.starts_with("-A") && !l.contains("ACCEPT"))
+            .count();
+        firewall_active = rules > 0;
+    }
 
     // DNS Resolvers
     let mut dns_resolvers = Vec::new();
