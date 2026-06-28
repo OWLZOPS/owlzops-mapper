@@ -10,6 +10,8 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use models::AgentReport;
 use std::process::Command;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 // =====================================================================
@@ -365,25 +367,36 @@ async fn main() {
                 local_binary: None,
                 ..args.clone()
             };
-            handles.push(tokio::spawn(
-                async move { Some(run_local_scan_async(&a).await) },
-            ));
+            handles.push(tokio::spawn(async move {
+                Ok(Some(run_local_scan_async(&a).await))
+            }));
         }
+        const MAX_CONCURRENT_SCANS: usize = 10;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS));
+
         for host in remote {
+            let sem = semaphore.clone();
             let a = Args {
                 hosts: None,
                 host: Vec::new(),
                 ..args.clone()
             };
-            handles.push(tokio::task::spawn_blocking(move || {
-                run_remote_scan(&host, &a)
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                tokio::task::spawn_blocking(move || run_remote_scan(&host, &a)).await
             }));
         }
 
         let mut reports = Vec::new();
-        for handle in handles {
-            if let Ok(Some(report)) = handle.await {
-                reports.push(report);
+        for (i, handle) in handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(inner_result) => match inner_result {
+                    Ok(Some(report)) => reports.push(report),
+                    Ok(None) => warn!(host_index = i, "scan returned no data"),
+                    Err(e) => warn!(host_index = i, "scan task failed: {e}"),
+                },
+                Err(e) if e.is_panic() => warn!(host_index = i, "scan task panicked: {e}"),
+                Err(e) => warn!(host_index = i, "scan task failed: {e}"),
             }
         }
 
