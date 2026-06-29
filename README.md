@@ -30,16 +30,16 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.3
+## Highlights v0.4.4
 
-- **Snapshotting & drift monitoring:** `snapshot` saves audits to `~/.owlzops/snapshots/<hostname>/`, `dir-compare` shows what changed between the last two runs, `compare --multi-host` compares entire fleets at once.
-- **Extended `compare` drift detection:** tracks firewall, SSH root/password auth, fail2ban, auditd, NTP, OS/kernel version, package count, and SSL certificate thresholds.
-- **Performance boost:** `last -i` executed once instead of per user – security scan time cut by up to 90%.
-- **Full zypper security coverage:** removed artificial 20‑patch limit; every security update is flagged.
-- **Resilient Docker collection:** warnings when containers cannot be inspected, no silent omissions.
-- **No `sh -c` in host scanner:** direct `dmesg` calls and `/proc/self/limits` parsing improve reliability.
-- **Backup detection fixes:** no more false positives for restic/borg/duplicati when merely installed but unused.
-- **Firewall detection refined:** correctly identifies host firewall while ignoring Docker‑only rules.
+- **Refactored host scanner** – split the 200‑line `gather_host_info` into focused sub‑collectors, improving readability, testability and maintainability.
+- **Extended test coverage** – added unit tests for compare logic, cron parser, backup detection, Excel export and more.
+- **Docker mount path truncation** – long volume paths are now intelligently truncated in the terminal table, keeping the beginning of the path visible.
+- **Better backup detection** – no more false positives for restic/borg/duplicati when merely installed but unused.
+- **Cron job collection** – `/etc/anacrontab` and `/etc/cron.d/*` are now included, alongside standard crontabs.
+- **Container inspection warnings** – Docker containers that fail to be inspected are now logged with a clear warning, never silently skipped.
+- **Firewall detection refined** – correctly identifies host firewall while ignoring Docker‑only rules.
+- **Timeout handling** – all external commands have explicit timeouts, preventing hung scans.
 
 ---
 
