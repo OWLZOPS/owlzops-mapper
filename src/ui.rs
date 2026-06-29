@@ -764,26 +764,12 @@ fn render_docker(report: &AgentReport) {
                 log_cell = log_cell.fg(Color::Red);
             }
 
-            let mut issues = Vec::new();
-            if c.privileged {
-                issues.push("PRIVILEGED".to_string());
-            }
-            if c.memory_limit_mb.is_none() {
-                issues.push("NoMemLimit".to_string());
-            }
-            if c.cpu_limit.is_none() {
-                issues.push("NoCpuLimit".to_string());
-            }
-            if c.cap_add.iter().any(|cap| cap == "SYS_ADMIN") {
-                issues.push("SYS_ADMIN".to_string());
-            }
-            if c.cap_add.iter().any(|cap| cap == "NET_ADMIN") {
-                issues.push("NET_ADMIN".to_string());
-            }
-            let issue_str = if issues.is_empty() {
+            // M-2: Use the single source of truth from ContainerInfo
+            let issue_list = c.security_issues();
+            let issue_str = if issue_list.is_empty() {
                 "-".to_string()
             } else {
-                issues.join(", ")
+                issue_list.join(", ")
             };
             let issue_cell = if issue_str == "-" {
                 Cell::new(issue_str)
