@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::default::Default;
 use std::fs;
 use tokio::task::JoinSet;
+use tracing::warn;
 
 pub async fn gather_docker_topology() -> TopologyInfo {
     match Docker::connect_with_local_defaults() {
@@ -76,19 +77,34 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                     }
                 }
 
-                // Gather results
+                // Gather results with warnings for failures
                 let mut inspects: HashMap<String, _> = HashMap::new();
                 while let Some(result) = join_set.join_next().await {
-                    if let Ok((c, Some(inspect))) = result {
-                        let id = c.id.clone().unwrap_or_default();
-                        inspects.insert(id, (c, inspect));
+                    match result {
+                        Ok((c, Some(inspect))) => {
+                            let id = c.id.clone().unwrap_or_default();
+                            inspects.insert(id, (c, inspect));
+                        }
+                        Ok((c, None)) => {
+                            let name = c
+                                .names
+                                .as_ref()
+                                .and_then(|n| n.first())
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            warn!(container = name, "Docker inspect returned no data");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Docker inspect task failed");
+                        }
                     }
                 }
 
-                // Now process each container with its inspect data
+                // Process each container with its inspect data
                 for c in containers {
                     let id = c.id.clone().unwrap_or_default();
                     let Some((container, inspect)) = inspects.get(&id) else {
+                        warn!(container_id = %id, "Container missing from inspect results — skipping");
                         continue;
                     };
                     let container = container.clone();
@@ -144,7 +160,6 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                     }
                     if let Some(host_config) = &inspect.host_config {
                         privileged = host_config.privileged.unwrap_or(false);
-                        // Collapsed ifs to satisfy clippy
                         if let Some(mem) = host_config.memory
                             && mem > 0
                         {
