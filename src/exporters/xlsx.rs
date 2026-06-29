@@ -1940,3 +1940,56 @@ pub fn write_multi_diff_xlsx(
     workbook.save(file_path)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::*;
+
+    fn minimal_report() -> AgentReport {
+        AgentReport {
+            scan_id: "test".into(),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            version: "0.4.3".into(),
+            duration_secs: 1.0,
+            risk_score: 10,
+            is_root_execution: true,
+            host: HostInfo {
+                hostname: "testhost".into(),
+                backup_tools: vec!["restic".into()],
+                ntp_synchronized: true,
+                ..Default::default()
+            },
+            databases: vec![],
+            network: NetworkInfo {
+                firewall_active: true,
+                ..Default::default()
+            },
+            storage: StorageInfo::default(),
+            topology: TopologyInfo::default(),
+            security: SecurityInfo {
+                ssh_root_login_enabled: false,
+                ssh_password_auth_enabled: false,
+                fail2ban_active: true,
+                auditd_active: true,
+                ..Default::default()
+            },
+            packages: PackagesInfo {
+                installed_count: 100,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn write_report_creates_nonempty_file() {
+        let tmp = std::env::temp_dir().join(format!("owlzops-test-{}.xlsx", uuid::Uuid::new_v4()));
+        let report = minimal_report();
+        let result = write_report(&report, tmp.to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(tmp.exists());
+        let metadata = std::fs::metadata(&tmp).unwrap();
+        assert!(metadata.len() > 0);
+        let _ = std::fs::remove_file(&tmp);
+    }
+}

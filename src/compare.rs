@@ -503,3 +503,95 @@ pub fn diff_to_json(report: &DiffReport) -> Result<String, serde_json::Error> {
 pub fn write_diff_xlsx(report: &DiffReport, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     crate::exporters::xlsx::write_diff_sheet(report, path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::*;
+
+    fn test_report() -> AgentReport {
+        AgentReport {
+            scan_id: "test".into(),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            version: "0.4.3".into(),
+            duration_secs: 1.0,
+            risk_score: 0,
+            is_root_execution: true,
+            host: HostInfo::default(),
+            databases: vec![],
+            network: NetworkInfo::default(),
+            storage: StorageInfo::default(),
+            topology: TopologyInfo::default(),
+            security: SecurityInfo::default(),
+            packages: PackagesInfo::default(),
+        }
+    }
+
+    #[test]
+    fn detect_firewall_disabled() {
+        let mut before = test_report();
+        before.network.firewall_active = true;
+
+        let mut after = test_report();
+        after.network.firewall_active = false;
+
+        let diff = compare_reports(&before, &after);
+        let change = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "network.firewall_active")
+            .expect("Firewall change not detected");
+
+        assert_eq!(change.before.as_deref(), Some("true"));
+        assert_eq!(change.after.as_deref(), Some("false"));
+        assert_eq!(change.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn detect_risk_score_increase() {
+        let mut before = test_report();
+        before.risk_score = 20;
+
+        let mut after = test_report();
+        after.risk_score = 50;
+
+        let diff = compare_reports(&before, &after);
+        let change = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "risk_score")
+            .expect("Risk score change not detected");
+
+        assert_eq!(change.before.as_deref(), Some("20"));
+        assert_eq!(change.after.as_deref(), Some("50"));
+        assert_eq!(change.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn detect_ssh_root_login_enabled() {
+        let mut before = test_report();
+        before.security.ssh_root_login_enabled = false;
+
+        let mut after = test_report();
+        after.security.ssh_root_login_enabled = true;
+
+        let diff = compare_reports(&before, &after);
+        let change = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "security.ssh_root_login_enabled")
+            .expect("SSH root login change not detected");
+
+        assert_eq!(change.before.as_deref(), Some("false"));
+        assert_eq!(change.after.as_deref(), Some("true"));
+        assert_eq!(change.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn no_changes_returns_empty() {
+        let before = test_report();
+        let after = test_report();
+        let diff = compare_reports(&before, &after);
+        assert!(diff.changes.is_empty(), "Expected no changes");
+    }
+}
