@@ -214,11 +214,6 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
 /// Determine NTP synchronization status and time offset.
 /// Handles containers without systemd gracefully.
 fn gather_ntp_info() -> (bool, Option<f64>) {
-    let in_container = Path::new("/.dockerenv").exists()
-        || std::fs::read_to_string("/proc/1/comm")
-            .map(|s| s.trim() != "systemd")
-            .unwrap_or(false);
-
     // 1. timedatectl
     if let Some(td_out) = crate::utils::run_with_timeout("timedatectl", &["status"], 5) {
         let synchronized = td_out.lines().any(|l| {
@@ -274,7 +269,7 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
     }
 
     // No NTP tools available: container → unknown (false), else assume OK
-    (!in_container, None)
+    (false, None)
 }
 
 /// Gather comprehensive host information.

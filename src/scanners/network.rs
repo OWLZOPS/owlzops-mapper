@@ -65,13 +65,20 @@ pub fn gather_network_info() -> NetworkInfo {
         firewall_active = meaningful > 0;
     }
 
-    // iptables – presence of rules (beyond standard chains) indicates a working firewall
+    // iptables – presence of rules or DROP/REJECT default policies indicates a working firewall
     if !firewall_active && let Some(out) = run_with_timeout("iptables-save", &[], 5) {
-        let rules = out
+        let has_drop_policy = out.lines().any(|l| {
+            l.starts_with(":INPUT DROP")
+                || l.starts_with(":INPUT REJECT")
+                || l.starts_with(":FORWARD DROP")
+                || l.starts_with(":FORWARD REJECT")
+        });
+        let has_rules = out
             .lines()
             .filter(|l| l.starts_with("-A") && !l.contains("ACCEPT"))
-            .count();
-        firewall_active = rules > 0;
+            .count()
+            > 0;
+        firewall_active = has_drop_policy || has_rules;
     }
 
     // DNS Resolvers
