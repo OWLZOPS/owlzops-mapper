@@ -56,29 +56,36 @@ pub fn gather_network_info() -> NetworkInfo {
     {
         firewall_active = true;
     }
-    // nftables – consider firewall active if there are rules beyond empty tables
     if !firewall_active && let Some(out) = run_with_timeout("nft", &["list", "ruleset"], 5) {
-        let meaningful = out
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("table"))
-            .count();
-        firewall_active = meaningful > 0;
+        let mut in_filter_table = false;
+        let mut has_input_rules = false;
+        for line in out.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("table") {
+                in_filter_table = trimmed.contains("filter");
+            } else if in_filter_table
+                && (trimmed.contains("hook input") || trimmed.contains("chain INPUT"))
+                && !trimmed.contains("DOCKER")
+                && !trimmed.contains("docker")
+            {
+                has_input_rules = true;
+                break;
+            }
+        }
+        firewall_active = has_input_rules;
     }
 
-    // iptables – presence of rules or DROP/REJECT default policies indicates a working firewall
     if !firewall_active && let Some(out) = run_with_timeout("iptables-save", &[], 5) {
-        let has_drop_policy = out.lines().any(|l| {
-            l.starts_with(":INPUT DROP")
-                || l.starts_with(":INPUT REJECT")
-                || l.starts_with(":FORWARD DROP")
-                || l.starts_with(":FORWARD REJECT")
+        let has_input_drop_policy = out.lines().any(|l| {
+            (l.starts_with(":INPUT DROP") || l.starts_with(":INPUT REJECT"))
+                && !l.contains("DOCKER")
         });
-        let has_rules = out
+        let has_input_rules = out
             .lines()
-            .filter(|l| l.starts_with("-A") && !l.contains("ACCEPT"))
+            .filter(|l| l.starts_with("-A INPUT") && !l.contains("DOCKER") && !l.contains("docker"))
             .count()
             > 0;
-        firewall_active = has_drop_policy || has_rules;
+        firewall_active = has_input_drop_policy || has_input_rules;
     }
 
     // DNS Resolvers

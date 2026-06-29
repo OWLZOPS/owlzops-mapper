@@ -35,6 +35,10 @@ enum Commands {
     Audit(AuditArgs),
     /// Compare two audit snapshots
     Compare(CompareArgs),
+    /// Save a snapshot to disk (always JSON)
+    Snapshot(SnapshotArgs),
+    /// Compare the two most recent snapshots in a directory
+    DirCompare(DirCompareArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -77,6 +81,27 @@ struct AuditArgs {
     local_binary: Option<String>,
 }
 
+#[derive(Args, Debug, Clone)]
+struct SnapshotArgs {
+    #[arg(long, default_value = "~/.owlzops/snapshots")]
+    output_dir: String,
+
+    #[command(flatten)]
+    audit: AuditArgs,
+}
+
+#[derive(Args, Debug)]
+struct DirCompareArgs {
+    /// Directory containing snapshots (JSON files)
+    dir: PathBuf,
+    /// Output format: terminal (default), json, excel
+    #[arg(short, long, default_value = "terminal")]
+    format: String,
+    /// Output file for json/excel (optional)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
 #[derive(Args, Debug)]
 struct CompareArgs {
     /// Path to the earlier JSON report
@@ -89,6 +114,9 @@ struct CompareArgs {
     /// Output file for json/excel (optional)
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Treat the input files as arrays of host reports (multi-host)
+    #[arg(long, default_value_t = false)]
+    multi_host: bool,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
@@ -351,6 +379,81 @@ fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
 }
 
 // =====================================================================
+// Snapshot helper
+// =====================================================================
+async fn snapshot_run(args: SnapshotArgs) -> i32 {
+    // Determine output directory.
+    // If running under sudo, replace "~" with the SUDO_USER's home directory
+    // so that snapshots land in the user's home, not /root.
+    let output_dir_str = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        let home = format!("/home/{}", sudo_user);
+        if std::path::Path::new(&home).exists() {
+            args.output_dir.replace('~', &home)
+        } else {
+            shellexpand::tilde(&args.output_dir).to_string()
+        }
+    } else {
+        shellexpand::tilde(&args.output_dir).to_string()
+    };
+    let output_dir = PathBuf::from(output_dir_str);
+
+    // Perform audit using the embedded AuditArgs
+    let report = if !args.audit.host.is_empty() {
+        let host = &args.audit.host[0];
+        match run_remote_scan(host, &args.audit) {
+            Some(report) => report,
+            None => {
+                eprintln!("Failed to scan remote host: {host}");
+                return 1;
+            }
+        }
+    } else if let Some(ref hosts_path) = args.audit.hosts {
+        let contents = std::fs::read_to_string(hosts_path).unwrap_or_default();
+        let first_host = contents
+            .lines()
+            .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| l.trim().to_string());
+        if let Some(host) = first_host {
+            match run_remote_scan(&host, &args.audit) {
+                Some(report) => report,
+                None => {
+                    eprintln!("Failed to scan remote host: {host}");
+                    return 1;
+                }
+            }
+        } else {
+            run_local_scan_async(&args.audit).await
+        }
+    } else {
+        run_local_scan_async(&args.audit).await
+    };
+
+    let hostname = &report.host.hostname;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let filename = format!("{}.json", timestamp);
+    let dir_path = output_dir.join(hostname);
+    let file_path = dir_path.join(&filename);
+
+    if let Err(e) = std::fs::create_dir_all(&dir_path) {
+        eprintln!("Failed to create directory {}: {}", dir_path.display(), e);
+        return 1;
+    }
+
+    let json = serde_json::to_string_pretty(&report).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize report: {e}");
+        std::process::exit(1);
+    });
+
+    if let Err(e) = std::fs::write(&file_path, &json) {
+        eprintln!("Failed to write snapshot {}: {}", file_path.display(), e);
+        return 1;
+    }
+
+    println!("Snapshot saved to {}", file_path.display());
+    0
+}
+
+// =====================================================================
 // Main command runner (returns exit code)
 // =====================================================================
 
@@ -495,6 +598,84 @@ async fn run_command(cli: Cli) -> i32 {
             exit_code
         }
 
+        Commands::Snapshot(args) => snapshot_run(args).await,
+
+        Commands::DirCompare(args) => {
+            let mut files: Vec<PathBuf> = match std::fs::read_dir(&args.dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+                    .collect(),
+                Err(_) => {
+                    eprintln!("Cannot read directory: {}", args.dir.display());
+                    return 1;
+                }
+            };
+            files.sort();
+            if files.len() < 2 {
+                eprintln!("Need at least 2 snapshots in directory");
+                return 1;
+            }
+            let before_path = files[files.len() - 2].clone();
+            let after_path = files[files.len() - 1].clone();
+            let before_data = std::fs::read_to_string(&before_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read '{}': {}", before_path.display(), e);
+                std::process::exit(1);
+            });
+            let after_data = std::fs::read_to_string(&after_path).unwrap_or_else(|e| {
+                eprintln!("Failed to read '{}': {}", after_path.display(), e);
+                std::process::exit(1);
+            });
+            let before: AgentReport = serde_json::from_str(&before_data).unwrap_or_else(|e| {
+                eprintln!("Invalid JSON in '{}': {}", before_path.display(), e);
+                std::process::exit(1);
+            });
+            let after: AgentReport = serde_json::from_str(&after_data).unwrap_or_else(|e| {
+                eprintln!("Invalid JSON in '{}': {}", after_path.display(), e);
+                std::process::exit(1);
+            });
+            let diff = compare::compare_reports(&before, &after);
+
+            match args.format.as_str() {
+                "terminal" => compare::print_diff_terminal(&diff),
+                "json" => {
+                    let json = compare::diff_to_json(&diff).unwrap_or_else(|e| {
+                        eprintln!("Failed to serialize diff JSON: {e}");
+                        std::process::exit(1);
+                    });
+                    if let Some(path) = args.output {
+                        std::fs::write(&path, json).unwrap_or_else(|e| {
+                            eprintln!("Failed to write JSON output: {e}");
+                            std::process::exit(1);
+                        });
+                        println!("Diff JSON written to {}", path.display());
+                    } else {
+                        println!("{}", json);
+                    }
+                }
+                "excel" => {
+                    let path = args.output.unwrap_or_else(|| {
+                        eprintln!("Error: --output is required for Excel format");
+                        std::process::exit(1);
+                    });
+                    compare::write_diff_xlsx(&diff, path.to_str().unwrap()).unwrap_or_else(|e| {
+                        eprintln!("Failed to write Excel diff: {e}");
+                        std::process::exit(1);
+                    });
+                    println!("Diff Excel written to {}", path.display());
+                }
+                _ => {
+                    eprintln!(
+                        "Unknown format '{}'. Supported: terminal, json, excel",
+                        args.format
+                    );
+                    return 1;
+                }
+            }
+            0
+        }
+
         Commands::Compare(cmp_args) => {
             // Read both JSON reports
             let before_data = std::fs::read_to_string(&cmp_args.before).unwrap_or_else(|e| {
@@ -505,6 +686,71 @@ async fn run_command(cli: Cli) -> i32 {
                 eprintln!("Failed to read 'after' file: {e}");
                 std::process::exit(1);
             });
+
+            // Multi-host mode
+            if cmp_args.multi_host {
+                let parse_array = |data: &str, label: &str| -> Vec<AgentReport> {
+                    if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
+                        return reports;
+                    }
+                    // If single object, wrap in array
+                    if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
+                        return vec![report];
+                    }
+                    eprintln!("Invalid JSON in '{}' file", label);
+                    std::process::exit(1);
+                };
+                let before = parse_array(&before_data, "before");
+                let after = parse_array(&after_data, "after");
+                let diffs = compare::compare_multi(&before, &after);
+
+                match cmp_args.format.as_str() {
+                    "terminal" => {
+                        for mh in &diffs {
+                            println!("\nHost: {}", mh.hostname);
+                            compare::print_diff_terminal(&mh.diff);
+                        }
+                    }
+                    "json" => {
+                        let json = serde_json::to_string_pretty(&diffs).unwrap_or_else(|e| {
+                            eprintln!("Failed to serialize multi-host diff: {e}");
+                            std::process::exit(1);
+                        });
+                        if let Some(path) = cmp_args.output {
+                            std::fs::write(&path, json).unwrap_or_else(|e| {
+                                eprintln!("Failed to write JSON output: {e}");
+                                std::process::exit(1);
+                            });
+                            println!("Multi-host diff JSON written to {}", path.display());
+                        } else {
+                            println!("{}", json);
+                        }
+                    }
+                    "excel" => {
+                        let path = cmp_args.output.unwrap_or_else(|| {
+                            eprintln!("Error: --output is required for Excel format");
+                            std::process::exit(1);
+                        });
+                        crate::exporters::xlsx::write_multi_diff_xlsx(
+                            &diffs,
+                            path.to_str().unwrap(),
+                        )
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to write multi-host Excel diff: {e}");
+                            std::process::exit(1);
+                        });
+                        println!("Multi-host diff Excel written to {}", path.display());
+                    }
+                    _ => {
+                        eprintln!(
+                            "Unknown format '{}'. Supported: terminal, json, excel",
+                            cmp_args.format
+                        );
+                        return 1;
+                    }
+                }
+                return 0;
+            }
 
             // Accept either a single AgentReport or an array of them (take the first)
             let parse_report = |data: &str, label: &str| -> AgentReport {

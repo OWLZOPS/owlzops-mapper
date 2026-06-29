@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, Change, DiffReport, Severity};
+use crate::models::{AgentReport, Change, DiffReport, MultiHostDiff, Severity};
 use std::collections::{HashMap, HashSet};
 
 /// Compare two AgentReports and produce a DiffReport
@@ -394,6 +394,62 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     });
 
     DiffReport { changes }
+}
+
+pub fn compare_multi(before: &[AgentReport], after: &[AgentReport]) -> Vec<MultiHostDiff> {
+    let before_map: HashMap<&str, &AgentReport> = before
+        .iter()
+        .map(|r| (r.host.hostname.as_str(), r))
+        .collect();
+    let after_map: HashMap<&str, &AgentReport> = after
+        .iter()
+        .map(|r| (r.host.hostname.as_str(), r))
+        .collect();
+
+    let all_hostnames: HashSet<&str> = before_map.keys().chain(after_map.keys()).copied().collect();
+    let mut diffs = Vec::new();
+
+    for hostname in all_hostnames {
+        match (before_map.get(hostname), after_map.get(hostname)) {
+            (Some(b), Some(a)) => {
+                let diff = compare_reports(b, a);
+                if !diff.changes.is_empty() {
+                    diffs.push(MultiHostDiff {
+                        hostname: hostname.to_string(),
+                        diff,
+                    });
+                }
+            }
+            (Some(_), None) => {
+                let changes = vec![Change {
+                    field: "host.removed".into(),
+                    before: Some(hostname.to_string()),
+                    after: None,
+                    severity: Severity::Degraded,
+                }];
+                diffs.push(MultiHostDiff {
+                    hostname: hostname.to_string(),
+                    diff: DiffReport { changes },
+                });
+            }
+            (None, Some(_)) => {
+                let changes = vec![Change {
+                    field: "host.added".into(),
+                    before: None,
+                    after: Some(hostname.to_string()),
+                    severity: Severity::Changed,
+                }];
+                diffs.push(MultiHostDiff {
+                    hostname: hostname.to_string(),
+                    diff: DiffReport { changes },
+                });
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    diffs.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    diffs
 }
 
 /// Terminal output with colored table (using comfy_table)

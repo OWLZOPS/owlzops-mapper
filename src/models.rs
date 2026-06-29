@@ -226,3 +226,9 @@ pub enum Severity {
     Degraded,
     Changed,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiHostDiff {
+    pub hostname: String,
+    pub diff: DiffReport,
+}

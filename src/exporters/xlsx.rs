@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, DiffReport, PackageManager, Severity};
+use crate::models::{AgentReport, DiffReport, MultiHostDiff, PackageManager, Severity};
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
 
 // ---------- basic formats (thin borders) ----------
@@ -1896,6 +1896,45 @@ pub fn write_diff_sheet(
             Severity::Changed => ("Changed", &yellow),
         };
         sheet.write_with_format(row, 3, sev_text, fmt)?;
+    }
+
+    workbook.save(file_path)?;
+    Ok(())
+}
+
+pub fn write_multi_diff_xlsx(
+    diffs: &[MultiHostDiff],
+    file_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet().set_name("Multi-Host Changes")?;
+
+    let header_fmt = Format::new().set_bold().set_background_color(Color::Gray);
+    sheet.write_with_format(0, 0, "Host", &header_fmt)?;
+    sheet.write_with_format(0, 1, "Field", &header_fmt)?;
+    sheet.write_with_format(0, 2, "Before", &header_fmt)?;
+    sheet.write_with_format(0, 3, "After", &header_fmt)?;
+    sheet.write_with_format(0, 4, "Severity", &header_fmt)?;
+
+    let green = Format::new().set_font_color(Color::Green);
+    let red = Format::new().set_font_color(Color::Red);
+    let yellow = Format::new().set_font_color(Color::RGB(0xCCAA00));
+
+    let mut row = 1u32;
+    for mh in diffs {
+        for change in &mh.diff.changes {
+            sheet.write(row, 0, &mh.hostname)?;
+            sheet.write(row, 1, &change.field)?;
+            sheet.write(row, 2, change.before.as_deref().unwrap_or("-"))?;
+            sheet.write(row, 3, change.after.as_deref().unwrap_or("-"))?;
+            let (sev_text, fmt) = match change.severity {
+                Severity::Improved => ("Improved", &green),
+                Severity::Degraded => ("Degraded", &red),
+                Severity::Changed => ("Changed", &yellow),
+            };
+            sheet.write_with_format(row, 4, sev_text, fmt)?;
+            row += 1;
+        }
     }
 
     workbook.save(file_path)?;
