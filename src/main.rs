@@ -14,6 +14,7 @@ use models::AgentReport;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
@@ -109,7 +110,7 @@ impl std::fmt::Display for OutputFormat {
 }
 
 // =====================================================================
-// Helper Functions (unchanged)
+// Helper Functions
 // =====================================================================
 
 fn is_running_as_root() -> bool {
@@ -174,6 +175,10 @@ fn is_local_host(host: &str) -> bool {
 }
 
 async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
+    let scan_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
+    let _enter = span.enter();
+
     let start = std::time::Instant::now();
     let is_root = is_running_as_root();
 
@@ -245,7 +250,7 @@ async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let duration_secs = start.elapsed().as_secs_f64();
 
     let mut report = AgentReport {
-        scan_id: uuid::Uuid::new_v4().to_string(),
+        scan_id,
         timestamp: Utc::now().to_rfc3339(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         duration_secs,
@@ -346,21 +351,10 @@ fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
 }
 
 // =====================================================================
-// Main coordination
+// Main command runner (returns exit code)
 // =====================================================================
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
-        )
-        .with_target(false)
-        .init();
-
-    let cli = Cli::parse();
-
+async fn run_command(cli: Cli) -> i32 {
     match cli.command {
         Commands::Audit(args) => {
             let mut hosts: Vec<String> = Vec::new();
@@ -416,7 +410,10 @@ async fn main() {
                         ..args.clone()
                     };
                     handles.push(tokio::spawn(async move {
-                        let _permit = sem.acquire().await.unwrap();
+                        let _permit = match sem.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return Ok(None), // semaphore closed, shutting down
+                        };
                         tokio::task::spawn_blocking(move || run_remote_scan(&host, &a)).await
                     }));
                 }
@@ -463,14 +460,12 @@ async fn main() {
                     }
                 }
                 // Compute overall exit code for fleet scans
-                let exit_code = if reports.iter().any(|r| compute_exit_code(r) == 1) {
-                    1
+                if reports.iter().any(|r| compute_exit_code(r) == 1) {
+                    return 1;
                 } else if reports.iter().any(|r| !r.is_root_execution) {
-                    2
-                } else {
-                    0
-                };
-                std::process::exit(exit_code);
+                    return 2;
+                }
+                return 0;
             }
 
             // Single local scan
@@ -497,7 +492,7 @@ async fn main() {
                     }
                 }
             }
-            std::process::exit(exit_code);
+            exit_code
         }
 
         Commands::Compare(cmp_args) => {
@@ -570,8 +565,36 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+            0
         }
     }
+}
+
+// =====================================================================
+// Entry point with graceful shutdown
+// =====================================================================
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
+        )
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+
+    let exit_code = tokio::select! {
+        code = run_command(cli) => code,
+        _ = signal::ctrl_c() => {
+            eprintln!("Interrupted — partial results discarded.");
+            130
+        }
+    };
+
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
