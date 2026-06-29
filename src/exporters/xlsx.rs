@@ -135,14 +135,17 @@ fn auto_fit_columns(
     Ok(())
 }
 
-// =====================================================================
-// Helper to truncate hostname for sheet names
-// =====================================================================
-fn truncate_hostname(name: &str, prefix: &str) -> String {
-    // Reserve space for prefix + one separator char
-    let max_chars = 31usize.saturating_sub(prefix.len() + 1);
-    let truncated: String = name.chars().take(max_chars).collect();
-    format!("{}-{}", prefix, truncated)
+/// Sanitize a hostname for use as an Excel sheet name.
+/// Sheet names must be ≤ 31 chars and must not contain: \ / ? * [ ] :
+fn sanitize_sheet_name(name: &str, prefix: &str) -> String {
+    const ILLEGAL: &[char] = &['\\', '/', '?', '*', '[', ']', ':'];
+    let max_chars = 31usize.saturating_sub(prefix.len() + 1); // +1 for '-'
+    let sanitized: String = name
+        .chars()
+        .filter(|c| !ILLEGAL.contains(c))
+        .take(max_chars)
+        .collect();
+    format!("{}-{}", prefix, sanitized)
 }
 
 // =====================================================================
@@ -1855,7 +1858,7 @@ pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<()
     workbook.push_worksheet(sheet_executive_summary(reports, true)?);
 
     for report in reports {
-        let name = truncate_hostname(&report.host.hostname, "Overview");
+        let name = sanitize_sheet_name(&report.host.hostname, "Overview");
         workbook.push_worksheet(sheet_host_combined(report, &name)?);
     }
 
