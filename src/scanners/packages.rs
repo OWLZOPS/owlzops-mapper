@@ -195,7 +195,7 @@ fn zypper_security_package_names() -> HashSet<String> {
 
     // Use sequential iterator – parallel zypper calls break RPM DB lock.
     // Each call wrapped in 15s timeout.
-    for patch in patch_names.iter().take(20) {
+    for patch in &patch_names {
         let Some(info_out) =
             crate::utils::run_with_timeout("zypper", &["-q", "info", "-t", "patch", patch], 15)
         else {
