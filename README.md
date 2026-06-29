@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 
-> One binary. One command. Full picture of your server - now with **Risk Score**, **multi‑host remote audit** and **snapshot diff**.
+> One binary. One command. Full picture of your server – now with **Risk Score**, **multi‑host remote audit**, **snapshot diff** and **drift monitoring**.
 
 **owlzops-mapper** is a self-contained Rust binary that performs a complete
 Linux server audit in seconds and exports the result to Excel, JSON or
@@ -30,14 +30,16 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.2
+## Highlights v0.4.3
 
+- **Snapshotting & drift monitoring:** `snapshot` saves audits to `~/.owlzops/snapshots/<hostname>/`, `dir-compare` shows what changed between the last two runs, `compare --multi-host` compares entire fleets at once.
 - **Extended `compare` drift detection:** tracks firewall, SSH root/password auth, fail2ban, auditd, NTP, OS/kernel version, package count, and SSL certificate thresholds.
 - **Performance boost:** `last -i` executed once instead of per user – security scan time cut by up to 90%.
 - **Full zypper security coverage:** removed artificial 20‑patch limit; every security update is flagged.
 - **Resilient Docker collection:** warnings when containers cannot be inspected, no silent omissions.
 - **No `sh -c` in host scanner:** direct `dmesg` calls and `/proc/self/limits` parsing improve reliability.
 - **Backup detection fixes:** no more false positives for restic/borg/duplicati when merely installed but unused.
+- **Firewall detection refined:** correctly identifies host firewall while ignoring Docker‑only rules.
 
 ---
 
@@ -92,6 +94,21 @@ sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --format excel
 > Add to `/etc/sudoers.d/owlzops`:  
 > `operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper`
 
+### Snapshotting & drift monitoring
+```bash
+# Save a timestamped JSON snapshot (default directory: ~/.owlzops/snapshots/<hostname>/)
+sudo ./owlzops-mapper snapshot
+
+# Specify custom output directory
+sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
+
+# Compare the two most recent snapshots for a host
+./owlzops-mapper dir-compare ~/.owlzops/snapshots/ubuntu
+
+# Export that comparison to Excel
+./owlzops-mapper dir-compare --format excel --output drift.xlsx ~/.owlzops/snapshots/ubuntu
+```
+
 ### Comparing snapshots (diff)
 ```bash
 # Compare two JSON snapshots in terminal (colored table)
@@ -102,6 +119,9 @@ sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --format excel
 
 # Export diff to Excel (color-coded: green=improved, red=degraded, yellow=changed)
 ./owlzops-mapper compare before.json after.json --format excel --output diff.xlsx
+
+# Multi‑host comparison: both files must be arrays of host reports (e.g., from a fleet scan)
+./owlzops-mapper compare --multi-host fleet_before.json fleet_after.json
 ```
 
 ---
@@ -130,7 +150,9 @@ sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --format excel
 | Command | Description |
 |---------|-------------|
 | `audit` | Run an audit scan (local or remote) |
+| `snapshot` | Run an audit and save the JSON snapshot to disk |
 | `compare <before> <after>` | Compare two JSON snapshots and show drift |
+| `dir-compare <dir>` | Compare the two most recent snapshots in a directory |
 
 ---
 
