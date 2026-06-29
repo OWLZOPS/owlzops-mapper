@@ -299,35 +299,47 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     }
 
     // Open files limit
-    let open_files_limit = crate::utils::run_with_timeout("sh", &["-c", "ulimit -n"], 3)
-        .map(|s| s.trim().to_string())
+    let open_files_limit = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Max open files"))
+                .and_then(|l| l.split_whitespace().nth(3).map(|s| s.to_string()))
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     // OOM kills
-    let oom_kills = crate::utils::run_with_timeout(
-        "sh",
-        &["-c", "dmesg 2>/dev/null | grep -i 'killed process' | wc -l"],
-        5,
-    )
-    .map(|s| s.trim().parse::<usize>().unwrap_or(0))
-    .unwrap_or(0);
+    let oom_kills = crate::utils::run_with_timeout("dmesg", &[], 5)
+        .map(|output| {
+            output
+                .lines()
+                .filter(|line| line.to_lowercase().contains("killed process"))
+                .count()
+        })
+        .unwrap_or(0);
 
-    // Dmesg errors (last 5)
-    let dmesg_errors = crate::utils::run_with_timeout(
-        "sh",
-        &[
-            "-c",
-            "dmesg -T 2>/dev/null | grep -iE 'error|critical|fail|segfault' | tail -n 5",
-        ],
-        5,
-    )
-    .map(|s| {
-        s.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
-    })
-    .unwrap_or_default();
+    // Dmesg errors (last 5) – try --ctime, fallback to -T
+    let dmesg_output = crate::utils::run_with_timeout("dmesg", &["--ctime"], 5)
+        .or_else(|| crate::utils::run_with_timeout("dmesg", &["-T"], 5))
+        .unwrap_or_default();
+
+    let dmesg_errors: Vec<String> = dmesg_output
+        .lines()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("error")
+                || lower.contains("critical")
+                || lower.contains("fail")
+                || lower.contains("segfault")
+        })
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(5)
+        .rev()
+        .collect();
 
     // GPU devices via lspci
     let gpu_devices = crate::utils::run_with_timeout("lspci", &[], 5)
