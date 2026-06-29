@@ -660,6 +660,24 @@ fn render_packages(report: &AgentReport) {
     }
 }
 
+/// Truncate each Docker mount string to at most `max_width` characters,
+/// appending "..." if truncated. Keeps the beginning of the path intact.
+fn truncate_docker_mounts(mounts: &[String], max_width: usize) -> String {
+    mounts
+        .iter()
+        .map(|m| {
+            if m.len() > max_width {
+                let trunc_len = max_width.saturating_sub(3);
+                let truncated: String = m.chars().take(trunc_len).collect();
+                format!("{}...", truncated)
+            } else {
+                m.clone()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
 fn render_docker(report: &AgentReport) {
     if !report.topology.docker_active {
         return;
@@ -778,12 +796,11 @@ fn render_docker(report: &AgentReport) {
                     .fg(Color::Red)
                     .add_attribute(Attribute::Bold)
             };
-            let mounts_str = if c.mounts.is_empty() {
-                "None (Stateless)".to_string()
-            } else {
-                c.mounts.join("\n")
-            };
-            let mounts_cell = Cell::new(mounts_str).fg(Color::DarkGrey);
+
+            // Truncate long mount paths for terminal readability (keep beginning, cap at 80 chars)
+            let mounts_display = truncate_docker_mounts(&c.mounts, 80);
+            let mounts_cell = Cell::new(mounts_display).fg(Color::DarkGrey);
+
             t_docker.add_row(vec![
                 Cell::new(&c.name),
                 status_cell,
