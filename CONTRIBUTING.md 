@@ -39,3 +39,11 @@ Tools don't define quality. Code review does.
 ## Commit Messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/):
+
+## 🐛 Reporting Bugs
+
+If you find a bug in `owlzops-mapper`, please open an issue in the repository. To help us fix it faster, include the following:
+
+* **Environment:** Your OS and Rust version (`rustc --version`).
+* **Steps to reproduce:** Exactly what you did before it broke.
+* **Expected behavior:** What you thought would happen vs what actually happened.
