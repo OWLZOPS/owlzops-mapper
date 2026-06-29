@@ -268,8 +268,17 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
         return (false, None);
     }
 
-    // No NTP tools available: container → unknown (false), else assume OK
+    // No NTP tools available: assume unsynchronized (conservative default)
     (false, None)
+}
+
+// ---------- helper for cron environment variable detection ----------
+fn is_cron_env(line: &str) -> bool {
+    if line.starts_with('@') {
+        return false; // special strings like @daily, @reboot
+    }
+    // Contains '=' and no space -> likely an env assignment
+    line.contains('=') && !line.contains(' ')
 }
 
 /// Gather comprehensive host information.
@@ -400,27 +409,72 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
                 .unwrap_or_else(|| "unknown".to_string());
     }
 
-    // Cron jobs
+    // ---------- Cron jobs collection ----------
     let mut cron_jobs = Vec::new();
+
+    // 1. /etc/crontab
     if let Ok(crontab) = fs::read_to_string("/etc/crontab") {
         for line in crontab.lines() {
             let l = line.trim();
-            if !l.is_empty() && !l.starts_with('#') {
+            if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
                 cron_jobs.push(format!("/etc/crontab: {}", l));
             }
         }
     }
-    if let Ok(entries) = fs::read_dir("/var/spool/cron/crontabs") {
-        for entry in entries.flatten() {
+
+    // 2. /etc/cron.d/ – package-provided fragments
+    if let Ok(cron_d) = fs::read_dir("/etc/cron.d") {
+        for entry in cron_d.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let name_str = name.to_string_lossy();
+            // Skip backup files, package leftovers
+            if name_str.ends_with('~')
+                || name_str.ends_with(".bak")
+                || name_str.ends_with(".rpmnew")
+                || name_str.ends_with(".rpmsave")
+            {
+                continue;
+            }
+            if let Ok(contents) = fs::read_to_string(&path) {
+                for line in contents.lines() {
+                    let l = line.trim();
+                    if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
+                        cron_jobs.push(format!("/etc/cron.d/{}: {}", name_str, l));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. /var/spool/cron/crontabs – user crontabs
+    if let Ok(spool) = fs::read_dir("/var/spool/cron/crontabs") {
+        for entry in spool.flatten() {
             let user = entry.file_name().to_string_lossy().to_string();
             if let Ok(contents) = fs::read_to_string(entry.path()) {
                 for line in contents.lines() {
                     let l = line.trim();
-                    if !l.is_empty() && !l.starts_with('#') {
+                    if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
                         cron_jobs.push(format!("user {}: {}", user, l));
                     }
                 }
             }
+        }
+    }
+
+    // 4. /etc/anacrontab – anacron jobs
+    if let Ok(anacron) = fs::read_to_string("/etc/anacrontab") {
+        for line in anacron.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') || is_cron_env(l) {
+                continue;
+            }
+            cron_jobs.push(format!("/etc/anacrontab: {}", l));
         }
     }
 
@@ -495,13 +549,11 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         let name_lower = name.to_ascii_lowercase();
 
         for &(process_name, display_name) in prefix_targets {
-            // use case‑insensitive prefix matching
             if name_lower.starts_with(process_name) && found_tech.insert(display_name) {
                 tech_stack.push(display_name.to_string());
             }
         }
         for &(process_name, display_name) in exact_targets {
-            // exact match, case‑insensitive
             if name_lower == process_name && found_tech.insert(display_name) {
                 tech_stack.push(display_name.to_string());
             }
