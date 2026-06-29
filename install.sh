@@ -1,5 +1,7 @@
 #!/bin/sh
 set -e
+# Enable pipefail where available
+(set -o pipefail 2>/dev/null) && set -o pipefail || true
 
 REPO="OWLZOPS/owlzops-mapper"
 BIN="owlzops-mapper"

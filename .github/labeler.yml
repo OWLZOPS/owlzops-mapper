@@ -25,3 +25,11 @@ ci:
   - changed-files:
       - any-glob-to-any-file: '.github/**'
       - any-glob-to-any-file: 'Cargo.toml'
+
+core:
+  - changed-files:
+      - any-glob-to-any-file: 'src/main.rs'
+      - any-glob-to-any-file: 'src/models.rs'
+      - any-glob-to-any-file: 'src/scoring.rs'
+      - any-glob-to-any-file: 'src/utils.rs'
+      - any-glob-to-any-file: 'src/compare.rs'
