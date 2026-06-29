@@ -30,6 +30,17 @@ sudo ./owlzops-mapper audit
 
 ---
 
+## Highlights v0.4.2
+
+- **Extended `compare` drift detection:** tracks firewall, SSH root/password auth, fail2ban, auditd, NTP, OS/kernel version, package count, and SSL certificate thresholds.
+- **Performance boost:** `last -i` executed once instead of per user – security scan time cut by up to 90%.
+- **Full zypper security coverage:** removed artificial 20‑patch limit; every security update is flagged.
+- **Resilient Docker collection:** warnings when containers cannot be inspected, no silent omissions.
+- **No `sh -c` in host scanner:** direct `dmesg` calls and `/proc/self/limits` parsing improve reliability.
+- **Backup detection fixes:** no more false positives for restic/borg/duplicati when merely installed but unused.
+
+---
+
 ## Usage
 
 ### Local audit
@@ -55,26 +66,31 @@ sudo ./owlzops-mapper audit --offline
 
 ### Remote audit (via SSH)
 ```bash
-# Scan a single remote host (binary must be present at /tmp/owlzops-mapper)
-sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user root
+# Scan a single remote host (binary must be present at /tmp/owlzops-mapper;
+# the remote user needs passwordless sudo permission for the binary path).
+sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user operator
 
 # Scan multiple comma-separated hosts
-sudo ./owlzops-mapper audit --host 192.168.1.10,192.168.1.11 --ssh-user root
+sudo ./owlzops-mapper audit --host 192.168.1.10,192.168.1.11 --ssh-user operator
 
 # Automatically copy the local static binary to the remote host first.
 # Release binaries are static (musl), so --copy-binary works out of the box.
-sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user root --copy-binary
+sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user operator --copy-binary
 
 # If you built your own binary (e.g. debug build), point to the musl release:
-sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user root --copy-binary \
+sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user operator --copy-binary \
   --local-binary target/x86_64-unknown-linux-musl/release/owlzops-mapper
 
 # Scan multiple hosts from a file (one per line)
-sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user root --copy-binary
+sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --copy-binary
 
 # Multi-host Excel report with one sheet per host
-sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user root --format excel --output fleet-audit.xlsx
+sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --format excel --output fleet-audit.xlsx
 ```
+
+> **Prerequisite on remote hosts:** the user (here `operator`) must be able to run `sudo /tmp/owlzops-mapper` without a password prompt.  
+> Add to `/etc/sudoers.d/owlzops`:  
+> `operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper`
 
 ### Comparing snapshots (diff)
 ```bash
@@ -101,7 +117,7 @@ sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user root --format excel --o
 | `--offline` | Disable **all** network calls. Overrides other flags if combined |
 | `--host <HOST>` | Single hostname/IP (or comma‑separated list) for remote scanning |
 | `--hosts <FILE>` | File with one hostname/IP per line for remote scanning |
-| `--ssh-user <USER>` | SSH user for remote connections (default: `root`) |
+| `--ssh-user <USER>` | SSH user for remote connections (default: `root`; prefer a non‑root user with passwordless sudo) |
 | `--ssh-key <PATH>` | Path to SSH private key (default: `~/.ssh/id_rsa`) |
 | `--copy-binary` | Copy the local binary to remote hosts before scanning. The binary **must** be statically linked (musl). GitHub release binaries are static, so you can safely use this flag with them. |
 | `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you're running a debug build locally but have a release build for remote hosts. |
