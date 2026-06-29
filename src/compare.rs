@@ -51,6 +51,122 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
+    // --- Security-critical boolean drifts (H-5) ---
+    macro_rules! compare_bool {
+        ($changes:expr, $before:expr, $after:expr, $field:literal, $degraded_when:literal) => {
+            if $before != $after {
+                let sev = if $after == $degraded_when {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                };
+                $changes.push(Change {
+                    field: $field.into(),
+                    before: Some($before.to_string()),
+                    after: Some($after.to_string()),
+                    severity: sev,
+                });
+            }
+        };
+    }
+
+    compare_bool!(
+        changes,
+        before.network.firewall_active,
+        after.network.firewall_active,
+        "network.firewall_active",
+        false
+    );
+    compare_bool!(
+        changes,
+        before.security.ssh_root_login_enabled,
+        after.security.ssh_root_login_enabled,
+        "security.ssh_root_login_enabled",
+        true
+    );
+    compare_bool!(
+        changes,
+        before.security.ssh_password_auth_enabled,
+        after.security.ssh_password_auth_enabled,
+        "security.ssh_password_auth_enabled",
+        true
+    );
+    compare_bool!(
+        changes,
+        before.security.fail2ban_active,
+        after.security.fail2ban_active,
+        "security.fail2ban_active",
+        false
+    );
+    compare_bool!(
+        changes,
+        before.security.auditd_active,
+        after.security.auditd_active,
+        "security.auditd_active",
+        false
+    );
+    compare_bool!(
+        changes,
+        before.host.ntp_synchronized,
+        after.host.ntp_synchronized,
+        "host.ntp_synchronized",
+        false
+    );
+
+    // OS / kernel changes (unexpected downgrades)
+    if before.host.os_version != after.host.os_version {
+        changes.push(Change {
+            field: "host.os_version".into(),
+            before: Some(before.host.os_version.clone()),
+            after: Some(after.host.os_version.clone()),
+            severity: Severity::Changed,
+        });
+    }
+    if before.host.kernel != after.host.kernel {
+        changes.push(Change {
+            field: "host.kernel".into(),
+            before: Some(before.host.kernel.clone()),
+            after: Some(after.host.kernel.clone()),
+            severity: Severity::Changed,
+        });
+    }
+
+    // Sudden package count change (possible supply-chain signal)
+    if before.packages.installed_count != after.packages.installed_count {
+        let sev = if after.packages.installed_count > before.packages.installed_count + 50 {
+            Severity::Degraded // large unexpected increase
+        } else {
+            Severity::Changed
+        };
+        changes.push(Change {
+            field: "packages.installed_count".into(),
+            before: Some(before.packages.installed_count.to_string()),
+            after: Some(after.packages.installed_count.to_string()),
+            severity: sev,
+        });
+    }
+
+    // SSL certificates – crossing critical/warning threshold
+    let before_certs: Vec<_> = before.network.ssl_certificates.iter().collect();
+    let after_certs: Vec<_> = after.network.ssl_certificates.iter().collect();
+    for after_cert in &after_certs {
+        if let Some(before_cert) = before_certs.iter().find(|c| c.domain == after_cert.domain)
+            && before_cert.is_critical != after_cert.is_critical
+        {
+            let sev = if after_cert.is_critical {
+                Severity::Degraded
+            } else {
+                Severity::Improved
+            };
+            changes.push(Change {
+                field: format!("network.ssl_certificates.{}.is_critical", after_cert.domain),
+                before: Some(before_cert.is_critical.to_string()),
+                after: Some(after_cert.is_critical.to_string()),
+                severity: sev,
+            });
+        }
+    }
+
     // --- network.listening_ports (key: bind_address:port) ---
     let before_ports: HashSet<(String, String)> = before
         .network
