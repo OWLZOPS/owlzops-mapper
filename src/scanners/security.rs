@@ -1,4 +1,5 @@
 use crate::models::{SecurityInfo, UserInfo};
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
@@ -125,8 +126,6 @@ fn gather_sysctl_issues() -> Vec<String> {
 // Main gather function
 // ---------------------------------------------------------------------
 pub fn gather_security_info() -> SecurityInfo {
-    let mut shell_users = Vec::new();
-
     // --- SSH config parsing ------------------------------------------------
     let (ssh_password_auth_enabled, ssh_root_login_enabled, ssh_config_source) =
         match sshd_effective_config() {
@@ -147,87 +146,113 @@ pub fn gather_security_info() -> SecurityInfo {
             }
         };
 
-    // --- Shell users -------------------------------------------------------
+    // --- Shell users – collect usernames and authorized_keys counts --------
+    const VALID_SHELLS: &[&str] = &[
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+        "/usr/bin/sh",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/bin/ash",
+        "/usr/bin/ash",
+        "/bin/fish",
+        "/usr/bin/fish",
+        "/bin/dash",
+        "/usr/bin/dash",
+        "/bin/ksh",
+        "/usr/bin/ksh",
+    ];
+    let valid_shells: std::collections::HashSet<&str> = VALID_SHELLS.iter().copied().collect();
+
+    let mut shell_usernames: Vec<String> = Vec::new();
+    let mut auth_keys_map: HashMap<String, usize> = HashMap::new();
+
     if let Ok(contents) = fs::read_to_string("/etc/passwd") {
-        // Expanded list that covers both /bin and /usr/bin paths as well
-        // as common shells on modern distributions (Fedora, Arch, Ubuntu).
-        const VALID_SHELLS: &[&str] = &[
-            "/bin/bash",
-            "/usr/bin/bash",
-            "/bin/sh",
-            "/usr/bin/sh",
-            "/bin/zsh",
-            "/usr/bin/zsh",
-            "/bin/ash",
-            "/usr/bin/ash",
-            "/bin/fish",
-            "/usr/bin/fish",
-            "/bin/dash",
-            "/usr/bin/dash",
-            "/bin/ksh",
-            "/usr/bin/ksh",
-        ];
-
-        let valid_shells: std::collections::HashSet<&str> = VALID_SHELLS.iter().copied().collect();
-
         for line in contents.lines() {
             let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() == 7 {
+            if parts.len() == 7 && valid_shells.contains(parts[6]) {
                 let username = parts[0].to_string();
-                if valid_shells.contains(parts[6]) {
-                    let mut last_login = "Never logged in".to_string();
-                    let mut last_ssh_login = "No remote SSH login found".to_string();
 
-                    // Use timeout wrapper for the `last` command
-                    if let Some(last_output) =
-                        crate::utils::run_with_timeout("last", &["-i", &username], 5)
-                    {
-                        let mut found_first = false;
-                        let mut found_ssh = false;
-                        for l in last_output.lines() {
-                            let cl = l.trim();
-                            if cl.is_empty() || cl.starts_with("wtmp") || !cl.starts_with(&username)
-                            {
-                                continue;
-                            }
-                            let clean_line = cl.replacen(&username, "", 1).trim().to_string();
-                            if !found_first {
-                                last_login = clean_line.clone();
-                                found_first = true;
-                            }
-                            if !found_ssh {
-                                let cols: Vec<&str> = clean_line.split_whitespace().collect();
-                                if cols.len() >= 2
-                                    && cols[1] != "0.0.0.0"
-                                    && (cols[1].contains('.') || cols[1].contains(':'))
-                                {
-                                    last_ssh_login = clean_line.clone();
-                                    found_ssh = true;
-                                }
-                            }
-                        }
-                    }
-
-                    let auth_keys_path = if username == "root" {
-                        "/root/.ssh/authorized_keys".to_string()
-                    } else {
-                        format!("/home/{}/.ssh/authorized_keys", username)
-                    };
-                    let authorized_keys_count = fs::read_to_string(&auth_keys_path)
-                        .unwrap_or_default()
-                        .lines()
-                        .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
-                        .count();
-                    shell_users.push(UserInfo {
-                        username,
-                        last_login,
-                        last_ssh_login,
-                        authorized_keys_count,
-                    });
-                }
+                // Count authorized keys
+                let auth_keys_path = if username == "root" {
+                    "/root/.ssh/authorized_keys".to_string()
+                } else {
+                    format!("/home/{}/.ssh/authorized_keys", username)
+                };
+                let count = fs::read_to_string(&auth_keys_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
+                    .count();
+                auth_keys_map.insert(username.clone(), count);
+                auth_keys_map.insert(username.clone(), count);
+                shell_usernames.push(username);
             }
         }
     }
+
+    // --- Optimized login collection: single `last -i` call ----------------
+    // Парсим last -i
+    let all_logins: HashMap<String, (String, Option<String>)> = {
+        let mut map = HashMap::new();
+        if let Some(output) = crate::utils::run_with_timeout("last", &["-i"], 10) {
+            for line in output.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+                let user = parts[0].to_string();
+                if !shell_usernames.contains(&user) {
+                    continue;
+                }
+                let detail = line[user.len()..].trim().to_string();
+                let ip = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
+                let is_remote = ip != "0.0.0.0"
+                    && ip != "127.0.0.1"
+                    && ip != "::1"
+                    && !ip.starts_with("192.168.")
+                    && !ip.starts_with("10.")
+                    && !ip.starts_with("172.");
+                let entry = map
+                    .entry(user.clone())
+                    .or_insert_with(|| (detail.clone(), None));
+                if entry.1.is_none() && is_remote {
+                    entry.1 = Some(detail);
+                }
+            }
+        }
+        map
+    };
+
+    // Build UserInfo list
+    let shell_users: Vec<UserInfo> = shell_usernames
+        .into_iter()
+        .map(|username| {
+            let authorized_keys_count = auth_keys_map.remove(&username).unwrap_or(0);
+            let (last_login, last_ssh_login) = all_logins
+                .get(&username)
+                .map(|(ll, sl)| {
+                    (
+                        ll.clone(),
+                        sl.clone()
+                            .unwrap_or_else(|| "No remote SSH login found".to_string()),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        "No login records found".to_string(),
+                        "No remote SSH login found".to_string(),
+                    )
+                });
+            UserInfo {
+                username,
+                last_login,
+                last_ssh_login,
+                authorized_keys_count,
+            }
+        })
+        .collect();
 
     // --- Fail2Ban and Auditd (with timeout wrapper) ------------------------
     let fail2ban_active =
