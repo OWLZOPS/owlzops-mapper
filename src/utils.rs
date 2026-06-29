@@ -1,14 +1,18 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-/// Execute a command with a timeout using system `timeout` (GNU coreutils).
-/// `timeout` sends SIGTERM on expiration, then SIGKILL, guaranteeing cleanup.
-/// Returns Some(stdout) only on successful execution (exit code 0).
+/// Execute a command with a timeout.
+/// Returns stdout if the command exits with success **and** within the timeout.
+/// On timeout the child process is killed and None is returned.
 pub fn run_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
     run_with_timeout_inner(program, args, timeout_secs, true)
 }
 
-/// Execute a command with a timeout, accepting any exit code (including non-zero).
-/// Use for commands like `dnf check-update` where exit 100 means "updates available".
+/// Execute a command with a timeout, accepting any exit code (including non‑zero).
+/// Still returns None on timeout.
 pub fn run_with_timeout_any_exit(
     program: &str,
     args: &[&str],
@@ -23,21 +27,38 @@ fn run_with_timeout_inner(
     timeout_secs: u64,
     require_success: bool,
 ) -> Option<String> {
-    let output = Command::new("timeout")
-        .arg(format!("{}s", timeout_secs))
-        .arg(program)
+    let mut child = Command::new(program)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
 
-    // Exit code 124 = timed out
-    if output.status.code() == Some(124) {
-        return None;
-    }
+    let (tx, rx) = mpsc::channel();
+    let mut child_stdout = child.stdout.take()?;
 
-    if require_success && !output.status.success() {
-        return None;
-    }
+    // Reader thread: accumulate stdout and send it back
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = child_stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
 
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    // Wait for the reader thread or timeout
+    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(stdout) => {
+            // Process finished (or at least closed stdout). Wait for it to reap zombie.
+            let status = child.wait().ok()?;
+            if require_success && !status.success() {
+                return None;
+            }
+            Some(stdout)
+        }
+        Err(_timeout) => {
+            // Kill the child and the reader thread will finish
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
 }
