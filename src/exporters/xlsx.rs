@@ -1004,7 +1004,7 @@ pub fn sheet_host_combined(
     }
 
     // ---------- Packages section ----------
-    if report.packages.manager != PackageManager::Unknown {
+    if report.packages.manager.is_known() {
         sheet.write_string_with_format(current_row, 0, "Packages", &header_format())?;
         current_row += 1;
 

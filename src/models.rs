@@ -190,6 +190,12 @@ pub enum PackageManager {
     #[default]
     Unknown,
 }
+impl PackageManager {
+    /// Returns `true` if a concrete package manager was detected.
+    pub fn is_known(&self) -> bool {
+        !matches!(self, PackageManager::Unknown)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UpgradablePackage {

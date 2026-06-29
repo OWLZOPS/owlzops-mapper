@@ -558,7 +558,7 @@ fn render_system_internals(report: &AgentReport) {
 }
 
 fn render_packages(report: &AgentReport) {
-    if report.packages.manager == PackageManager::Unknown {
+    if !report.packages.manager.is_known() {
         return;
     }
     let manager_str = match report.packages.manager {
