@@ -50,7 +50,7 @@ fn gather_sudo_nopasswd() -> Vec<String> {
     if let Ok(dir) = fs::read_dir("/etc/sudoers.d") {
         for entry in dir.flatten() {
             if entry.path().is_file() && !entry.file_name().to_string_lossy().starts_with('.') {
-                files.push(entry.path().to_string_lossy().to_string());
+                files.push(entry.path().display().to_string());
             }
         }
     }

@@ -491,14 +491,18 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
             zombie_processes += 1;
         }
 
-        let name = proc.name().to_lowercase();
+        let name = proc.name();
+        let name_lower = name.to_ascii_lowercase();
+
         for &(process_name, display_name) in prefix_targets {
-            if name.starts_with(process_name) && found_tech.insert(display_name) {
+            // use case‑insensitive prefix matching
+            if name_lower.starts_with(process_name) && found_tech.insert(display_name) {
                 tech_stack.push(display_name.to_string());
             }
         }
         for &(process_name, display_name) in exact_targets {
-            if name == process_name && found_tech.insert(display_name) {
+            // exact match, case‑insensitive
+            if name_lower == process_name && found_tech.insert(display_name) {
                 tech_stack.push(display_name.to_string());
             }
         }
