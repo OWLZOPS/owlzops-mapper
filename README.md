@@ -12,6 +12,15 @@ terminal. No internet required. No data leaves the server.
 For sysadmins it's instant inventory. For CTOs it's technical debt visibility. For CEOs it's
 risk and cost optimization.
 
+## Why does this exist?
+
+Most infrastructure scanners require agents, Python runtimes, or open
+firewall ports. This one doesn't. It's a static Rust binary that does
+everything locally and exits. I built it because I was tired of manually
+checking server configurations during audits - and I wanted a tool that
+could diff snapshots over time, so I could see exactly what changed and
+when.
+
 ---
 
 ## Quick Start
