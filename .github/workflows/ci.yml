@@ -105,7 +105,9 @@ jobs:
             -w /src \
             opensuse/tumbleweed:latest \
             bash -c "
-            zypper --non-interactive install -y gcc gcc-c++ make curl glibc-devel
+            set -ex
+            zypper --non-interactive refresh
+            zypper --non-interactive install -y gcc gcc-c++ make curl glibc-devel tar gzip
             export CC=gcc
             export CXX=g++
             export RUSTFLAGS='-C linker=gcc'
