@@ -106,9 +106,9 @@ jobs:
             opensuse/tumbleweed:latest \
             bash -c "
             zypper --non-interactive install -y gcc gcc-c++ make curl glibc-devel
-            # Force cc -> gcc symlink regardless of existing /usr/bin/cc
-            ln -sf /usr/bin/gcc /usr/bin/cc
             export CC=gcc
+            export CXX=g++
+            export RUSTFLAGS='-C linker=gcc'
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
             source \$HOME/.cargo/env
             cargo build --locked
