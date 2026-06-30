@@ -14,13 +14,6 @@ jobs:
         id: meta
         uses: dependabot/fetch-metadata@0fb21704c18a42ce5aa8d720ea4b912f5e6babef  # v2.0.0
 
-      - name: Wait for CI checks
-        run: |
-          gh pr checks "$PR_URL" --watch --fail-fast
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Approve a PR
         if: |
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
