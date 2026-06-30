@@ -80,7 +80,11 @@ sudo ./owlzops-mapper audit --offline
 # Scan a single remote host (binary must be present at /tmp/owlzops-mapper;
 # the remote user needs passwordless sudo permission for the binary path).
 sudo ./owlzops-mapper audit --host 192.168.1.10 --ssh-user operator
+```
 
+![owlzops-mapper remote audit](demo.gif)
+
+```bash
 # Scan multiple comma-separated hosts
 sudo ./owlzops-mapper audit --host 192.168.1.10,192.168.1.11 --ssh-user operator
 
