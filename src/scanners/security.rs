@@ -1,14 +1,13 @@
 use crate::models::{SecurityInfo, UserInfo};
 use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 
+// ── Helpers ──────────────────────────────────────────────────────────────
+
 /// Extract a directive value from `sshd -T` output (format: "directive value").
-/// This is the effective sshd configuration — it already accounts for all
-/// `Include` files (for example /etc/ssh/sshd_config.d/*.conf) and platform
-/// defaults, so there is no need to manually parse and merge configuration files.
 fn sshd_effective_config() -> Option<String> {
-    // Use the timeout wrapper to avoid hanging on a broken sshd
     crate::utils::run_with_timeout("sshd", &["-T"], 5)
 }
 
@@ -24,9 +23,7 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
     })
 }
 
-/// Fallback used when `sshd -T` is unavailable (no root access, binary not in PATH, etc.).
-/// In this case, we read only the main config file — this is less accurate (it does not
-/// include `Include` files or platform defaults), but better than nothing.
+/// Fallback used when `sshd -T` is unavailable.
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     if let Ok(sshd_config) = fs::read_to_string("/etc/ssh/sshd_config") {
         for line in sshd_config.lines() {
@@ -41,9 +38,19 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     }
 }
 
-// ---------------------------------------------------------------------
-// Sudo audit
-// ---------------------------------------------------------------------
+/// Determine if an IP address is local (loopback, private, unspecified).
+/// Uses the standard library's `Ipv4Addr::is_private()` which correctly
+/// covers all three RFC1918 ranges (10/8, 172.16/12, 192.168/16).
+fn is_local_ip(ip: &str) -> bool {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_unspecified(),
+        Ok(IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
+        Err(_) => true, // if it can't be parsed, treat it as local (safe side)
+    }
+}
+
+// ── Sudo audit ───────────────────────────────────────────────────────────
+
 fn gather_sudo_nopasswd() -> Vec<String> {
     let mut entries = Vec::new();
     let mut files = vec!["/etc/sudoers".to_string()];
@@ -63,6 +70,12 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                     continue;
                 }
                 if l.to_lowercase().contains("nopasswd") {
+                    // Exclude entries that are exclusively for owlzops-mapper itself
+                    // (needed for remote scanning without password prompt)
+                    let is_self_only = l.contains("owlzops-mapper") && !l.contains("ALL");
+                    if is_self_only {
+                        continue;
+                    }
                     entries.push(format!("{}: {}", file, l));
                 }
             }
@@ -81,9 +94,8 @@ fn get_sudoers_mode() -> Option<u32> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Sysctl audit
-// ---------------------------------------------------------------------
+// ── Sysctl audit ─────────────────────────────────────────────────────────
+
 fn gather_sysctl_issues() -> Vec<String> {
     let mut issues = Vec::new();
     let checks: &[(&str, &str, &str)] = &[
@@ -122,9 +134,8 @@ fn gather_sysctl_issues() -> Vec<String> {
     issues
 }
 
-// ---------------------------------------------------------------------
-// Main gather function
-// ---------------------------------------------------------------------
+// ── Main gather function ─────────────────────────────────────────────────
+
 pub fn gather_security_info() -> SecurityInfo {
     // --- SSH config parsing ------------------------------------------------
     let (ssh_password_auth_enabled, ssh_root_login_enabled, ssh_config_source) =
@@ -192,7 +203,6 @@ pub fn gather_security_info() -> SecurityInfo {
     }
 
     // --- Optimized login collection: single `last -i` call ----------------
-    // Парсим last -i
     let all_logins: HashMap<String, (String, Option<String>)> = {
         let mut map = HashMap::new();
         if let Some(output) = crate::utils::run_with_timeout("last", &["-i"], 10) {
@@ -207,12 +217,7 @@ pub fn gather_security_info() -> SecurityInfo {
                 }
                 let detail = line[user.len()..].trim().to_string();
                 let ip = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
-                let is_remote = ip != "0.0.0.0"
-                    && ip != "127.0.0.1"
-                    && ip != "::1"
-                    && !ip.starts_with("192.168.")
-                    && !ip.starts_with("10.")
-                    && !ip.starts_with("172.");
+                let is_remote = !is_local_ip(&ip);
                 let entry = map
                     .entry(user.clone())
                     .or_insert_with(|| (detail.clone(), None));
