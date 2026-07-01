@@ -25,6 +25,22 @@ fn is_cron_env(line: &str) -> bool {
     line.contains('=') && !line.contains(' ')
 }
 
+// ── structure for basic OS facts (replaces 12-tuple) ──────
+struct SystemBasics {
+    hostname: String,
+    external_ipv4: String,
+    hosting_provider: String,
+    os_version: String,
+    kernel: String,
+    uptime_days: u64,
+    cpu_cores: usize,
+    total_ram_mb: u64,
+    swap_total_mb: u64,
+    swap_used_mb: u64,
+    load_average: (f64, f64, f64),
+    os_install_date: String,
+}
+
 // ── database detection (unchanged) ─────────────────────────
 
 pub fn gather_databases_info() -> Vec<DatabaseInfo> {
@@ -104,24 +120,7 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
 // ── sub‑collectors for gather_host_info ────────────────────
 
 /// Basic OS / hardware facts that don't require iterating over processes.
-#[allow(clippy::type_complexity)]
-fn gather_system_basics_values(
-    sys: &System,
-    fetch_external_ip: bool,
-) -> (
-    String,
-    String,
-    String,
-    String,
-    String,
-    u64,
-    usize,
-    u64,
-    u64,
-    u64,
-    (f64, f64, f64),
-    String,
-) {
+fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemBasics {
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
     let os_version = System::long_os_version().unwrap_or_else(|| "unknown".to_string());
     let kernel = System::kernel_version().unwrap_or_else(|| "unknown".to_string());
@@ -169,7 +168,7 @@ fn gather_system_basics_values(
                 .unwrap_or_else(|| "unknown".to_string());
     }
 
-    (
+    SystemBasics {
         hostname,
         external_ipv4,
         hosting_provider,
@@ -180,9 +179,9 @@ fn gather_system_basics_values(
         total_ram_mb,
         swap_total_mb,
         swap_used_mb,
-        (load.one, load.five, load.fifteen),
+        load_average: (load.one, load.five, load.fifteen),
         os_install_date,
-    )
+    }
 }
 
 /// Returns top‑5 memory processes, zombie count, and detected tech stack.
@@ -617,20 +616,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     sys.refresh_all();
     let reboot_required = Path::new("/var/run/reboot-required").exists();
 
-    let (
-        hostname,
-        external_ipv4,
-        hosting_provider,
-        os_version,
-        kernel,
-        uptime_days,
-        cpu_cores,
-        total_ram_mb,
-        swap_total_mb,
-        swap_used_mb,
-        load_average,
-        os_install_date,
-    ) = gather_system_basics_values(sys, fetch_external_ip);
+    let basics = gather_system_basics_values(sys, fetch_external_ip);
 
     let (top_memory_processes, zombie_processes, tech_stack) = gather_process_and_tech(sys);
 
@@ -643,19 +629,19 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
     let (ntp_synchronized, time_offset_ms) = gather_ntp_info();
 
     HostInfo {
-        hostname,
-        external_ipv4,
-        hosting_provider,
-        os_install_date,
-        os_version,
-        kernel,
-        uptime_days,
+        hostname: basics.hostname,
+        external_ipv4: basics.external_ipv4,
+        hosting_provider: basics.hosting_provider,
+        os_install_date: basics.os_install_date,
+        os_version: basics.os_version,
+        kernel: basics.kernel,
+        uptime_days: basics.uptime_days,
         reboot_required,
-        cpu_cores,
-        total_ram_mb,
-        swap_total_mb,
-        swap_used_mb,
-        load_average,
+        cpu_cores: basics.cpu_cores,
+        total_ram_mb: basics.total_ram_mb,
+        swap_total_mb: basics.swap_total_mb,
+        swap_used_mb: basics.swap_used_mb,
+        load_average: basics.load_average,
         open_files_limit,
         oom_kills,
         zombie_processes,

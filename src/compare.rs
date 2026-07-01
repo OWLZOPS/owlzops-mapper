@@ -167,7 +167,19 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // --- network.listening_ports (key: bind_address:port) ---
+    // Detect removed certificates
+    for before_cert in &before_certs {
+        if !after_certs.iter().any(|c| c.domain == before_cert.domain) {
+            changes.push(Change {
+                field: format!("network.ssl_certificates.{}.removed", before_cert.domain),
+                before: Some(before_cert.domain.clone()),
+                after: None,
+                severity: Severity::Changed,
+            });
+        }
+    }
+
+    // --- network.listening_ports (key: protocol:bind_address:port) ---
     let before_ports: HashSet<(String, String, String)> = before
         .network
         .listening_ports
