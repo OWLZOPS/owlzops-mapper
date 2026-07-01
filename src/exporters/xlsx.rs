@@ -1,5 +1,261 @@
 use crate::models::{AgentReport, DiffReport, MultiHostDiff, PackageManager, Severity};
-use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, XlsxError};
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksheet, XlsxError};
+// =====================================================================
+// Pre-allocated formats (single allocation for the whole workbook)
+// =====================================================================
+
+struct Formats {
+    header: Format,
+    critical: Format,
+    ok: Format,
+    number: Format,
+    even_row: Format,
+    odd_row: Format,
+    critical_even: Format,
+    critical_odd: Format,
+    warning_even: Format,
+    warning_odd: Format,
+    ok_even: Format,
+    ok_odd: Format,
+    #[allow(dead_code)]
+    subtle: Format,
+    #[allow(dead_code)]
+    host_cell: Format,
+}
+
+impl Formats {
+    fn new() -> Self {
+        let even_bg = Color::RGB(0xF2F2F2);
+        let white = Color::White;
+        let critical_color = Color::RGB(0xC00000);
+        let warning_color = Color::RGB(0xBF8F00);
+        let ok_color = Color::RGB(0x375623);
+
+        let header = Format::new()
+            .set_bold()
+            .set_background_color(Color::RGB(0x1F4E78))
+            .set_font_color(Color::White)
+            .set_align(FormatAlign::Left)
+            .set_border(FormatBorder::Thin);
+
+        let critical = Format::new()
+            .set_font_color(critical_color)
+            .set_bold()
+            .set_border(FormatBorder::Thin);
+
+        let ok = Format::new()
+            .set_font_color(ok_color)
+            .set_border(FormatBorder::Thin);
+
+        let number = Format::new()
+            .set_num_format("0.00")
+            .set_border(FormatBorder::Thin);
+
+        let even_row = Format::new()
+            .set_background_color(even_bg)
+            .set_border(FormatBorder::Thin);
+
+        let odd_row = Format::new()
+            .set_background_color(white)
+            .set_border(FormatBorder::Thin);
+
+        let critical_even = Format::new()
+            .set_background_color(even_bg)
+            .set_font_color(critical_color)
+            .set_bold()
+            .set_border(FormatBorder::Thin);
+
+        let critical_odd = Format::new()
+            .set_background_color(white)
+            .set_font_color(critical_color)
+            .set_bold()
+            .set_border(FormatBorder::Thin);
+
+        let warning_even = Format::new()
+            .set_background_color(even_bg)
+            .set_font_color(warning_color)
+            .set_border(FormatBorder::Thin);
+
+        let warning_odd = Format::new()
+            .set_background_color(white)
+            .set_font_color(warning_color)
+            .set_border(FormatBorder::Thin);
+
+        let ok_even = Format::new()
+            .set_background_color(even_bg)
+            .set_font_color(ok_color)
+            .set_border(FormatBorder::Thin);
+
+        let ok_odd = Format::new()
+            .set_background_color(white)
+            .set_font_color(ok_color)
+            .set_border(FormatBorder::Thin);
+
+        let subtle = Format::new()
+            .set_font_size(10)
+            .set_font_color(Color::RGB(0x808080))
+            .set_italic();
+
+        let host_cell = Format::new()
+            .set_bold()
+            .set_background_color(Color::RGB(0xE0E0E0))
+            .set_border(FormatBorder::Thin);
+
+        Self {
+            header,
+            critical,
+            ok,
+            number,
+            even_row,
+            odd_row,
+            critical_even,
+            critical_odd,
+            warning_even,
+            warning_odd,
+            ok_even,
+            ok_odd,
+            subtle,
+            host_cell,
+        }
+    }
+
+    fn row_band(&self, row: u32) -> &Format {
+        if row.is_multiple_of(2) {
+            &self.even_row
+        } else {
+            &self.odd_row
+        }
+    }
+
+    fn critical_band(&self, row: u32) -> &Format {
+        if row.is_multiple_of(2) {
+            &self.critical_even
+        } else {
+            &self.critical_odd
+        }
+    }
+
+    #[allow(dead_code)]
+    fn warning_band(&self, row: u32) -> &Format {
+        if row.is_multiple_of(2) {
+            &self.warning_even
+        } else {
+            &self.warning_odd
+        }
+    }
+
+    fn ok_band(&self, row: u32) -> &Format {
+        if row.is_multiple_of(2) {
+            &self.ok_even
+        } else {
+            &self.ok_odd
+        }
+    }
+}
+
+// =====================================================================
+// SheetWriter – a tiny builder that knows the current row and formats
+// =====================================================================
+struct SheetWriter<'a> {
+    sheet: &'a mut Worksheet,
+    row: u32,
+    fmts: &'a Formats,
+    col_widths: Vec<f64>,
+}
+
+impl<'a> SheetWriter<'a> {
+    fn new(sheet: &'a mut Worksheet, fmts: &'a Formats) -> Self {
+        Self {
+            sheet,
+            row: 0,
+            fmts,
+            col_widths: Vec::new(),
+        }
+    }
+
+    fn next_row(&mut self) -> u32 {
+        self.row += 1;
+        self.row
+    }
+
+    fn observe_width(&mut self, col: usize, text: &str) {
+        let len = text.len() as f64;
+        if col >= self.col_widths.len() {
+            self.col_widths.resize(col + 1, 0.0);
+        }
+        if len > self.col_widths[col] {
+            self.col_widths[col] = len;
+        }
+    }
+
+    fn write_header(&mut self, headers: &[&str]) -> Result<(), XlsxError> {
+        for (col, h) in headers.iter().enumerate() {
+            self.sheet
+                .write_string_with_format(self.row, col as u16, *h, &self.fmts.header)?;
+            self.observe_width(col, h);
+        }
+        self.next_row();
+        Ok(())
+    }
+
+    fn write_kv_row(
+        &mut self,
+        key: &str,
+        value: &str,
+        value_fmt: Option<&Format>,
+    ) -> Result<(), XlsxError> {
+        let band = self.fmts.row_band(self.row);
+        self.sheet
+            .write_string_with_format(self.row, 0, key, band)?;
+        let fmt = value_fmt.unwrap_or(band);
+        self.sheet
+            .write_string_with_format(self.row, 1, value, fmt)?;
+
+        self.observe_width(0, key);
+        self.observe_width(1, value);
+        self.next_row();
+        Ok(())
+    }
+
+    // Write a string to a specific column with an explicit format
+    fn write_string(&mut self, col: usize, value: &str, fmt: &Format) -> Result<(), XlsxError> {
+        self.sheet
+            .write_string_with_format(self.row, col as u16, value, fmt)?;
+        self.observe_width(col, value);
+        Ok(())
+    }
+
+    // Write a number to a specific column with an explicit format
+    fn write_number(&mut self, col: usize, value: f64, fmt: &Format) -> Result<(), XlsxError> {
+        self.sheet
+            .write_number_with_format(self.row, col as u16, value, fmt)?;
+        // Width observation for numbers: just use a reasonable estimate
+        let text = format!("{:.2}", value);
+        self.observe_width(col, &text);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn write_section_title(&mut self, title: &str) -> Result<(), XlsxError> {
+        self.sheet
+            .write_string_with_format(self.row, 0, title, &self.fmts.header)?;
+        self.next_row();
+        Ok(())
+    }
+
+    fn current_row(&self) -> u32 {
+        self.row
+    }
+
+    fn apply_col_widths_with_min(&mut self, min_widths: &[f64]) -> Result<(), XlsxError> {
+        for (col, &mw) in self.col_widths.iter().enumerate() {
+            let min_w = min_widths.get(col).copied().unwrap_or(8.0);
+            let w = (mw + 2.0).max(min_w);
+            self.sheet.set_column_width(col as u16, w)?;
+        }
+        Ok(())
+    }
+}
 
 // ---------- basic formats (thin borders) ----------
 fn header_format() -> Format {
@@ -63,7 +319,7 @@ fn critical_band(row: u32) -> Format {
         .set_bold()
         .set_border(FormatBorder::Thin)
 }
-
+#[allow(dead_code)]
 fn warning_band(row: u32) -> Format {
     let bg = if row.is_multiple_of(2) {
         Color::RGB(0xF2F2F2)
@@ -1201,76 +1457,49 @@ fn sheet_overview_named(
     Ok(sheet)
 }
 
-fn sheet_storage(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_storage_named(report, "Storage")
-}
+fn sheet_storage(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Storage")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
-fn sheet_storage_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
+    w.write_header(&[
+        "Mount Point",
+        "Total (GB)",
+        "Used (GB)",
+        "Usage %",
+        "Inodes %",
+    ])?;
 
-    write_headers(
-        &mut sheet,
-        &[
-            "Mount Point",
-            "Total (GB)",
-            "Used (GB)",
-            "Usage %",
-            "Inodes %",
-        ],
-    )?;
-
-    let num_fmt = number_format();
-    let mut data: Vec<Vec<String>> = vec![vec![
-        "Mount Point".to_string(),
-        "Total (GB)".to_string(),
-        "Used (GB)".to_string(),
-        "Usage %".to_string(),
-        "Inodes %".to_string(),
-    ]];
-
-    let mut row = 1u32;
     for disk in &report.storage.disks {
         if disk.total_gb == 0 {
             continue;
         }
         let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
-        let band = row_band(row);
+        let band = fmts.row_band(w.current_row());
 
-        sheet.write_string_with_format(row, 0, &disk.mount_point, &band)?;
-        sheet.write_number_with_format(row, 1, disk.total_gb as f64, &num_fmt)?;
-        sheet.write_number_with_format(row, 2, disk.used_gb as f64, &num_fmt)?;
+        w.write_string(0, &disk.mount_point, band)?;
+        w.write_number(1, disk.total_gb as f64, &fmts.number)?;
+        w.write_number(2, disk.used_gb as f64, &fmts.number)?;
 
         let usage_fmt = if usage_pct > 90.0 {
-            critical_band(row)
+            fmts.critical_band(w.current_row())
         } else if usage_pct > 75.0 {
-            warning_band(row)
+            fmts.warning_band(w.current_row())
         } else {
-            ok_band(row)
+            fmts.ok_band(w.current_row())
         };
-        sheet.write_number_with_format(row, 3, usage_pct, &usage_fmt)?;
+        w.write_number(3, usage_pct, usage_fmt)?;
 
         let inode_str = disk
             .inode_usage_percent
             .clone()
             .unwrap_or_else(|| "-".to_string());
-        sheet.write_string_with_format(row, 4, &inode_str, &band)?;
+        w.write_string(4, &inode_str, band)?;
 
-        data.push(vec![
-            disk.mount_point.clone(),
-            format!("{:.2}", disk.total_gb),
-            format!("{:.2}", disk.used_gb),
-            format!("{:.1}", usage_pct),
-            inode_str,
-        ]);
-
-        row += 1;
+        w.next_row();
     }
 
-    auto_fit_columns(&mut sheet, &data, &[12.0, 10.0, 10.0, 10.0, 10.0])?;
+    w.apply_col_widths_with_min(&[12.0, 10.0, 10.0, 10.0, 10.0])?;
     Ok(sheet)
 }
 
@@ -1442,106 +1671,76 @@ fn sheet_network_named(
     Ok(sheet)
 }
 
-fn sheet_security(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_security_named(report, "Security")
-}
+fn sheet_security(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Security")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
-fn sheet_security_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
-
-    let risky = critical_format();
-    let safe = ok_format();
-
-    sheet.write_string_with_format(0, 0, "SSH Password Auth Enabled", &header_format())?;
+    // SSH Password Auth
     let pa_fmt = if report.security.ssh_password_auth_enabled {
-        &risky
+        Some(&fmts.critical)
     } else {
-        &safe
+        Some(&fmts.ok)
     };
-    sheet.write_string_with_format(
-        0,
-        1,
-        report.security.ssh_password_auth_enabled.to_string(),
+    w.write_kv_row(
+        "SSH Password Auth Enabled",
+        &report.security.ssh_password_auth_enabled.to_string(),
         pa_fmt,
     )?;
 
-    sheet.write_string_with_format(1, 0, "SSH Root Login Enabled", &header_format())?;
+    // SSH Root Login
     let rl_fmt = if report.security.ssh_root_login_enabled {
-        &risky
+        Some(&fmts.critical)
     } else {
-        &safe
+        Some(&fmts.ok)
     };
-    sheet.write_string_with_format(
-        1,
-        1,
-        report.security.ssh_root_login_enabled.to_string(),
+    w.write_kv_row(
+        "SSH Root Login Enabled",
+        &report.security.ssh_root_login_enabled.to_string(),
         rl_fmt,
     )?;
 
-    sheet.write_string_with_format(2, 0, "SSH Config Source", &header_format())?;
-    sheet.write_string_with_format(2, 1, &report.security.ssh_config_source, &row_band(2))?;
+    // SSH Config Source
+    w.write_kv_row(
+        "SSH Config Source",
+        &report.security.ssh_config_source,
+        None,
+    )?;
 
-    sheet.write_string_with_format(3, 0, "Fail2Ban Active", &header_format())?;
+    // Fail2Ban Active
     let f2b_fmt = if report.security.fail2ban_active {
-        &safe
+        Some(&fmts.ok)
     } else {
-        &risky
+        Some(&fmts.critical)
     };
-    sheet.write_string_with_format(3, 1, report.security.fail2ban_active.to_string(), f2b_fmt)?;
+    w.write_kv_row(
+        "Fail2Ban Active",
+        &report.security.fail2ban_active.to_string(),
+        f2b_fmt,
+    )?;
 
-    sheet.write_string_with_format(4, 0, "Auditd Active", &header_format())?;
+    // Auditd Active
     let audit_fmt = if report.security.auditd_active {
-        &safe
+        Some(&fmts.ok)
     } else {
-        &risky
+        Some(&fmts.critical)
     };
-    sheet.write_string_with_format(4, 1, report.security.auditd_active.to_string(), audit_fmt)?;
+    w.write_kv_row(
+        "Auditd Active",
+        &report.security.auditd_active.to_string(),
+        audit_fmt,
+    )?;
 
-    let mut dyn_row = 5u32;
-    let mut data = vec![
-        vec![
-            "SSH Password Auth Enabled".to_string(),
-            report.security.ssh_password_auth_enabled.to_string(),
-        ],
-        vec![
-            "SSH Root Login Enabled".to_string(),
-            report.security.ssh_root_login_enabled.to_string(),
-        ],
-        vec![
-            "SSH Config Source".to_string(),
-            report.security.ssh_config_source.clone(),
-        ],
-        vec![
-            "Fail2Ban Active".to_string(),
-            report.security.fail2ban_active.to_string(),
-        ],
-        vec![
-            "Auditd Active".to_string(),
-            report.security.auditd_active.to_string(),
-        ],
-    ];
-
+    // Failed Services
     if !report.host.failed_services.is_empty() {
-        sheet.write_string_with_format(dyn_row, 0, "Failed Services", &header_format())?;
-        sheet.write_string_with_format(
-            dyn_row,
-            1,
-            report.host.failed_services.join(", "),
-            &critical_band(dyn_row),
+        w.write_kv_row(
+            "Failed Services",
+            &report.host.failed_services.join(", "),
+            Some(fmts.critical_band(w.current_row())),
         )?;
-        data.push(vec![
-            "Failed Services".to_string(),
-            report.host.failed_services.join(", "),
-        ]);
-        dyn_row += 1;
     }
 
-    // NTP – always shown (fixed: use dyn_row, include data push)
-    sheet.write_string_with_format(dyn_row, 0, "NTP Synchronized", &header_format())?;
+    // NTP
     let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
         (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
         (true, None) => "yes".to_string(),
@@ -1549,82 +1748,65 @@ fn sheet_security_named(
         (false, None) => "no".to_string(),
     };
     let ntp_fmt = if report.host.ntp_synchronized {
-        ok_band(dyn_row)
+        Some(fmts.ok_band(w.current_row()))
     } else {
-        critical_band(dyn_row)
+        Some(fmts.critical_band(w.current_row()))
     };
-    sheet.write_string_with_format(dyn_row, 1, &ntp_value, &ntp_fmt)?;
-    data.push(vec!["NTP Synchronized".to_string(), ntp_value]);
-    dyn_row += 1;
+    w.write_kv_row("NTP Synchronized", &ntp_value, ntp_fmt)?;
 
+    // Sudo NOPASSWD
     if !report.security.sudo_nopasswd_entries.is_empty() {
-        sheet.write_string_with_format(dyn_row, 0, "Sudo NOPASSWD", &header_format())?;
-        sheet.write_string_with_format(
-            dyn_row,
-            1,
-            report.security.sudo_nopasswd_entries.join("; "),
-            &critical_band(dyn_row),
+        w.write_kv_row(
+            "Sudo NOPASSWD",
+            &report.security.sudo_nopasswd_entries.join("; "),
+            Some(fmts.critical_band(w.current_row())),
         )?;
-        data.push(vec![
-            "Sudo NOPASSWD".to_string(),
-            report.security.sudo_nopasswd_entries.join("; "),
-        ]);
-        dyn_row += 1;
     }
+
+    // Sudoers Permissions
     if let Some(mode) = report.security.sudoers_mode {
-        sheet.write_string_with_format(dyn_row, 0, "Sudoers Permissions", &header_format())?;
         let (text, fmt) = if mode != 0o440 {
             (
                 format!("{:o} (expected 0440)", mode),
-                critical_band(dyn_row),
+                Some(fmts.critical_band(w.current_row())),
             )
         } else {
-            (format!("{:o}", mode), ok_band(dyn_row))
+            (format!("{:o}", mode), Some(fmts.ok_band(w.current_row())))
         };
-        sheet.write_string_with_format(dyn_row, 1, &text, &fmt)?;
-        data.push(vec!["Sudoers Permissions".to_string(), text]);
-        dyn_row += 1;
+        w.write_kv_row("Sudoers Permissions", &text, fmt)?;
     }
 
+    // Sysctl Issues
     if !report.security.sysctl_issues.is_empty() {
-        sheet.write_string_with_format(dyn_row, 0, "Sysctl Issues", &header_format())?;
-        sheet.write_string_with_format(
-            dyn_row,
-            1,
-            report.security.sysctl_issues.join("; "),
-            &critical_band(dyn_row),
+        w.write_kv_row(
+            "Sysctl Issues",
+            &report.security.sysctl_issues.join("; "),
+            Some(fmts.critical_band(w.current_row())),
         )?;
-        data.push(vec![
-            "Sysctl Issues".to_string(),
-            report.security.sysctl_issues.join("; "),
-        ]);
-        dyn_row += 1;
     }
 
-    let users_start = dyn_row + 1;
-    write_headers_at(
-        &mut sheet,
-        users_start,
-        &["User", "Last Login", "Last Remote SSH", "Authorized Keys"],
-    )?;
-
-    for (i, u) in report.security.shell_users.iter().enumerate() {
-        let row = users_start + 1 + i as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, &u.username, &band)?;
-        sheet.write_string_with_format(row, 1, &u.last_login, &band)?;
-        sheet.write_string_with_format(row, 2, &u.last_ssh_login, &band)?;
-        sheet.write_number_with_format(row, 3, u.authorized_keys_count as f64, &number_format())?;
-
-        data.push(vec![
-            u.username.clone(),
-            u.last_login.clone(),
-            u.last_ssh_login.clone(),
-            u.authorized_keys_count.to_string(),
-        ]);
+    // Shell Users table
+    if !report.security.shell_users.is_empty() {
+        w.next_row(); // blank line before table
+        w.write_header(&["User", "Last Login", "Last Remote SSH", "Authorized Keys"])?;
+        for u in &report.security.shell_users {
+            let band = fmts.row_band(w.current_row());
+            w.sheet
+                .write_string_with_format(w.current_row(), 0, &u.username, band)?;
+            w.sheet
+                .write_string_with_format(w.current_row(), 1, &u.last_login, band)?;
+            w.sheet
+                .write_string_with_format(w.current_row(), 2, &u.last_ssh_login, band)?;
+            w.sheet.write_number_with_format(
+                w.current_row(),
+                3,
+                u.authorized_keys_count as f64,
+                &fmts.number,
+            )?;
+            w.next_row();
+        }
     }
 
-    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 12.0])?;
     Ok(sheet)
 }
 
@@ -1831,6 +2013,7 @@ fn sheet_packages_named(
 // WRITE REPORT (single host)
 // =====================================================================
 pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
+    let fmts = Formats::new();
     let mut workbook = Workbook::new();
 
     workbook.push_worksheet(sheet_executive_summary(
@@ -1838,10 +2021,10 @@ pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
         false,
     )?);
     workbook.push_worksheet(sheet_overview(report)?);
-    workbook.push_worksheet(sheet_storage(report)?);
+    workbook.push_worksheet(sheet_storage(report, &fmts)?);
     workbook.push_worksheet(sheet_databases(report)?);
     workbook.push_worksheet(sheet_network(report)?);
-    workbook.push_worksheet(sheet_security(report)?);
+    workbook.push_worksheet(sheet_security(report, &fmts)?);
     workbook.push_worksheet(sheet_docker(report)?);
     workbook.push_worksheet(sheet_packages(report)?);
 
