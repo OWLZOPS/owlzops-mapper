@@ -2,6 +2,7 @@ mod cli;
 mod compare;
 mod exporters;
 mod models;
+mod output;
 mod runner;
 mod scanners;
 mod scoring;
@@ -9,7 +10,7 @@ mod ui;
 mod utils;
 
 use clap::Parser;
-use cli::{AuditArgs, Cli, Commands, OutputFormat};
+use cli::{AuditArgs, Cli, Commands};
 use models::AgentReport;
 use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
 use scoring::*;
@@ -129,34 +130,7 @@ async fn run_command(cli: Cli) -> i32 {
                     }
                 }
 
-                match args.format {
-                    OutputFormat::Text => {
-                        if reports.len() == 1 {
-                            ui::render_dashboard(&reports[0]);
-                        } else {
-                            ui::render_multi_host_summary(&reports);
-                        }
-                    }
-                    OutputFormat::Json => {
-                        if let Ok(json) = serde_json::to_string_pretty(&reports) {
-                            println!("{json}");
-                        } else {
-                            warn!("error serializing multi‑host report");
-                        }
-                    }
-                    OutputFormat::Xlsx => {
-                        let filename = args.output.unwrap_or_else(|| {
-                            format!(
-                                "owlzops-multi-{}.xlsx",
-                                chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-                            )
-                        });
-                        match exporters::xlsx::write_multi_host_report(&reports, &filename) {
-                            Ok(_) => println!("✅ Multi‑host Excel report: {filename}"),
-                            Err(e) => warn!("failed to generate Excel report: {e}"),
-                        }
-                    }
-                }
+                output::output_multi(&reports, &args.format, args.output);
                 // Compute overall exit code for fleet scans
                 if reports.iter().any(|r| compute_exit_code(r) == 1) {
                     return 1;
@@ -169,27 +143,7 @@ async fn run_command(cli: Cli) -> i32 {
             // Single local scan
             let report = run_local_scan_async(&args).await;
             let exit_code = compute_exit_code(&report);
-
-            match args.format {
-                OutputFormat::Json => match serde_json::to_string_pretty(&report) {
-                    Ok(json) => println!("{json}"),
-                    Err(e) => warn!("error serializing Owlzops report: {e}"),
-                },
-                OutputFormat::Text => ui::render_dashboard(&report),
-                OutputFormat::Xlsx => {
-                    let filename = args.output.unwrap_or_else(|| {
-                        format!(
-                            "owlzops-report-{}-{}.xlsx",
-                            report.host.hostname,
-                            chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-                        )
-                    });
-                    match exporters::xlsx::write_report(&report, &filename) {
-                        Ok(_) => println!("✅ Excel report successfully generated: {filename}"),
-                        Err(e) => warn!("failed to generate Excel report: {e}"),
-                    }
-                }
-            }
+            output::output_single(&report, &args.format, args.output);
             exit_code
         }
 
