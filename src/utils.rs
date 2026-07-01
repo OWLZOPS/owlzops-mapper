@@ -1,8 +1,30 @@
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
+/// If the process is still alive after the deadline, it is killed and we wait
+/// a short grace period for the kill to take effect.
+fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if start.elapsed() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                // Deadline exceeded – kill and give a short grace for cleanup
+                let _ = child.kill();
+                thread::sleep(Duration::from_millis(100));
+                return child.try_wait().ok().flatten();
+            }
+            Err(_) => return None,
+        }
+    }
+}
 
 /// Execute a command with a timeout.
 /// Returns stdout if the command exits with success **and** within the timeout.
@@ -44,20 +66,24 @@ fn run_with_timeout_inner(
         let _ = tx.send(buf);
     });
 
-    // Wait for the reader thread or timeout
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(stdout) => {
-            // Process finished (or at least closed stdout). Wait for it to reap zombie.
-            let status = child.wait().ok()?;
-            if require_success && !status.success() {
-                return None;
+            // Process closed stdout (or finished). Wait for it to reap, but with a deadline.
+            let status = poll_wait(&mut child, Duration::from_secs(2));
+            if require_success {
+                match status {
+                    Some(s) if s.success() => Some(stdout),
+                    _ => None,
+                }
+            } else {
+                // Any exit code is acceptable (even if we killed it after deadline – we already have stdout)
+                Some(stdout)
             }
-            Some(stdout)
         }
         Err(_timeout) => {
-            // Kill the child and the reader thread will finish
+            // Timeout while waiting for stdout – kill the child
             let _ = child.kill();
-            let _ = child.wait();
+            poll_wait(&mut child, Duration::from_secs(1));
             None
         }
     }
