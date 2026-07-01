@@ -1791,22 +1791,15 @@ fn sheet_security(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
         w.write_header(&["User", "Last Login", "Last Remote SSH", "Authorized Keys"])?;
         for u in &report.security.shell_users {
             let band = fmts.row_band(w.current_row());
-            w.sheet
-                .write_string_with_format(w.current_row(), 0, &u.username, band)?;
-            w.sheet
-                .write_string_with_format(w.current_row(), 1, &u.last_login, band)?;
-            w.sheet
-                .write_string_with_format(w.current_row(), 2, &u.last_ssh_login, band)?;
-            w.sheet.write_number_with_format(
-                w.current_row(),
-                3,
-                u.authorized_keys_count as f64,
-                &fmts.number,
-            )?;
+            w.write_string(0, &u.username, band)?;
+            w.write_string(1, &u.last_login, band)?;
+            w.write_string(2, &u.last_ssh_login, band)?;
+            w.write_number(3, u.authorized_keys_count as f64, &fmts.number)?;
             w.next_row();
         }
     }
 
+    w.apply_col_widths_with_min(&[12.0, 12.0, 12.0, 10.0])?;
     Ok(sheet)
 }
 
