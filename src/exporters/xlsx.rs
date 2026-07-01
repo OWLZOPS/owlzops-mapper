@@ -345,29 +345,6 @@ fn ok_band(row: u32) -> Format {
 }
 
 // ---------- header helpers ----------
-fn write_headers(
-    sheet: &mut rust_xlsxwriter::Worksheet,
-    headers: &[&str],
-) -> Result<(), XlsxError> {
-    let fmt = header_format();
-    for (col, h) in headers.iter().enumerate() {
-        sheet.write_string_with_format(0, col as u16, *h, &fmt)?;
-        sheet.set_column_width(col as u16, (h.len() as f64 + 4.0).max(12.0))?;
-    }
-    Ok(())
-}
-
-fn write_headers_at(
-    sheet: &mut rust_xlsxwriter::Worksheet,
-    row: u32,
-    headers: &[&str],
-) -> Result<(), XlsxError> {
-    let fmt = header_format();
-    for (col, h) in headers.iter().enumerate() {
-        sheet.write_string_with_format(row, col as u16, *h, &fmt)?;
-    }
-    Ok(())
-}
 
 fn auto_fit_columns(
     sheet: &mut rust_xlsxwriter::Worksheet,
@@ -404,6 +381,17 @@ fn sanitize_sheet_name(name: &str, prefix: &str) -> String {
     format!("{}-{}", prefix, sanitized)
 }
 
+fn write_headers_at(
+    sheet: &mut rust_xlsxwriter::Worksheet,
+    row: u32,
+    headers: &[&str],
+) -> Result<(), XlsxError> {
+    let fmt = header_format();
+    for (col, h) in headers.iter().enumerate() {
+        sheet.write_string_with_format(row, col as u16, *h, &fmt)?;
+    }
+    Ok(())
+}
 // =====================================================================
 // EXECUTIVE SUMMARY sheet
 // =====================================================================
@@ -1336,17 +1324,10 @@ pub fn sheet_host_combined(
 // Wrappers for single‑host report (backward compatible)
 // =====================================================================
 
-fn sheet_overview(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_overview_named(report, "Overview")
-}
-
-fn sheet_overview_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
-    write_headers(&mut sheet, &["Field", "Value"])?;
+fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Overview")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
     let backup_str = if report.host.backup_tools.is_empty() {
         "None (CRITICAL)".to_string()
@@ -1354,27 +1335,47 @@ fn sheet_overview_named(
         report.host.backup_tools.join(", ")
     };
 
-    let rows: Vec<(&str, String)> = vec![
-        ("Risk Score", format!("{}/100", report.risk_score)),
-        ("Scan ID", report.scan_id.clone()),
-        ("Timestamp", report.timestamp.clone()),
-        ("Ran as root", report.is_root_execution.to_string()),
-        ("Hostname", report.host.hostname.clone()),
-        ("Provider", report.host.hosting_provider.clone()),
-        ("External IP", report.host.external_ipv4.clone()),
-        ("OS", report.host.os_version.clone()),
-        ("Kernel", report.host.kernel.clone()),
-        ("Backup tools", backup_str),
-        ("Uptime (days)", report.host.uptime_days.to_string()),
-        ("Reboot required", report.host.reboot_required.to_string()),
-        ("CPU cores", report.host.cpu_cores.to_string()),
+    let rows: Vec<(&str, String, Option<&Format>)> = vec![
+        ("Risk Score", format!("{}/100", report.risk_score), {
+            if report.risk_score >= 70 {
+                Some(fmts.critical_band(0))
+            } else if report.risk_score >= 40 {
+                Some(fmts.warning_band(0))
+            } else {
+                Some(fmts.ok_band(0))
+            }
+        }),
+        ("Scan ID", report.scan_id.clone(), None),
+        ("Timestamp", report.timestamp.clone(), None),
+        ("Ran as root", report.is_root_execution.to_string(), None),
+        ("Hostname", report.host.hostname.clone(), None),
+        ("Provider", report.host.hosting_provider.clone(), None),
+        ("External IP", report.host.external_ipv4.clone(), None),
+        ("OS", report.host.os_version.clone(), None),
+        ("Kernel", report.host.kernel.clone(), None),
+        ("Backup tools", backup_str.clone(), {
+            if report.host.backup_tools.is_empty() {
+                Some(fmts.critical_band(w.current_row()))
+            } else {
+                Some(fmts.ok_band(w.current_row()))
+            }
+        }),
+        ("Uptime (days)", report.host.uptime_days.to_string(), None),
+        (
+            "Reboot required",
+            report.host.reboot_required.to_string(),
+            None,
+        ),
+        ("CPU cores", report.host.cpu_cores.to_string(), None),
         (
             "RAM total (GB)",
             format!("{:.2}", report.host.total_ram_mb as f64 / 1024.0),
+            None,
         ),
         (
             "Swap total (GB)",
             format!("{:.2}", report.host.swap_total_mb as f64 / 1024.0),
+            None,
         ),
         (
             "Load average",
@@ -1382,78 +1383,57 @@ fn sheet_overview_named(
                 "{:.2}, {:.2}, {:.2}",
                 report.host.load_average.0, report.host.load_average.1, report.host.load_average.2
             ),
+            None,
         ),
-        ("OOM kills", report.host.oom_kills.to_string()),
-        ("Zombie processes", report.host.zombie_processes.to_string()),
+        ("OOM kills", report.host.oom_kills.to_string(), None),
+        (
+            "Zombie processes",
+            report.host.zombie_processes.to_string(),
+            None,
+        ),
         (
             "Security modules (LSM)",
             report.host.security_modules.join(", "),
+            None,
         ),
-        ("Tech stack", report.host.tech_stack.join(", ")),
+        ("Tech stack", report.host.tech_stack.join(", "), None),
     ];
 
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let row = (i + 1) as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, *label, &band)?;
-        if *label == "Risk Score" {
-            let score_fmt = if report.risk_score >= 70 {
-                critical_band(row)
-            } else if report.risk_score >= 40 {
-                warning_band(row)
-            } else {
-                ok_band(row)
-            };
-            sheet.write_string_with_format(row, 1, value, &score_fmt)?;
-        } else if *label == "Backup tools" {
-            let bk_fmt = if report.host.backup_tools.is_empty() {
-                critical_band(row)
-            } else {
-                ok_band(row)
-            };
-            sheet.write_string_with_format(row, 1, value, &bk_fmt)?;
-        } else {
-            sheet.write_string_with_format(row, 1, value, &band)?;
-        }
+    for (key, value, value_fmt) in &rows {
+        w.write_kv_row(key, value, *value_fmt)?;
     }
 
-    let branding_row = rows.len() as u32 + 2;
-    let subtle = Format::new()
-        .set_font_size(10)
-        .set_font_color(Color::RGB(0x808080))
-        .set_italic();
+    w.next_row();
 
-    sheet.write_formula_with_format(
-        branding_row,
+    // Branding hyperlinks
+    let subtle = &fmts.subtle;
+    w.sheet.write_formula_with_format(
+        w.current_row(),
         0,
         r#"=HYPERLINK("https://owlzops.com", "Generated by Owlzops Mapper")"#,
-        &subtle,
+        subtle,
     )?;
-    sheet.write_formula_with_format(
-        branding_row + 1,
+    w.next_row();
+    w.sheet.write_formula_with_format(
+        w.current_row(),
         0,
         r#"=HYPERLINK("mailto:hello@owlzops.com", "Need help with server audit or migration? Contact us: hello@owlzops.com")"#,
-        &subtle,
+        subtle,
     )?;
+    w.next_row();
+    w.next_row();
 
-    let start = branding_row + 3;
-    sheet.write_string_with_format(start, 0, "Top Memory Processes", &header_format())?;
-    sheet.write_string_with_format(start, 1, "PID", &header_format())?;
-    sheet.write_string_with_format(start, 2, "RAM (MB)", &header_format())?;
-    for (i, p) in report.host.top_memory_processes.iter().enumerate() {
-        let row = start + 1 + i as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, &p.name, &band)?;
-        sheet.write_number_with_format(row, 1, p.pid as f64, &number_format())?;
-        sheet.write_number_with_format(row, 2, p.memory_mb as f64, &number_format())?;
+    // Top Memory Processes
+    w.write_header(&["Process", "PID", "RAM (MB)"])?;
+    for p in &report.host.top_memory_processes {
+        let band = fmts.row_band(w.current_row());
+        w.write_string(0, &p.name, band)?;
+        w.write_number(1, p.pid as f64, &fmts.number)?;
+        w.write_number(2, p.memory_mb as f64, &fmts.number)?;
+        w.next_row();
     }
 
-    let mut data: Vec<Vec<String>> = vec![vec!["Field".to_string(), "Value".to_string()]];
-    for (label, value) in &rows {
-        data.push(vec![label.to_string(), value.clone()]);
-    }
-    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0])?;
-
+    w.apply_col_widths_with_min(&[20.0, 15.0, 15.0])?;
     Ok(sheet)
 }
 
@@ -1503,171 +1483,109 @@ fn sheet_storage(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xlsx
     Ok(sheet)
 }
 
-fn sheet_databases(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_databases_named(report, "Databases")
-}
+fn sheet_databases(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Databases")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
-fn sheet_databases_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
-
-    write_headers(
-        &mut sheet,
-        &["Engine", "Version", "Data Directory", "Size (GB)"],
-    )?;
-
-    let num_fmt = number_format();
-    let mut data: Vec<Vec<String>> = vec![vec![
-        "Engine".to_string(),
-        "Version".to_string(),
-        "Data Directory".to_string(),
-        "Size (GB)".to_string(),
-    ]];
-
-    for (i, db) in report.databases.iter().enumerate() {
-        let row = (i + 1) as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, &db.engine, &band)?;
-        sheet.write_string_with_format(row, 1, &db.version, &band)?;
-        sheet.write_string_with_format(row, 2, &db.data_dir, &band)?;
-        sheet.write_number_with_format(row, 3, db.size_mb as f64 / 1024.0, &num_fmt)?;
-
-        data.push(vec![
-            db.engine.clone(),
-            db.version.clone(),
-            db.data_dir.clone(),
-            format!("{:.2}", db.size_mb as f64 / 1024.0),
-        ]);
+    if report.databases.is_empty() {
+        return Ok(sheet);
     }
 
-    if !report.databases.is_empty() {
-        let total_row = report.databases.len() as u32 + 2;
-        let total_gb: f64 = report
-            .databases
-            .iter()
-            .map(|d| d.size_mb as f64 / 1024.0)
-            .sum();
-        sheet.write_string_with_format(total_row, 2, "Total", &header_format())?;
-        sheet.write_number_with_format(total_row, 3, total_gb, &num_fmt)?;
+    w.write_header(&["Engine", "Version", "Data Directory", "Size (GB)"])?;
 
-        data.push(vec![
-            String::new(),
-            String::new(),
-            "Total".to_string(),
-            format!("{:.2}", total_gb),
-        ]);
+    for db in &report.databases {
+        let band = fmts.row_band(w.current_row());
+        w.write_string(0, &db.engine, band)?;
+        w.write_string(1, &db.version, band)?;
+        w.write_string(2, &db.data_dir, band)?;
+        w.write_number(3, db.size_mb as f64 / 1024.0, &fmts.number)?;
+        w.next_row();
     }
 
-    auto_fit_columns(&mut sheet, &data, &[10.0, 20.0, 20.0, 10.0])?;
+    w.apply_col_widths_with_min(&[12.0, 30.0, 20.0, 10.0])?;
     Ok(sheet)
 }
 
-fn sheet_network(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_network_named(report, "Network")
-}
+fn sheet_network(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Network")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
-fn sheet_network_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
-
-    sheet.write_string_with_format(0, 0, "Firewall Active", &header_format())?;
-    sheet.write_string_with_format(
-        0,
-        1,
-        report.network.firewall_active.to_string(),
-        &row_band(0),
+    // Firewall Active
+    let fw_fmt = if report.network.firewall_active {
+        Some(&fmts.ok)
+    } else {
+        Some(&fmts.critical)
+    };
+    w.write_kv_row(
+        "Firewall Active",
+        &report.network.firewall_active.to_string(),
+        fw_fmt,
     )?;
-    sheet.write_string_with_format(1, 0, "DNS Resolvers", &header_format())?;
-    sheet.write_string_with_format(1, 1, report.network.dns_resolvers.join(", "), &row_band(1))?;
 
-    let mut data = vec![
-        vec![
-            "Firewall Active".to_string(),
-            report.network.firewall_active.to_string(),
-        ],
-        vec![
-            "DNS Resolvers".to_string(),
-            report.network.dns_resolvers.join(", "),
-        ],
-    ];
-
-    let port_start = 3u32;
-    write_headers_at(
-        &mut sheet,
-        port_start,
-        &["Protocol", "Port", "Process", "Bind Address"],
+    // DNS Resolvers
+    w.write_kv_row(
+        "DNS Resolvers",
+        &report.network.dns_resolvers.join(", "),
+        None,
     )?;
-    for (i, p) in report.network.listening_ports.iter().enumerate() {
-        let row = port_start + 1 + i as u32;
-        let band = row_band(row);
 
-        sheet.write_string_with_format(row, 0, &p.protocol, &band)?;
-        sheet.write_string_with_format(row, 1, &p.port, &band)?;
-        sheet.write_string_with_format(row, 2, &p.process, &band)?;
+    w.next_row();
+
+    // Listening Ports table
+    w.write_header(&["Protocol", "Port", "Process", "Bind Address"])?;
+    for p in &report.network.listening_ports {
+        let band = fmts.row_band(w.current_row());
+        w.write_string(0, &p.protocol, band)?;
+        w.write_string(1, &p.port, band)?;
+        w.write_string(2, &p.process, band)?;
         let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
-            critical_band(row)
+            fmts.critical_band(w.current_row())
         } else {
-            ok_band(row)
+            fmts.ok_band(w.current_row())
         };
-        sheet.write_string_with_format(row, 3, &p.bind_address, &addr_fmt)?;
-
-        data.push(vec![
-            p.protocol.clone(),
-            p.port.clone(),
-            p.process.clone(),
-            p.bind_address.clone(),
-        ]);
+        w.write_string(3, &p.bind_address, addr_fmt)?;
+        w.next_row();
     }
 
-    let ssl_start = port_start + report.network.listening_ports.len() as u32 + 3;
-    write_headers_at(&mut sheet, ssl_start, &["Domain", "Expires", "Days Left"])?;
-    for (i, cert) in report.network.ssl_certificates.iter().enumerate() {
-        let row = ssl_start + 1 + i as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, &cert.domain, &band)?;
-        sheet.write_string_with_format(row, 1, &cert.expiry_date, &band)?;
-        match cert.days_remaining {
-            Some(d) if cert.is_critical => {
-                sheet.write_number_with_format(row, 2, d as f64, &critical_band(row))?
+    w.next_row();
+
+    // SSL Certificates
+    if !report.network.ssl_certificates.is_empty() {
+        w.write_header(&["Domain", "Expires", "Days Left"])?;
+        for cert in &report.network.ssl_certificates {
+            let band = fmts.row_band(w.current_row());
+            w.write_string(0, &cert.domain, band)?;
+            w.write_string(1, &cert.expiry_date, band)?;
+            if let Some(days) = cert.days_remaining {
+                let days_fmt = if cert.is_critical {
+                    fmts.critical_band(w.current_row())
+                } else if cert.is_warning {
+                    fmts.warning_band(w.current_row())
+                } else {
+                    fmts.ok_band(w.current_row())
+                };
+                w.write_number(2, days as f64, days_fmt)?;
+            } else {
+                w.write_string(2, "unknown", band)?;
             }
-            Some(d) if cert.is_warning => {
-                sheet.write_number_with_format(row, 2, d as f64, &warning_band(row))?
-            }
-            Some(d) => sheet.write_number_with_format(row, 2, d as f64, &ok_band(row))?,
-            None => sheet.write_string_with_format(row, 2, "unknown", &band)?,
-        };
-
-        data.push(vec![
-            cert.domain.clone(),
-            cert.expiry_date.clone(),
-            cert.days_remaining
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            String::new(),
-        ]);
+            w.next_row();
+        }
+        w.next_row();
     }
 
-    let hosts_start = ssl_start + report.network.ssl_certificates.len() as u32 + 3;
-    sheet.write_string_with_format(
-        hosts_start,
-        0,
-        "Custom /etc/hosts Overrides",
-        &header_format(),
-    )?;
-    for (i, h) in report.network.custom_host_overrides.iter().enumerate() {
-        let row = hosts_start + 1 + i as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, h, &band)?;
-        data.push(vec![h.clone(), String::new(), String::new(), String::new()]);
+    // Custom /etc/hosts overrides
+    if !report.network.custom_host_overrides.is_empty() {
+        w.write_section_title("Custom /etc/hosts Overrides")?;
+        for h in &report.network.custom_host_overrides {
+            let band = fmts.row_band(w.current_row());
+            w.write_string(0, h, band)?;
+            w.next_row();
+        }
     }
 
-    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 12.0])?;
+    w.apply_col_widths_with_min(&[12.0, 12.0, 12.0, 12.0])?;
     Ok(sheet)
 }
 
@@ -1803,68 +1721,52 @@ fn sheet_security(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
     Ok(sheet)
 }
 
-fn sheet_docker(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_docker_named(report, "Docker")
-}
+fn sheet_docker(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Docker")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
-fn sheet_docker_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
-
-    sheet.write_string_with_format(0, 0, "Docker Active", &header_format())?;
-    sheet.write_string_with_format(
-        0,
-        1,
-        report.topology.docker_active.to_string(),
-        &row_band(0),
+    w.write_kv_row(
+        "Docker Active",
+        &report.topology.docker_active.to_string(),
+        None,
     )?;
-    sheet.write_string_with_format(1, 0, "Total Images", &header_format())?;
-    sheet.write_number_with_format(1, 1, report.topology.images_count as f64, &number_format())?;
-    sheet.write_string_with_format(2, 0, "Dangling Images", &header_format())?;
-    sheet.write_number_with_format(
-        2,
-        1,
-        report.topology.dangling_images_count as f64,
-        &number_format(),
-    )?;
-    sheet.write_string_with_format(3, 0, "Dangling Wasted Space (GB)", &header_format())?;
-    sheet.write_number_with_format(
-        3,
-        1,
-        report.topology.total_dangling_size_mb as f64 / 1024.0,
-        &number_format(),
+    w.write_kv_row(
+        "Total Images",
+        &report.topology.images_count.to_string(),
+        None,
     )?;
 
-    let mut data = vec![
-        vec![
-            "Docker Active".to_string(),
-            report.topology.docker_active.to_string(),
-        ],
-        vec![
-            "Total Images".to_string(),
-            report.topology.images_count.to_string(),
-        ],
-        vec![
-            "Dangling Images".to_string(),
-            report.topology.dangling_images_count.to_string(),
-        ],
-        vec![
-            "Dangling Wasted Space (GB)".to_string(),
-            format!(
-                "{:.2}",
-                report.topology.total_dangling_size_mb as f64 / 1024.0
-            ),
-        ],
-    ];
+    let dangling_count = report.topology.dangling_images_count.to_string();
+    let dangling_size = format!(
+        "{:.2}",
+        report.topology.total_dangling_size_mb as f64 / 1024.0
+    );
+    if report.topology.dangling_images_count > 0 {
+        w.write_kv_row(
+            "Dangling (Unused) Images",
+            &dangling_count,
+            Some(fmts.warning_band(w.current_row())),
+        )?;
+        w.write_kv_row(
+            "Dangling Wasted Space (GB)",
+            &dangling_size,
+            Some(fmts.warning_band(w.current_row())),
+        )?;
+    } else {
+        w.write_kv_row("Dangling (Unused) Images", &dangling_count, None)?;
+        w.write_kv_row("Dangling Wasted Space (GB)", &dangling_size, None)?;
+    }
 
-    let containers_start = 5u32;
-    write_headers_at(
-        &mut sheet,
-        containers_start,
-        &[
+    w.write_kv_row(
+        "Dangling Volumes",
+        &report.topology.dangling_volumes_count.to_string(),
+        None,
+    )?;
+
+    if !report.topology.containers.is_empty() {
+        w.next_row();
+        w.write_header(&[
             "Name",
             "Image",
             "State",
@@ -1873,61 +1775,49 @@ fn sheet_docker_named(
             "Log Size (GB)",
             "Mounts",
             "Security Issues",
-        ],
-    )?;
-    for (i, c) in report.topology.containers.iter().enumerate() {
-        let row = containers_start + 1 + i as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, &c.name, &band)?;
-        sheet.write_string_with_format(row, 1, &c.image, &band)?;
-        sheet.write_string_with_format(row, 2, &c.state, &band)?;
-        sheet.write_string_with_format(row, 3, &c.status, &band)?;
-        sheet.write_number_with_format(row, 4, c.size_mb as f64 / 1024.0, &number_format())?;
-        sheet.write_number_with_format(row, 5, c.log_size_mb as f64 / 1024.0, &number_format())?;
-        sheet.write_string_with_format(row, 6, c.mounts.join(" | "), &band)?;
+        ])?;
+        for c in &report.topology.containers {
+            let band = fmts.row_band(w.current_row());
+            w.write_string(0, &c.name, band)?;
+            w.write_string(1, &c.image, band)?;
+            w.write_string(2, &c.state, band)?;
+            w.write_string(3, &c.status, band)?;
+            w.write_number(4, c.size_mb as f64 / 1024.0, &fmts.number)?;
+            w.write_number(5, c.log_size_mb as f64 / 1024.0, &fmts.number)?;
+            let mounts = if c.mounts.is_empty() {
+                "-".to_string()
+            } else {
+                c.mounts.join(" | ")
+            };
+            w.write_string(6, &mounts, band)?;
 
-        let issues = c.security_issues();
-        let issue_str = if issues.is_empty() {
-            "-".to_string()
-        } else {
-            issues.join(", ")
-        };
-        if issue_str != "-" {
-            sheet.write_string_with_format(row, 7, &issue_str, &critical_band(row))?;
-        } else {
-            sheet.write_string_with_format(row, 7, &issue_str, &band)?;
+            let issue_list = c.security_issues();
+            let issue_str = if issue_list.is_empty() {
+                "-".to_string()
+            } else {
+                issue_list.join(", ")
+            };
+            if issue_str != "-" {
+                w.write_string(7, &issue_str, fmts.critical_band(w.current_row()))?;
+            } else {
+                w.write_string(7, &issue_str, band)?;
+            }
+            w.next_row();
         }
-
-        data.push(vec![
-            c.name.clone(),
-            c.image.clone(),
-            c.state.clone(),
-            c.status.clone(),
-            format!("{:.2}", c.size_mb as f64 / 1024.0),
-            format!("{:.2}", c.log_size_mb as f64 / 1024.0),
-            c.mounts.join(" | "),
-            issue_str,
-        ]);
     }
 
-    auto_fit_columns(
-        &mut sheet,
-        &data,
-        &[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0],
-    )?;
+    w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
     Ok(sheet)
 }
 
-fn sheet_packages(report: &AgentReport) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    sheet_packages_named(report, "Packages")
-}
+fn sheet_packages(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Packages")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
 
-fn sheet_packages_named(
-    report: &AgentReport,
-    sheet_name: &str,
-) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
-    let mut sheet = rust_xlsxwriter::Worksheet::new();
-    sheet.set_name(sheet_name)?;
+    if !report.packages.manager.is_known() {
+        return Ok(sheet);
+    }
 
     let manager_str = match report.packages.manager {
         PackageManager::Apt => "apt (Debian/Ubuntu)",
@@ -1937,68 +1827,38 @@ fn sheet_packages_named(
         PackageManager::Zypper => "zypper (openSUSE/SLES)",
         PackageManager::Unknown => "Unknown",
     };
-    sheet.write_string_with_format(0, 0, "Package Manager", &header_format())?;
-    sheet.write_string_with_format(0, 1, manager_str, &row_band(0))?;
-    sheet.write_string_with_format(1, 0, "Installed Packages", &header_format())?;
-    sheet.write_number_with_format(
-        1,
-        1,
-        report.packages.installed_count as f64,
-        &number_format(),
+    w.write_kv_row("Package Manager", manager_str, None)?;
+    w.write_kv_row(
+        "Installed Packages",
+        &report.packages.installed_count.to_string(),
+        None,
     )?;
-    sheet.write_string_with_format(2, 0, "Cache Freshly Refreshed", &header_format())?;
-    sheet.write_string_with_format(
-        2,
-        1,
-        report.packages.cache_refreshed.to_string(),
-        &row_band(2),
+    w.write_kv_row(
+        "Cache Freshly Refreshed",
+        &report.packages.cache_refreshed.to_string(),
+        None,
     )?;
 
-    let mut data = vec![
-        vec!["Package Manager".to_string(), manager_str.to_string()],
-        vec![
-            "Installed Packages".to_string(),
-            report.packages.installed_count.to_string(),
-        ],
-        vec![
-            "Cache Freshly Refreshed".to_string(),
-            report.packages.cache_refreshed.to_string(),
-        ],
-    ];
-
-    let upg_start = 4u32;
-    write_headers_at(
-        &mut sheet,
-        upg_start,
-        &["Package", "Current", "Available", "Security"],
-    )?;
-    let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
-    sorted.sort_by_key(|b| std::cmp::Reverse(b.is_security));
-    for (i, p) in sorted.iter().enumerate() {
-        let row = upg_start + 1 + i as u32;
-        let band = row_band(row);
-        sheet.write_string_with_format(row, 0, &p.name, &band)?;
-        sheet.write_string_with_format(row, 1, &p.current_version, &band)?;
-        sheet.write_string_with_format(row, 2, &p.new_version, &band)?;
-        if p.is_security {
-            sheet.write_string_with_format(row, 3, "YES", &critical_band(row))?;
-        } else {
-            sheet.write_string_with_format(row, 3, "-", &band)?;
-        }
-
-        data.push(vec![
-            p.name.clone(),
-            p.current_version.clone(),
-            p.new_version.clone(),
+    if !report.packages.upgradable.is_empty() {
+        w.next_row();
+        w.write_header(&["Package", "Current", "Available", "Security"])?;
+        let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.is_security));
+        for p in &sorted {
+            let band = fmts.row_band(w.current_row());
+            w.write_string(0, &p.name, band)?;
+            w.write_string(1, &p.current_version, band)?;
+            w.write_string(2, &p.new_version, band)?;
             if p.is_security {
-                "YES".to_string()
+                w.write_string(3, "YES", fmts.critical_band(w.current_row()))?;
             } else {
-                "-".to_string()
-            },
-        ]);
+                w.write_string(3, "-", band)?;
+            }
+            w.next_row();
+        }
     }
 
-    auto_fit_columns(&mut sheet, &data, &[12.0, 12.0, 12.0, 10.0])?;
+    w.apply_col_widths_with_min(&[20.0, 20.0, 20.0, 10.0])?;
     Ok(sheet)
 }
 
@@ -2013,13 +1873,13 @@ pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
         std::slice::from_ref(report),
         false,
     )?);
-    workbook.push_worksheet(sheet_overview(report)?);
+    workbook.push_worksheet(sheet_overview(report, &fmts)?);
     workbook.push_worksheet(sheet_storage(report, &fmts)?);
-    workbook.push_worksheet(sheet_databases(report)?);
-    workbook.push_worksheet(sheet_network(report)?);
+    workbook.push_worksheet(sheet_databases(report, &fmts)?);
+    workbook.push_worksheet(sheet_network(report, &fmts)?);
     workbook.push_worksheet(sheet_security(report, &fmts)?);
-    workbook.push_worksheet(sheet_docker(report)?);
-    workbook.push_worksheet(sheet_packages(report)?);
+    workbook.push_worksheet(sheet_docker(report, &fmts)?);
+    workbook.push_worksheet(sheet_packages(report, &fmts)?);
 
     workbook.save(path)?;
     Ok(())
