@@ -78,43 +78,43 @@ impl CriticalFlags {
     pub fn risk_penalty(&self) -> u8 {
         let mut score = 0u8;
         if self.firewall_disabled {
-            score += RISK_NO_FIREWALL;
+            score = score.saturating_add(RISK_NO_FIREWALL);
         }
         if self.ssh_root_login {
-            score += RISK_SSH_ROOT_LOGIN;
+            score = score.saturating_add(RISK_SSH_ROOT_LOGIN);
         }
         if self.security_updates {
-            score += RISK_SECURITY_UPDATES;
+            score = score.saturating_add(RISK_SECURITY_UPDATES);
         }
         if self.critical_ssl {
-            score += RISK_CRITICAL_SSL_MAX;
+            score = score.saturating_add(RISK_CRITICAL_SSL_MAX);
         }
         if self.failed_services {
-            score += RISK_FAILED_SERVICES;
+            score = score.saturating_add(RISK_FAILED_SERVICES);
         }
         if self.no_backups {
-            score += RISK_NO_BACKUP;
+            score = score.saturating_add(RISK_NO_BACKUP);
         }
         if self.sudo_nopasswd {
-            score += RISK_SUDO_NOPASSWD;
+            score = score.saturating_add(RISK_SUDO_NOPASSWD);
         }
         if self.ntp_not_synced {
-            score += RISK_NTP_NOT_SYNCED;
+            score = score.saturating_add(RISK_NTP_NOT_SYNCED);
         }
         if self.ssh_password_auth {
-            score += RISK_SSH_PASSWORD_AUTH;
+            score = score.saturating_add(RISK_SSH_PASSWORD_AUTH);
         }
         if self.oom_kills {
-            score += RISK_OOM_KILLS;
+            score = score.saturating_add(RISK_OOM_KILLS);
         }
         if self.sudoers_bad_mode {
-            score += RISK_SUDOERS_MODE;
+            score = score.saturating_add(RISK_SUDOERS_MODE);
         }
         let sysctl_penalty = std::cmp::min(
             self.sysctl_issues_count as u8 * RISK_SYSCTL_PER_ISSUE,
             RISK_SYSCTL_MAX,
         );
-        score += sysctl_penalty;
+        score = score.saturating_add(sysctl_penalty);
         score.min(100)
     }
 }

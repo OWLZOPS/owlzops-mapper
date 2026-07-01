@@ -167,35 +167,29 @@ fn zypper_refresh_cache() -> bool {
 }
 
 fn zypper_security_package_names() -> HashSet<String> {
+    const MAX_PATCHES_TO_INSPECT: usize = 50;
+
     let mut pkg_names = HashSet::new();
 
-    let Some(stdout) = crate::utils::run_with_timeout(
-        "zypper",
-        &["-n", "-q", "list-patches", "--category", "security"],
-        30,
-    ) else {
+    // 1. get list of security patches
+    let Some(list_out) =
+        crate::utils::run_with_timeout("zypper", &["list-patches", "--category", "security"], 30)
+    else {
         return pkg_names;
     };
 
-    let mut patch_names: Vec<String> = Vec::new();
+    let patch_names: Vec<String> = list_out
+        .lines()
+        .skip_while(|l| !l.starts_with("---"))
+        .skip(1)
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            parts.first().map(|s| s.to_string())
+        })
+        .collect();
 
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("security") {
-            continue;
-        }
-        let cols: Vec<&str> = trimmed.splitn(6, '|').collect();
-        if cols.len() >= 3 {
-            let patch = cols[2].trim().to_string();
-            if !patch.is_empty() {
-                patch_names.push(patch);
-            }
-        }
-    }
-
-    // Use sequential iterator – parallel zypper calls break RPM DB lock.
-    // Each call wrapped in 15s timeout.
-    for patch in &patch_names {
+    // 2. inspect up to MAX_PATCHES_TO_INSPECT patches (each with a timeout)
+    for patch in patch_names.iter().take(MAX_PATCHES_TO_INSPECT) {
         let Some(info_out) =
             crate::utils::run_with_timeout("zypper", &["-q", "info", "-t", "patch", patch], 15)
         else {
