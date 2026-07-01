@@ -186,7 +186,6 @@ pub fn gather_security_info() -> SecurityInfo {
                     .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
                     .count();
                 auth_keys_map.insert(username.clone(), count);
-                auth_keys_map.insert(username.clone(), count);
                 shell_usernames.push(username);
             }
         }

@@ -168,31 +168,31 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     }
 
     // --- network.listening_ports (key: bind_address:port) ---
-    let before_ports: HashSet<(String, String)> = before
+    let before_ports: HashSet<(String, String, String)> = before
         .network
         .listening_ports
         .iter()
-        .map(|p| (p.bind_address.clone(), p.port.clone()))
+        .map(|p| (p.protocol.clone(), p.bind_address.clone(), p.port.clone()))
         .collect();
-    let after_ports: HashSet<(String, String)> = after
+    let after_ports: HashSet<(String, String, String)> = after
         .network
         .listening_ports
         .iter()
-        .map(|p| (p.bind_address.clone(), p.port.clone()))
+        .map(|p| (p.protocol.clone(), p.bind_address.clone(), p.port.clone()))
         .collect();
 
     for added in after_ports.difference(&before_ports) {
         changes.push(Change {
             field: "network.listening_ports".into(),
             before: None,
-            after: Some(format!("{}:{}", added.0, added.1)),
+            after: Some(format!("{}:{}:{}", added.0, added.1, added.2)),
             severity: Severity::Degraded,
         });
     }
     for removed in before_ports.difference(&after_ports) {
         changes.push(Change {
             field: "network.listening_ports".into(),
-            before: Some(format!("{}:{}", removed.0, removed.1)),
+            before: Some(format!("{}:{}:{}", removed.0, removed.1, removed.2)),
             after: None,
             severity: Severity::Improved,
         });
