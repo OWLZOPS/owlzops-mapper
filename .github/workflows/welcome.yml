@@ -10,8 +10,8 @@ jobs:
     steps:
       - uses: actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d  # v3.1.0
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          issue-message: |
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          issue_message: |
             👋 Thanks for opening an issue in **owlzops-mapper**!
 
             While you wait:
@@ -20,7 +20,7 @@ jobs:
             - ⭐ Star the repo if the tool is useful!
 
             We'll respond within 24-48 hours.
-          pr-message: |
+          pr_message: |
             🎉 First PR to owlzops-mapper — great!
 
             Pre-review checklist:
