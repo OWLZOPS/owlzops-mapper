@@ -72,7 +72,12 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                 if l.to_lowercase().contains("nopasswd") {
                     // Exclude entries that are exclusively for owlzops-mapper itself
                     // (needed for remote scanning without password prompt)
-                    let is_self_only = l.contains("owlzops-mapper") && !l.contains("ALL");
+                    let is_self_only = l.contains("owlzops-mapper")
+                        && !l
+                            .rsplit(':')
+                            .next()
+                            .map(|cmd| cmd.trim() == "ALL")
+                            .unwrap_or(false);
                     if is_self_only {
                         continue;
                     }
