@@ -126,7 +126,7 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
 
       - name: Create Pull Request for changelog update
-        uses: peter-evans/create-pull-request@eccdff1bb7d20ce8e2e9ad19687ca65b61b4a45e  # v7.0.8
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e  # v7.0.8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "docs: update CHANGELOG for ${{ github.ref_name }}"
