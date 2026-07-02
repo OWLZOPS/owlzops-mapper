@@ -820,7 +820,7 @@ fn sheet_host_combined(
     w.next_row();
     write_packages_section(&mut w, report)?;
 
-    w.apply_col_widths_with_min(&[20.0, 15.0, 15.0])?;
+    w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
     Ok(sheet)
 }
 
