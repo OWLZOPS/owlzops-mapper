@@ -274,17 +274,16 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let oom_kills = crate::utils::run_with_timeout("dmesg", &[], 5)
-        .map(|out| {
-            out.lines()
-                .filter(|l| l.to_lowercase().contains("killed process"))
-                .count()
-        })
-        .unwrap_or(0);
-
+    // Single dmesg call reused for both OOM kills and error detection
     let dmesg_raw = crate::utils::run_with_timeout("dmesg", &["--ctime"], 5)
         .or_else(|| crate::utils::run_with_timeout("dmesg", &["-T"], 5))
         .unwrap_or_default();
+
+    let oom_kills = dmesg_raw
+        .lines()
+        .filter(|l| l.to_lowercase().contains("killed process"))
+        .count();
+
     let dmesg_errors: Vec<String> = dmesg_raw
         .lines()
         .filter(|l| {
