@@ -26,6 +26,47 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
     }
 }
 
+pub fn run_child_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Option<std::process::Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let deadline = Duration::from_secs(timeout_secs);
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                child.stdout.take()?.read_to_end(&mut stdout).ok()?;
+                child.stderr.take()?.read_to_end(&mut stderr).ok()?;
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if start.elapsed() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                thread::sleep(Duration::from_millis(100));
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Execute a command with a timeout.
 /// Returns stdout if the command exits with success **and** within the timeout.
 /// On timeout the child process is killed and None is returned.

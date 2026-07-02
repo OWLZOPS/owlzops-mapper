@@ -6,6 +6,7 @@ use bollard::volume::ListVolumesOptions;
 use std::collections::HashMap;
 use std::default::Default;
 use std::fs;
+use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::warn;
 
@@ -19,13 +20,17 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             let mut total_dangling_size_mb = 0;
             let mut dangling_images = Vec::new();
 
-            if let Ok(images) = docker
-                .list_images(Some(ListImagesOptions::<String> {
+            // list_images with 10s timeout
+            let images_result = tokio::time::timeout(
+                Duration::from_secs(10),
+                docker.list_images(Some(ListImagesOptions::<String> {
                     all: true,
                     ..Default::default()
-                }))
-                .await
-            {
+                })),
+            )
+            .await;
+
+            if let Ok(Ok(images)) = images_result {
                 for img in images {
                     images_count += 1;
                     let size_mb = (img.size / (1024 * 1024)) as u64;
@@ -48,18 +53,33 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         });
                     }
                 }
+            } else {
+                warn!("Docker list_images timed out or failed");
             }
+
             dangling_images.sort_by_key(|b| std::cmp::Reverse(b.size_mb));
 
-            if let Ok(containers) = docker
-                .list_containers(Some(ListContainersOptions::<String> {
+            // list_containers with 10s timeout
+            let containers_result = tokio::time::timeout(
+                Duration::from_secs(10),
+                docker.list_containers(Some(ListContainersOptions::<String> {
                     all: true,
                     size: true,
                     ..Default::default()
-                }))
-                .await
-            {
-                // Spawn inspect tasks using JoinSet (replaces FuturesUnordered)
+                })),
+            )
+            .await;
+
+            let containers = match containers_result {
+                Ok(Ok(ctrs)) => ctrs,
+                _ => {
+                    warn!("Docker list_containers timed out or failed");
+                    vec![]
+                }
+            };
+
+            if !containers.is_empty() {
+                // Spawn inspect tasks with individual 5s timeouts
                 let mut join_set: JoinSet<(
                     bollard::models::ContainerSummary,
                     Option<bollard::models::ContainerInspectResponse>,
@@ -71,7 +91,13 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         let id = id.to_string();
                         let c = c.clone();
                         join_set.spawn(async move {
-                            let inspect = docker.inspect_container(&id, None).await.ok();
+                            let inspect = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                docker.inspect_container(&id, None),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok());
                             (c, inspect)
                         });
                     }

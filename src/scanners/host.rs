@@ -274,17 +274,16 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let oom_kills = crate::utils::run_with_timeout("dmesg", &[], 5)
-        .map(|out| {
-            out.lines()
-                .filter(|l| l.to_lowercase().contains("killed process"))
-                .count()
-        })
-        .unwrap_or(0);
-
+    // Single dmesg call reused for both OOM kills and error detection
     let dmesg_raw = crate::utils::run_with_timeout("dmesg", &["--ctime"], 5)
         .or_else(|| crate::utils::run_with_timeout("dmesg", &["-T"], 5))
         .unwrap_or_default();
+
+    let oom_kills = dmesg_raw
+        .lines()
+        .filter(|l| l.to_lowercase().contains("killed process"))
+        .count();
+
     let dmesg_errors: Vec<String> = dmesg_raw
         .lines()
         .filter(|l| {
@@ -468,7 +467,10 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
 }
 
 /// Detect backup tools and last Restic snapshot.
-fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
+fn gather_backup_info(
+    cron_jobs: &[String],
+    systemd_timers: &[String],
+) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
     let mut last_restic = None;
 
@@ -534,8 +536,20 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
         l.contains("restic") || l.contains("borg") || l.contains("rsync") || l.contains("backup")
     });
 
-    if backup_in_cron && tools.is_empty() {
-        tools.push("cron (rsync/backup)".to_string());
+    let backup_in_timer = systemd_timers.iter().any(|t| {
+        let l = t.to_lowercase();
+        l.contains("restic") || l.contains("borg")
+    });
+
+    if (backup_in_cron || backup_in_timer) && tools.is_empty() {
+        tools.push(
+            if backup_in_timer {
+                "systemd-timer (restic/borg)"
+            } else {
+                "cron (rsync/backup)"
+            }
+            .to_string(),
+        );
     }
 
     (tools, last_restic)
@@ -617,7 +631,7 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
 
     let (native_services, failed_services, cron_jobs, systemd_timers) = gather_services();
 
-    let (backup_tools, last_restic_snapshot) = gather_backup_info(&cron_jobs);
+    let (backup_tools, last_restic_snapshot) = gather_backup_info(&cron_jobs, &systemd_timers);
     let (ntp_synchronized, time_offset_ms) = gather_ntp_info();
 
     HostInfo {

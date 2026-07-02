@@ -62,6 +62,9 @@ pub struct AuditArgs {
 
     #[arg(long)]
     pub local_binary: Option<String>,
+
+    #[arg(long, default_value = "120")]
+    pub remote_timeout_secs: u64,
 }
 
 #[derive(Args, Debug, Clone)]
