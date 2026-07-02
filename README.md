@@ -39,17 +39,15 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.5
+## Highlights v0.4.7
 
-- **Risk Score breakdown** – the terminal dashboard now shows exactly which findings contribute to the score, e.g. `• Firewall inactive (+30)`.
-- **Refactored host scanner** – split the 200‑line `gather_host_info` into focused sub‑collectors, improving readability, testability and maintainability.
-- **Extended test coverage** – added unit tests for compare logic, cron parser, backup detection, Excel export and more.
-- **Docker mount path truncation** – long volume paths are now intelligently truncated in the terminal table, keeping the beginning of the path visible.
-- **Better backup detection** – no more false positives for restic/borg/duplicati when merely installed but unused.
-- **Cron job collection** – `/etc/anacrontab` and `/etc/cron.d/*` are now included, alongside standard crontabs.
-- **Container inspection warnings** – Docker containers that fail to be inspected are now logged with a clear warning, never silently skipped.
-- **Firewall detection refined** – correctly identifies host firewall while ignoring Docker‑only rules.
-- **Timeout handling** – all external commands have explicit timeouts, preventing hung scans.
+- **Critical bug fixes** – removed `panic = "abort"` from release profile, ensuring scanner failures no longer crash the whole binary; fixed remote scan timeout that blocked fleet audits; corrected byte‑index panic in error logging.
+- **Backup detection improvements** – now checks systemd timers for backup tools, reducing false negatives; no longer flags the documented `owlzops-mapper` sudo entry as a security finding.
+- **Package parsers with tests** – isolated parsing logic for apt/dnf/yum/pacman/zypper into pure functions and added unit tests for each; APT parser now correctly reads new version from upgradable lists.
+- **Docker & SSH timeouts** – all Docker API calls are wrapped in explicit deadlines; remote SSH/SCP commands respect the new `--remote-timeout` flag.
+- **Excel sheet collision protection** – automatic deduplication with `~2`/`~3` suffixes when fleet hostnames would produce duplicate sheet names.
+- **Performance** – `dmesg` and `df -i` now called once instead of N times; `restic snapshots` runs once and reuses output for date extraction.
+- **Documentation** – `docs/FIELDS.md` updated to reflect actual field names in the latest JSON schema.
 
 ---
 
@@ -156,6 +154,7 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `--copy-binary` | Copy the local binary to remote hosts before scanning. The binary **must** be statically linked (musl). GitHub release binaries are static, so you can safely use this flag with them. |
 | `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you're running a debug build locally but have a release build for remote hosts. |
 | `--remote-path <PATH>` | Path where the binary is placed on remote hosts (default: `/tmp/owlzops-mapper`) |
+| `--remote-timeout <SECS>` | Maximum time to wait for remote scan (default: 120 seconds) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
