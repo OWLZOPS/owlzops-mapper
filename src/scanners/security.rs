@@ -25,15 +25,66 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
 
 /// Fallback used when `sshd -T` is unavailable.
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
-    if let Ok(sshd_config) = fs::read_to_string("/etc/ssh/sshd_config") {
-        for line in sshd_config.lines() {
+    let mut config_lines = Vec::new();
+
+    // Read the main config file
+    if let Ok(contents) = fs::read_to_string("/etc/ssh/sshd_config") {
+        for line in contents.lines() {
             let clean = line.trim();
-            if clean.starts_with("PasswordAuthentication") {
-                *pass_auth = clean.ends_with("yes");
+            if clean.is_empty() || clean.starts_with('#') {
+                continue;
             }
-            if clean.starts_with("PermitRootLogin") {
-                *root_login = !clean.ends_with("no");
+            if clean.starts_with("Include") {
+                let path_part = clean.strip_prefix("Include").unwrap_or("").trim();
+                if path_part.is_empty() {
+                    continue;
+                }
+                // Expand glob pattern if present
+                if path_part.contains('*') {
+                    if let Some(parent) = std::path::Path::new(path_part).parent()
+                        && let Some(_pattern) = std::path::Path::new(path_part).file_name()
+                        && let Ok(entries) = std::fs::read_dir(parent)
+                    {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if let Some(name) = path.file_name() {
+                                let name = name.to_string_lossy();
+                                if name.ends_with(".conf")
+                                    && !name.starts_with('.')
+                                    && let Ok(inc_contents) = std::fs::read_to_string(&path)
+                                {
+                                    for l in inc_contents.lines() {
+                                        let l = l.trim();
+                                        if !l.is_empty() && !l.starts_with('#') {
+                                            config_lines.push(l.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(inc_contents) = std::fs::read_to_string(path_part) {
+                    for l in inc_contents.lines() {
+                        let l = l.trim();
+                        if !l.is_empty() && !l.starts_with('#') {
+                            config_lines.push(l.to_string());
+                        }
+                    }
+                }
+            } else {
+                config_lines.push(clean.to_string());
             }
+        }
+    }
+
+    // Parse collected config lines
+    for line in &config_lines {
+        let clean = line.trim();
+        if clean.starts_with("PasswordAuthentication") {
+            *pass_auth = clean.ends_with("yes");
+        }
+        if clean.starts_with("PermitRootLogin") {
+            *root_login = !clean.ends_with("no");
         }
     }
 }
