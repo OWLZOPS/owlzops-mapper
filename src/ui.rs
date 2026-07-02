@@ -95,6 +95,21 @@ fn render_header(report: &AgentReport) {
         risk_color, report.risk_score
     );
 
+    // Risk Score breakdown
+    let flags = crate::scoring::CriticalFlags::from_report(report);
+    let breakdown = flags.breakdown();
+
+    if !breakdown.is_empty() {
+        let parts: Vec<String> = breakdown
+            .iter()
+            .map(|(name, score)| format!("  • {} (+{})", name, score))
+            .collect();
+        println!("Breakdown:");
+        for part in &parts {
+            println!("{}", part);
+        }
+    }
+
     if !report.is_root_execution {
         println!(
             "\x1b[1;31m[!] WARNING: Script not run as root. Data is incomplete. Please use `sudo`.\x1b[0m\n"

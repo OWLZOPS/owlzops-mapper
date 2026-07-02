@@ -117,4 +117,50 @@ impl CriticalFlags {
         score = score.saturating_add(sysctl_penalty);
         score.min(100)
     }
+    /// Return a human-readable breakdown of the risk score contributions.
+    pub fn breakdown(&self) -> Vec<(&'static str, u8)> {
+        let mut items = Vec::new();
+
+        if self.firewall_disabled {
+            items.push(("Firewall inactive", RISK_NO_FIREWALL));
+        }
+        if self.ssh_root_login {
+            items.push(("SSH root login allowed", RISK_SSH_ROOT_LOGIN));
+        }
+        if self.security_updates {
+            items.push(("Pending security updates", RISK_SECURITY_UPDATES));
+        }
+        if self.critical_ssl {
+            items.push(("SSL certificate expiring", RISK_CRITICAL_SSL_MAX));
+        }
+        if self.failed_services {
+            items.push(("Failed systemd services", RISK_FAILED_SERVICES));
+        }
+        if self.ssh_password_auth {
+            items.push(("SSH password auth enabled", RISK_SSH_PASSWORD_AUTH));
+        }
+        if self.oom_kills {
+            items.push(("OOM kills present", RISK_OOM_KILLS));
+        }
+        if self.no_backups {
+            items.push(("No backup tools detected", RISK_NO_BACKUP));
+        }
+        if self.ntp_not_synced {
+            items.push(("NTP not synchronized", RISK_NTP_NOT_SYNCED));
+        }
+        if self.sudo_nopasswd {
+            items.push(("Sudo NOPASSWD entries found", RISK_SUDO_NOPASSWD));
+        }
+        if self.sudoers_bad_mode {
+            items.push(("Sudoers permissions not 0440", RISK_SUDOERS_MODE));
+        }
+        let sysctl_penalty = std::cmp::min(
+            self.sysctl_issues_count as u8 * RISK_SYSCTL_PER_ISSUE,
+            RISK_SYSCTL_MAX,
+        );
+        if sysctl_penalty > 0 {
+            items.push(("Sysctl security issues", sysctl_penalty));
+        }
+        items
+    }
 }
