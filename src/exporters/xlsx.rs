@@ -284,15 +284,29 @@ fn auto_fit_columns(
 
 /// Sanitize a hostname for use as an Excel sheet name.
 /// Sheet names must be ≤ 31 chars and must not contain: \ / ? * [ ] :
-fn sanitize_sheet_name(name: &str, prefix: &str) -> String {
+fn sanitize_sheet_name(
+    name: &str,
+    prefix: &str,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
     const ILLEGAL: &[char] = &['\\', '/', '?', '*', '[', ']', ':'];
     let max_chars = 31usize.saturating_sub(prefix.len() + 1); // +1 for '-'
-    let sanitized: String = name
+    let base: String = name
         .chars()
         .filter(|c| !ILLEGAL.contains(c))
         .take(max_chars)
         .collect();
-    format!("{}-{}", prefix, sanitized)
+    let mut candidate = format!("{}-{}", prefix, base);
+    let mut n = 2u32;
+    while used.contains(&candidate) {
+        let suffix = format!("~{}", n);
+        let trimmed_len = 31usize.saturating_sub(prefix.len() + 1 + suffix.len());
+        let trimmed: String = base.chars().take(trimmed_len).collect();
+        candidate = format!("{}-{}{}", prefix, trimmed, suffix);
+        n += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
 }
 
 fn write_headers_at(
@@ -1676,8 +1690,9 @@ pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<()
 
     workbook.push_worksheet(sheet_executive_summary(reports, true, &fmts)?);
 
+    let mut used_names = std::collections::HashSet::new();
     for report in reports {
-        let name = sanitize_sheet_name(&report.host.hostname, "Overview");
+        let name = sanitize_sheet_name(&report.host.hostname, "Overview", &mut used_names);
         workbook.push_worksheet(sheet_host_combined(report, &name, &fmts)?);
     }
 
