@@ -2,7 +2,6 @@ use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 use chrono::Utc;
 use std::path::PathBuf;
-use std::process::Command;
 use tracing::{info, warn};
 
 // ── Validation helpers (public – also used in main) ────────
@@ -151,6 +150,7 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     let ssh_user = &args.ssh_user;
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
 
+    // Validate inputs before using them in shell commands
     if let Err(e) = validate_remote_path(remote_path) {
         warn!("{e}");
         return None;
@@ -162,25 +162,33 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
 
     if args.copy_binary {
         let local_bin = args.local_binary.as_deref().unwrap_or("/proc/self/exe");
-        let status = Command::new("scp")
-            .args([
+        let status = match crate::utils::run_child_with_timeout(
+            "scp",
+            &[
                 "-i",
                 &ssh_key,
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 local_bin,
                 &format!("{}@{}:{}", ssh_user, host, remote_path),
-            ])
-            .status()
-            .ok()?;
-        if !status.success() {
-            warn!("failed to copy binary to {host}");
+            ],
+            args.remote_timeout_secs / 2,
+        ) {
+            Some(s) => s,
+            None => {
+                warn!(host = %host, "SCP timed out or failed");
+                return None;
+            }
+        };
+        if !status.status.success() {
+            warn!(host = %host, "SCP returned non-zero exit code");
             return None;
         }
     }
 
-    let output = Command::new("ssh")
-        .args([
+    let output = crate::utils::run_child_with_timeout(
+        "ssh",
+        &[
             "-i",
             &ssh_key,
             "-o",
@@ -199,24 +207,30 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             "--format",
             "json",
             "--offline",
-        ])
-        .output()
-        .ok()?;
+        ],
+        args.remote_timeout_secs,
+    );
+
+    let output = match output {
+        Some(out) => out,
+        None => {
+            warn!(host = %host, "SSH command timed out after {}s", args.remote_timeout_secs);
+            return None;
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Ok(report) = serde_json::from_str::<AgentReport>(&stdout) {
         return Some(report);
     }
 
-    warn!("remote scan failed on {host}");
+    warn!(host = %host, "remote scan failed");
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     if !stderr_str.trim().is_empty() {
-        warn!("stderr: {}", stderr_str.trim());
+        warn!(host = %host, stderr = %stderr_str.trim(), "remote scan stderr");
     } else if !stdout.trim().is_empty() {
-        warn!(
-            "stdout (truncated): {}",
-            &stdout.trim()[..stdout.trim().len().min(200)]
-        );
+        let truncated: String = stdout.trim().chars().take(200).collect();
+        warn!(host = %host, stdout_truncated = %truncated, "remote scan stdout");
     }
     None
 }
