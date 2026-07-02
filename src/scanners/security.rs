@@ -44,8 +44,10 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
 fn is_local_ip(ip: &str) -> bool {
     match ip.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private() || v4.is_unspecified(),
-        Ok(IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
-        Err(_) => true, // if it can't be parsed, treat it as local (safe side)
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00 == 0xfc00)
+        }
+        Err(_) => true,
     }
 }
 

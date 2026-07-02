@@ -14,6 +14,7 @@ use cli::{AuditArgs, Cli, Commands};
 use models::AgentReport;
 use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
 use scoring::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -87,6 +88,10 @@ async fn run_command(cli: Cli) -> i32 {
                     }
                 }
             }
+
+            // Remove duplicate hosts
+            let mut seen = HashSet::new();
+            hosts.retain(|h| seen.insert(h.clone()));
 
             if !hosts.is_empty() {
                 let mut remote = Vec::new();
