@@ -1,10 +1,11 @@
 use crate::models::{AgentReport, DiffReport, MultiHostDiff, PackageManager, Severity};
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksheet, XlsxError};
+
 // =====================================================================
 // Pre-allocated formats (single allocation for the whole workbook)
 // =====================================================================
 
-struct Formats {
+pub struct Formats {
     header: Format,
     critical: Format,
     ok: Format,
@@ -257,74 +258,6 @@ impl<'a> SheetWriter<'a> {
     }
 }
 
-// ---------- basic formats (thin borders) ----------
-fn header_format() -> Format {
-    Format::new()
-        .set_bold()
-        .set_background_color(Color::RGB(0x1F4E78))
-        .set_font_color(Color::White)
-        .set_align(FormatAlign::Left)
-        .set_border(FormatBorder::Thin)
-}
-
-// ---------- row banding (background + borders) ----------
-fn even_row_fmt() -> Format {
-    Format::new()
-        .set_background_color(Color::RGB(0xF2F2F2))
-        .set_border(FormatBorder::Thin)
-}
-
-fn odd_row_fmt() -> Format {
-    Format::new()
-        .set_background_color(Color::White)
-        .set_border(FormatBorder::Thin)
-}
-
-fn row_band(row: u32) -> Format {
-    if row.is_multiple_of(2) {
-        even_row_fmt()
-    } else {
-        odd_row_fmt()
-    }
-}
-
-fn critical_band(row: u32) -> Format {
-    let bg = if row.is_multiple_of(2) {
-        Color::RGB(0xF2F2F2)
-    } else {
-        Color::White
-    };
-    Format::new()
-        .set_background_color(bg)
-        .set_font_color(Color::RGB(0xC00000))
-        .set_bold()
-        .set_border(FormatBorder::Thin)
-}
-#[allow(dead_code)]
-fn warning_band(row: u32) -> Format {
-    let bg = if row.is_multiple_of(2) {
-        Color::RGB(0xF2F2F2)
-    } else {
-        Color::White
-    };
-    Format::new()
-        .set_background_color(bg)
-        .set_font_color(Color::RGB(0xBF8F00))
-        .set_border(FormatBorder::Thin)
-}
-
-fn ok_band(row: u32) -> Format {
-    let bg = if row.is_multiple_of(2) {
-        Color::RGB(0xF2F2F2)
-    } else {
-        Color::White
-    };
-    Format::new()
-        .set_background_color(bg)
-        .set_font_color(Color::RGB(0x375623))
-        .set_border(FormatBorder::Thin)
-}
-
 // ---------- header helpers ----------
 
 fn auto_fit_columns(
@@ -366,19 +299,21 @@ fn write_headers_at(
     sheet: &mut rust_xlsxwriter::Worksheet,
     row: u32,
     headers: &[&str],
+    header_fmt: &Format,
 ) -> Result<(), XlsxError> {
-    let fmt = header_format();
     for (col, h) in headers.iter().enumerate() {
-        sheet.write_string_with_format(row, col as u16, *h, &fmt)?;
+        sheet.write_string_with_format(row, col as u16, *h, header_fmt)?;
     }
     Ok(())
 }
+
 // =====================================================================
 // EXECUTIVE SUMMARY sheet
 // =====================================================================
 pub fn sheet_executive_summary(
     reports: &[AgentReport],
     multi_host: bool,
+    fmts: &Formats,
 ) -> Result<rust_xlsxwriter::Worksheet, XlsxError> {
     let mut sheet = rust_xlsxwriter::Worksheet::new();
     sheet.set_name("Executive Summary")?;
@@ -408,7 +343,7 @@ pub fn sheet_executive_summary(
     if !multi_host && reports.len() == 1 {
         let report = &reports[0];
 
-        sheet.write_string_with_format(current_row, 0, "Risk Score", &header_format())?;
+        sheet.write_string_with_format(current_row, 0, "Risk Score", &fmts.header)?;
         sheet.write_string_with_format(
             current_row,
             1,
@@ -464,19 +399,19 @@ pub fn sheet_executive_summary(
             ),
         ];
 
-        write_headers_at(&mut sheet, current_row, &["Check", "Status"])?;
+        write_headers_at(&mut sheet, current_row, &["Check", "Status"], &fmts.header)?;
         data.push(vec!["Check".to_string(), "Status".to_string()]);
         current_row += 1;
 
         for (label, value, ok) in &metrics {
-            let band = row_band(current_row);
-            sheet.write_string_with_format(current_row, 0, *label, &band)?;
+            let band = fmts.row_band(current_row);
+            sheet.write_string_with_format(current_row, 0, *label, band)?;
             let status_fmt = if *ok {
-                ok_band(current_row)
+                fmts.ok_band(current_row)
             } else {
-                critical_band(current_row)
+                fmts.critical_band(current_row)
             };
-            sheet.write_string_with_format(current_row, 1, value, &status_fmt)?;
+            sheet.write_string_with_format(current_row, 1, value, status_fmt)?;
             data.push(vec![label.to_string(), value.clone()]);
             current_row += 1;
         }
@@ -520,17 +455,12 @@ pub fn sheet_executive_summary(
         }
 
         if !criticals.is_empty() {
-            sheet.write_string_with_format(
-                current_row,
-                0,
-                "Critical Findings",
-                &header_format(),
-            )?;
+            sheet.write_string_with_format(current_row, 0, "Critical Findings", &fmts.header)?;
             data.push(vec!["Critical Findings".to_string(), String::new()]);
             current_row += 1;
             for c in &criticals {
-                let band = row_band(current_row);
-                sheet.write_string_with_format(current_row, 0, *c, &band)?;
+                let band = fmts.row_band(current_row);
+                sheet.write_string_with_format(current_row, 0, *c, band)?;
                 data.push(vec![c.to_string(), String::new()]);
                 current_row += 1;
             }
@@ -550,6 +480,7 @@ pub fn sheet_executive_summary(
                 "Sudo NOPASSWD",
                 "Sysctl Issues",
             ],
+            &fmts.header,
         )?;
         data.push(vec![
             "Host".to_string(),
@@ -580,7 +511,7 @@ pub fn sheet_executive_summary(
                 current_row += 1;
             }
 
-            let band = row_band(current_row);
+            let band = fmts.row_band(current_row);
             sheet.write_string_with_format(
                 current_row,
                 0,
@@ -589,13 +520,13 @@ pub fn sheet_executive_summary(
             )?;
 
             let score_fmt = if report.risk_score >= 70 {
-                critical_band(current_row)
+                fmts.critical_band(current_row)
             } else if report.risk_score >= 40 {
-                warning_band(current_row)
+                fmts.warning_band(current_row)
             } else {
-                ok_band(current_row)
+                fmts.ok_band(current_row)
             };
-            sheet.write_number_with_format(current_row, 1, report.risk_score as f64, &score_fmt)?;
+            sheet.write_number_with_format(current_row, 1, report.risk_score as f64, score_fmt)?;
 
             sheet.write_string_with_format(
                 current_row,
@@ -605,7 +536,7 @@ pub fn sheet_executive_summary(
                 } else {
                     "OFF"
                 },
-                &band,
+                band,
             )?;
             sheet.write_string_with_format(
                 current_row,
@@ -615,7 +546,7 @@ pub fn sheet_executive_summary(
                 } else {
                     "disabled"
                 },
-                &band,
+                band,
             )?;
             sheet.write_string_with_format(
                 current_row,
@@ -625,7 +556,7 @@ pub fn sheet_executive_summary(
                 } else {
                     "no"
                 },
-                &band,
+                band,
             )?;
             sheet.write_string_with_format(
                 current_row,
@@ -635,7 +566,7 @@ pub fn sheet_executive_summary(
                 } else {
                     "found"
                 },
-                &band,
+                band,
             )?;
             sheet.write_string_with_format(
                 current_row,
@@ -645,19 +576,19 @@ pub fn sheet_executive_summary(
                 } else {
                     "NO"
                 },
-                &band,
+                band,
             )?;
             sheet.write_string_with_format(
                 current_row,
                 7,
                 report.security.sudo_nopasswd_entries.len().to_string(),
-                &band,
+                band,
             )?;
             sheet.write_string_with_format(
                 current_row,
                 8,
                 report.security.sysctl_issues.len().to_string(),
-                &band,
+                band,
             )?;
 
             data.push(vec![
@@ -1034,6 +965,7 @@ fn write_network_section(w: &mut SheetWriter, report: &AgentReport) -> Result<()
     }
     Ok(())
 }
+
 fn write_docker_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
     if !report.topology.docker_active {
         return Ok(());
@@ -1721,6 +1653,7 @@ pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
     workbook.push_worksheet(sheet_executive_summary(
         std::slice::from_ref(report),
         false,
+        &fmts,
     )?);
     workbook.push_worksheet(sheet_overview(report, &fmts)?);
     workbook.push_worksheet(sheet_storage(report, &fmts)?);
@@ -1741,7 +1674,7 @@ pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<()
     let fmts = Formats::new();
     let mut workbook = Workbook::new();
 
-    workbook.push_worksheet(sheet_executive_summary(reports, true)?);
+    workbook.push_worksheet(sheet_executive_summary(reports, true, &fmts)?);
 
     for report in reports {
         let name = sanitize_sheet_name(&report.host.hostname, "Overview");

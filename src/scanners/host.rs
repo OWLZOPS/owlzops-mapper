@@ -483,21 +483,29 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
 
         let has_data = match tool {
             "restic" => {
-                let has_snapshots = crate::utils::run_with_timeout(
+                let snapshot_out = crate::utils::run_with_timeout(
                     "restic",
                     &["snapshots", "--no-cache", "--json", "--last", "1"],
                     5,
-                )
-                .map(|stdout| {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                        json.as_array().map(|arr| !arr.is_empty()).unwrap_or(false)
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
+                );
+                let snapshots_val = snapshot_out
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                let snap_arr = snapshots_val
+                    .as_ref()
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.as_slice())
+                    .unwrap_or(&[]);
 
-                has_snapshots
+                if !snap_arr.is_empty() {
+                    last_restic = snap_arr
+                        .first()
+                        .and_then(|s| s.get("time"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string());
+                }
+
+                !snap_arr.is_empty()
                     || Path::new("/root/.restic").exists()
                     || Path::new("/var/lib/restic").exists()
             }
@@ -525,22 +533,6 @@ fn gather_backup_info(cron_jobs: &[String]) -> (Vec<String>, Option<String>) {
         let l = job.to_lowercase();
         l.contains("restic") || l.contains("borg") || l.contains("rsync") || l.contains("backup")
     });
-
-    if tools.contains(&"restic".to_string())
-        && let Some(stdout) = crate::utils::run_with_timeout(
-            "restic",
-            &["snapshots", "--json", "--last", "1", "--no-cache"],
-            5,
-        )
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout)
-        && let Some(snapshots) = json.as_array()
-        && let Some(snap) = snapshots.first()
-    {
-        last_restic = snap
-            .get("time")
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string());
-    }
 
     if backup_in_cron && tools.is_empty() {
         tools.push("cron (rsync/backup)".to_string());
