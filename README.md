@@ -39,8 +39,9 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.4
+## Highlights v0.4.5
 
+- **Risk Score breakdown** – the terminal dashboard now shows exactly which findings contribute to the score, e.g. `• Firewall inactive (+30)`.
 - **Refactored host scanner** – split the 200‑line `gather_host_info` into focused sub‑collectors, improving readability, testability and maintainability.
 - **Extended test coverage** – added unit tests for compare logic, cron parser, backup detection, Excel export and more.
 - **Docker mount path truncation** – long volume paths are now intelligently truncated in the terminal table, keeping the beginning of the path visible.
@@ -223,6 +224,26 @@ and placed prominently at the top of every report.
 | Internals | Cron jobs, systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
 | Backups | Detection of restic, borg, duplicati, rsync/backup in cron |
 | NTP | Time synchronization status and offset |
+
+---
+
+## What do these findings mean?
+
+Owlzops provides fixed-price engineering packages to fix the architectural issues discovered by this scanner.
+
+| Finding | What it means | Recommended Next Step |
+|---------|---------------|-----------------------|
+| **Risk Score ≥ 70** | The infrastructure has systemic risks across multiple vectors. You need a comprehensive review. | [Infrastructure Healthcheck](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_table#services:~:text=Infrastructure%20Healthcheck) |
+| **No backup tools** | No automated backups or disaster recovery strategy detected. Data loss is just a matter of time. | [Production Reliability Sprint](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_table#services:~:text=Production%20Reliability%20Sprint) |
+| **Failed systemd / OOM kills** | Production stability is compromised. Services are crashing or starving for resources. | [Production Reliability Sprint](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_table#services:~:text=Production%20Reliability%20Sprint) |
+| **Security updates pending** | The system is accumulating technical debt and unpatched vulnerabilities. | [Reliability Retainer](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_table#services:~:text=Reliability%20Retainer) |
+| **Firewall disabled / SSH root** | Critical authentication weaknesses. The host is exposed to the public internet. | [Free Mapper Consultation](https://owlzops.com/contact?utm_source=github&utm_medium=readme&utm_campaign=mapper_table) |
+
+If owlzops-mapper flagged critical issues, we can review your JSON report and provide a concrete remediation plan.
+
+→ [Book a free 30-min infrastructure review](https://owlzops.com/contact?utm_source=github&utm_medium=readme&utm_campaign=mapper_table)
+
+We review your scan before the call. No pitch - just facts.
 
 ---
 
