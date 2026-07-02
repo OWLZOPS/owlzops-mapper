@@ -48,7 +48,24 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
 
     if flags.has_critical() { 1 } else { 0 }
 }
-
+async fn run_remote_scan_with_timeout(
+    host: String,
+    args: AuditArgs,
+) -> Result<Option<AgentReport>, tokio::task::JoinError> {
+    let host_for_log = host.clone();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            warn!(host = %host_for_log, "remote scan timed out after 600s");
+            Ok(None)
+        }
+    }
+}
 // =====================================================================
 // Main command runner (returns exit code)
 // =====================================================================
@@ -82,7 +99,9 @@ async fn run_command(cli: Cli) -> i32 {
                     }
                 }
 
-                let mut handles = Vec::new();
+                let mut handles: Vec<
+                    tokio::task::JoinHandle<Result<Option<AgentReport>, tokio::task::JoinError>>,
+                > = Vec::new();
                 for _host in local {
                     let a = AuditArgs {
                         hosts: None,
@@ -111,9 +130,9 @@ async fn run_command(cli: Cli) -> i32 {
                     handles.push(tokio::spawn(async move {
                         let _permit = match sem.acquire().await {
                             Ok(p) => p,
-                            Err(_) => return Ok(None), // semaphore closed, shutting down
+                            Err(_) => return Ok(None),
                         };
-                        tokio::task::spawn_blocking(move || run_remote_scan(&host, &a)).await
+                        run_remote_scan_with_timeout(host, a).await
                     }));
                 }
 
