@@ -39,8 +39,19 @@ echo "✓ SHA256 checksum OK"
 # ---- Optional GPG verification ----
 if command -v gpg >/dev/null 2>&1; then
     echo "→ GPG available – verifying signature..."
+
+    # Download signature and public key
     curl -sSLO "${BASE_URL}/${SIGNATURE}"
     curl -sSL "$GPG_KEY_URL" | gpg --import >/dev/null 2>&1
+
+    # Verify fingerprint of the imported key
+    EXPECTED_FPR="63C349F81ACBB9929EF8E73EB47BCE304E7C265E"
+    ACTUAL_FPR=$(gpg --list-keys --with-colons "$EXPECTED_FPR" 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')
+    if [ "$ACTUAL_FPR" != "$EXPECTED_FPR" ]; then
+        echo "✗ Downloaded key fingerprint mismatch — aborting"
+        exit 1
+    fi
+
     if gpg --verify "${SIGNATURE}" "${TARBALL}" >/dev/null 2>&1; then
         echo "✓ GPG signature verified"
         rm "${SIGNATURE}"
