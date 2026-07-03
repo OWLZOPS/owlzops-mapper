@@ -977,6 +977,16 @@ fn write_network_section(w: &mut SheetWriter, report: &AgentReport) -> Result<()
             w.next_row();
         }
     }
+    // Custom /etc/hosts overrides
+    if !report.network.custom_host_overrides.is_empty() {
+        w.next_row();
+        w.write_section_title("Custom /etc/hosts Overrides")?;
+        for h in &report.network.custom_host_overrides {
+            let band = w.fmts.row_band(w.current_row());
+            w.write_string(0, h, band)?;
+            w.next_row();
+        }
+    }
     Ok(())
 }
 
