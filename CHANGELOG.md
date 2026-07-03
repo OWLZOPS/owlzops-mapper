@@ -1,4 +1,3 @@
-# Changelog
 
 ## Bug Fixes
 
@@ -33,6 +32,11 @@
 - Add tempfile as a dev-dependency in Cargo.toml
 - Bump version to 0.4.8 in Cargo.toml and Cargo.lock
 - Move SBOM generation to signing step in release workflow
+- Optimize SBOM generation in release workflow for x86_64 targets only
+- Update CHANGELOG with bug fixes, features, CI/CD changes, and refactoring notes for v0.4.8
+- Move SBOM generation to signing step and update dependencies in CI workflow
+- Add SBOM generation step to CI workflow and update dependencies
+- Update SBOM filename override handling in release workflow
 
 ## Refactoring
 
