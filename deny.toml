@@ -12,9 +12,11 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
 ]
-exceptions = [
-    { name = "owlzops-mapper", allow = ["Apache-2.0"] },
-]
+
+[[licenses.clarify]]
+name = "owlzops-mapper"
+license-files = [{ path = "LICENSE" }]
+expression = "Apache-2.0"
 
 [bans]
 multiple-versions = "warn"
