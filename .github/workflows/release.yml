@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # action HEAD as of 2026-06-28
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537  # action HEAD as of 2026-06-28
         with:
           toolchain: stable
 
@@ -63,8 +63,8 @@ jobs:
       - name: Generate SBOM
         run: |
           cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --format json
-          mv bom.json sbom.json
+          # Use --override-filename without extension; the tool auto-appends .json
+          cargo cyclonedx --format json --override-filename sbom
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
