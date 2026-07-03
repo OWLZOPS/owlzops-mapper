@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, develop]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -91,6 +94,7 @@ jobs:
         run: cargo build --locked
       - name: Run tests
         run: cargo test --locked
+
   test-opensuse:
     name: Test in openSUSE Tumbleweed
     runs-on: ubuntu-latest

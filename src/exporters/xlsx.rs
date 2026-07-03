@@ -753,24 +753,30 @@ fn sheet_host_combined(
     }
 
     w.next_row();
-    write_storage_section(&mut w, report)?;
+    write_storage_section(&mut w, report, false)?;
     w.next_row();
-    write_databases_section(&mut w, report)?;
+    write_databases_section(&mut w, report, false)?;
     w.next_row();
-    write_network_section(&mut w, report)?;
+    write_network_section(&mut w, report, false)?;
     w.next_row();
-    write_security_section(&mut w, report)?;
+    write_security_section(&mut w, report, false)?;
     w.next_row();
-    write_docker_section(&mut w, report)?;
+    write_docker_section(&mut w, report, false)?;
     w.next_row();
-    write_packages_section(&mut w, report)?;
+    write_packages_section(&mut w, report, false)?;
 
     w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
     Ok(sheet)
 }
 
-fn write_storage_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
-    w.write_section_title("Storage")?;
+fn write_storage_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+    standalone: bool,
+) -> Result<(), XlsxError> {
+    if !standalone {
+        w.write_section_title("Storage")?;
+    }
     w.write_header(&[
         "Mount Point",
         "Total (GB)",
@@ -805,8 +811,22 @@ fn write_storage_section(w: &mut SheetWriter, report: &AgentReport) -> Result<()
     Ok(())
 }
 
-fn write_security_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
-    w.write_section_title("Security")?;
+fn sheet_storage(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Storage")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
+    write_storage_section(&mut w, report, true)?;
+    w.apply_col_widths_with_min(&[12.0, 10.0, 10.0, 10.0, 10.0])?;
+    Ok(sheet)
+}
+fn write_security_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+    standalone: bool,
+) -> Result<(), XlsxError> {
+    if !standalone {
+        w.write_section_title("Security")?;
+    }
 
     let pa_fmt = if report.security.ssh_password_auth_enabled {
         Some(&w.fmts.critical)
@@ -921,8 +941,23 @@ fn write_security_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(
     Ok(())
 }
 
-fn write_network_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
-    w.write_section_title("Network")?;
+fn sheet_security(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Security")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
+    write_security_section(&mut w, report, true)?;
+    w.apply_col_widths_with_min(&[12.0, 12.0, 12.0, 10.0])?;
+    Ok(sheet)
+}
+
+fn write_network_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+    standalone: bool,
+) -> Result<(), XlsxError> {
+    if !standalone {
+        w.write_section_title("Network")?;
+    }
 
     let fw_fmt = if report.network.firewall_active {
         Some(&w.fmts.ok)
@@ -977,14 +1012,40 @@ fn write_network_section(w: &mut SheetWriter, report: &AgentReport) -> Result<()
             w.next_row();
         }
     }
+
+    // Custom /etc/hosts overrides
+    if !report.network.custom_host_overrides.is_empty() {
+        w.next_row();
+        w.write_section_title("Custom /etc/hosts Overrides")?;
+        for h in &report.network.custom_host_overrides {
+            let band = w.fmts.row_band(w.current_row());
+            w.write_string(0, h, band)?;
+            w.next_row();
+        }
+    }
     Ok(())
 }
 
-fn write_docker_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
+fn sheet_network(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Network")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
+    write_network_section(&mut w, report, true)?;
+    w.apply_col_widths_with_min(&[12.0, 12.0, 12.0, 12.0])?;
+    Ok(sheet)
+}
+
+fn write_docker_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+    standalone: bool,
+) -> Result<(), XlsxError> {
     if !report.topology.docker_active {
         return Ok(());
     }
-    w.write_section_title("Docker")?;
+    if !standalone {
+        w.write_section_title("Docker")?;
+    }
     w.write_kv_row(
         "Docker Active",
         &report.topology.docker_active.to_string(),
@@ -995,25 +1056,28 @@ fn write_docker_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(),
         &report.topology.images_count.to_string(),
         None,
     )?;
+
+    let dangling_count = report.topology.dangling_images_count.to_string();
+    let dangling_size = format!(
+        "{:.2}",
+        report.topology.total_dangling_size_mb as f64 / 1024.0
+    );
     if report.topology.dangling_images_count > 0 {
         w.write_kv_row(
             "Dangling (Unused) Images",
-            &report.topology.dangling_images_count.to_string(),
+            &dangling_count,
             Some(w.fmts.warning_band(w.current_row())),
         )?;
-        let dangling_size = format!(
-            "{:.2}",
-            report.topology.total_dangling_size_mb as f64 / 1024.0
-        );
         w.write_kv_row(
             "Dangling Wasted Space (GB)",
             &dangling_size,
             Some(w.fmts.warning_band(w.current_row())),
         )?;
     } else {
-        w.write_kv_row("Dangling (Unused) Images", "0", None)?;
-        w.write_kv_row("Dangling Wasted Space (GB)", "0.00", None)?;
+        w.write_kv_row("Dangling (Unused) Images", &dangling_count, None)?;
+        w.write_kv_row("Dangling Wasted Space (GB)", &dangling_size, None)?;
     }
+
     w.write_kv_row(
         "Dangling Volumes",
         &report.topology.dangling_volumes_count.to_string(),
@@ -1058,11 +1122,26 @@ fn write_docker_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(),
     Ok(())
 }
 
-fn write_packages_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
+fn sheet_docker(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Docker")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
+    write_docker_section(&mut w, report, true)?;
+    w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
+    Ok(sheet)
+}
+
+fn write_packages_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+    standalone: bool,
+) -> Result<(), XlsxError> {
     if !report.packages.manager.is_known() {
         return Ok(());
     }
-    w.write_section_title("Packages")?;
+    if !standalone {
+        w.write_section_title("Packages")?;
+    }
     let manager_str = match report.packages.manager {
         PackageManager::Apt => "apt (Debian/Ubuntu)",
         PackageManager::Dnf => "dnf (Fedora/RHEL)",
@@ -1104,11 +1183,26 @@ fn write_packages_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(
     Ok(())
 }
 
-fn write_databases_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
+fn sheet_packages(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Packages")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
+    write_packages_section(&mut w, report, true)?;
+    w.apply_col_widths_with_min(&[20.0, 20.0, 20.0, 10.0])?;
+    Ok(sheet)
+}
+
+fn write_databases_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+    standalone: bool,
+) -> Result<(), XlsxError> {
     if report.databases.is_empty() {
         return Ok(());
     }
-    w.write_section_title("Databases")?;
+    if !standalone {
+        w.write_section_title("Databases")?;
+    }
     w.write_header(&["Engine", "Version", "Data Directory", "Size (GB)"])?;
     for db in &report.databases {
         let band = w.fmts.row_band(w.current_row());
@@ -1119,6 +1213,15 @@ fn write_databases_section(w: &mut SheetWriter, report: &AgentReport) -> Result<
         w.next_row();
     }
     Ok(())
+}
+
+fn sheet_databases(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
+    let mut sheet = Worksheet::new();
+    sheet.set_name("Databases")?;
+    let mut w = SheetWriter::new(&mut sheet, fmts);
+    write_databases_section(&mut w, report, true)?;
+    w.apply_col_widths_with_min(&[12.0, 30.0, 20.0, 10.0])?;
+    Ok(sheet)
 }
 
 // =====================================================================
@@ -1235,425 +1338,6 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
     }
 
     w.apply_col_widths_with_min(&[20.0, 15.0, 15.0])?;
-    Ok(sheet)
-}
-
-fn sheet_storage(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
-    let mut sheet = Worksheet::new();
-    sheet.set_name("Storage")?;
-    let mut w = SheetWriter::new(&mut sheet, fmts);
-
-    w.write_header(&[
-        "Mount Point",
-        "Total (GB)",
-        "Used (GB)",
-        "Usage %",
-        "Inodes %",
-    ])?;
-
-    for disk in &report.storage.disks {
-        if disk.total_gb == 0 {
-            continue;
-        }
-        let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
-        let band = fmts.row_band(w.current_row());
-
-        w.write_string(0, &disk.mount_point, band)?;
-        w.write_number(1, disk.total_gb as f64, &fmts.number)?;
-        w.write_number(2, disk.used_gb as f64, &fmts.number)?;
-
-        let usage_fmt = if usage_pct > 90.0 {
-            fmts.critical_band(w.current_row())
-        } else if usage_pct > 75.0 {
-            fmts.warning_band(w.current_row())
-        } else {
-            fmts.ok_band(w.current_row())
-        };
-        w.write_number(3, usage_pct, usage_fmt)?;
-
-        let inode_str = disk
-            .inode_usage_percent
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
-        w.write_string(4, &inode_str, band)?;
-
-        w.next_row();
-    }
-
-    w.apply_col_widths_with_min(&[12.0, 10.0, 10.0, 10.0, 10.0])?;
-    Ok(sheet)
-}
-
-fn sheet_databases(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
-    let mut sheet = Worksheet::new();
-    sheet.set_name("Databases")?;
-    let mut w = SheetWriter::new(&mut sheet, fmts);
-
-    if report.databases.is_empty() {
-        return Ok(sheet);
-    }
-
-    w.write_header(&["Engine", "Version", "Data Directory", "Size (GB)"])?;
-
-    for db in &report.databases {
-        let band = fmts.row_band(w.current_row());
-        w.write_string(0, &db.engine, band)?;
-        w.write_string(1, &db.version, band)?;
-        w.write_string(2, &db.data_dir, band)?;
-        w.write_number(3, db.size_mb as f64 / 1024.0, &fmts.number)?;
-        w.next_row();
-    }
-
-    w.apply_col_widths_with_min(&[12.0, 30.0, 20.0, 10.0])?;
-    Ok(sheet)
-}
-
-fn sheet_network(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
-    let mut sheet = Worksheet::new();
-    sheet.set_name("Network")?;
-    let mut w = SheetWriter::new(&mut sheet, fmts);
-
-    // Firewall Active
-    let fw_fmt = if report.network.firewall_active {
-        Some(&fmts.ok)
-    } else {
-        Some(&fmts.critical)
-    };
-    w.write_kv_row(
-        "Firewall Active",
-        &report.network.firewall_active.to_string(),
-        fw_fmt,
-    )?;
-
-    // DNS Resolvers
-    w.write_kv_row(
-        "DNS Resolvers",
-        &report.network.dns_resolvers.join(", "),
-        None,
-    )?;
-
-    w.next_row();
-
-    // Listening Ports table
-    w.write_header(&["Protocol", "Port", "Process", "Bind Address"])?;
-    for p in &report.network.listening_ports {
-        let band = fmts.row_band(w.current_row());
-        w.write_string(0, &p.protocol, band)?;
-        w.write_string(1, &p.port, band)?;
-        w.write_string(2, &p.process, band)?;
-        let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
-            fmts.critical_band(w.current_row())
-        } else {
-            fmts.ok_band(w.current_row())
-        };
-        w.write_string(3, &p.bind_address, addr_fmt)?;
-        w.next_row();
-    }
-
-    w.next_row();
-
-    // SSL Certificates
-    if !report.network.ssl_certificates.is_empty() {
-        w.write_header(&["Domain", "Expires", "Days Left"])?;
-        for cert in &report.network.ssl_certificates {
-            let band = fmts.row_band(w.current_row());
-            w.write_string(0, &cert.domain, band)?;
-            w.write_string(1, &cert.expiry_date, band)?;
-            if let Some(days) = cert.days_remaining {
-                let days_fmt = if cert.is_critical {
-                    fmts.critical_band(w.current_row())
-                } else if cert.is_warning {
-                    fmts.warning_band(w.current_row())
-                } else {
-                    fmts.ok_band(w.current_row())
-                };
-                w.write_number(2, days as f64, days_fmt)?;
-            } else {
-                w.write_string(2, "unknown", band)?;
-            }
-            w.next_row();
-        }
-        w.next_row();
-    }
-
-    // Custom /etc/hosts overrides
-    if !report.network.custom_host_overrides.is_empty() {
-        w.write_section_title("Custom /etc/hosts Overrides")?;
-        for h in &report.network.custom_host_overrides {
-            let band = fmts.row_band(w.current_row());
-            w.write_string(0, h, band)?;
-            w.next_row();
-        }
-    }
-
-    w.apply_col_widths_with_min(&[12.0, 12.0, 12.0, 12.0])?;
-    Ok(sheet)
-}
-
-fn sheet_security(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
-    let mut sheet = Worksheet::new();
-    sheet.set_name("Security")?;
-    let mut w = SheetWriter::new(&mut sheet, fmts);
-
-    // SSH Password Auth
-    let pa_fmt = if report.security.ssh_password_auth_enabled {
-        Some(&fmts.critical)
-    } else {
-        Some(&fmts.ok)
-    };
-    w.write_kv_row(
-        "SSH Password Auth Enabled",
-        &report.security.ssh_password_auth_enabled.to_string(),
-        pa_fmt,
-    )?;
-
-    // SSH Root Login
-    let rl_fmt = if report.security.ssh_root_login_enabled {
-        Some(&fmts.critical)
-    } else {
-        Some(&fmts.ok)
-    };
-    w.write_kv_row(
-        "SSH Root Login Enabled",
-        &report.security.ssh_root_login_enabled.to_string(),
-        rl_fmt,
-    )?;
-
-    // SSH Config Source
-    w.write_kv_row(
-        "SSH Config Source",
-        &report.security.ssh_config_source,
-        None,
-    )?;
-
-    // Fail2Ban Active
-    let f2b_fmt = if report.security.fail2ban_active {
-        Some(&fmts.ok)
-    } else {
-        Some(&fmts.critical)
-    };
-    w.write_kv_row(
-        "Fail2Ban Active",
-        &report.security.fail2ban_active.to_string(),
-        f2b_fmt,
-    )?;
-
-    // Auditd Active
-    let audit_fmt = if report.security.auditd_active {
-        Some(&fmts.ok)
-    } else {
-        Some(&fmts.critical)
-    };
-    w.write_kv_row(
-        "Auditd Active",
-        &report.security.auditd_active.to_string(),
-        audit_fmt,
-    )?;
-
-    // Failed Services
-    if !report.host.failed_services.is_empty() {
-        w.write_kv_row(
-            "Failed Services",
-            &report.host.failed_services.join(", "),
-            Some(fmts.critical_band(w.current_row())),
-        )?;
-    }
-
-    // NTP
-    let ntp_value = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
-        (true, Some(ms)) => format!("yes ({:.1}ms offset)", ms),
-        (true, None) => "yes".to_string(),
-        (false, Some(ms)) => format!("no ({:.0}ms offset)", ms),
-        (false, None) => "no".to_string(),
-    };
-    let ntp_fmt = if report.host.ntp_synchronized {
-        Some(fmts.ok_band(w.current_row()))
-    } else {
-        Some(fmts.critical_band(w.current_row()))
-    };
-    w.write_kv_row("NTP Synchronized", &ntp_value, ntp_fmt)?;
-
-    // Sudo NOPASSWD
-    if !report.security.sudo_nopasswd_entries.is_empty() {
-        w.write_kv_row(
-            "Sudo NOPASSWD",
-            &report.security.sudo_nopasswd_entries.join("; "),
-            Some(fmts.critical_band(w.current_row())),
-        )?;
-    }
-
-    // Sudoers Permissions
-    if let Some(mode) = report.security.sudoers_mode {
-        let (text, fmt) = if mode != 0o440 {
-            (
-                format!("{:o} (expected 0440)", mode),
-                Some(fmts.critical_band(w.current_row())),
-            )
-        } else {
-            (format!("{:o}", mode), Some(fmts.ok_band(w.current_row())))
-        };
-        w.write_kv_row("Sudoers Permissions", &text, fmt)?;
-    }
-
-    // Sysctl Issues
-    if !report.security.sysctl_issues.is_empty() {
-        w.write_kv_row(
-            "Sysctl Issues",
-            &report.security.sysctl_issues.join("; "),
-            Some(fmts.critical_band(w.current_row())),
-        )?;
-    }
-
-    // Shell Users table
-    if !report.security.shell_users.is_empty() {
-        w.next_row(); // blank line before table
-        w.write_header(&["User", "Last Login", "Last Remote SSH", "Authorized Keys"])?;
-        for u in &report.security.shell_users {
-            let band = fmts.row_band(w.current_row());
-            w.write_string(0, &u.username, band)?;
-            w.write_string(1, &u.last_login, band)?;
-            w.write_string(2, &u.last_ssh_login, band)?;
-            w.write_number(3, u.authorized_keys_count as f64, &fmts.number)?;
-            w.next_row();
-        }
-    }
-
-    w.apply_col_widths_with_min(&[12.0, 12.0, 12.0, 10.0])?;
-    Ok(sheet)
-}
-
-fn sheet_docker(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
-    let mut sheet = Worksheet::new();
-    sheet.set_name("Docker")?;
-    let mut w = SheetWriter::new(&mut sheet, fmts);
-
-    w.write_kv_row(
-        "Docker Active",
-        &report.topology.docker_active.to_string(),
-        None,
-    )?;
-    w.write_kv_row(
-        "Total Images",
-        &report.topology.images_count.to_string(),
-        None,
-    )?;
-
-    let dangling_count = report.topology.dangling_images_count.to_string();
-    let dangling_size = format!(
-        "{:.2}",
-        report.topology.total_dangling_size_mb as f64 / 1024.0
-    );
-    if report.topology.dangling_images_count > 0 {
-        w.write_kv_row(
-            "Dangling (Unused) Images",
-            &dangling_count,
-            Some(fmts.warning_band(w.current_row())),
-        )?;
-        w.write_kv_row(
-            "Dangling Wasted Space (GB)",
-            &dangling_size,
-            Some(fmts.warning_band(w.current_row())),
-        )?;
-    } else {
-        w.write_kv_row("Dangling (Unused) Images", &dangling_count, None)?;
-        w.write_kv_row("Dangling Wasted Space (GB)", &dangling_size, None)?;
-    }
-
-    w.write_kv_row(
-        "Dangling Volumes",
-        &report.topology.dangling_volumes_count.to_string(),
-        None,
-    )?;
-
-    if !report.topology.containers.is_empty() {
-        w.next_row();
-        w.write_header(&[
-            "Name",
-            "Image",
-            "State",
-            "Status",
-            "Size (GB)",
-            "Log Size (GB)",
-            "Mounts",
-            "Security Issues",
-        ])?;
-        for c in &report.topology.containers {
-            let band = w.fmts.row_band(w.current_row());
-            w.write_string(0, &c.name, band)?;
-            w.write_string(1, &c.image, band)?;
-            w.write_string(2, &c.state, band)?;
-            w.write_string(3, &c.status, band)?;
-            w.write_number(4, c.size_mb as f64 / 1024.0, &w.fmts.number)?;
-            w.write_number(5, c.log_size_mb as f64 / 1024.0, &w.fmts.number)?;
-            w.write_string(6, &c.mounts.join(" | "), band)?;
-            let issues = c.security_issues();
-            let issue_str = if issues.is_empty() {
-                "-".to_string()
-            } else {
-                issues.join(", ")
-            };
-            if issue_str != "-" {
-                w.write_string(7, &issue_str, w.fmts.critical_band(w.current_row()))?;
-            } else {
-                w.write_string(7, &issue_str, band)?;
-            }
-            w.next_row();
-        }
-    }
-
-    w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
-    Ok(sheet)
-}
-
-fn sheet_packages(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
-    let mut sheet = Worksheet::new();
-    sheet.set_name("Packages")?;
-    let mut w = SheetWriter::new(&mut sheet, fmts);
-
-    if !report.packages.manager.is_known() {
-        return Ok(sheet);
-    }
-
-    let manager_str = match report.packages.manager {
-        PackageManager::Apt => "apt (Debian/Ubuntu)",
-        PackageManager::Dnf => "dnf (Fedora/RHEL)",
-        PackageManager::Yum => "yum (RHEL/CentOS)",
-        PackageManager::Pacman => "pacman (Arch)",
-        PackageManager::Zypper => "zypper (openSUSE/SLES)",
-        PackageManager::Unknown => "Unknown",
-    };
-    w.write_kv_row("Package Manager", manager_str, None)?;
-    w.write_kv_row(
-        "Installed Packages",
-        &report.packages.installed_count.to_string(),
-        None,
-    )?;
-    w.write_kv_row(
-        "Cache Freshly Refreshed",
-        &report.packages.cache_refreshed.to_string(),
-        None,
-    )?;
-
-    if !report.packages.upgradable.is_empty() {
-        w.next_row();
-        w.write_header(&["Package", "Current", "Available", "Security"])?;
-        let mut sorted: Vec<_> = report.packages.upgradable.iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.is_security));
-        for p in &sorted {
-            let band = fmts.row_band(w.current_row());
-            w.write_string(0, &p.name, band)?;
-            w.write_string(1, &p.current_version, band)?;
-            w.write_string(2, &p.new_version, band)?;
-            if p.is_security {
-                w.write_string(3, "YES", fmts.critical_band(w.current_row()))?;
-            } else {
-                w.write_string(3, "-", band)?;
-            }
-            w.next_row();
-        }
-    }
-
-    w.apply_col_widths_with_min(&[20.0, 20.0, 20.0, 10.0])?;
     Ok(sheet)
 }
 
@@ -1788,6 +1472,7 @@ mod tests {
             duration_secs: 1.0,
             risk_score: 10,
             is_root_execution: true,
+            scan_warnings: Vec::new(),
             host: HostInfo {
                 hostname: "testhost".into(),
                 backup_tools: vec!["restic".into()],

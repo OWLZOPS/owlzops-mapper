@@ -22,9 +22,21 @@ pub fn validate_remote_path(path: &str) -> Result<(), String> {
 /// Validate that an SSH username looks safe.
 pub fn validate_ssh_user(user: &str) -> Result<(), String> {
     if user.is_empty()
+        || user.starts_with('-')
         || user.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
     {
         return Err(format!("invalid ssh user: '{user}'"));
+    }
+    Ok(())
+}
+
+/// Validate that a hostname/IP is safe for SSH arguments.
+pub fn validate_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!("invalid host: '{host}'"));
+    }
+    if host.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_.:".contains(c)) {
+        return Err(format!("host contains unexpected characters: '{host}'"));
     }
     Ok(())
 }
@@ -85,13 +97,16 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         network_task,
         storage_task,
         security_task,
-        crate::scanners::docker::gather_docker_topology(),
+        tokio::spawn(crate::scanners::docker::gather_docker_topology()),
         packages_task,
     );
 
-    // Structured logging for scanner failures
+    // Collect warnings from scanner failures
+    let mut scan_warnings = Vec::new();
+
     let host_info = host_res.unwrap_or_else(|e| {
         warn!(scanner = "host", error = ?e, "scanner panicked");
+        scan_warnings.push("host scanner panicked".to_string());
         crate::models::HostInfo {
             hostname: "unknown".to_string(),
             ..Default::default()
@@ -99,23 +114,35 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     });
     let dbs = dbs_res.unwrap_or_else(|e| {
         warn!(scanner = "databases", error = ?e, "scanner panicked");
+        scan_warnings.push("databases scanner panicked".to_string());
         vec![]
     });
     let network_info = network_res.unwrap_or_else(|e| {
         warn!(scanner = "network", error = ?e, "scanner panicked");
+        scan_warnings.push("network scanner panicked".to_string());
         crate::models::NetworkInfo::default()
     });
     let storage_info = storage_res.unwrap_or_else(|e| {
         warn!(scanner = "storage", error = ?e, "scanner panicked");
+        scan_warnings.push("storage scanner panicked".to_string());
         crate::models::StorageInfo::default()
     });
     let security_info = security_res.unwrap_or_else(|e| {
         warn!(scanner = "security", error = ?e, "scanner panicked");
+        scan_warnings
+            .push("security scanner panicked — SSH/sudo/sysctl fields NOT verified".to_string());
         crate::models::SecurityInfo::default()
     });
     let packages_info = packages_res.unwrap_or_else(|e| {
         warn!(scanner = "packages", error = ?e, "scanner panicked");
+        scan_warnings.push("packages scanner panicked".to_string());
         crate::models::PackagesInfo::default()
+    });
+
+    let topology_info = topology_info.unwrap_or_else(|e| {
+        warn!(scanner = "docker", error = ?e, "docker scanner panicked");
+        scan_warnings.push("docker scanner panicked".to_string());
+        crate::models::TopologyInfo::default()
     });
 
     let duration_secs = start.elapsed().as_secs_f64();
@@ -127,6 +154,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         duration_secs,
         risk_score: 0,
         is_root_execution: is_root,
+        scan_warnings,
         host: host_info,
         databases: dbs,
         network: network_info,
@@ -156,6 +184,10 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         return None;
     }
     if let Err(e) = validate_ssh_user(ssh_user) {
+        warn!("{e}");
+        return None;
+    }
+    if let Err(e) = validate_host(host) {
         warn!("{e}");
         return None;
     }

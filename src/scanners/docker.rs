@@ -126,21 +126,15 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                     }
                 }
 
-                // Process each container with its inspect data
-                for c in containers {
-                    let id = c.id.clone().unwrap_or_default();
-                    let Some((container, inspect)) = inspects.get(&id) else {
-                        warn!(container_id = %id, "Container missing from inspect results — skipping");
-                        continue;
-                    };
-                    let container = container.clone();
-                    let inspect = inspect.clone();
-
+                // Consume inspects to avoid cloning
+                for (_, (container, inspect)) in inspects {
                     let name = container
                         .names
-                        .clone()
-                        .and_then(|mut n| n.pop())
-                        .map(|n| n.trim_start_matches('/').to_string())
+                        .map(|mut n| {
+                            n.pop()
+                                .map(|s| s.trim_start_matches('/').to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        })
                         .unwrap_or_else(|| "unknown".to_string());
 
                     // ports

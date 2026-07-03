@@ -11,7 +11,13 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "MPL-2.0",
+    "LicenseRef-Commons-Clause",
 ]
+
+[[licenses.clarify]]
+name = "owlzops-mapper"
+license-files = [{ path = "LICENSE", hash = 0x892cda00 }]
+expression = "LicenseRef-Commons-Clause"
 
 [bans]
 multiple-versions = "warn"
