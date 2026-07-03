@@ -10,7 +10,7 @@ mod ui;
 mod utils;
 
 use clap::Parser;
-use cli::{AuditArgs, Cli, Commands};
+use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use models::AgentReport;
 use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
 use scoring::*;
@@ -47,8 +47,14 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
         return 2;
     }
 
+    if !report.scan_warnings.is_empty() {
+        warn!(warnings = ?report.scan_warnings, "one or more scanners failed – report may be incomplete");
+        return 2;
+    }
+
     if flags.has_critical() { 1 } else { 0 }
 }
+
 async fn run_remote_scan_with_timeout(
     host: String,
     args: AuditArgs,
@@ -67,6 +73,7 @@ async fn run_remote_scan_with_timeout(
         }
     }
 }
+
 // =====================================================================
 // Main command runner (returns exit code)
 // =====================================================================
@@ -160,12 +167,8 @@ async fn run_command(cli: Cli) -> i32 {
 
                 output::output_multi(&reports, &args.format, args.output);
                 // Compute overall exit code for fleet scans
-                if reports.iter().any(|r| compute_exit_code(r) == 1) {
-                    return 1;
-                } else if reports.iter().any(|r| !r.is_root_execution) {
-                    return 2;
-                }
-                return 0;
+                let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
+                return if worst >= 1 { worst.min(2) } else { 0 };
             }
 
             // Single local scan
@@ -214,9 +217,9 @@ async fn run_command(cli: Cli) -> i32 {
             });
             let diff = compare::compare_reports(&before, &after);
 
-            match args.format.as_str() {
-                "terminal" => compare::print_diff_terminal(&diff),
-                "json" => {
+            match args.format {
+                OutputFormat::Text => compare::print_diff_terminal(&diff),
+                OutputFormat::Json => {
                     let json = compare::diff_to_json(&diff).unwrap_or_else(|e| {
                         eprintln!("Failed to serialize diff JSON: {e}");
                         std::process::exit(1);
@@ -231,7 +234,7 @@ async fn run_command(cli: Cli) -> i32 {
                         println!("{}", json);
                     }
                 }
-                "excel" => {
+                OutputFormat::Xlsx => {
                     let path = args.output.unwrap_or_else(|| {
                         eprintln!("Error: --output is required for Excel format");
                         std::process::exit(1);
@@ -241,13 +244,6 @@ async fn run_command(cli: Cli) -> i32 {
                         std::process::exit(1);
                     });
                     println!("Diff Excel written to {}", path.display());
-                }
-                _ => {
-                    eprintln!(
-                        "Unknown format '{}'. Supported: terminal, json, excel",
-                        args.format
-                    );
-                    return 1;
                 }
             }
             0
@@ -281,14 +277,14 @@ async fn run_command(cli: Cli) -> i32 {
                 let after = parse_array(&after_data, "after");
                 let diffs = compare::compare_multi(&before, &after);
 
-                match cmp_args.format.as_str() {
-                    "terminal" => {
+                match cmp_args.format {
+                    OutputFormat::Text => {
                         for mh in &diffs {
                             println!("\nHost: {}", mh.hostname);
                             compare::print_diff_terminal(&mh.diff);
                         }
                     }
-                    "json" => {
+                    OutputFormat::Json => {
                         let json = serde_json::to_string_pretty(&diffs).unwrap_or_else(|e| {
                             eprintln!("Failed to serialize multi-host diff: {e}");
                             std::process::exit(1);
@@ -303,7 +299,7 @@ async fn run_command(cli: Cli) -> i32 {
                             println!("{}", json);
                         }
                     }
-                    "excel" => {
+                    OutputFormat::Xlsx => {
                         let path = cmp_args.output.unwrap_or_else(|| {
                             eprintln!("Error: --output is required for Excel format");
                             std::process::exit(1);
@@ -317,13 +313,6 @@ async fn run_command(cli: Cli) -> i32 {
                             std::process::exit(1);
                         });
                         println!("Multi-host diff Excel written to {}", path.display());
-                    }
-                    _ => {
-                        eprintln!(
-                            "Unknown format '{}'. Supported: terminal, json, excel",
-                            cmp_args.format
-                        );
-                        return 1;
                     }
                 }
                 return 0;
@@ -352,9 +341,9 @@ async fn run_command(cli: Cli) -> i32 {
 
             let diff = compare::compare_reports(&before_report, &after_report);
 
-            match cmp_args.format.as_str() {
-                "terminal" => compare::print_diff_terminal(&diff),
-                "json" => {
+            match cmp_args.format {
+                OutputFormat::Text => compare::print_diff_terminal(&diff),
+                OutputFormat::Json => {
                     let json = compare::diff_to_json(&diff).unwrap_or_else(|e| {
                         eprintln!("Failed to serialize diff JSON: {e}");
                         std::process::exit(1);
@@ -369,7 +358,7 @@ async fn run_command(cli: Cli) -> i32 {
                         println!("{}", json);
                     }
                 }
-                "excel" => {
+                OutputFormat::Xlsx => {
                     let path = cmp_args.output.unwrap_or_else(|| {
                         eprintln!("Error: --output is required for Excel format");
                         std::process::exit(1);
@@ -379,13 +368,6 @@ async fn run_command(cli: Cli) -> i32 {
                         std::process::exit(1);
                     });
                     println!("Diff Excel written to {}", path.display());
-                }
-                other => {
-                    eprintln!(
-                        "Unknown format '{}'. Supported: terminal, json, excel",
-                        other
-                    );
-                    std::process::exit(1);
                 }
             }
             0

@@ -81,8 +81,8 @@ pub struct DirCompareArgs {
     /// Directory containing snapshots (JSON files)
     pub dir: PathBuf,
     /// Output format: terminal (default), json, excel
-    #[arg(short, long, default_value = "terminal")]
-    pub format: String,
+    #[arg(short, long, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Output file for json/excel (optional)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
@@ -95,8 +95,8 @@ pub struct CompareArgs {
     /// Path to the later JSON report
     pub after: PathBuf,
     /// Output format: terminal (default), json, excel
-    #[arg(short, long, default_value = "terminal")]
-    pub format: String,
+    #[arg(short, long, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Output file for json/excel (optional)
     #[arg(short, long)]
     pub output: Option<PathBuf>,

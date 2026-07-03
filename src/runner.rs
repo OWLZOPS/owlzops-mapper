@@ -308,6 +308,11 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     let dir_path = output_dir.join(hostname);
     let file_path = dir_path.join(&filename);
 
+    if args.audit.format != crate::cli::OutputFormat::Json || args.audit.output.is_some() {
+        eprintln!(
+            "note: `snapshot` always writes JSON under --output-dir; --format/--output are ignored here."
+        );
+    }
     if let Err(e) = std::fs::create_dir_all(&dir_path) {
         eprintln!("Failed to create directory {}: {}", dir_path.display(), e);
         return 1;
