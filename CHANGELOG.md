@@ -1,33 +1,44 @@
+# Changelog
 
 ## Bug Fixes
 
-- Refine `is_self_only` logic in security scanner to handle edge cases with "ALL" command detection
+- Add scan_warnings to detect scanner panics and adjust exit code
+- Add host validation for SSH arguments in `validate_host`
+- Refine chrony output parsing to improve time sync detection
+- Add support for parsing user crontabs in RHEL/CentOS/Fedora
+- Add support for exporting custom /etc/hosts overrides to XLSX report
+- Allow license-file in cargo-deny for custom LICENSE
+- Remove allow-license-file from deny.toml configuration
+- Use only license-file for non-standard license
+- Clarify license configuration in deny.toml
+- Add hash for license clarification in cargo-deny
+- Prevent duplicate entries in local hosts list
+- Clarify license expression and include Commons Clause in deny.toml
 
 ## CI/CD
 
-- Replace direct changelog commits with PR-based automation
-- Docs: update CHANGELOG for v0.4.6
-- Uppdate action version in release workflow to latest commit hash
-- Replace action with custom script for changelog PR creation
+- Update workflows with refined permissions and improved artifact signing
 
 ## Documentation
 
-- Update JSON schema reference with expanded fields and new sections
-- Update highlights and CLI options for v0.4.7
+- Update CHANGELOG for v0.4.7
+
+## Features
+
+- Detect process and image changes for network ports and containers
+- Add support for parsing sshd_config includes and glob patterns
 
 ## Miscellaneous
 
-- Bump version to 0.4.7
+- Add tempfile as a dev-dependency in Cargo.toml
+- Bump version to 0.4.8 in Cargo.toml and Cargo.lock
+- Move SBOM generation to signing step in release workflow
 
 ## Refactoring
 
-- Introduce `run_child_with_timeout` for robust command execution
-- Streamline package manager logic with parsers and reduce duplication
-- Reuse dmesg output for OOM kill detection and error filtering
+- Refactor XLSX export sections for standalone mode support and consolidate redundant code
 
-## enhance
+## Testing
 
-- Detect backup tools via systemd timers in addition to cron jobs
-- Add timeouts for Docker API calls to prevent indefinite waits
-- Prevent duplicate sheet names in XLSX exports
+- Add unit tests for security module and update dependencies (tempfile)
 
