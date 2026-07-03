@@ -39,15 +39,16 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.7
+## Highlights v0.4.8
 
-- **Critical bug fixes** – removed `panic = "abort"` from release profile, ensuring scanner failures no longer crash the whole binary; fixed remote scan timeout that blocked fleet audits; corrected byte‑index panic in error logging.
-- **Backup detection improvements** – now checks systemd timers for backup tools, reducing false negatives; no longer flags the documented `owlzops-mapper` sudo entry as a security finding.
-- **Package parsers with tests** – isolated parsing logic for apt/dnf/yum/pacman/zypper into pure functions and added unit tests for each; APT parser now correctly reads new version from upgradable lists.
-- **Docker & SSH timeouts** – all Docker API calls are wrapped in explicit deadlines; remote SSH/SCP commands respect the new `--remote-timeout` flag.
-- **Excel sheet collision protection** – automatic deduplication with `~2`/`~3` suffixes when fleet hostnames would produce duplicate sheet names.
-- **Performance** – `dmesg` and `df -i` now called once instead of N times; `restic snapshots` runs once and reuses output for date extraction.
-- **Documentation** – `docs/FIELDS.md` updated to reflect actual field names in the latest JSON schema.
+- **Scanner panic detection** – the report now includes a `scan_warnings` field; if any scanner crashes, the audit explicitly warns instead of silently substituting "safe" defaults. Exit code 2 is returned when warnings are present.
+- **SSH argument validation** – `--host` and `--ssh-user` are now strictly validated to prevent option injection, closing a security gap in remote scanning.
+- **Chrony NTP accuracy** – parses `Leap status` instead of `Reference ID`, eliminating a false‑positive window where chrony was reported as synchronized during convergence.
+- **RHEL / CentOS / Fedora cron support** – user crontabs are now correctly detected on `cronie`‑based distributions (`/var/spool/cron/<user>`), not just Debian/Ubuntu.
+- **Multi‑host XLSX parity** – `custom_host_overrides` are now included in fleet reports; single‑host and multi‑host Excel export logic has been unified to prevent future divergence bugs.
+- **Expanded test coverage** – 30 unit tests now cover network parsing, package managers, security checks, diffing, and Excel generation.
+- **License accuracy** – the package now uses `license-file = "LICENSE"` to precisely represent Apache‑2.0 with Commons Clause, while CI validates dependencies against standard SPDX identifiers.
+- **Supply‑chain hardening** – SBOM is now signed as part of the release workflow; CI permissions are scoped to individual jobs; `cargo‑deny` exceptions cleanly handle the custom root license.
 
 ---
 
