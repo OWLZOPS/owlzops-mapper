@@ -96,9 +96,13 @@ async fn run_command(cli: Cli) -> i32 {
             if !hosts.is_empty() {
                 let mut remote = Vec::new();
                 let mut local = Vec::new();
+                let mut local_seen = false;
                 for h in hosts {
                     if is_local_host(&h) {
-                        local.push(h);
+                        if !local_seen {
+                            local.push(h);
+                            local_seen = true;
+                        }
                     } else {
                         remote.push(h);
                     }
