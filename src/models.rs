@@ -8,6 +8,7 @@ pub struct AgentReport {
     pub duration_secs: f64,
     pub risk_score: u8,
     pub is_root_execution: bool,
+    pub scan_warnings: Vec<String>,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,
     pub network: NetworkInfo,
@@ -15,6 +16,27 @@ pub struct AgentReport {
     pub topology: TopologyInfo,
     pub security: SecurityInfo,
     pub packages: PackagesInfo,
+}
+
+impl Default for AgentReport {
+    fn default() -> Self {
+        Self {
+            scan_id: String::new(),
+            timestamp: String::new(),
+            version: String::new(),
+            duration_secs: 0.0,
+            risk_score: 0,
+            is_root_execution: false,
+            scan_warnings: Vec::new(),
+            host: HostInfo::default(),
+            databases: Vec::new(),
+            network: NetworkInfo::default(),
+            storage: StorageInfo::default(),
+            topology: TopologyInfo::default(),
+            security: SecurityInfo::default(),
+            packages: PackagesInfo::default(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -137,6 +159,7 @@ pub struct ContainerInfo {
     pub cpu_limit: Option<f64>,
     pub cap_add: Vec<String>,
 }
+
 impl ContainerInfo {
     pub fn security_issues(&self) -> Vec<&'static str> {
         let mut issues = Vec::new();
@@ -190,8 +213,8 @@ pub enum PackageManager {
     #[default]
     Unknown,
 }
+
 impl PackageManager {
-    /// Returns `true` if a concrete package manager was detected.
     pub fn is_known(&self) -> bool {
         !matches!(self, PackageManager::Unknown)
     }

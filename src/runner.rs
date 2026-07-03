@@ -85,13 +85,16 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         network_task,
         storage_task,
         security_task,
-        crate::scanners::docker::gather_docker_topology(),
+        tokio::spawn(crate::scanners::docker::gather_docker_topology()),
         packages_task,
     );
 
-    // Structured logging for scanner failures
+    // Collect warnings from scanner failures
+    let mut scan_warnings = Vec::new();
+
     let host_info = host_res.unwrap_or_else(|e| {
         warn!(scanner = "host", error = ?e, "scanner panicked");
+        scan_warnings.push("host scanner panicked".to_string());
         crate::models::HostInfo {
             hostname: "unknown".to_string(),
             ..Default::default()
@@ -99,23 +102,35 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     });
     let dbs = dbs_res.unwrap_or_else(|e| {
         warn!(scanner = "databases", error = ?e, "scanner panicked");
+        scan_warnings.push("databases scanner panicked".to_string());
         vec![]
     });
     let network_info = network_res.unwrap_or_else(|e| {
         warn!(scanner = "network", error = ?e, "scanner panicked");
+        scan_warnings.push("network scanner panicked".to_string());
         crate::models::NetworkInfo::default()
     });
     let storage_info = storage_res.unwrap_or_else(|e| {
         warn!(scanner = "storage", error = ?e, "scanner panicked");
+        scan_warnings.push("storage scanner panicked".to_string());
         crate::models::StorageInfo::default()
     });
     let security_info = security_res.unwrap_or_else(|e| {
         warn!(scanner = "security", error = ?e, "scanner panicked");
+        scan_warnings
+            .push("security scanner panicked — SSH/sudo/sysctl fields NOT verified".to_string());
         crate::models::SecurityInfo::default()
     });
     let packages_info = packages_res.unwrap_or_else(|e| {
         warn!(scanner = "packages", error = ?e, "scanner panicked");
+        scan_warnings.push("packages scanner panicked".to_string());
         crate::models::PackagesInfo::default()
+    });
+
+    let topology_info = topology_info.unwrap_or_else(|e| {
+        warn!(scanner = "docker", error = ?e, "docker scanner panicked");
+        scan_warnings.push("docker scanner panicked".to_string());
+        crate::models::TopologyInfo::default()
     });
 
     let duration_secs = start.elapsed().as_secs_f64();
@@ -127,6 +142,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         duration_secs,
         risk_score: 0,
         is_root_execution: is_root,
+        scan_warnings,
         host: host_info,
         databases: dbs,
         network: network_info,
