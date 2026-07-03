@@ -210,6 +210,26 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
+    // Detect process changes on unchanged ports
+    for after_p in &after.network.listening_ports {
+        if let Some(before_p) = before.network.listening_ports.iter().find(|p| {
+            p.protocol == after_p.protocol
+                && p.bind_address == after_p.bind_address
+                && p.port == after_p.port
+        }) && before_p.process != after_p.process
+        {
+            changes.push(Change {
+                field: format!(
+                    "network.listening_ports.{}.{}.{}.process",
+                    after_p.protocol, after_p.bind_address, after_p.port
+                ),
+                before: Some(before_p.process.clone()),
+                after: Some(after_p.process.clone()),
+                severity: Severity::Degraded,
+            });
+        }
+    }
+
     // --- packages.upgradable (key: package name) ---
     let before_pkgs: HashSet<&str> = before
         .packages
@@ -308,6 +328,24 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             after: None,
             severity: Severity::Improved,
         });
+    }
+
+    // Detect image changes on unchanged containers
+    for after_c in &after.topology.containers {
+        if let Some(before_c) = before
+            .topology
+            .containers
+            .iter()
+            .find(|c| c.name == after_c.name)
+            && before_c.image != after_c.image
+        {
+            changes.push(Change {
+                field: format!("topology.containers.{}.image", after_c.name),
+                before: Some(before_c.image.clone()),
+                after: Some(after_c.image.clone()),
+                severity: Severity::Degraded,
+            });
+        }
     }
 
     // --- security.sysctl_issues (text description) ---
