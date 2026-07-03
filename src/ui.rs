@@ -121,6 +121,12 @@ fn render_header(report: &AgentReport) {
             "\x1b[1;41;37m[CRITICAL] SYSTEM REBOOT REQUIRED (Security patches pending)\x1b[0m\n"
         );
     }
+    if !report.scan_warnings.is_empty() {
+        println!(
+            "\x1b[1;31m[!] Scan incomplete — {} scanner(s) failed. Report may be unreliable.\x1b[0m\n",
+            report.scan_warnings.len()
+        );
+    }
 }
 
 fn render_system_overview(report: &AgentReport) {

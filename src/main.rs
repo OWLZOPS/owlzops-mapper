@@ -39,11 +39,16 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if !report.is_root_execution {
         if flags.has_critical() {
             warn!(
-                "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
+                "not running as root AND critical issues detected - results may be incomplete, re-run with sudo."
             );
         } else {
-            warn!("not running as root – results may be incomplete.");
+            warn!("not running as root - results may be incomplete.");
         }
+        return 2;
+    }
+
+    if !report.scan_warnings.is_empty() {
+        warn!(warnings = ?report.scan_warnings, "one or more scanners failed - report may be incomplete");
         return 2;
     }
 
@@ -160,12 +165,8 @@ async fn run_command(cli: Cli) -> i32 {
 
                 output::output_multi(&reports, &args.format, args.output);
                 // Compute overall exit code for fleet scans
-                if reports.iter().any(|r| compute_exit_code(r) == 1) {
-                    return 1;
-                } else if reports.iter().any(|r| !r.is_root_execution) {
-                    return 2;
-                }
-                return 0;
+                let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
+                return if worst >= 1 { worst.min(2) } else { 0 };
             }
 
             // Single local scan

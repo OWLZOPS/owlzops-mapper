@@ -479,6 +479,20 @@ pub fn sheet_executive_summary(
                 current_row += 1;
             }
         }
+        if !report.scan_warnings.is_empty() {
+            sheet.write_string_with_format(current_row, 0, "Data Quality", &fmts.header)?;
+            sheet.write_string_with_format(
+                current_row,
+                1,
+                "PARTIAL – scanners failed",
+                fmts.critical_band(current_row),
+            )?;
+            data.push(vec![
+                "Data Quality".to_string(),
+                "PARTIAL – scanners failed".to_string(),
+            ]);
+            current_row += 1;
+        }
     } else {
         write_headers_at(
             &mut sheet,
