@@ -28,6 +28,7 @@ shellexpand = "3"
 libc = "0.2.186"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.27.0"
 
 [profile.release]
 opt-level = 3
