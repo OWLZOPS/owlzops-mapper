@@ -41,24 +41,29 @@ jobs:
           cd ../../..
           sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
 
-      - name: Generate SBOM
-        run: |
-          cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --format json --override-filename sbom.json
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.archive }}
           path: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
-            sbom.json
 
   sign:
     name: Sign artifacts
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        with:
+          toolchain: stable
+
+      - name: Generate SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --override-filename sbom.json
+
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
