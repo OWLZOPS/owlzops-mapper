@@ -435,6 +435,24 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
             }
         }
     }
+    // RHEL/CentOS/Fedora user crontabs (without 'crontabs' subdirectory)
+    if let Ok(spool) = fs::read_dir("/var/spool/cron") {
+        for entry in spool.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue; // skip subdirectory crontabs/ (already handled above)
+            }
+            let user = entry.file_name().to_string_lossy().to_string();
+            if let Ok(contents) = fs::read_to_string(&path) {
+                for l in contents.lines() {
+                    let l = l.trim();
+                    if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
+                        cron_jobs.push(format!("user {}: {}", user, l));
+                    }
+                }
+            }
+        }
+    }
     if let Ok(anacron) = fs::read_to_string("/etc/anacrontab") {
         for l in anacron.lines() {
             let l = l.trim();
