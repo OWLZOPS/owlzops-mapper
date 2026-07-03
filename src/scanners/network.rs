@@ -1,6 +1,8 @@
 use crate::models::{NetworkInfo, PortInfo, SslCertInfo};
+use crate::scanners::Scanner;
 use crate::utils::run_with_timeout;
 use chrono::{NaiveDateTime, Utc};
+use std::error::Error;
 use std::fs;
 
 /// openssl `-enddate` always returns dates in the format
@@ -211,6 +213,20 @@ pub fn gather_network_info() -> NetworkInfo {
         custom_host_overrides,
         ssl_certificates,
         listening_ports,
+    }
+}
+
+#[allow(dead_code)]
+pub struct NetworkScanner;
+
+impl Scanner for NetworkScanner {
+    fn name(&self) -> &'static str {
+        "network"
+    }
+
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn Error + Send>> {
+        let info = gather_network_info();
+        Ok(Box::new(info))
     }
 }
 

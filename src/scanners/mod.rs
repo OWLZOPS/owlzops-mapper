@@ -4,3 +4,10 @@ pub mod network;
 pub mod packages;
 pub mod security;
 pub mod storage;
+use std::error::Error;
+
+#[allow(dead_code)]
+pub trait Scanner: Send {
+    fn name(&self) -> &'static str;
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn Error + Send>>;
+}

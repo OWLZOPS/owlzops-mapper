@@ -1,5 +1,7 @@
 use crate::models::{DatabaseInfo, HostInfo, ProcessInfo};
+use crate::scanners::Scanner;
 use std::collections::{BinaryHeap, HashSet};
+use std::error::Error;
 use std::fs;
 use std::path::Path;
 use sysinfo::{ProcessStatus, System};
@@ -664,5 +666,21 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         last_restic_snapshot,
         ntp_synchronized,
         time_offset_ms,
+    }
+}
+#[allow(dead_code)]
+pub struct HostScanner {
+    pub fetch_external_ip: bool,
+}
+
+impl Scanner for HostScanner {
+    fn name(&self) -> &'static str {
+        "host"
+    }
+
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn Error + Send>> {
+        let mut sys = sysinfo::System::new_all();
+        let info = gather_host_info(&mut sys, self.fetch_external_ip);
+        Ok(Box::new(info))
     }
 }

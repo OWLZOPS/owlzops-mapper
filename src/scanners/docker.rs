@@ -1,10 +1,12 @@
 use crate::models::{ContainerInfo, DanglingImageInfo, TopologyInfo};
+use crate::scanners::Scanner;
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::image::ListImagesOptions;
 use bollard::volume::ListVolumesOptions;
 use std::collections::HashMap;
 use std::default::Default;
+use std::error::Error;
 use std::fs;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -255,5 +257,21 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             dangling_images: vec![],
             containers: vec![],
         },
+    }
+}
+
+#[allow(dead_code)]
+pub struct DockerScanner;
+
+impl Scanner for DockerScanner {
+    fn name(&self) -> &'static str {
+        "docker"
+    }
+
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn Error + Send>> {
+        let info = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(gather_docker_topology());
+        Ok(Box::new(info))
     }
 }

@@ -1,4 +1,6 @@
 use crate::models::{DiskInfo, StorageInfo};
+use crate::scanners::Scanner;
+use std::error::Error;
 use sysinfo::Disks;
 
 pub fn gather_storage_info() -> StorageInfo {
@@ -33,4 +35,18 @@ pub fn gather_storage_info() -> StorageInfo {
     }
 
     StorageInfo { disks }
+}
+
+#[allow(dead_code)]
+pub struct StorageScanner;
+
+impl Scanner for StorageScanner {
+    fn name(&self) -> &'static str {
+        "storage"
+    }
+
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn Error + Send>> {
+        let info = gather_storage_info();
+        Ok(Box::new(info))
+    }
 }

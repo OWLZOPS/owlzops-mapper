@@ -1,5 +1,7 @@
 use crate::models::{PackageManager, PackagesInfo, UpgradablePackage};
+use crate::scanners::Scanner;
 use std::collections::HashSet;
+use std::error::Error;
 
 /// Parse the stdout of `dnf check-update` (or `yum check-update`).
 /// Format: "pkg.arch  version  repo" (three columns, repo may contain "security")
@@ -289,6 +291,22 @@ pub fn gather_packages_info(refresh: bool) -> PackagesInfo {
         installed_count: installed,
         upgradable,
         cache_refreshed,
+    }
+}
+
+#[allow(dead_code)]
+pub struct PackagesScanner {
+    pub refresh: bool,
+}
+
+impl Scanner for PackagesScanner {
+    fn name(&self) -> &'static str {
+        "packages"
+    }
+
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn Error + Send>> {
+        let info = gather_packages_info(self.refresh);
+        Ok(Box::new(info))
     }
 }
 
