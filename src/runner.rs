@@ -22,9 +22,21 @@ pub fn validate_remote_path(path: &str) -> Result<(), String> {
 /// Validate that an SSH username looks safe.
 pub fn validate_ssh_user(user: &str) -> Result<(), String> {
     if user.is_empty()
+        || user.starts_with('-')
         || user.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
     {
         return Err(format!("invalid ssh user: '{user}'"));
+    }
+    Ok(())
+}
+
+/// Validate that a hostname/IP is safe for SSH arguments.
+pub fn validate_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!("invalid host: '{host}'"));
+    }
+    if host.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_.:".contains(c)) {
+        return Err(format!("host contains unexpected characters: '{host}'"));
     }
     Ok(())
 }
@@ -65,57 +77,134 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
 
     info!("scan started");
 
-    let host_task = tokio::task::spawn_blocking(move || {
-        let mut sys = sysinfo::System::new_all();
-        crate::scanners::host::gather_host_info(&mut sys, want_external_ip)
+    // Build a dynamic list of scanners
+    let scanners: Vec<Box<dyn crate::scanners::Scanner>> = vec![
+        Box::new(crate::scanners::host::HostScanner {
+            fetch_external_ip: want_external_ip,
+        }),
+        Box::new(crate::scanners::storage::StorageScanner),
+        Box::new(crate::scanners::network::NetworkScanner),
+        Box::new(crate::scanners::security::SecurityScanner),
+        Box::new(crate::scanners::packages::PackagesScanner {
+            refresh: want_refresh_packages,
+        }),
+        Box::new(crate::scanners::docker::DockerScanner),
+    ];
+
+    let mut handles = Vec::new();
+    for scanner in scanners {
+        let name = scanner.name().to_string();
+        handles.push(tokio::task::spawn_blocking(move || (name, scanner.scan())));
+    }
+
+    // Databases are collected separately (they are in host.rs)
+    let dbs_handle = tokio::task::spawn_blocking(|| {
+        ("databases".to_string(), {
+            let info = crate::scanners::host::gather_databases_info();
+            Ok::<Box<dyn std::any::Any + Send>, Box<dyn std::error::Error + Send>>(Box::new(info))
+        })
     });
 
-    let dbs_task = tokio::task::spawn_blocking(crate::scanners::host::gather_databases_info);
-    let network_task = tokio::task::spawn_blocking(crate::scanners::network::gather_network_info);
-    let storage_task = tokio::task::spawn_blocking(crate::scanners::storage::gather_storage_info);
-    let security_task =
-        tokio::task::spawn_blocking(crate::scanners::security::gather_security_info);
-    let packages_task = tokio::task::spawn_blocking(move || {
-        crate::scanners::packages::gather_packages_info(want_refresh_packages)
-    });
+    let mut scan_warnings = Vec::new();
+    let mut host_info = None;
+    let mut dbs = Vec::new();
+    let mut network_info = None;
+    let mut storage_info = None;
+    let mut security_info = None;
+    let mut packages_info = None;
+    let mut topology_info = None;
 
-    let (host_res, dbs_res, network_res, storage_res, security_res, topology_info, packages_res) = tokio::join!(
-        host_task,
-        dbs_task,
-        network_task,
-        storage_task,
-        security_task,
-        crate::scanners::docker::gather_docker_topology(),
-        packages_task,
-    );
+    // Collect results
+    for handle in handles {
+        match handle.await {
+            Ok((name, Ok(result))) => match name.as_str() {
+                "host" => {
+                    if let Some(info) = result.downcast_ref::<crate::models::HostInfo>() {
+                        host_info = Some(info.clone());
+                    }
+                }
+                "network" => {
+                    if let Some(info) = result.downcast_ref::<crate::models::NetworkInfo>() {
+                        network_info = Some(info.clone());
+                    }
+                }
+                "storage" => {
+                    if let Some(info) = result.downcast_ref::<crate::models::StorageInfo>() {
+                        storage_info = Some(info.clone());
+                    }
+                }
+                "security" => {
+                    if let Some(info) = result.downcast_ref::<crate::models::SecurityInfo>() {
+                        security_info = Some(info.clone());
+                    }
+                }
+                "packages" => {
+                    if let Some(info) = result.downcast_ref::<crate::models::PackagesInfo>() {
+                        packages_info = Some(info.clone());
+                    }
+                }
+                "docker" => {
+                    if let Some(info) = result.downcast_ref::<crate::models::TopologyInfo>() {
+                        topology_info = Some(info.clone());
+                    }
+                }
+                _ => {}
+            },
+            Ok((name, Err(e))) => {
+                warn!(scanner = %name, error = %e, "scanner failed");
+                scan_warnings.push(format!("{} scanner failed: {}", name, e));
+            }
+            Err(e) => {
+                warn!(scanner = "unknown", error = %e, "scanner panicked");
+                scan_warnings.push("a scanner panicked".to_string());
+            }
+        }
+    }
 
-    // Structured logging for scanner failures
-    let host_info = host_res.unwrap_or_else(|e| {
-        warn!(scanner = "host", error = ?e, "scanner panicked");
+    // Collect databases
+    match dbs_handle.await {
+        Ok((_, Ok(result))) => {
+            if let Some(db_list) = result.downcast_ref::<Vec<crate::models::DatabaseInfo>>() {
+                dbs = db_list.clone();
+            }
+        }
+        Ok((name, Err(e))) => {
+            warn!(scanner = %name, error = %e, "scanner failed");
+            scan_warnings.push(format!("{} scanner failed: {}", name, e));
+        }
+        Err(e) => {
+            warn!(scanner = "databases", error = %e, "scanner panicked");
+            scan_warnings.push("databases scanner panicked".to_string());
+        }
+    }
+
+    // Fill defaults for any scanner that didn't return
+    let host_info = host_info.unwrap_or_else(|| {
+        scan_warnings.push("host scanner did not return data".to_string());
         crate::models::HostInfo {
             hostname: "unknown".to_string(),
             ..Default::default()
         }
     });
-    let dbs = dbs_res.unwrap_or_else(|e| {
-        warn!(scanner = "databases", error = ?e, "scanner panicked");
-        vec![]
-    });
-    let network_info = network_res.unwrap_or_else(|e| {
-        warn!(scanner = "network", error = ?e, "scanner panicked");
+    let network_info = network_info.unwrap_or_else(|| {
+        scan_warnings.push("network scanner did not return data".to_string());
         crate::models::NetworkInfo::default()
     });
-    let storage_info = storage_res.unwrap_or_else(|e| {
-        warn!(scanner = "storage", error = ?e, "scanner panicked");
+    let storage_info = storage_info.unwrap_or_else(|| {
+        scan_warnings.push("storage scanner did not return data".to_string());
         crate::models::StorageInfo::default()
     });
-    let security_info = security_res.unwrap_or_else(|e| {
-        warn!(scanner = "security", error = ?e, "scanner panicked");
+    let security_info = security_info.unwrap_or_else(|| {
+        scan_warnings.push("security scanner did not return data".to_string());
         crate::models::SecurityInfo::default()
     });
-    let packages_info = packages_res.unwrap_or_else(|e| {
-        warn!(scanner = "packages", error = ?e, "scanner panicked");
+    let packages_info = packages_info.unwrap_or_else(|| {
+        scan_warnings.push("packages scanner did not return data".to_string());
         crate::models::PackagesInfo::default()
+    });
+    let topology_info = topology_info.unwrap_or_else(|| {
+        scan_warnings.push("docker scanner did not return data".to_string());
+        crate::models::TopologyInfo::default()
     });
 
     let duration_secs = start.elapsed().as_secs_f64();
@@ -127,6 +216,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         duration_secs,
         risk_score: 0,
         is_root_execution: is_root,
+        scan_warnings,
         host: host_info,
         databases: dbs,
         network: network_info,
@@ -156,6 +246,10 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         return None;
     }
     if let Err(e) = validate_ssh_user(ssh_user) {
+        warn!("{e}");
+        return None;
+    }
+    if let Err(e) = validate_host(host) {
         warn!("{e}");
         return None;
     }
@@ -276,6 +370,11 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     let dir_path = output_dir.join(hostname);
     let file_path = dir_path.join(&filename);
 
+    if args.audit.format != crate::cli::OutputFormat::Json || args.audit.output.is_some() {
+        eprintln!(
+            "note: `snapshot` always writes JSON under --output-dir; --format/--output are ignored here."
+        );
+    }
     if let Err(e) = std::fs::create_dir_all(&dir_path) {
         eprintln!("Failed to create directory {}: {}", dir_path.display(), e);
         return 1;

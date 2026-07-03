@@ -429,6 +429,7 @@ mod tests {
             duration_secs: 1.0,
             risk_score: 0,
             is_root_execution: true,
+            scan_warnings: Vec::new(),
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),

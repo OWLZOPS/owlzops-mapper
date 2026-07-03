@@ -260,7 +260,6 @@ pub async fn gather_docker_topology() -> TopologyInfo {
     }
 }
 
-#[allow(dead_code)]
 pub struct DockerScanner;
 
 impl Scanner for DockerScanner {

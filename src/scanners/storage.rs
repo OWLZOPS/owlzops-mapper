@@ -37,7 +37,6 @@ pub fn gather_storage_info() -> StorageInfo {
     StorageInfo { disks }
 }
 
-#[allow(dead_code)]
 pub struct StorageScanner;
 
 impl Scanner for StorageScanner {

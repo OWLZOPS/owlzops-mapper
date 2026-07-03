@@ -216,7 +216,6 @@ pub fn gather_network_info() -> NetworkInfo {
     }
 }
 
-#[allow(dead_code)]
 pub struct NetworkScanner;
 
 impl Scanner for NetworkScanner {

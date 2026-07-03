@@ -1,9 +1,21 @@
 use crate::models::{SecurityInfo, UserInfo};
+use crate::scanners::Scanner;
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
+pub struct SecurityScanner;
 
+impl Scanner for SecurityScanner {
+    fn name(&self) -> &'static str {
+        "security"
+    }
+
+    fn scan(&self) -> Result<Box<dyn std::any::Any + Send>, Box<dyn std::error::Error + Send>> {
+        let info = gather_security_info();
+        Ok(Box::new(info))
+    }
+}
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Extract a directive value from `sshd -T` output (format: "directive value").

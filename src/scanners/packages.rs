@@ -294,7 +294,6 @@ pub fn gather_packages_info(refresh: bool) -> PackagesInfo {
     }
 }
 
-#[allow(dead_code)]
 pub struct PackagesScanner {
     pub refresh: bool,
 }

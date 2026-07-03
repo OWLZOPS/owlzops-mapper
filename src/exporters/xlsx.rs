@@ -1788,6 +1788,7 @@ mod tests {
             duration_secs: 1.0,
             risk_score: 10,
             is_root_execution: true,
+            scan_warnings: Vec::new(),
             host: HostInfo {
                 hostname: "testhost".into(),
                 backup_tools: vec!["restic".into()],

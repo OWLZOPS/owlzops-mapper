@@ -668,7 +668,6 @@ pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
         time_offset_ms,
     }
 }
-#[allow(dead_code)]
 pub struct HostScanner {
     pub fetch_external_ip: bool,
 }
