@@ -1,6 +1,6 @@
 [package]
 name = "owlzops-mapper"
-version = "0.4.7"
+version = "0.4.9"
 edition = "2024"
 license = "Apache-2.0"
 description = "Owlzops Infrastructure Discovery Agent"
