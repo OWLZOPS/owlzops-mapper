@@ -582,7 +582,9 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
     if let Some(chrony_out) = crate::utils::run_with_timeout("chronyc", &["tracking"], 5) {
         let synced = chrony_out
             .lines()
-            .any(|l| l.contains("Reference ID") && !l.contains("7F000001"));
+            .find_map(|l| l.strip_prefix("Leap status"))
+            .map(|v| v.trim_start_matches(':').trim() == "Normal")
+            .unwrap_or(false);
         let mut offset = None;
         for line in chrony_out.lines() {
             if line.contains("System time") {
