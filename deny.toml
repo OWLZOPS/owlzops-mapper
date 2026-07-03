@@ -12,7 +12,6 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
 ]
-allow-license-file = true
 exceptions = [
     { name = "owlzops-mapper", allow = ["Apache-2.0"] },
 ]
