@@ -22,9 +22,21 @@ pub fn validate_remote_path(path: &str) -> Result<(), String> {
 /// Validate that an SSH username looks safe.
 pub fn validate_ssh_user(user: &str) -> Result<(), String> {
     if user.is_empty()
+        || user.starts_with('-')
         || user.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
     {
         return Err(format!("invalid ssh user: '{user}'"));
+    }
+    Ok(())
+}
+
+/// Validate that a hostname/IP is safe for SSH arguments.
+pub fn validate_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!("invalid host: '{host}'"));
+    }
+    if host.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_.:".contains(c)) {
+        return Err(format!("host contains unexpected characters: '{host}'"));
     }
     Ok(())
 }
@@ -172,6 +184,10 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         return None;
     }
     if let Err(e) = validate_ssh_user(ssh_user) {
+        warn!("{e}");
+        return None;
+    }
+    if let Err(e) = validate_host(host) {
         warn!("{e}");
         return None;
     }
