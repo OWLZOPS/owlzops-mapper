@@ -2,6 +2,7 @@
 name = "owlzops-mapper"
 version = "0.4.7"
 edition = "2024"
+license = "Apache-2.0"
 license-file = "LICENSE"
 description = "Owlzops Infrastructure Discovery Agent"
 
