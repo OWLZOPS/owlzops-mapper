@@ -312,7 +312,10 @@ The install script (`install.sh`) now performs GPG verification automatically if
 
 ## License
 
-Apache-2.0 with Commons Clause - free to use, not to resell.
-Is it free? Yes, 100% free for internal use, server audits and personal projects.
-The Commons Clause is only there to prevent direct reselling of this software.
+*Apache-2.0 with Commons Clause** - free to use, not to resell.
+
+**Is it free for my company?**
+Yes. You are 100% free to use owlzops-mapper for commercial purposes, corporate infrastructure audits and internal security checks.
+
+The Commons Clause simply prevents third parties from taking this codebase and directly reselling it as their own commercial software or SaaS product
 See [LICENSE](LICENSE) for details.
