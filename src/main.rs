@@ -165,6 +165,13 @@ async fn run_command(cli: Cli) -> i32 {
                     }
                 }
 
+                // exit with code 2 when fleet scan produced no reports
+                if reports.is_empty() {
+                    warn!("fleet scan produced no reports — all hosts failed");
+                    output::output_multi(&reports, &args.format, args.output);
+                    return 2;
+                }
+
                 output::output_multi(&reports, &args.format, args.output);
                 // Compute overall exit code for fleet scans
                 let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
