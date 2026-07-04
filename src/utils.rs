@@ -38,33 +38,44 @@ pub fn run_child_with_timeout(
         .spawn()
         .ok()?;
 
+    let mut out_pipe = child.stdout.take()?;
+    let mut err_pipe = child.stderr.take()?;
+
+    let out_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+
     let deadline = Duration::from_secs(timeout_secs);
     let start = Instant::now();
-    loop {
+
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                child.stdout.take()?.read_to_end(&mut stdout).ok()?;
-                child.stderr.take()?.read_to_end(&mut stderr).ok()?;
-                return Some(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() < deadline => {
                 thread::sleep(Duration::from_millis(50));
             }
-            Ok(None) => {
+            _ => {
                 let _ = child.kill();
-                thread::sleep(Duration::from_millis(100));
                 let _ = child.wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
                 return None;
             }
-            Err(_) => return None,
         }
-    }
+    };
+
+    Some(std::process::Output {
+        status,
+        stdout: out_handle.join().unwrap_or_default(),
+        stderr: err_handle.join().unwrap_or_default(),
+    })
 }
 
 /// Execute a command with a timeout.
@@ -127,5 +138,26 @@ fn run_with_timeout_inner(
             poll_wait(&mut child, Duration::from_secs(1));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_child_with_timeout_large_stdout_does_not_deadlock() {
+        let result = run_child_with_timeout("sh", &["-c", "head -c 200000 /dev/zero | base64"], 10);
+        assert!(result.is_some(), "Process should not time out");
+        let output = result.unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 100_000);
+    }
+
+    #[test]
+    fn run_child_with_timeout_timeout_kills_child() {
+        // Use direct 'sleep' process to avoid orphan grandchildren holding pipe
+        let result = run_child_with_timeout("sleep", &["60"], 1);
+        assert!(result.is_none());
     }
 }

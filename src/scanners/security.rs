@@ -24,6 +24,7 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
 }
 
 /// Fallback used when `sshd -T` is unavailable.
+/// Fallback used when `sshd -T` is unavailable.
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     let mut config_lines = Vec::new();
 
@@ -77,14 +78,31 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
         }
     }
 
-    // Parse collected config lines
+    // Parse collected config lines using first-match semantics,
+    // stop at Match blocks, and perform case-insensitive matching.
+    let mut pa_seen = false;
+    let mut rl_seen = false;
+
     for line in &config_lines {
-        let clean = line.trim();
-        if clean.starts_with("PasswordAuthentication") {
-            *pass_auth = clean.ends_with("yes");
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let Some(val) = parts.next() else { continue };
+
+        // Directives inside Match blocks are conditional; ignore them.
+        if key.eq_ignore_ascii_case("match") {
+            break;
         }
-        if clean.starts_with("PermitRootLogin") {
-            *root_login = !clean.ends_with("no");
+
+        if !pa_seen && key.eq_ignore_ascii_case("passwordauthentication") {
+            *pass_auth = val.eq_ignore_ascii_case("yes");
+            pa_seen = true;
+        } else if !rl_seen && key.eq_ignore_ascii_case("permitrootlogin") {
+            *root_login = !val.eq_ignore_ascii_case("no");
+            rl_seen = true;
+        }
+
+        if pa_seen && rl_seen {
+            break;
         }
     }
 }
@@ -115,6 +133,9 @@ fn gather_sudo_nopasswd() -> Vec<String> {
         }
     }
 
+    // Only these exact paths are considered self-referential (remote scanning).
+    const SELF_PATHS: &[&str] = &["/tmp/owlzops-mapper", "/usr/local/bin/owlzops-mapper"];
+
     for file in files {
         if let Ok(contents) = fs::read_to_string(&file) {
             for line in contents.lines() {
@@ -123,16 +144,12 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                     continue;
                 }
                 if l.to_lowercase().contains("nopasswd") {
-                    // Exclude entries that are exclusively for owlzops-mapper itself
-                    // (needed for remote scanning without password prompt)
+                    // Exclude entries that are exclusively for the scanner itself,
+                    // to avoid flagging our own remote scanning capability.
                     let is_self_only = l.contains("owlzops-mapper")
                         && l.rsplit(':')
                             .next()
-                            .map(|cmd| {
-                                cmd.split(',').all(|c| {
-                                    c.trim().ends_with("owlzops-mapper") && c.trim() != "ALL"
-                                })
-                            })
+                            .map(|cmd| cmd.split(',').all(|c| SELF_PATHS.contains(&c.trim())))
                             .unwrap_or(false);
                     if is_self_only {
                         continue;
@@ -247,11 +264,8 @@ pub fn gather_security_info() -> SecurityInfo {
                 let username = parts[0].to_string();
 
                 // Count authorized keys
-                let auth_keys_path = if username == "root" {
-                    "/root/.ssh/authorized_keys".to_string()
-                } else {
-                    format!("/home/{}/.ssh/authorized_keys", username)
-                };
+                let home = parts[5];
+                let auth_keys_path = format!("{}/.ssh/authorized_keys", home);
                 let count = fs::read_to_string(&auth_keys_path)
                     .unwrap_or_default()
                     .lines()

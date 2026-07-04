@@ -230,14 +230,13 @@ fn refresh_cache(manager: PackageManager, bin: Option<&str>) -> bool {
     }
 }
 
-fn installed_count(manager: PackageManager, bin: Option<&str>) -> usize {
+fn installed_count(manager: PackageManager) -> usize {
     match manager {
         PackageManager::Apt => crate::utils::run_with_timeout("dpkg-query", &["-W"], 10)
             .map(|s| s.lines().count())
             .unwrap_or(0),
         PackageManager::Dnf | PackageManager::Yum => {
-            let b = bin.unwrap_or("rpm");
-            crate::utils::run_with_timeout(b, &["-qa"], 15)
+            crate::utils::run_with_timeout("rpm", &["-qa"], 15)
                 .map(|s| s.lines().count())
                 .unwrap_or(0)
         }
@@ -262,7 +261,7 @@ pub fn gather_packages_info(refresh: bool) -> PackagesInfo {
     } else {
         false
     };
-    let installed = installed_count(manager, bin.as_deref());
+    let installed = installed_count(manager);
 
     let mut upgradable = match manager {
         PackageManager::Dnf | PackageManager::Yum => {

@@ -8,7 +8,7 @@ use sysinfo::{ProcessStatus, System};
 
 /// Get directory size in MB using `du` with a 10‑second timeout.
 fn get_dir_size_mb(path: &str) -> u64 {
-    if let Some(stdout) = crate::utils::run_with_timeout("du", &["-sm", path], 10)
+    if let Some(stdout) = crate::utils::run_with_timeout("du", &["-sxm", path], 60)
         && let Some(first_val) = stdout.split_whitespace().next()
     {
         return first_val.parse::<u64>().unwrap_or(0);
@@ -140,9 +140,9 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
             &["-s", "-4", "--max-time", "5", "https://ifconfig.me"],
             6,
         ) {
-            let ip = stdout.trim().to_string();
-            if !ip.is_empty() {
-                external_ipv4 = ip;
+            let candidate = stdout.trim().to_string();
+            if candidate.parse::<std::net::Ipv4Addr>().is_ok() {
+                external_ipv4 = candidate;
             }
         }
     }
@@ -573,25 +573,56 @@ fn gather_backup_info(
     (tools, last_restic)
 }
 
+/// Parse a timesync offset string like "+1.200ms", "-340us", "+0.004s" into milliseconds (absolute).
+fn parse_offset_to_ms(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let (sign, rest) = if let Some(stripped) = s.strip_prefix('-') {
+        (-1.0, stripped)
+    } else if let Some(stripped) = s.strip_prefix('+') {
+        (1.0, stripped)
+    } else {
+        (1.0, s)
+    };
+
+    // Separate numeric part and unit
+    let (num_str, unit) = if let Some(pos) = rest.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        (&rest[..pos], &rest[pos..])
+    } else {
+        (rest, "")
+    };
+
+    let value: f64 = num_str.parse().ok()?;
+    let ms = match unit.to_lowercase().as_str() {
+        "s" | "sec" | "seconds" => value * 1000.0,
+        "ms" | "msec" | "milliseconds" => value,
+        "us" | "usec" | "microseconds" => value / 1000.0,
+        "ns" | "nsec" | "nanoseconds" => value / 1_000_000.0,
+        _ => return None, // unknown unit
+    };
+    Some((sign * ms).abs()) // always return positive offset magnitude
+}
+
 /// Determine NTP synchronization status and time offset.
 /// Handles containers without systemd gracefully.
 fn gather_ntp_info() -> (bool, Option<f64>) {
-    // 1. timedatectl
+    // 1. timedatectl (systemd-timesyncd)
     if let Some(td_out) = crate::utils::run_with_timeout("timedatectl", &["status"], 5) {
         let synchronized = td_out.lines().any(|l| {
             (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
         });
-        let mut offset = None;
-        for line in td_out.lines() {
-            if let Some(rest) = line.strip_prefix("NTP offset:")
-                && let Some(ms) = rest.trim().strip_suffix("ms")
-                && let Ok(val) = ms.trim().parse::<f64>()
-            {
-                offset = Some(val.abs());
-                break;
-            }
-        }
         if synchronized {
+            // Extract actual offset from timesync-status
+            let offset = crate::utils::run_with_timeout("timedatectl", &["timesync-status"], 5)
+                .and_then(|ts_out| {
+                    ts_out.lines().find_map(|line| {
+                        let rest = line.trim().strip_prefix("Offset:")?;
+                        parse_offset_to_ms(rest.trim())
+                    })
+                });
             return (true, offset);
         }
     }
@@ -639,7 +670,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 // ── main host info collector ───────────────────────────────
 
 pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
-    sys.refresh_all();
     let reboot_required = Path::new("/var/run/reboot-required").exists();
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);

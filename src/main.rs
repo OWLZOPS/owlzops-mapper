@@ -60,15 +60,16 @@ async fn run_remote_scan_with_timeout(
     args: AuditArgs,
 ) -> Result<Option<AgentReport>, tokio::task::JoinError> {
     let host_for_log = host.clone();
+    let cap = args.remote_timeout_secs.saturating_mul(2) + 60;
     match tokio::time::timeout(
-        std::time::Duration::from_secs(600),
+        std::time::Duration::from_secs(cap),
         tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
     )
     .await
     {
         Ok(inner) => inner,
         Err(_elapsed) => {
-            warn!(host = %host_for_log, "remote scan timed out after 600s");
+            warn!(host = %host_for_log, "remote scan timed out after {}s", cap);
             Ok(None)
         }
     }
@@ -165,7 +166,27 @@ async fn run_command(cli: Cli) -> i32 {
                     }
                 }
 
-                output::output_multi(&reports, &args.format, args.output);
+                // exit with code 2 when fleet scan produced no reports
+                if reports.is_empty() {
+                    warn!("fleet scan produced no reports — all hosts failed");
+                    if let Err(e) = output::output_multi(
+                        &reports,
+                        &args.format,
+                        args.output.as_deref().map(std::path::Path::new),
+                    ) {
+                        warn!("output error: {e}");
+                    }
+                    return 2;
+                }
+
+                if let Err(e) = output::output_multi(
+                    &reports,
+                    &args.format,
+                    args.output.as_deref().map(std::path::Path::new),
+                ) {
+                    warn!("output error: {e}");
+                    return 2;
+                }
                 // Compute overall exit code for fleet scans
                 let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
                 return if worst >= 1 { worst.min(2) } else { 0 };
@@ -174,7 +195,14 @@ async fn run_command(cli: Cli) -> i32 {
             // Single local scan
             let report = run_local_scan_async(&args).await;
             let exit_code = compute_exit_code(&report);
-            output::output_single(&report, &args.format, args.output);
+            if let Err(e) = output::output_single(
+                &report,
+                &args.format,
+                args.output.as_deref().map(std::path::Path::new),
+            ) {
+                warn!("output error: {e}");
+                return 2;
+            }
             exit_code
         }
 

@@ -14,7 +14,7 @@ pub fn gather_storage_info() -> StorageInfo {
         let mut inode_usage = None;
 
         // Use run_with_timeout to avoid hanging on NFS or stuck mounts
-        if let Some(stdout_str) = crate::utils::run_with_timeout("df", &["-i", &mount_point], 5) {
+        if let Some(stdout_str) = crate::utils::run_with_timeout("df", &["-Pi", &mount_point], 5) {
             let lines: Vec<&str> = stdout_str.lines().collect();
             if lines.len() > 1 {
                 let parts: Vec<&str> = lines[1].split_whitespace().collect();
