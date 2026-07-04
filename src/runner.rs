@@ -298,12 +298,9 @@ fn read_user_home(username: &str) -> Option<String> {
 pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     // When running under sudo, resolve ~ to the original user's home directory,
     // so snapshots are stored in the user's own tree instead of /root.
-    let output_dir = if args.output_dir == "~/.owlzops/snapshots"
-        && crate::is_running_as_root()
-    {
+    let output_dir = if args.output_dir == "~/.owlzops/snapshots" && crate::is_running_as_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-            let home = read_user_home(&sudo_user)
-                .unwrap_or_else(|| format!("/home/{}", sudo_user));
+            let home = read_user_home(&sudo_user).unwrap_or_else(|| format!("/home/{}", sudo_user));
             shellexpand::tilde(&format!("{}/.owlzops/snapshots", home)).to_string()
         } else {
             shellexpand::tilde(&args.output_dir).to_string()
