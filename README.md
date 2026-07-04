@@ -39,16 +39,17 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.8
+## Highlights v0.4.10
 
-- **Scanner panic detection** – the report now includes a `scan_warnings` field; if any scanner crashes, the audit explicitly warns instead of silently substituting "safe" defaults. Exit code 2 is returned when warnings are present.
-- **SSH argument validation** – `--host` and `--ssh-user` are now strictly validated to prevent option injection, closing a security gap in remote scanning.
-- **Chrony NTP accuracy** – parses `Leap status` instead of `Reference ID`, eliminating a false‑positive window where chrony was reported as synchronized during convergence.
-- **RHEL / CentOS / Fedora cron support** – user crontabs are now correctly detected on `cronie`‑based distributions (`/var/spool/cron/<user>`), not just Debian/Ubuntu.
-- **Multi‑host XLSX parity** – `custom_host_overrides` are now included in fleet reports; single‑host and multi‑host Excel export logic has been unified to prevent future divergence bugs.
-- **Expanded test coverage** – 30 unit tests now cover network parsing, package managers, security checks, diffing, and Excel generation.
-- **License accuracy** – the package now uses `license-file = "LICENSE"` to precisely represent Apache‑2.0 with Commons Clause, while CI validates dependencies against standard SPDX identifiers.
-- **Supply‑chain hardening** – SBOM is now signed as part of the release workflow; CI permissions are scoped to individual jobs; `cargo‑deny` exceptions cleanly handle the custom root license.
+- **Remote pipe‑deadlock fixed** – SSH scans producing reports larger than 64 KB no longer hang; stdout/stderr are now drained in parallel threads.
+- **Accurate package counts on RPM systems** – `installed_count` now uses `rpm -qa` instead of broken `dnf -qa`, which silently returned fake numbers.
+- **Honest exit codes for fleet scans** – a fleet scan where all hosts fail now returns exit code 2 instead of a false‑positive 0.
+- **JSON export respects `--output`** – the `--output` flag is now honoured for JSON format, and export errors are properly propagated to the exit code.
+- **Database size measurement no longer silently returns 0 GB** – `du` timeout increased to 60 s, avoiding false zero sizes on large data directories.
+- **NTP offset extraction from systemd‑timesyncd** – actual time synchronisation offset is now shown instead of a blank field on many Linux distributions.
+- **More robust SSH config parsing** – the fallback parser now follows first‑match semantics, ignores conditional `Match` blocks, and is case‑insensitive.
+- **Sudo self‑exclusion tightened** – only canonical binary paths are excluded from the NOPASSWD audit, preventing accidental blind spots.
+- **Miscellaneous hardening** – `df -P` output stability, external IP validation, removal of a double sysinfo refresh, dynamic remote timeout cap, and `saturating_mul` for risk scores.
 
 ---
 
@@ -176,7 +177,7 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 |------|-------------|---------------------|
 | `0`  | No critical issues found | All hosts clean |
 | `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) | Any host has critical issues |
-| `2`  | Not running as root – results may be incomplete | Any host not running as root |
+| `2`  | Not running as root, scan warnings present, **or fleet scan produced zero reports** | Any host not running as root, **or all remote hosts failed** |
 
 You can use these codes directly in CI/CD pipelines:
 ```bash
