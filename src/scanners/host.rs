@@ -669,7 +669,7 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 
 // ── main host info collector ───────────────────────────────
 
-pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
+pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
     let reboot_required = Path::new("/var/run/reboot-required").exists();
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);

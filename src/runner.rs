@@ -78,8 +78,8 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         info!("scan started");
 
         let host_task = tokio::task::spawn_blocking(move || {
-            let mut sys = sysinfo::System::new_all();
-            crate::scanners::host::gather_host_info(&mut sys, want_external_ip)
+            let sys = sysinfo::System::new_all();
+            crate::scanners::host::gather_host_info(&sys, want_external_ip)
         });
 
         let dbs_task = tokio::task::spawn_blocking(crate::scanners::host::gather_databases_info);
@@ -287,11 +287,17 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
 
     // Perform audit using the embedded AuditArgs (always JSON, but we serialize ourselves)
     let report = if !args.audit.host.is_empty() {
-        let host = &args.audit.host[0];
-        match run_remote_scan(host, &args.audit) {
-            Some(report) => report,
-            None => {
-                eprintln!("Failed to scan remote host: {host}");
+        let host = args.audit.host[0].clone();
+        let host_for_msg = host.clone();
+        let audit_args = args.audit.clone();
+        match tokio::task::spawn_blocking(move || run_remote_scan(&host, &audit_args)).await {
+            Ok(Some(report)) => report,
+            Ok(None) => {
+                eprintln!("Failed to scan remote host: {host_for_msg}");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("Remote scan task panicked: {e} (host: {host_for_msg})");
                 return 1;
             }
         }
@@ -302,10 +308,18 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
             .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
             .map(|l| l.trim().to_string());
         if let Some(host) = first_host {
-            match run_remote_scan(&host, &args.audit) {
-                Some(report) => report,
-                None => {
+            let host_clone = host.clone();
+            let audit_args = args.audit.clone();
+            match tokio::task::spawn_blocking(move || run_remote_scan(&host_clone, &audit_args))
+                .await
+            {
+                Ok(Some(report)) => report,
+                Ok(None) => {
                     eprintln!("Failed to scan remote host: {host}");
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("Remote scan task panicked: {e} (host: {host})");
                     return 1;
                 }
             }
