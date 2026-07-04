@@ -147,7 +147,6 @@ mod tests {
 
     #[test]
     fn run_child_with_timeout_large_stdout_does_not_deadlock() {
-        // 200 KB of raw data, which becomes ~270 KB after Base64 encoding
         let result = run_child_with_timeout("sh", &["-c", "head -c 200000 /dev/zero | base64"], 10);
         assert!(result.is_some(), "Process should not time out");
         let output = result.unwrap();
@@ -157,7 +156,8 @@ mod tests {
 
     #[test]
     fn run_child_with_timeout_timeout_kills_child() {
-        let result = run_child_with_timeout("sh", &["-c", "sleep 60"], 1);
+        // Use direct 'sleep' process to avoid orphan grandchildren holding pipe
+        let result = run_child_with_timeout("sleep", &["60"], 1);
         assert!(result.is_none());
     }
 }
