@@ -265,11 +265,8 @@ pub fn gather_security_info() -> SecurityInfo {
                 let username = parts[0].to_string();
 
                 // Count authorized keys
-                let auth_keys_path = if username == "root" {
-                    "/root/.ssh/authorized_keys".to_string()
-                } else {
-                    format!("/home/{}/.ssh/authorized_keys", username)
-                };
+                let home = parts[5];
+                let auth_keys_path = format!("{}/.ssh/authorized_keys", home);
                 let count = fs::read_to_string(&auth_keys_path)
                     .unwrap_or_default()
                     .lines()
