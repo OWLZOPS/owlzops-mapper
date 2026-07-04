@@ -24,7 +24,6 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
 }
 
 /// Fallback used when `sshd -T` is unavailable.
-/// Fallback used when `sshd -T` is unavailable.
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     let mut config_lines = Vec::new();
 

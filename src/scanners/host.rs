@@ -6,7 +6,7 @@ use sysinfo::{ProcessStatus, System};
 
 // ── helpers ────────────────────────────────────────────────
 
-/// Get directory size in MB using `du` with a 10‑second timeout.
+/// Get directory size in MB using `du` with a 60‑second timeout.
 fn get_dir_size_mb(path: &str) -> u64 {
     if let Some(stdout) = crate::utils::run_with_timeout("du", &["-sxm", path], 60)
         && let Some(first_val) = stdout.split_whitespace().next()
