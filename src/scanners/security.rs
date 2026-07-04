@@ -133,9 +133,6 @@ fn gather_sudo_nopasswd() -> Vec<String> {
         }
     }
 
-    // Only these exact paths are considered self-referential (remote scanning).
-    const SELF_PATHS: &[&str] = &["/tmp/owlzops-mapper", "/usr/local/bin/owlzops-mapper"];
-
     for file in files {
         if let Ok(contents) = fs::read_to_string(&file) {
             for line in contents.lines() {
@@ -146,12 +143,7 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                 if l.to_lowercase().contains("nopasswd") {
                     // Exclude entries that are exclusively for the scanner itself,
                     // to avoid flagging our own remote scanning capability.
-                    let is_self_only = l.contains("owlzops-mapper")
-                        && l.rsplit(':')
-                            .next()
-                            .map(|cmd| cmd.split(',').all(|c| SELF_PATHS.contains(&c.trim())))
-                            .unwrap_or(false);
-                    if is_self_only {
+                    if is_self_only_sudo_line(l) {
                         continue;
                     }
                     entries.push(format!("{}: {}", file, l));
@@ -160,6 +152,18 @@ fn gather_sudo_nopasswd() -> Vec<String> {
         }
     }
     entries
+}
+
+/// Return `true` if the given sudoers line is solely for the scanner itself
+/// and should be excluded from the NOPASSWD audit.
+pub fn is_self_only_sudo_line(line: &str) -> bool {
+    const SELF_PATHS: &[&str] = &["/tmp/owlzops-mapper", "/usr/local/bin/owlzops-mapper"];
+    line.contains("owlzops-mapper")
+        && line
+            .rsplit(':')
+            .next()
+            .map(|cmd| cmd.split(',').all(|c| SELF_PATHS.contains(&c.trim())))
+            .unwrap_or(false)
 }
 
 fn get_sudoers_mode() -> Option<u32> {
@@ -406,47 +410,35 @@ mod tests {
         assert!(!is_local_ip("2001:db8::1"));
     }
 
-    // ── is_self_only (sudoers exclusion) ───────────────────
+    // ── is_self_only_sudo_line (sudoers exclusion) ────────
 
     #[test]
-    fn self_only_owlzops_mapper_single_command() {
-        // The exact sudoers line from README
-        let line = "drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper";
-        // Simulate the logic from gather_sudo_nopasswd
-        let is_self_only = line.contains("owlzops-mapper")
-            && !line
-                .rsplit(':')
-                .next()
-                .map(|cmd| cmd.trim() == "ALL")
-                .unwrap_or(false);
-        assert!(is_self_only);
+    fn self_only_single_canonical_path() {
+        assert!(is_self_only_sudo_line(
+            "drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper"
+        ));
+        assert!(is_self_only_sudo_line(
+            "user ALL=(ALL) NOPASSWD: /usr/local/bin/owlzops-mapper"
+        ));
     }
 
     #[test]
-    fn self_only_owlzops_mapper_with_another_command() {
-        let line = "operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper, /usr/bin/other";
-        let is_self_only = line.contains("owlzops-mapper")
-            && line
-                .rsplit(':')
-                .next()
-                .map(|cmd| {
-                    cmd.split(',')
-                        .all(|c| c.trim().ends_with("owlzops-mapper") && c.trim() != "ALL")
-                })
-                .unwrap_or(false);
-        assert!(!is_self_only);
+    fn self_only_with_another_command() {
+        assert!(!is_self_only_sudo_line(
+            "operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper, /usr/bin/other"
+        ));
     }
 
     #[test]
-    fn self_only_all() {
-        let line = "root ALL=(ALL) NOPASSWD: ALL";
-        let is_self_only = line.contains("owlzops-mapper")
-            && !line
-                .rsplit(':')
-                .next()
-                .map(|cmd| cmd.trim() == "ALL")
-                .unwrap_or(false);
-        assert!(!is_self_only);
+    fn self_only_all_is_not_self() {
+        assert!(!is_self_only_sudo_line("root ALL=(ALL) NOPASSWD: ALL"));
+    }
+
+    #[test]
+    fn self_only_does_not_exclude_non_canonical_path() {
+        assert!(!is_self_only_sudo_line(
+            "operator ALL=(ALL) NOPASSWD: /home/x/owlzops-mapper"
+        ));
     }
 
     // ── fallback_parse_main_config ─────────────────────────
@@ -455,32 +447,21 @@ mod tests {
     fn fallback_parse_main_config_no_include() {
         use std::io::Write;
 
-        // Create a temporary sshd_config
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("sshd_config");
         let mut f = std::fs::File::create(&config_path).unwrap();
         writeln!(f, "PasswordAuthentication yes").unwrap();
         writeln!(f, "PermitRootLogin no").unwrap();
 
-        // Override the path (we'll test the logic by calling with our temp file)
-        // Since the function hardcodes /etc/ssh/sshd_config, we test the logic indirectly
-        // by ensuring our real implementation works for common cases.
-        // For a real unit test, we'd refactor to accept a path, but that's out of scope.
-        // We'll just verify the real function doesn't panic.
         let mut pass_auth = false;
         let mut root_login = true;
         fallback_parse_main_config(&mut pass_auth, &mut root_login);
-        // After parsing, pass_auth should be true (if /etc/ssh/sshd_config exists)
-        // We can't assert exact values without knowing the test environment
-        // So we just verify the function runs without panicking
     }
 
     #[test]
     fn fallback_parse_main_config_include() {
-        // Similar non-panicking test
         let mut pass_auth = false;
         let mut root_login = true;
         fallback_parse_main_config(&mut pass_auth, &mut root_login);
-        // Function should not panic
     }
 }

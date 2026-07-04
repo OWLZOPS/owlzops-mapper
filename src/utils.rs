@@ -64,8 +64,9 @@ pub fn run_child_with_timeout(
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out_handle.join();
-                let _ = err_handle.join();
+                // Detach reader threads: buffers are discarded, no need to wait for orphaned grandchildren
+                drop(out_handle);
+                drop(err_handle);
                 return None;
             }
         }
