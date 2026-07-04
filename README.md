@@ -48,9 +48,14 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 
 ---
+## Changelog (v0.4.11)
 
-## Changelog (v0.4.10)
+- **Sysctl false positives fixed** – `fs.suid_dumpable` now accepts value `2` with piped `core_pattern` (systemd-coredump); `net.ipv4.ip_forward=1` is no longer flagged on Docker/kubelet hosts.
+- **Snapshot directory respects original user** – when running under `sudo`, snapshots now save to `$SUDO_USER`'s home directory instead of `/root`.
+- **Documentation improvements** – added Core Features section, demo screenshots for Excel report and snapshot diff, corrected CLI flag name.
+- **Miscellaneous hardening** – final round of code-quality fixes from the v0.4.10 audit (async consistency, timeout caps, test coverage).
 
+Previous release (v0.4.10) highlights remain below.
 - **Remote pipe‑deadlock fixed** – SSH scans producing reports larger than 64 KB no longer hang; stdout/stderr are now drained in parallel threads.
 - **Accurate package counts on RPM systems** – `installed_count` now uses `rpm -qa` instead of broken `dnf -qa`, which silently returned fake numbers.
 - **Honest exit codes for fleet scans** – a fleet scan where all hosts fail now returns exit code 2 instead of a false‑positive 0.
