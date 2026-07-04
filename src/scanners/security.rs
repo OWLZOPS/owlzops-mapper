@@ -179,19 +179,42 @@ fn get_sudoers_mode() -> Option<u32> {
 
 fn gather_sysctl_issues() -> Vec<String> {
     let mut issues = Vec::new();
-    let checks: &[(&str, &str, &str)] = &[
+
+    // Check suid_dumpable with consideration of core_pattern
+    if let Ok(v) = std::fs::read_to_string("/proc/sys/fs/suid_dumpable") {
+        let v = v.trim().to_string();
+        let piped = std::fs::read_to_string("/proc/sys/kernel/core_pattern")
+            .map(|s| s.trim_start().starts_with('|'))
+            .unwrap_or(false);
+        let ok = v == "0" || (v == "2" && piped);
+        if !ok {
+            issues.push(format!(
+                "fs.suid_dumpable={} (expected 0, or 2 with piped core_pattern)",
+                v
+            ));
+        }
+    }
+
+    // Net.ipv4.ip_forward – context-aware handling done in runner.rs
+    if let Ok(v) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
+        let v = v.trim().to_string();
+        if v == "1" {
+            issues.push(format!("net.ipv4.ip_forward={} (expected 0)", v));
+        }
+    }
+
+    // Other checks remain unchanged
+    let other_checks: &[(&str, &str, &str)] = &[
         (
             "/proc/sys/kernel/randomize_va_space",
             "2",
             "kernel.randomize_va_space",
         ),
-        ("/proc/sys/net/ipv4/ip_forward", "0", "net.ipv4.ip_forward"),
         (
             "/proc/sys/net/ipv4/tcp_syncookies",
             "1",
             "net.ipv4.tcp_syncookies",
         ),
-        ("/proc/sys/fs/suid_dumpable", "0", "fs.suid_dumpable"),
         (
             "/proc/sys/kernel/dmesg_restrict",
             "1",
@@ -204,7 +227,7 @@ fn gather_sysctl_issues() -> Vec<String> {
         ),
     ];
 
-    for &(path, expected, name) in checks {
+    for &(path, expected, name) in other_checks {
         if let Ok(value) = fs::read_to_string(path) {
             let value = value.trim();
             if value != expected {
