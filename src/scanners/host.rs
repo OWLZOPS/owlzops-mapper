@@ -8,14 +8,12 @@ use sysinfo::{ProcessStatus, System};
 
 /// Get directory size in MB using `du` with a 10‑second timeout.
 fn get_dir_size_mb(path: &str) -> u64 {
-    crate::utils::run_with_timeout("du", &["-sxm", path], 60)
-        .and_then(|out| {
-            out.lines()
-                .next()
-                .and_then(|line| line.split_whitespace().next()?.parse().ok())
-        })
-        .map(|mb: u64| mb / 1024) // MB -> GB
-        .unwrap_or(0)
+    if let Some(stdout) = crate::utils::run_with_timeout("du", &["-sxm", path], 60)
+        && let Some(first_val) = stdout.split_whitespace().next()
+    {
+        return first_val.parse::<u64>().unwrap_or(0);
+    }
+    0
 }
 
 /// Returns `true` when a line looks like a cron environment variable
