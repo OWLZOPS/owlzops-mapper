@@ -133,6 +133,9 @@ fn gather_sudo_nopasswd() -> Vec<String> {
         }
     }
 
+    // Only these exact paths are considered self-referential (remote scanning).
+    const SELF_PATHS: &[&str] = &["/tmp/owlzops-mapper", "/usr/local/bin/owlzops-mapper"];
+
     for file in files {
         if let Ok(contents) = fs::read_to_string(&file) {
             for line in contents.lines() {
@@ -141,16 +144,12 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                     continue;
                 }
                 if l.to_lowercase().contains("nopasswd") {
-                    // Exclude entries that are exclusively for owlzops-mapper itself
-                    // (needed for remote scanning without password prompt)
+                    // Exclude entries that are exclusively for the scanner itself,
+                    // to avoid flagging our own remote scanning capability.
                     let is_self_only = l.contains("owlzops-mapper")
                         && l.rsplit(':')
                             .next()
-                            .map(|cmd| {
-                                cmd.split(',').all(|c| {
-                                    c.trim().ends_with("owlzops-mapper") && c.trim() != "ALL"
-                                })
-                            })
+                            .map(|cmd| cmd.split(',').all(|c| SELF_PATHS.contains(&c.trim())))
                             .unwrap_or(false);
                     if is_self_only {
                         continue;
