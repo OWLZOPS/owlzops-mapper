@@ -24,6 +24,7 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
 }
 
 /// Fallback used when `sshd -T` is unavailable.
+/// Fallback used when `sshd -T` is unavailable.
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     let mut config_lines = Vec::new();
 
@@ -77,14 +78,31 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
         }
     }
 
-    // Parse collected config lines
+    // Parse collected config lines using first-match semantics,
+    // stop at Match blocks, and perform case-insensitive matching.
+    let mut pa_seen = false;
+    let mut rl_seen = false;
+
     for line in &config_lines {
-        let clean = line.trim();
-        if clean.starts_with("PasswordAuthentication") {
-            *pass_auth = clean.ends_with("yes");
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let Some(val) = parts.next() else { continue };
+
+        // Directives inside Match blocks are conditional; ignore them.
+        if key.eq_ignore_ascii_case("match") {
+            break;
         }
-        if clean.starts_with("PermitRootLogin") {
-            *root_login = !clean.ends_with("no");
+
+        if !pa_seen && key.eq_ignore_ascii_case("passwordauthentication") {
+            *pass_auth = val.eq_ignore_ascii_case("yes");
+            pa_seen = true;
+        } else if !rl_seen && key.eq_ignore_ascii_case("permitrootlogin") {
+            *root_login = !val.eq_ignore_ascii_case("no");
+            rl_seen = true;
+        }
+
+        if pa_seen && rl_seen {
+            break;
         }
     }
 }

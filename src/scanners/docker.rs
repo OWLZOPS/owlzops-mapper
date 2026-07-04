@@ -220,9 +220,11 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             let mut dangling_volumes_count = 0;
             let mut filter = HashMap::new();
             filter.insert("dangling".to_string(), vec!["true".to_string()]);
-            if let Ok(volumes_resp) = docker
-                .list_volumes(Some(ListVolumesOptions { filters: filter }))
-                .await
+            if let Ok(Ok(volumes_resp)) = tokio::time::timeout(
+                Duration::from_secs(10),
+                docker.list_volumes(Some(ListVolumesOptions { filters: filter })),
+            )
+            .await
                 && let Some(vols) = volumes_resp.volumes
             {
                 dangling_volumes_count = vols.len();
