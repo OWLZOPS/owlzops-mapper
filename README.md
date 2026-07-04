@@ -156,7 +156,7 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `--copy-binary` | Copy the local binary to remote hosts before scanning. The binary **must** be statically linked (musl). GitHub release binaries are static, so you can safely use this flag with them. |
 | `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you're running a debug build locally but have a release build for remote hosts. |
 | `--remote-path <PATH>` | Path where the binary is placed on remote hosts (default: `/tmp/owlzops-mapper`) |
-| `--remote-timeout <SECS>` | Maximum time to wait for remote scan (default: 120 seconds) |
+| `--remote-timeout-secs <SECS>` | Maximum time to wait for remote scan (default: 120 seconds) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 

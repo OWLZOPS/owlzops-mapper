@@ -60,7 +60,10 @@ async fn run_remote_scan_with_timeout(
     args: AuditArgs,
 ) -> Result<Option<AgentReport>, tokio::task::JoinError> {
     let host_for_log = host.clone();
-    let cap = args.remote_timeout_secs.saturating_mul(2) + 60;
+    let cap = args
+        .remote_timeout_secs
+        .saturating_mul(2)
+        .saturating_add(60);
     match tokio::time::timeout(
         std::time::Duration::from_secs(cap),
         tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),

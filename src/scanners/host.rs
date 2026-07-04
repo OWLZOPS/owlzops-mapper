@@ -6,7 +6,7 @@ use sysinfo::{ProcessStatus, System};
 
 // ── helpers ────────────────────────────────────────────────
 
-/// Get directory size in MB using `du` with a 10‑second timeout.
+/// Get directory size in MB using `du` with a 60‑second timeout.
 fn get_dir_size_mb(path: &str) -> u64 {
     if let Some(stdout) = crate::utils::run_with_timeout("du", &["-sxm", path], 60)
         && let Some(first_val) = stdout.split_whitespace().next()
@@ -669,7 +669,7 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 
 // ── main host info collector ───────────────────────────────
 
-pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
+pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
     let reboot_required = Path::new("/var/run/reboot-required").exists();
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);
