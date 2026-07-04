@@ -39,7 +39,17 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.4.10
+## Core Features
+
+- **Multi‑host remote audit** – scan dozens of servers over SSH in parallel, with automatic binary deployment and concurrency limits.
+- **Snapshot diff & drift monitoring** – capture server state as JSON snapshots, compare any two, and get colour‑coded Excel/terminal diffs of exactly what changed.
+- **Risk Score calculator** – every finding contributes to a 0‑100 risk score with a human‑readable breakdown, so you can prioritise remediation without being a security expert.
+- **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
+- **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
+
+---
+
+## Changelog (v0.4.10)
 
 - **Remote pipe‑deadlock fixed** – SSH scans producing reports larger than 64 KB no longer hang; stdout/stderr are now drained in parallel threads.
 - **Accurate package counts on RPM systems** – `installed_count` now uses `rpm -qa` instead of broken `dnf -qa`, which silently returned fake numbers.
@@ -62,7 +72,11 @@ sudo ./owlzops-mapper audit
 
 # Export to Excel (with Executive Summary as first sheet)
 sudo ./owlzops-mapper audit --format excel --output report.xlsx
+```
 
+![Excel Report Example](singl_xlsx.png)
+
+```bash
 # JSON for programmatic use
 sudo ./owlzops-mapper audit --format json > snapshot.json
 
@@ -124,6 +138,11 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 ```
 
 ### Comparing snapshots (diff)
+
+![owlzops-mapper snapshot diff](ss_diff.png)
+
+*Demo: a before/after comparison of two snapshots showing improvements (firewall restored, backup added, load dropped, NTP synced), degradations (new security updates, failed docker service, OOM kills), and neutral changes (uptime, database size). Artificially crafted to illustrate the diff feature.*
+
 ```bash
 # Compare two JSON snapshots in terminal (colored table)
 ./owlzops-mapper compare before.json after.json
@@ -294,4 +313,6 @@ The install script (`install.sh`) now performs GPG verification automatically if
 ## License
 
 Apache-2.0 with Commons Clause - free to use, not to resell.
+Is it free? Yes, 100% free for internal use, server audits and personal projects.
+The Commons Clause is only there to prevent direct reselling of this software.
 See [LICENSE](LICENSE) for details.

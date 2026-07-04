@@ -281,8 +281,36 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     None
 }
 
+/// Read the home directory of a user from /etc/passwd.
+fn read_user_home(username: &str) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut parts = line.splitn(7, ':');
+        if parts.next()? == username {
+            let home = parts.nth(4)?; // skip uid, gid, gecos
+            Some(home.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
-    let output_dir = shellexpand::tilde(&args.output_dir).to_string();
+    // When running under sudo, resolve ~ to the original user's home directory,
+    // so snapshots are stored in the user's own tree instead of /root.
+    let output_dir = if args.output_dir == "~/.owlzops/snapshots"
+        && crate::is_running_as_root()
+    {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            let home = read_user_home(&sudo_user)
+                .unwrap_or_else(|| format!("/home/{}", sudo_user));
+            shellexpand::tilde(&format!("{}/.owlzops/snapshots", home)).to_string()
+        } else {
+            shellexpand::tilde(&args.output_dir).to_string()
+        }
+    } else {
+        shellexpand::tilde(&args.output_dir).to_string()
+    };
     let output_dir = PathBuf::from(output_dir);
 
     // Perform audit using the embedded AuditArgs (always JSON, but we serialize ourselves)
