@@ -168,11 +168,24 @@ async fn run_command(cli: Cli) -> i32 {
                 // exit with code 2 when fleet scan produced no reports
                 if reports.is_empty() {
                     warn!("fleet scan produced no reports — all hosts failed");
-                    output::output_multi(&reports, &args.format, args.output);
+                    if let Err(e) = output::output_multi(
+                        &reports,
+                        &args.format,
+                        args.output.as_deref().map(std::path::Path::new),
+                    ) {
+                        warn!("output error: {e}");
+                    }
                     return 2;
                 }
 
-                output::output_multi(&reports, &args.format, args.output);
+                if let Err(e) = output::output_multi(
+                    &reports,
+                    &args.format,
+                    args.output.as_deref().map(std::path::Path::new),
+                ) {
+                    warn!("output error: {e}");
+                    return 2;
+                }
                 // Compute overall exit code for fleet scans
                 let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
                 return if worst >= 1 { worst.min(2) } else { 0 };
@@ -181,7 +194,14 @@ async fn run_command(cli: Cli) -> i32 {
             // Single local scan
             let report = run_local_scan_async(&args).await;
             let exit_code = compute_exit_code(&report);
-            output::output_single(&report, &args.format, args.output);
+            if let Err(e) = output::output_single(
+                &report,
+                &args.format,
+                args.output.as_deref().map(std::path::Path::new),
+            ) {
+                warn!("output error: {e}");
+                return 2;
+            }
             exit_code
         }
 
