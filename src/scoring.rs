@@ -111,12 +111,13 @@ impl CriticalFlags {
             score = score.saturating_add(RISK_SUDOERS_MODE);
         }
         let sysctl_penalty = std::cmp::min(
-            self.sysctl_issues_count as u8 * RISK_SYSCTL_PER_ISSUE,
+            (self.sysctl_issues_count as u8).saturating_mul(RISK_SYSCTL_PER_ISSUE),
             RISK_SYSCTL_MAX,
         );
         score = score.saturating_add(sysctl_penalty);
         score.min(100)
     }
+
     /// Return a human-readable breakdown of the risk score contributions.
     pub fn breakdown(&self) -> Vec<(&'static str, u8)> {
         let mut items = Vec::new();
@@ -155,7 +156,7 @@ impl CriticalFlags {
             items.push(("Sudoers permissions not 0440", RISK_SUDOERS_MODE));
         }
         let sysctl_penalty = std::cmp::min(
-            self.sysctl_issues_count as u8 * RISK_SYSCTL_PER_ISSUE,
+            (self.sysctl_issues_count as u8).saturating_mul(RISK_SYSCTL_PER_ISSUE),
             RISK_SYSCTL_MAX,
         );
         if sysctl_penalty > 0 {

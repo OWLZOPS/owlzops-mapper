@@ -140,9 +140,9 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
             &["-s", "-4", "--max-time", "5", "https://ifconfig.me"],
             6,
         ) {
-            let ip = stdout.trim().to_string();
-            if !ip.is_empty() {
-                external_ipv4 = ip;
+            let candidate = stdout.trim().to_string();
+            if candidate.parse::<std::net::Ipv4Addr>().is_ok() {
+                external_ipv4 = candidate;
             }
         }
     }
@@ -670,7 +670,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 // ── main host info collector ───────────────────────────────
 
 pub fn gather_host_info(sys: &mut System, fetch_external_ip: bool) -> HostInfo {
-    sys.refresh_all();
     let reboot_required = Path::new("/var/run/reboot-required").exists();
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);
