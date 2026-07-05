@@ -1,22 +1,41 @@
 use crate::models::{AgentReport, Change, DiffReport, MultiHostDiff, Severity};
 use std::collections::{HashMap, HashSet};
 
+fn sev_rank(s: &Severity) -> u8 {
+    match s {
+        Severity::Degraded => 0,
+        Severity::Changed => 1,
+        Severity::Improved => 2,
+    }
+}
+
 /// Compare two AgentReports and produce a DiffReport
 pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport {
     let mut changes = Vec::new();
 
     // --- risk_score ---
     if before.risk_score != after.risk_score {
-        let sev = if after.risk_score > before.risk_score {
+        let formula_changed = before.scoring_version != after.scoring_version;
+        let severity = if formula_changed {
+            Severity::Changed
+        } else if after.risk_score > before.risk_score {
             Severity::Degraded
         } else {
             Severity::Improved
         };
+        let field_label = if formula_changed {
+            format!(
+                "risk_score (scoring v{}→v{}, not directly comparable)",
+                before.scoring_version, after.scoring_version
+            )
+        } else {
+            "risk_score".into()
+        };
         changes.push(Change {
-            field: "risk_score".into(),
+            field: field_label,
             before: Some(before.risk_score.to_string()),
             after: Some(after.risk_score.to_string()),
-            severity: sev,
+            severity,
         });
     }
 
@@ -134,7 +153,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     // Sudden package count change (possible supply-chain signal)
     if before.packages.installed_count != after.packages.installed_count {
         let sev = if after.packages.installed_count > before.packages.installed_count + 50 {
-            Severity::Degraded // large unexpected increase
+            Severity::Degraded
         } else {
             Severity::Changed
         };
@@ -436,11 +455,14 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // Sort by severity: Degraded first, then Changed, then Improved
-    changes.sort_unstable_by_key(|c| match c.severity {
-        Severity::Degraded => 0,
-        Severity::Changed => 1,
-        Severity::Improved => 2,
+    // Deterministic sort: Degraded first, then Changed, then Improved;
+    // within same severity, stable order by field/before/after
+    changes.sort_unstable_by(|a, b| {
+        sev_rank(&a.severity)
+            .cmp(&sev_rank(&b.severity))
+            .then_with(|| a.field.cmp(&b.field))
+            .then_with(|| a.before.cmp(&b.before))
+            .then_with(|| a.after.cmp(&b.after))
     });
 
     DiffReport { changes }
@@ -568,6 +590,7 @@ mod tests {
             risk_score: 0,
             is_root_execution: true,
             scan_warnings: Vec::new(),
+            scoring_version: 1,
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),

@@ -16,6 +16,7 @@ pub const RISK_SYSCTL_PER_ISSUE: u8 = 5;
 
 pub const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 
+pub const SCORING_VERSION: u8 = 2;
 // ── New Finding model (v0.5) ───────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +472,7 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            scoring_version: 1,
         }
     }
 

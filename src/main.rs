@@ -450,6 +450,7 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            scoring_version: 1,
         }
     }
 

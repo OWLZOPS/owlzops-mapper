@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_scoring_version() -> u8 {
+    1
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentReport {
     pub scan_id: String,
@@ -9,6 +13,8 @@ pub struct AgentReport {
     pub risk_score: u8,
     pub is_root_execution: bool,
     pub scan_warnings: Vec<String>,
+    #[serde(default = "default_scoring_version")]
+    pub scoring_version: u8,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,
     pub network: NetworkInfo,
@@ -28,6 +34,7 @@ impl Default for AgentReport {
             risk_score: 0,
             is_root_execution: false,
             scan_warnings: Vec::new(),
+            scoring_version: 1,
             host: HostInfo::default(),
             databases: Vec::new(),
             network: NetworkInfo::default(),
