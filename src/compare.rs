@@ -574,6 +574,7 @@ fn human_span(before: &str, after: &str) -> Option<(String, bool)> {
 pub fn print_diff_terminal(report: &DiffReport) {
     // Metadata header
     if let (Some(b), Some(a)) = (&report.before, &report.after) {
+        println!("  host:    {}", b.hostname);
         println!(
             "  before: {}  (v{}, risk {})",
             fmt_ts(&b.timestamp),
