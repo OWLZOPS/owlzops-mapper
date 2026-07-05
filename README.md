@@ -43,11 +43,27 @@ sudo ./owlzops-mapper audit
 
 - **Multi‑host remote audit** – scan dozens of servers over SSH in parallel, with automatic binary deployment and concurrency limits.
 - **Snapshot diff & drift monitoring** – capture server state as JSON snapshots, compare any two, and get colour‑coded Excel/terminal diffs of exactly what changed.
-- **Risk Score calculator** – every finding contributes to a 0‑100 risk score with a human‑readable breakdown, so you can prioritise remediation without being a security expert.
+- **Context‑aware Risk Score** – findings are evaluated with awareness of the environment (e.g., Docker/kubelet hosts are not penalised for `ip_forward=1`). Sub‑scores for Security, Reliability and Hygiene prevent score saturation.
+- **CIS Benchmark mapping** – every security finding includes a reference to the corresponding CIS Benchmark rule (e.g., `CIS 5.2.10`), ready for compliance audits.
 - **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 
 ---
+
+## Highlights v0.5.0
+
+- **Context‑aware scoring** – `ip_forward` and `suid_dumpable` are no longer flagged on Docker/kubelet hosts or when systemd‑coredump is active.
+- **Graduated weights** – SSH `PermitRootLogin` differentiates `prohibit‑password`; security updates are tiered; sudo `NOPASSWD` distinguishes `ALL` from restricted commands.
+- **Docker security findings** – containers missing memory/CPU limits, privileged mode, and dangerous capabilities now directly affect Risk Score.
+- **CIS Benchmark references** – every finding includes a CIS reference (e.g., `CIS 5.2.10`) for immediate audit compliance mapping.
+- **Sub‑scores** – Security, Reliability, and Hygiene now have individual caps (60/30/10), preventing score saturation and enabling drift visibility.
+- **Transparent Breakdown** – the terminal dashboard now shows the exact active findings with weights and CIS tags.
+
+---
+
+<details>
+<summary>Previous releases (v0.4.11, v0.4.10)</summary>
+
 ## Changelog (v0.4.11)
 
 - **Sysctl false positives fixed** – `fs.suid_dumpable` now accepts value `2` with piped `core_pattern` (systemd-coredump); `net.ipv4.ip_forward=1` is no longer flagged on Docker/kubelet hosts.
@@ -55,7 +71,8 @@ sudo ./owlzops-mapper audit
 - **Documentation improvements** – added Core Features section, demo screenshots for Excel report and snapshot diff, corrected CLI flag name.
 - **Miscellaneous hardening** – final round of code-quality fixes from the v0.4.10 audit (async consistency, timeout caps, test coverage).
 
-Previous release (v0.4.10) highlights remain below.
+## Changelog (v0.4.10)
+
 - **Remote pipe‑deadlock fixed** – SSH scans producing reports larger than 64 KB no longer hang; stdout/stderr are now drained in parallel threads.
 - **Accurate package counts on RPM systems** – `installed_count` now uses `rpm -qa` instead of broken `dnf -qa`, which silently returned fake numbers.
 - **Honest exit codes for fleet scans** – a fleet scan where all hosts fail now returns exit code 2 instead of a false‑positive 0.
@@ -65,6 +82,8 @@ Previous release (v0.4.10) highlights remain below.
 - **More robust SSH config parsing** – the fallback parser now follows first‑match semantics, ignores conditional `Match` blocks, and is case‑insensitive.
 - **Sudo self‑exclusion tightened** – only canonical binary paths are excluded from the NOPASSWD audit, preventing accidental blind spots.
 - **Miscellaneous hardening** – `df -P` output stability, external IP validation, removal of a double sysinfo refresh, dynamic remote timeout cap, and `saturating_mul` for risk scores.
+
+</details>
 
 ---
 
@@ -213,25 +232,36 @@ sudo ./owlzops-mapper audit || echo "Security scan failed – check the report"
 ## Risk Score
 
 The dashboard and Excel report include a **Risk Score (0–100)** calculated
-from real findings:
+from real findings. The score is split into three sub‑scores:
+
+| Category | Cap | Examples |
+|---|---|---|
+| **Security** | 60 | Firewall, SSH config, security updates, Docker risks, sysctl hardening |
+| **Reliability** | 30 | Failed services, missing backups, OOM kills |
+| **Hygiene** | 10 | NTP synchronization |
+
+Lower scores are better. Each finding is tagged with a CIS Benchmark reference where applicable.  
+Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 
 | Finding | Penalty |
 |---|---|
 | Firewall inactive | +30 |
-| SSH root login allowed | +25 |
-| Pending security updates | +20 |
+| SSH root login allowed | +25 (`prohibit-password` reduces weight) |
+| Pending security updates | +20 (stepped: 10/15/20 depending on count) |
 | SSL certificate expires within 7 days | +15 (max) |
 | Failed systemd services | +10 |
 | SSH password authentication enabled | +10 |
 | OOM kills present | +10 |
 | No backup tools detected | +20 |
 | NTP not synchronized | +10 |
-| Sudo NOPASSWD entries found | +10 |
+| Sudo NOPASSWD entries found | +5 (restricted commands) / +15 (ALL) |
 | Sudoers permissions not 0440 | +5 |
-| Sysctl security issues | +5 per issue (max +15) |
-
-Lower scores are better. The score is displayed in colour (green < 40, yellow 40–69, red ≥ 70)
-and placed prominently at the top of every report.
+| Sysctl security issues | +5 per issue (context‑sensitive) |
+| Docker: containers without memory limits | +5 |
+| Docker: containers without CPU limits | +3 |
+| Docker: privileged containers | +10 |
+| Docker: dangerous capabilities | +10 |
+| Root login with password (combo) | +5 |
 
 ---
 
@@ -317,10 +347,10 @@ The install script (`install.sh`) now performs GPG verification automatically if
 
 ## License
 
-*Apache-2.0 with Commons Clause** - free to use, not to resell.
+**Apache-2.0 with Commons Clause** - free to use, not to resell.
 
 **Is it free for my company?**
 Yes. You are 100% free to use owlzops-mapper for commercial purposes, corporate infrastructure audits and internal security checks.
 
-The Commons Clause simply prevents third parties from taking this codebase and directly reselling it as their own commercial software or SaaS product
+The Commons Clause simply prevents third parties from taking this codebase and directly reselling it as their own commercial software or SaaS product.
 See [LICENSE](LICENSE) for details.
