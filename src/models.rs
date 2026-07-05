@@ -245,8 +245,40 @@ pub struct PackagesInfo {
     pub cache_refreshed: bool,
 }
 
+// ── Diff model (compare v2) ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotMeta {
+    pub hostname: String,
+    pub timestamp: String,
+    pub version: String,
+    pub scoring_version: u8,
+    pub risk_score: u8,
+}
+
+impl SnapshotMeta {
+    pub fn from_report(r: &AgentReport) -> Self {
+        Self {
+            hostname: r.host.hostname.clone(),
+            timestamp: r.timestamp.clone(),
+            version: r.version.clone(),
+            scoring_version: r.scoring_version,
+            risk_score: r.risk_score,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum HostDiffStatus {
+    Compared,
+    Added,
+    Removed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffReport {
+    pub before: Option<SnapshotMeta>,
+    pub after: Option<SnapshotMeta>,
     pub changes: Vec<Change>,
 }
 
@@ -268,5 +300,6 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize)]
 pub struct MultiHostDiff {
     pub hostname: String,
+    pub status: HostDiffStatus,
     pub diff: DiffReport,
 }

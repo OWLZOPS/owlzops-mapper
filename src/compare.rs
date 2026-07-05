@@ -1,4 +1,6 @@
-use crate::models::{AgentReport, Change, DiffReport, MultiHostDiff, Severity};
+use crate::models::{
+    AgentReport, Change, DiffReport, HostDiffStatus, MultiHostDiff, Severity, SnapshotMeta,
+};
 use std::collections::{HashMap, HashSet};
 
 fn sev_rank(s: &Severity) -> u8 {
@@ -465,67 +467,140 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             .then_with(|| a.after.cmp(&b.after))
     });
 
-    DiffReport { changes }
+    DiffReport {
+        before: Some(SnapshotMeta::from_report(before)),
+        after: Some(SnapshotMeta::from_report(after)),
+        changes,
+    }
 }
 
 pub fn compare_multi(before: &[AgentReport], after: &[AgentReport]) -> Vec<MultiHostDiff> {
-    let before_map: HashMap<&str, &AgentReport> = before
-        .iter()
-        .map(|r| (r.host.hostname.as_str(), r))
-        .collect();
-    let after_map: HashMap<&str, &AgentReport> = after
-        .iter()
-        .map(|r| (r.host.hostname.as_str(), r))
-        .collect();
-
-    let all_hostnames: HashSet<&str> = before_map.keys().chain(after_map.keys()).copied().collect();
-    let mut diffs = Vec::new();
-
-    for hostname in all_hostnames {
-        match (before_map.get(hostname), after_map.get(hostname)) {
-            (Some(b), Some(a)) => {
-                let diff = compare_reports(b, a);
-                if !diff.changes.is_empty() {
-                    diffs.push(MultiHostDiff {
-                        hostname: hostname.to_string(),
-                        diff,
-                    });
-                }
-            }
-            (Some(_), None) => {
-                let changes = vec![Change {
-                    field: "host.removed".into(),
-                    before: Some(hostname.to_string()),
-                    after: None,
-                    severity: Severity::Degraded,
-                }];
-                diffs.push(MultiHostDiff {
-                    hostname: hostname.to_string(),
-                    diff: DiffReport { changes },
-                });
-            }
-            (None, Some(_)) => {
-                let changes = vec![Change {
-                    field: "host.added".into(),
-                    before: None,
-                    after: Some(hostname.to_string()),
-                    severity: Severity::Changed,
-                }];
-                diffs.push(MultiHostDiff {
-                    hostname: hostname.to_string(),
-                    diff: DiffReport { changes },
-                });
-            }
-            (None, None) => unreachable!(),
+    let mut before_map: HashMap<&str, &AgentReport> = HashMap::with_capacity(before.len());
+    for r in before {
+        if before_map.insert(r.host.hostname.as_str(), r).is_some() {
+            tracing::warn!(
+                host = %r.host.hostname,
+                "duplicate hostname in 'before' set — using the last entry"
+            );
         }
     }
 
-    diffs.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    let mut after_map: HashMap<&str, &AgentReport> = HashMap::with_capacity(after.len());
+    for r in after {
+        if after_map.insert(r.host.hostname.as_str(), r).is_some() {
+            tracing::warn!(
+                host = %r.host.hostname,
+                "duplicate hostname in 'after' set — using the last entry"
+            );
+        }
+    }
+
+    let mut hostnames: Vec<&str> = before_map.keys().chain(after_map.keys()).copied().collect();
+    hostnames.sort_unstable();
+    hostnames.dedup();
+
+    let mut diffs = Vec::new();
+    for hostname in hostnames {
+        match (before_map.get(hostname), after_map.get(hostname)) {
+            (Some(b), Some(a)) => diffs.push(MultiHostDiff {
+                hostname: hostname.to_string(),
+                status: HostDiffStatus::Compared,
+                diff: compare_reports(b, a),
+            }),
+            (Some(b), None) => diffs.push(MultiHostDiff {
+                hostname: hostname.to_string(),
+                status: HostDiffStatus::Removed,
+                diff: DiffReport {
+                    before: Some(SnapshotMeta::from_report(b)),
+                    after: None,
+                    changes: vec![Change {
+                        field: "host.removed".into(),
+                        before: Some(hostname.to_string()),
+                        after: None,
+                        severity: Severity::Degraded,
+                    }],
+                },
+            }),
+            (None, Some(a)) => diffs.push(MultiHostDiff {
+                hostname: hostname.to_string(),
+                status: HostDiffStatus::Added,
+                diff: DiffReport {
+                    before: None,
+                    after: Some(SnapshotMeta::from_report(a)),
+                    changes: vec![Change {
+                        field: "host.added".into(),
+                        before: None,
+                        after: Some(format!("{} (risk {})", hostname, a.risk_score)),
+                        severity: Severity::Changed,
+                    }],
+                },
+            }),
+            (None, None) => unreachable!(),
+        }
+    }
     diffs
+}
+
+// ── Terminal helpers ─────────────────────────────────────────────────────
+
+fn fmt_ts(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn human_span(before: &str, after: &str) -> Option<(String, bool)> {
+    let b = chrono::DateTime::parse_from_rfc3339(before).ok()?;
+    let a = chrono::DateTime::parse_from_rfc3339(after).ok()?;
+    let secs = (a - b).num_seconds();
+    let neg = secs < 0;
+    let s = secs.unsigned_abs();
+    let (d, h, m) = (s / 86400, s % 86400 / 3600, s % 3600 / 60);
+    let text = if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    };
+    Some((text, neg))
 }
 
 /// Terminal output with colored table (using comfy_table)
 pub fn print_diff_terminal(report: &DiffReport) {
+    // Metadata header
+    if let (Some(b), Some(a)) = (&report.before, &report.after) {
+        println!(
+            "  before: {}  (v{}, risk {})",
+            fmt_ts(&b.timestamp),
+            b.version,
+            b.risk_score
+        );
+        println!(
+            "  after:  {}  (v{}, risk {})",
+            fmt_ts(&a.timestamp),
+            a.version,
+            a.risk_score
+        );
+        match human_span(&b.timestamp, &a.timestamp) {
+            Some((_, true)) => println!(
+                "  \x1b[1;33m[!] 'after' is OLDER than 'before' — arguments swapped?\x1b[0m"
+            ),
+            Some((span, false)) => println!("  span:   {span}"),
+            None => {}
+        }
+        if b.hostname != a.hostname {
+            println!(
+                "  \x1b[1;33m[!] comparing different hosts: {} vs {}\x1b[0m",
+                b.hostname, a.hostname
+            );
+        }
+    }
+
     use comfy_table::presets::UTF8_FULL;
     use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 
