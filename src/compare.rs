@@ -1,5 +1,6 @@
 use crate::models::{
-    AgentReport, Change, DiffReport, HostDiffStatus, MultiHostDiff, Severity, SnapshotMeta,
+    AgentReport, Change, DiffReport, HostDiffStatus, MultiHostDiff, PortInfo, Severity,
+    SnapshotMeta,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -167,23 +168,45 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // SSL certificates – crossing critical/warning threshold
+    // SSL certificates – crossing critical/warning threshold + added/removed
     let before_certs: Vec<_> = before.network.ssl_certificates.iter().collect();
     let after_certs: Vec<_> = after.network.ssl_certificates.iter().collect();
+
     for after_cert in &after_certs {
-        if let Some(before_cert) = before_certs.iter().find(|c| c.domain == after_cert.domain)
-            && before_cert.is_critical != after_cert.is_critical
-        {
-            let sev = if after_cert.is_critical {
-                Severity::Degraded
-            } else {
-                Severity::Improved
-            };
+        if let Some(before_cert) = before_certs.iter().find(|c| c.domain == after_cert.domain) {
+            if before_cert.is_critical != after_cert.is_critical {
+                let sev = if after_cert.is_critical {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                };
+                changes.push(Change {
+                    field: format!("network.ssl_certificates.{}.is_critical", after_cert.domain),
+                    before: Some(before_cert.is_critical.to_string()),
+                    after: Some(after_cert.is_critical.to_string()),
+                    severity: sev,
+                });
+            }
+            if before_cert.is_warning != after_cert.is_warning {
+                let sev = if after_cert.is_warning {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                };
+                changes.push(Change {
+                    field: format!("network.ssl_certificates.{}.is_warning", after_cert.domain),
+                    before: Some(before_cert.is_warning.to_string()),
+                    after: Some(after_cert.is_warning.to_string()),
+                    severity: sev,
+                });
+            }
+        } else {
+            // New certificate
             changes.push(Change {
-                field: format!("network.ssl_certificates.{}.is_critical", after_cert.domain),
-                before: Some(before_cert.is_critical.to_string()),
-                after: Some(after_cert.is_critical.to_string()),
-                severity: sev,
+                field: format!("network.ssl_certificates.{}.added", after_cert.domain),
+                before: None,
+                after: Some(after_cert.domain.clone()),
+                severity: Severity::Degraded,
             });
         }
     }
@@ -201,51 +224,68 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     }
 
     // --- network.listening_ports (key: protocol:bind_address:port) ---
-    let before_ports: HashSet<(String, String, String)> = before
+    type PortKey<'a> = (&'a str, &'a str, &'a str);
+    let before_ports: HashMap<PortKey<'_>, &PortInfo> = before
         .network
         .listening_ports
         .iter()
-        .map(|p| (p.protocol.clone(), p.bind_address.clone(), p.port.clone()))
+        .map(|p| {
+            (
+                (
+                    p.protocol.as_str(),
+                    p.bind_address.as_str(),
+                    p.port.as_str(),
+                ),
+                p,
+            )
+        })
         .collect();
-    let after_ports: HashSet<(String, String, String)> = after
+    let after_ports: HashMap<PortKey<'_>, &PortInfo> = after
         .network
         .listening_ports
         .iter()
-        .map(|p| (p.protocol.clone(), p.bind_address.clone(), p.port.clone()))
+        .map(|p| {
+            (
+                (
+                    p.protocol.as_str(),
+                    p.bind_address.as_str(),
+                    p.port.as_str(),
+                ),
+                p,
+            )
+        })
         .collect();
 
-    for added in after_ports.difference(&before_ports) {
-        changes.push(Change {
-            field: "network.listening_ports".into(),
-            before: None,
-            after: Some(format!("{}:{}:{}", added.0, added.1, added.2)),
-            severity: Severity::Degraded,
-        });
+    for k in after_ports.keys() {
+        if !before_ports.contains_key(k) {
+            changes.push(Change {
+                field: "network.listening_ports".into(),
+                before: None,
+                after: Some(format!("{}:{}:{}", k.0, k.1, k.2)),
+                severity: Severity::Degraded,
+            });
+        }
     }
-    for removed in before_ports.difference(&after_ports) {
-        changes.push(Change {
-            field: "network.listening_ports".into(),
-            before: Some(format!("{}:{}:{}", removed.0, removed.1, removed.2)),
-            after: None,
-            severity: Severity::Improved,
-        });
+    for k in before_ports.keys() {
+        if !after_ports.contains_key(k) {
+            changes.push(Change {
+                field: "network.listening_ports".into(),
+                before: Some(format!("{}:{}:{}", k.0, k.1, k.2)),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
     }
 
-    // Detect process changes on unchanged ports
-    for after_p in &after.network.listening_ports {
-        if let Some(before_p) = before.network.listening_ports.iter().find(|p| {
-            p.protocol == after_p.protocol
-                && p.bind_address == after_p.bind_address
-                && p.port == after_p.port
-        }) && before_p.process != after_p.process
+    // Detect process changes on unchanged ports (O(n) via HashMap lookup)
+    for (k, a) in &after_ports {
+        if let Some(b) = before_ports.get(k)
+            && b.process != a.process
         {
             changes.push(Change {
-                field: format!(
-                    "network.listening_ports.{}.{}.{}.process",
-                    after_p.protocol, after_p.bind_address, after_p.port
-                ),
-                before: Some(before_p.process.clone()),
-                after: Some(after_p.process.clone()),
+                field: format!("network.listening_ports.{}.{}.{}.process", k.0, k.1, k.2),
+                before: Some(b.process.clone()),
+                after: Some(a.process.clone()),
                 severity: Severity::Degraded,
             });
         }

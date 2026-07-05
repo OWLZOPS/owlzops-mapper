@@ -218,7 +218,6 @@ impl<'a> SheetWriter<'a> {
         Ok(())
     }
 
-    // Write a string to a specific column with an explicit format
     fn write_string(&mut self, col: usize, value: &str, fmt: &Format) -> Result<(), XlsxError> {
         self.sheet
             .write_string_with_format(self.row, col as u16, value, fmt)?;
@@ -226,11 +225,9 @@ impl<'a> SheetWriter<'a> {
         Ok(())
     }
 
-    // Write a number to a specific column with an explicit format
     fn write_number(&mut self, col: usize, value: f64, fmt: &Format) -> Result<(), XlsxError> {
         self.sheet
             .write_number_with_format(self.row, col as u16, value, fmt)?;
-        // Width observation for numbers: just use a reasonable estimate
         let text = format!("{:.2}", value);
         self.observe_width(col, &text);
         Ok(())
@@ -282,15 +279,13 @@ fn auto_fit_columns(
     Ok(())
 }
 
-/// Sanitize a hostname for use as an Excel sheet name.
-/// Sheet names must be ≤ 31 chars and must not contain: \ / ? * [ ] :
 fn sanitize_sheet_name(
     name: &str,
     prefix: &str,
     used: &mut std::collections::HashSet<String>,
 ) -> String {
     const ILLEGAL: &[char] = &['\\', '/', '?', '*', '[', ']', ':'];
-    let max_chars = 31usize.saturating_sub(prefix.len() + 1); // +1 for '-'
+    let max_chars = 31usize.saturating_sub(prefix.len() + 1);
     let base: String = name
         .chars()
         .filter(|c| !ILLEGAL.contains(c))
@@ -689,7 +684,6 @@ fn sheet_host_combined(
         report.host.backup_tools.join(", ")
     };
 
-    // Overview fields
     w.write_kv_row(
         "Risk Score",
         &format!("{}/100", report.risk_score),
@@ -833,6 +827,7 @@ fn sheet_storage(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xlsx
     w.apply_col_widths_with_min(&[12.0, 10.0, 10.0, 10.0, 10.0])?;
     Ok(sheet)
 }
+
 fn write_security_section(
     w: &mut SheetWriter,
     report: &AgentReport,
@@ -1027,7 +1022,6 @@ fn write_network_section(
         }
     }
 
-    // Custom /etc/hosts overrides
     if !report.network.custom_host_overrides.is_empty() {
         w.next_row();
         w.write_section_title("Custom /etc/hosts Overrides")?;
@@ -1323,7 +1317,6 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
 
     w.next_row();
 
-    // Branding hyperlinks
     let subtle = &fmts.subtle;
     w.sheet.write_formula_with_format(
         w.current_row(),
@@ -1341,7 +1334,6 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
     w.next_row();
     w.next_row();
 
-    // Top Memory Processes
     w.write_header(&["Process", "PID", "RAM (MB)"])?;
     for p in &report.host.top_memory_processes {
         let band = fmts.row_band(w.current_row());
@@ -1398,6 +1390,10 @@ pub fn write_multi_host_report(reports: &[AgentReport], path: &str) -> Result<()
     Ok(())
 }
 
+// =====================================================================
+// DIFF sheets
+// =====================================================================
+
 pub fn write_diff_sheet(
     report: &DiffReport,
     file_path: &str,
@@ -1429,6 +1425,12 @@ pub fn write_diff_sheet(
         };
         sheet.write_with_format(row, 3, sev_text, fmt)?;
     }
+
+    // Set column widths for readability
+    sheet.set_column_width(0, 44)?; // Field
+    sheet.set_column_width(1, 30)?; // Before
+    sheet.set_column_width(2, 30)?; // After
+    sheet.set_column_width(3, 12)?; // Severity
 
     workbook.save(file_path)?;
     Ok(())
@@ -1468,6 +1470,13 @@ pub fn write_multi_diff_xlsx(
             row += 1;
         }
     }
+
+    // Set column widths for multi-host diff
+    sheet.set_column_width(0, 30)?; // Host
+    sheet.set_column_width(1, 44)?; // Field
+    sheet.set_column_width(2, 30)?; // Before
+    sheet.set_column_width(3, 30)?; // After
+    sheet.set_column_width(4, 12)?; // Severity
 
     workbook.save(file_path)?;
     Ok(())
@@ -1519,7 +1528,7 @@ mod tests {
     fn write_report_creates_nonempty_file() {
         let tmp = std::env::temp_dir().join(format!("owlzops-test-{}.xlsx", uuid::Uuid::new_v4()));
         let report = minimal_report();
-        let result = write_report(&report, tmp.to_str().unwrap());
+        let result = write_report(&report, &tmp.to_string_lossy());
         assert!(result.is_ok());
         assert!(tmp.exists());
         let metadata = std::fs::metadata(&tmp).unwrap();
