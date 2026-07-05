@@ -36,14 +36,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (warnings as errors)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Build
-        run: cargo build --locked
       - name: Run tests
         run: cargo test --locked
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Run security audit
-        run: cargo audit --deny yanked
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
 
@@ -68,7 +62,7 @@ jobs:
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Install system dependencies (build-only)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
@@ -101,7 +95,7 @@ jobs:
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Run tests in openSUSE container
         run: |
           docker run --rm \
