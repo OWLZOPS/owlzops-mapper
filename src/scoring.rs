@@ -26,7 +26,7 @@ pub enum Category {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // will be removed once evaluate/score are wired in main
+#[allow(dead_code)]
 pub struct Finding {
     pub id: &'static str,
     pub title: String,
@@ -34,6 +34,7 @@ pub struct Finding {
     pub weight: u8,
     pub evidence: String,
     pub suppressed: Option<String>,
+    pub cis_ref: Option<&'static str>,
 }
 
 /// Evaluate a full agent report into a list of findings.
@@ -51,6 +52,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_NO_FIREWALL,
             evidence: "No active firewall (ufw/firewalld/nftables/iptables)".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 3.5.1.1"), // Ensure firewall is active
         });
     }
 
@@ -73,6 +75,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight,
             evidence: format!("PermitRootLogin {}", detail),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.10"), // Ensure SSH root login is disabled
         });
     }
 
@@ -98,6 +101,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight,
             evidence: format!("{} security update(s) available", count),
             suppressed: None,
+            cis_ref: Some("CIS 1.9"), // Ensure updates, patches, and additional security software are installed
         });
     }
 
@@ -114,6 +118,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_CRITICAL_SSL_MAX,
             evidence: "One or more SSL certificates expire within 7 days".to_string(),
             suppressed: None,
+            cis_ref: None, // No direct CIS mapping
         });
     }
 
@@ -134,6 +139,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 report.security.sudo_nopasswd_entries.len()
             ),
             suppressed: None,
+            cis_ref: Some("CIS 5.4.2"), // Ensure sudo commands use pty (related to logging/visibility)
         });
     }
 
@@ -147,6 +153,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_SUDOERS_MODE,
             evidence: format!("sudoers mode is {:o}", mode),
             suppressed: None,
+            cis_ref: Some("CIS 1.8.2"), // Ensure sudoers file permissions are configured
         });
     }
 
@@ -167,6 +174,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 weight: RISK_SYSCTL_PER_ISSUE,
                 evidence: issue.clone(),
                 suppressed,
+                cis_ref: Some("CIS 3.3.1"), // Ensure IP forwarding is disabled
             });
         } else {
             let title = issue
@@ -174,6 +182,14 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .next()
                 .unwrap_or("sysctl issue")
                 .to_string();
+            // map other sysctl issues
+            let cis = match title.as_str() {
+                "kernel.randomize_va_space" => Some("CIS 1.6.2"),
+                "net.ipv4.tcp_syncookies" => Some("CIS 3.3.8"),
+                "kernel.dmesg_restrict" => Some("CIS 1.6.2"),
+                "net.ipv4.conf.all.accept_redirects" => Some("CIS 3.3.2"),
+                _ => None,
+            };
             findings.push(Finding {
                 id: "SEC-007",
                 title,
@@ -181,6 +197,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 weight: RISK_SYSCTL_PER_ISSUE,
                 evidence: issue.clone(),
                 suppressed: None,
+                cis_ref: cis,
             });
         }
     }
@@ -194,6 +211,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_SSH_PASSWORD_AUTH,
             evidence: "PasswordAuthentication yes".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.4"), // Ensure SSH PasswordAuthentication is disabled
         });
     }
 
@@ -206,6 +224,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 5,
             evidence: "PermitRootLogin enabled AND PasswordAuthentication yes".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.10/5.2.4"), // combination of both
         });
     }
 
@@ -236,6 +255,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 5,
             evidence: "At least one container lacks a memory limit".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.3"), // Ensure containers are limited in memory usage
         });
     }
     if has_cpu_limit_issue {
@@ -246,6 +266,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 3,
             evidence: "At least one container lacks a CPU limit".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.2"), // Ensure containers are limited in CPU usage
         });
     }
     if has_privileged {
@@ -256,6 +277,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 10,
             evidence: "At least one container is running in privileged mode".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.4"), // Ensure containers are not run with the privileged flag
         });
     }
     if has_dangerous_caps {
@@ -268,6 +290,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 "At least one container has elevated kernel capabilities (SYS_ADMIN/NET_ADMIN)"
                     .to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 5.2.5"), // Ensure sensitive host system directories are not mounted on containers (but capabilities are closely related)
         });
     }
 
@@ -286,6 +309,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_FAILED_SERVICES,
             evidence: format!("{} failed service(s)", report.host.failed_services.len()),
             suppressed: None,
+            cis_ref: None, // Operational concern, not directly a CIS item
         });
     }
 
@@ -297,6 +321,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_NO_BACKUP,
             evidence: "No automated backup tools found".to_string(),
             suppressed: None,
+            cis_ref: None, // Backup is a policy, not specific CIS rule
         });
     }
 
@@ -308,6 +333,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_OOM_KILLS,
             evidence: format!("{} OOM kill(s) detected", report.host.oom_kills),
             suppressed: None,
+            cis_ref: None,
         });
     }
 
@@ -321,6 +347,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_NTP_NOT_SYNCED,
             evidence: "Time not synchronized".to_string(),
             suppressed: None,
+            cis_ref: Some("CIS 2.2.1.1"), // Ensure time synchronization is in use
         });
     }
 

@@ -111,7 +111,12 @@ fn render_header(report: &AgentReport) {
     if !active_findings.is_empty() {
         println!("Breakdown:");
         for f in &active_findings {
-            println!("  • {} (+{})", f.title, f.weight);
+            let cis_note = if let Some(cis) = f.cis_ref {
+                format!(" [{}]", cis)
+            } else {
+                String::new()
+            };
+            println!("  • {} (+{}){}", f.title, f.weight, cis_note);
         }
     }
 
