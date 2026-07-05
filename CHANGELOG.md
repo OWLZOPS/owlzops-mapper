@@ -1,21 +1,24 @@
 
+## Bug Fixes
+
+- Handle mapper exit codes in E2E workflow
+
 ## Documentation
 
-- Update CHANGELOG for v0.4.11
+- Update CHANGELOG for v0.5.0
 
 ## Features
 
-- Introduce new scoring model and structured findings evaluation system
-- Filter suppressed sysctl issues in UI
-- Enhance security scoring with detailed conditions and Docker checks
-- Add CIS references to findings and enhance UI
+- Integrate scoring version into reports and comparison logic
+- Improve multi-host comparison and reporting logic
+- Display hostname in terminal diff metadata header
 
 ## Miscellaneous
 
-- Bump version to 0.5.0, update README with release highlights and risk scoring updates
-- Optimize build settings, streamline CI workflows and improve SBOM generation
+- Add E2E workflow for local audit smoke testing on PRs
+- Bump version to 0.5.1, update README with release highlights and fleet scan usage details
 
 ## Refactoring
 
-- Replace legacy risk scoring logic with new evaluation model
+- Remove redundant comments and improve width handling in XLSX exports
 
