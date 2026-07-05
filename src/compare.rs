@@ -1,5 +1,16 @@
-use crate::models::{AgentReport, Change, DiffReport, MultiHostDiff, Severity};
+use crate::models::{
+    AgentReport, Change, DiffReport, HostDiffStatus, MultiHostDiff, PortInfo, Severity,
+    SnapshotMeta,
+};
 use std::collections::{HashMap, HashSet};
+
+fn sev_rank(s: &Severity) -> u8 {
+    match s {
+        Severity::Degraded => 0,
+        Severity::Changed => 1,
+        Severity::Improved => 2,
+    }
+}
 
 /// Compare two AgentReports and produce a DiffReport
 pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport {
@@ -7,16 +18,27 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
 
     // --- risk_score ---
     if before.risk_score != after.risk_score {
-        let sev = if after.risk_score > before.risk_score {
+        let formula_changed = before.scoring_version != after.scoring_version;
+        let severity = if formula_changed {
+            Severity::Changed
+        } else if after.risk_score > before.risk_score {
             Severity::Degraded
         } else {
             Severity::Improved
         };
+        let field_label = if formula_changed {
+            format!(
+                "risk_score (scoring v{}→v{}, not directly comparable)",
+                before.scoring_version, after.scoring_version
+            )
+        } else {
+            "risk_score".into()
+        };
         changes.push(Change {
-            field: "risk_score".into(),
+            field: field_label,
             before: Some(before.risk_score.to_string()),
             after: Some(after.risk_score.to_string()),
-            severity: sev,
+            severity,
         });
     }
 
@@ -134,7 +156,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     // Sudden package count change (possible supply-chain signal)
     if before.packages.installed_count != after.packages.installed_count {
         let sev = if after.packages.installed_count > before.packages.installed_count + 50 {
-            Severity::Degraded // large unexpected increase
+            Severity::Degraded
         } else {
             Severity::Changed
         };
@@ -146,23 +168,45 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // SSL certificates – crossing critical/warning threshold
+    // SSL certificates – crossing critical/warning threshold + added/removed
     let before_certs: Vec<_> = before.network.ssl_certificates.iter().collect();
     let after_certs: Vec<_> = after.network.ssl_certificates.iter().collect();
+
     for after_cert in &after_certs {
-        if let Some(before_cert) = before_certs.iter().find(|c| c.domain == after_cert.domain)
-            && before_cert.is_critical != after_cert.is_critical
-        {
-            let sev = if after_cert.is_critical {
-                Severity::Degraded
-            } else {
-                Severity::Improved
-            };
+        if let Some(before_cert) = before_certs.iter().find(|c| c.domain == after_cert.domain) {
+            if before_cert.is_critical != after_cert.is_critical {
+                let sev = if after_cert.is_critical {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                };
+                changes.push(Change {
+                    field: format!("network.ssl_certificates.{}.is_critical", after_cert.domain),
+                    before: Some(before_cert.is_critical.to_string()),
+                    after: Some(after_cert.is_critical.to_string()),
+                    severity: sev,
+                });
+            }
+            if before_cert.is_warning != after_cert.is_warning {
+                let sev = if after_cert.is_warning {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                };
+                changes.push(Change {
+                    field: format!("network.ssl_certificates.{}.is_warning", after_cert.domain),
+                    before: Some(before_cert.is_warning.to_string()),
+                    after: Some(after_cert.is_warning.to_string()),
+                    severity: sev,
+                });
+            }
+        } else {
+            // New certificate
             changes.push(Change {
-                field: format!("network.ssl_certificates.{}.is_critical", after_cert.domain),
-                before: Some(before_cert.is_critical.to_string()),
-                after: Some(after_cert.is_critical.to_string()),
-                severity: sev,
+                field: format!("network.ssl_certificates.{}.added", after_cert.domain),
+                before: None,
+                after: Some(after_cert.domain.clone()),
+                severity: Severity::Degraded,
             });
         }
     }
@@ -180,51 +224,68 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     }
 
     // --- network.listening_ports (key: protocol:bind_address:port) ---
-    let before_ports: HashSet<(String, String, String)> = before
+    type PortKey<'a> = (&'a str, &'a str, &'a str);
+    let before_ports: HashMap<PortKey<'_>, &PortInfo> = before
         .network
         .listening_ports
         .iter()
-        .map(|p| (p.protocol.clone(), p.bind_address.clone(), p.port.clone()))
+        .map(|p| {
+            (
+                (
+                    p.protocol.as_str(),
+                    p.bind_address.as_str(),
+                    p.port.as_str(),
+                ),
+                p,
+            )
+        })
         .collect();
-    let after_ports: HashSet<(String, String, String)> = after
+    let after_ports: HashMap<PortKey<'_>, &PortInfo> = after
         .network
         .listening_ports
         .iter()
-        .map(|p| (p.protocol.clone(), p.bind_address.clone(), p.port.clone()))
+        .map(|p| {
+            (
+                (
+                    p.protocol.as_str(),
+                    p.bind_address.as_str(),
+                    p.port.as_str(),
+                ),
+                p,
+            )
+        })
         .collect();
 
-    for added in after_ports.difference(&before_ports) {
-        changes.push(Change {
-            field: "network.listening_ports".into(),
-            before: None,
-            after: Some(format!("{}:{}:{}", added.0, added.1, added.2)),
-            severity: Severity::Degraded,
-        });
+    for k in after_ports.keys() {
+        if !before_ports.contains_key(k) {
+            changes.push(Change {
+                field: "network.listening_ports".into(),
+                before: None,
+                after: Some(format!("{}:{}:{}", k.0, k.1, k.2)),
+                severity: Severity::Degraded,
+            });
+        }
     }
-    for removed in before_ports.difference(&after_ports) {
-        changes.push(Change {
-            field: "network.listening_ports".into(),
-            before: Some(format!("{}:{}:{}", removed.0, removed.1, removed.2)),
-            after: None,
-            severity: Severity::Improved,
-        });
+    for k in before_ports.keys() {
+        if !after_ports.contains_key(k) {
+            changes.push(Change {
+                field: "network.listening_ports".into(),
+                before: Some(format!("{}:{}:{}", k.0, k.1, k.2)),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
     }
 
-    // Detect process changes on unchanged ports
-    for after_p in &after.network.listening_ports {
-        if let Some(before_p) = before.network.listening_ports.iter().find(|p| {
-            p.protocol == after_p.protocol
-                && p.bind_address == after_p.bind_address
-                && p.port == after_p.port
-        }) && before_p.process != after_p.process
+    // Detect process changes on unchanged ports (O(n) via HashMap lookup)
+    for (k, a) in &after_ports {
+        if let Some(b) = before_ports.get(k)
+            && b.process != a.process
         {
             changes.push(Change {
-                field: format!(
-                    "network.listening_ports.{}.{}.{}.process",
-                    after_p.protocol, after_p.bind_address, after_p.port
-                ),
-                before: Some(before_p.process.clone()),
-                after: Some(after_p.process.clone()),
+                field: format!("network.listening_ports.{}.{}.{}.process", k.0, k.1, k.2),
+                before: Some(b.process.clone()),
+                after: Some(a.process.clone()),
                 severity: Severity::Degraded,
             });
         }
@@ -436,74 +497,151 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // Sort by severity: Degraded first, then Changed, then Improved
-    changes.sort_unstable_by_key(|c| match c.severity {
-        Severity::Degraded => 0,
-        Severity::Changed => 1,
-        Severity::Improved => 2,
+    // Deterministic sort: Degraded first, then Changed, then Improved;
+    // within same severity, stable order by field/before/after
+    changes.sort_unstable_by(|a, b| {
+        sev_rank(&a.severity)
+            .cmp(&sev_rank(&b.severity))
+            .then_with(|| a.field.cmp(&b.field))
+            .then_with(|| a.before.cmp(&b.before))
+            .then_with(|| a.after.cmp(&b.after))
     });
 
-    DiffReport { changes }
+    DiffReport {
+        before: Some(SnapshotMeta::from_report(before)),
+        after: Some(SnapshotMeta::from_report(after)),
+        changes,
+    }
 }
 
 pub fn compare_multi(before: &[AgentReport], after: &[AgentReport]) -> Vec<MultiHostDiff> {
-    let before_map: HashMap<&str, &AgentReport> = before
-        .iter()
-        .map(|r| (r.host.hostname.as_str(), r))
-        .collect();
-    let after_map: HashMap<&str, &AgentReport> = after
-        .iter()
-        .map(|r| (r.host.hostname.as_str(), r))
-        .collect();
-
-    let all_hostnames: HashSet<&str> = before_map.keys().chain(after_map.keys()).copied().collect();
-    let mut diffs = Vec::new();
-
-    for hostname in all_hostnames {
-        match (before_map.get(hostname), after_map.get(hostname)) {
-            (Some(b), Some(a)) => {
-                let diff = compare_reports(b, a);
-                if !diff.changes.is_empty() {
-                    diffs.push(MultiHostDiff {
-                        hostname: hostname.to_string(),
-                        diff,
-                    });
-                }
-            }
-            (Some(_), None) => {
-                let changes = vec![Change {
-                    field: "host.removed".into(),
-                    before: Some(hostname.to_string()),
-                    after: None,
-                    severity: Severity::Degraded,
-                }];
-                diffs.push(MultiHostDiff {
-                    hostname: hostname.to_string(),
-                    diff: DiffReport { changes },
-                });
-            }
-            (None, Some(_)) => {
-                let changes = vec![Change {
-                    field: "host.added".into(),
-                    before: None,
-                    after: Some(hostname.to_string()),
-                    severity: Severity::Changed,
-                }];
-                diffs.push(MultiHostDiff {
-                    hostname: hostname.to_string(),
-                    diff: DiffReport { changes },
-                });
-            }
-            (None, None) => unreachable!(),
+    let mut before_map: HashMap<&str, &AgentReport> = HashMap::with_capacity(before.len());
+    for r in before {
+        if before_map.insert(r.host.hostname.as_str(), r).is_some() {
+            tracing::warn!(
+                host = %r.host.hostname,
+                "duplicate hostname in 'before' set — using the last entry"
+            );
         }
     }
 
-    diffs.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    let mut after_map: HashMap<&str, &AgentReport> = HashMap::with_capacity(after.len());
+    for r in after {
+        if after_map.insert(r.host.hostname.as_str(), r).is_some() {
+            tracing::warn!(
+                host = %r.host.hostname,
+                "duplicate hostname in 'after' set — using the last entry"
+            );
+        }
+    }
+
+    let mut hostnames: Vec<&str> = before_map.keys().chain(after_map.keys()).copied().collect();
+    hostnames.sort_unstable();
+    hostnames.dedup();
+
+    let mut diffs = Vec::new();
+    for hostname in hostnames {
+        match (before_map.get(hostname), after_map.get(hostname)) {
+            (Some(b), Some(a)) => diffs.push(MultiHostDiff {
+                hostname: hostname.to_string(),
+                status: HostDiffStatus::Compared,
+                diff: compare_reports(b, a),
+            }),
+            (Some(b), None) => diffs.push(MultiHostDiff {
+                hostname: hostname.to_string(),
+                status: HostDiffStatus::Removed,
+                diff: DiffReport {
+                    before: Some(SnapshotMeta::from_report(b)),
+                    after: None,
+                    changes: vec![Change {
+                        field: "host.removed".into(),
+                        before: Some(hostname.to_string()),
+                        after: None,
+                        severity: Severity::Degraded,
+                    }],
+                },
+            }),
+            (None, Some(a)) => diffs.push(MultiHostDiff {
+                hostname: hostname.to_string(),
+                status: HostDiffStatus::Added,
+                diff: DiffReport {
+                    before: None,
+                    after: Some(SnapshotMeta::from_report(a)),
+                    changes: vec![Change {
+                        field: "host.added".into(),
+                        before: None,
+                        after: Some(format!("{} (risk {})", hostname, a.risk_score)),
+                        severity: Severity::Changed,
+                    }],
+                },
+            }),
+            (None, None) => unreachable!(),
+        }
+    }
     diffs
+}
+
+// ── Terminal helpers ─────────────────────────────────────────────────────
+
+fn fmt_ts(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn human_span(before: &str, after: &str) -> Option<(String, bool)> {
+    let b = chrono::DateTime::parse_from_rfc3339(before).ok()?;
+    let a = chrono::DateTime::parse_from_rfc3339(after).ok()?;
+    let secs = (a - b).num_seconds();
+    let neg = secs < 0;
+    let s = secs.unsigned_abs();
+    let (d, h, m) = (s / 86400, s % 86400 / 3600, s % 3600 / 60);
+    let text = if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    };
+    Some((text, neg))
 }
 
 /// Terminal output with colored table (using comfy_table)
 pub fn print_diff_terminal(report: &DiffReport) {
+    // Metadata header
+    if let (Some(b), Some(a)) = (&report.before, &report.after) {
+        println!("  host:    {}", b.hostname);
+        println!(
+            "  before: {}  (v{}, risk {})",
+            fmt_ts(&b.timestamp),
+            b.version,
+            b.risk_score
+        );
+        println!(
+            "  after:  {}  (v{}, risk {})",
+            fmt_ts(&a.timestamp),
+            a.version,
+            a.risk_score
+        );
+        match human_span(&b.timestamp, &a.timestamp) {
+            Some((_, true)) => println!(
+                "  \x1b[1;33m[!] 'after' is OLDER than 'before' — arguments swapped?\x1b[0m"
+            ),
+            Some((span, false)) => println!("  span:   {span}"),
+            None => {}
+        }
+        if b.hostname != a.hostname {
+            println!(
+                "  \x1b[1;33m[!] comparing different hosts: {} vs {}\x1b[0m",
+                b.hostname, a.hostname
+            );
+        }
+    }
+
     use comfy_table::presets::UTF8_FULL;
     use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 
@@ -568,6 +706,7 @@ mod tests {
             risk_score: 0,
             is_root_execution: true,
             scan_warnings: Vec::new(),
+            scoring_version: 1,
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),

@@ -173,6 +173,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             topology: topology_info,
             security: security_info,
             packages: packages_info,
+            scoring_version: crate::scoring::SCORING_VERSION,
         };
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
@@ -296,7 +297,7 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     let output_dir = PathBuf::from(output_dir);
 
     // Perform audit using the embedded AuditArgs (always JSON, but we serialize ourselves)
-    let report = if !args.audit.host.is_empty() {
+    let mut report = if !args.audit.host.is_empty() {
         let host = args.audit.host[0].clone();
         let host_for_msg = host.clone();
         let audit_args = args.audit.clone();
@@ -356,6 +357,7 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
         return 1;
     }
 
+    report.scoring_version = crate::scoring::SCORING_VERSION;
     let json = serde_json::to_string_pretty(&report).unwrap_or_else(|e| {
         eprintln!("Failed to serialize report: {e}");
         std::process::exit(1);

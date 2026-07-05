@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_scoring_version() -> u8 {
+    1
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentReport {
     pub scan_id: String,
@@ -9,6 +13,8 @@ pub struct AgentReport {
     pub risk_score: u8,
     pub is_root_execution: bool,
     pub scan_warnings: Vec<String>,
+    #[serde(default = "default_scoring_version")]
+    pub scoring_version: u8,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,
     pub network: NetworkInfo,
@@ -28,6 +34,7 @@ impl Default for AgentReport {
             risk_score: 0,
             is_root_execution: false,
             scan_warnings: Vec::new(),
+            scoring_version: 1,
             host: HostInfo::default(),
             databases: Vec::new(),
             network: NetworkInfo::default(),
@@ -238,8 +245,40 @@ pub struct PackagesInfo {
     pub cache_refreshed: bool,
 }
 
+// ── Diff model (compare v2) ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotMeta {
+    pub hostname: String,
+    pub timestamp: String,
+    pub version: String,
+    pub scoring_version: u8,
+    pub risk_score: u8,
+}
+
+impl SnapshotMeta {
+    pub fn from_report(r: &AgentReport) -> Self {
+        Self {
+            hostname: r.host.hostname.clone(),
+            timestamp: r.timestamp.clone(),
+            version: r.version.clone(),
+            scoring_version: r.scoring_version,
+            risk_score: r.risk_score,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum HostDiffStatus {
+    Compared,
+    Added,
+    Removed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffReport {
+    pub before: Option<SnapshotMeta>,
+    pub after: Option<SnapshotMeta>,
     pub changes: Vec<Change>,
 }
 
@@ -261,5 +300,6 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize)]
 pub struct MultiHostDiff {
     pub hostname: String,
+    pub status: HostDiffStatus,
     pub diff: DiffReport,
 }

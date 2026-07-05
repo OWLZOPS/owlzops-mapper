@@ -11,7 +11,7 @@ mod utils;
 
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
-use models::AgentReport;
+use models::{AgentReport, HostDiffStatus};
 use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
 use scoring::*;
 use std::collections::HashSet;
@@ -306,8 +306,24 @@ async fn run_command(cli: Cli) -> i32 {
 
                 match cmp_args.format {
                     OutputFormat::Text => {
-                        for mh in &diffs {
-                            println!("\nHost: {}", mh.hostname);
+                        let changed: Vec<_> = diffs
+                            .iter()
+                            .filter(|d| !d.diff.changes.is_empty())
+                            .collect();
+                        let unchanged = diffs.len() - changed.len();
+                        println!(
+                            "Fleet drift: {} host(s) — {} changed, {} unchanged",
+                            diffs.len(),
+                            changed.len(),
+                            unchanged
+                        );
+                        for mh in &changed {
+                            let tag = match mh.status {
+                                HostDiffStatus::Added => " [+ added]",
+                                HostDiffStatus::Removed => " [− removed]",
+                                HostDiffStatus::Compared => "",
+                            };
+                            println!("\nHost: {}{}", mh.hostname, tag);
                             compare::print_diff_terminal(&mh.diff);
                         }
                     }
@@ -450,6 +466,7 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            scoring_version: 1,
         }
     }
 
