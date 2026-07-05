@@ -49,6 +49,17 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 
 ---
+## Highlights v0.5.1 (compare v2)
+
+- **Rich diff metadata** – terminal and Excel diffs now show hostname, timestamps, binary version, and time span between snapshots.
+- **Scoring version guard** – `risk_score` changes across different scoring engine versions are marked as `Changed`, preventing false drift.
+- **Deterministic diff order** – byte‑identical reports for the same snapshots, safe for version control.
+- **Multi‑host summary** – fleet diffs show summary line and status tags (`[+ added]`, `[− removed]`).
+- **Extended SSL tracking** – warning‑level expiry and newly added certificates are detected.
+- **Port diff optimization** – zero‑copy O(n) comparison.
+
+<details>
+<summary>Previous release (v0.5.0)</summary>
 
 ## Highlights v0.5.0
 
@@ -58,6 +69,8 @@ sudo ./owlzops-mapper audit
 - **CIS Benchmark references** – every finding includes a CIS reference (e.g., `CIS 5.2.10`) for immediate audit compliance mapping.
 - **Sub‑scores** – Security, Reliability, and Hygiene now have individual caps (60/30/10), preventing score saturation and enabling drift visibility.
 - **Transparent Breakdown** – the terminal dashboard now shows the exact active findings with weights and CIS tags.
+
+</details>
 
 ---
 
@@ -141,6 +154,33 @@ sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --copy-binary
 # Multi-host Excel report with one sheet per host
 sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --format excel --output fleet-audit.xlsx
 ```
+
+### Fleet scan: 20+ VPS in one command
+
+1. Create a `hosts.txt` file (one host per line):
+   ```
+   10.0.0.1
+   10.0.0.2
+   ...
+   10.0.0.20
+   ```
+
+2. One‑time setup on each VPS (can be baked into cloud‑init / Terraform):
+   ```bash
+   echo "ubuntu ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper" | sudo tee /etc/sudoers.d/owlzops
+   ```
+
+3. Run the audit from your local machine – the binary copies itself, scans in parallel, and cleans up automatically:
+   ```bash
+   sudo ./owlzops-mapper audit \
+     --hosts hosts.txt \
+     --ssh-user ubuntu \
+     --copy-binary \
+     --format excel \
+     --output fleet-report.xlsx
+   ```
+
+Under the hood, `owlzops-mapper` connects to all 20 servers via SSH, uploads itself to `/tmp/owlzops-mapper`, executes the audit, collects the JSON results, removes the binary from each host, and produces a single multi‑sheet Excel report. No agent installation, no open ports beyond SSH.
 
 > **Prerequisite on remote hosts:** the user (here `operator`) must be able to run `sudo /tmp/owlzops-mapper` without a password prompt.  
 > Add to `/etc/sudoers.d/owlzops`:  
