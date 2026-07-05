@@ -165,6 +165,8 @@ pub struct ContainerInfo {
     pub memory_limit_mb: Option<u64>,
     pub cpu_limit: Option<f64>,
     pub cap_add: Vec<String>,
+    #[serde(default)]
+    pub sensitive_mounts: Vec<String>,
 }
 
 impl ContainerInfo {

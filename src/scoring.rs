@@ -16,7 +16,7 @@ pub const RISK_SYSCTL_PER_ISSUE: u8 = 5;
 
 pub const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 
-pub const SCORING_VERSION: u8 = 2;
+pub const SCORING_VERSION: u8 = 3;
 // ── New Finding model (v0.5) ───────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +295,44 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── Sensitive host mounts (Docker breakout surface) ──
+    let mut has_socket_or_root = false;
+    let mut has_sensitive_rw = false;
+
+    for container in &report.topology.containers {
+        for m in &container.sensitive_mounts {
+            if m == "DOCKER_SOCKET" || m == "HOST_ROOT" {
+                has_socket_or_root = true;
+            } else if m.ends_with("(rw)") {
+                has_sensitive_rw = true;
+            }
+        }
+    }
+
+    if has_socket_or_root {
+        findings.push(Finding {
+            id: "DOCK-005",
+            title: "Container mounts Docker socket or host root".to_string(),
+            category: Category::Security,
+            weight: 15,
+            evidence: "A container bind-mounts /var/run/docker.sock or / (host takeover primitive)"
+                .to_string(),
+            suppressed: None,
+            cis_ref: Some("CIS 5.31"),
+        });
+    }
+    if has_sensitive_rw {
+        findings.push(Finding {
+            id: "DOCK-006",
+            title: "Container mounts sensitive host path (writable)".to_string(),
+            category: Category::Security,
+            weight: 10,
+            evidence: "A container has a writable bind-mount of a sensitive host directory"
+                .to_string(),
+            suppressed: None,
+            cis_ref: Some("CIS 5.7"),
+        });
+    }
     // ── Reliability ─────────────────────────────────────
 
     if report

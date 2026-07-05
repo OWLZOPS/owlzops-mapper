@@ -10,6 +10,38 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::warn;
 
+/// Classify a host-side bind-mount source into a sensitive-mount label, if any.
+/// `writable`: from inspect Mount.rw (defaults to true = conservative when unknown).
+fn classify_mount(source: &str, writable: bool) -> Option<String> {
+    // Docker socket is host-takeover regardless of mount location inside the container
+    if source == "/var/run/docker.sock" || source == "/run/docker.sock" {
+        return Some("DOCKER_SOCKET".to_string());
+    }
+    // Host root mount gives full filesystem access
+    if source == "/" {
+        return Some("HOST_ROOT".to_string());
+    }
+    // Other sensitive host directories — only flag writable ones
+    const SENSITIVE: &[&str] = &[
+        "/etc",
+        "/root",
+        "/boot",
+        "/proc",
+        "/sys",
+        "/var/run",
+        "/run",
+        "/var/lib/docker",
+    ];
+    let hit = SENSITIVE
+        .iter()
+        .find(|p| source == **p || source.starts_with(&format!("{p}/")))?;
+    if writable {
+        Some(format!("{hit} (rw)"))
+    } else {
+        Some(format!("{hit} (ro)"))
+    }
+}
+
 pub async fn gather_docker_topology() -> TopologyInfo {
     match Docker::connect_with_local_defaults() {
         Ok(docker) => {
@@ -158,6 +190,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
 
                     // Mounts, log size, security checks
                     let mut mounts_vec = Vec::new();
+                    let mut sensitive_mounts = Vec::new(); // NEW
                     let mut log_size_mb = 0;
                     let mut privileged = false;
                     let mut memory_limit_mb = None;
@@ -170,6 +203,11 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                                 (m.source.clone(), m.destination.clone())
                             {
                                 mounts_vec.push(format!("{} -> {}", src, dst));
+                                // NEW: classify the host-side source
+                                let writable = m.rw.unwrap_or(true);
+                                if let Some(label) = classify_mount(&src, writable) {
+                                    sensitive_mounts.push(label);
+                                }
                             }
                         }
                     }
@@ -213,6 +251,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         memory_limit_mb,
                         cpu_limit,
                         cap_add,
+                        sensitive_mounts, // NEW
                     });
                 }
             }
