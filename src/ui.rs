@@ -94,6 +94,11 @@ fn render_header(report: &AgentReport) {
         "🛡️  Risk Score: {}{}/100\x1b[0m\n",
         risk_color, report.risk_score
     );
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    println!(
+        "  Security: {}/60  Reliability: {}/30  Hygiene: {}/10",
+        scored.security, scored.reliability, scored.hygiene
+    );
 
     // Risk Score breakdown
     let flags = crate::scoring::CriticalFlags::from_report(report);

@@ -328,49 +328,6 @@ impl CriticalFlags {
             || self.sysctl_issues_count >= SYSCTL_CRITICAL_THRESHOLD
     }
 
-    pub fn risk_penalty(&self) -> u8 {
-        let mut score = 0u8;
-        if self.firewall_disabled {
-            score = score.saturating_add(RISK_NO_FIREWALL);
-        }
-        if self.ssh_root_login {
-            score = score.saturating_add(RISK_SSH_ROOT_LOGIN);
-        }
-        if self.security_updates {
-            score = score.saturating_add(RISK_SECURITY_UPDATES);
-        }
-        if self.critical_ssl {
-            score = score.saturating_add(RISK_CRITICAL_SSL_MAX);
-        }
-        if self.failed_services {
-            score = score.saturating_add(RISK_FAILED_SERVICES);
-        }
-        if self.no_backups {
-            score = score.saturating_add(RISK_NO_BACKUP);
-        }
-        if self.sudo_nopasswd {
-            score = score.saturating_add(RISK_SUDO_NOPASSWD);
-        }
-        if self.ntp_not_synced {
-            score = score.saturating_add(RISK_NTP_NOT_SYNCED);
-        }
-        if self.ssh_password_auth {
-            score = score.saturating_add(RISK_SSH_PASSWORD_AUTH);
-        }
-        if self.oom_kills {
-            score = score.saturating_add(RISK_OOM_KILLS);
-        }
-        if self.sudoers_bad_mode {
-            score = score.saturating_add(RISK_SUDOERS_MODE);
-        }
-        let sysctl_penalty = std::cmp::min(
-            (self.sysctl_issues_count as u8).saturating_mul(RISK_SYSCTL_PER_ISSUE),
-            RISK_SYSCTL_MAX,
-        );
-        score = score.saturating_add(sysctl_penalty);
-        score.min(100)
-    }
-
     pub fn breakdown(&self) -> Vec<(&'static str, u8)> {
         let mut items = Vec::new();
         if self.firewall_disabled {
@@ -462,8 +419,6 @@ mod tests {
                 is_security: true,
             });
         }
-        let flags = CriticalFlags::from_report(&r);
-        assert!(flags.risk_penalty() <= 100);
 
         let scored = score(evaluate(&r));
         assert!(scored.total <= 100);
