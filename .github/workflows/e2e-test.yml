@@ -1,0 +1,35 @@
+name: E2E Smoke Test
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  local-audit:
+    name: Local audit smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # action HEAD as of 2026-06-28
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Build executable (debug for speed)
+        run: cargo build --locked
+
+      - name: Run Local Audit & Validate JSON
+        run: |
+          sudo ./target/debug/owlzops-mapper audit --format json > audit_result.json
+          jq -e '.scan_id != null' audit_result.json > /dev/null
+          jq -e '.risk_score != null' audit_result.json > /dev/null
+          jq -e '.host.hostname != null' audit_result.json > /dev/null
+          jq -e '.packages.installed_count != null' audit_result.json > /dev/null
+          echo "✅ Lightweight E2E passed successfully!"
