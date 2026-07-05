@@ -174,17 +174,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             security: security_info,
             packages: packages_info,
         };
-        report.risk_score = crate::compute_risk_score(&report);
-
-        // Suppress ip_forward flag on container hosts where it is expected
-        if report.topology.docker_active
-            || report.host.native_services.iter().any(|s| s == "kubelet")
-        {
-            report
-                .security
-                .sysctl_issues
-                .retain(|issue| !issue.starts_with("net.ipv4.ip_forward="));
-        }
+        report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
         info!(
             scan_id = %report.scan_id,

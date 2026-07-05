@@ -94,19 +94,29 @@ fn render_header(report: &AgentReport) {
         "🛡️  Risk Score: {}{}/100\x1b[0m\n",
         risk_color, report.risk_score
     );
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    println!(
+        "  Security: {}/60  Reliability: {}/30  Hygiene: {}/10",
+        scored.security, scored.reliability, scored.hygiene
+    );
 
     // Risk Score breakdown
-    let flags = crate::scoring::CriticalFlags::from_report(report);
-    let breakdown = flags.breakdown();
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    let active_findings: Vec<&crate::scoring::Finding> = scored
+        .findings
+        .iter()
+        .filter(|f| f.suppressed.is_none())
+        .collect();
 
-    if !breakdown.is_empty() {
-        let parts: Vec<String> = breakdown
-            .iter()
-            .map(|(name, score)| format!("  • {} (+{})", name, score))
-            .collect();
+    if !active_findings.is_empty() {
         println!("Breakdown:");
-        for part in &parts {
-            println!("{}", part);
+        for f in &active_findings {
+            let cis_note = if let Some(cis) = f.cis_ref {
+                format!(" [{}]", cis)
+            } else {
+                String::new()
+            };
+            println!("  • {} (+{}){}", f.title, f.weight, cis_note);
         }
     }
 
@@ -253,6 +263,15 @@ fn render_databases(report: &AgentReport) {
 }
 
 fn render_security_health(report: &AgentReport) {
+    // Build list of suppressed sysctl issues from the new finding model
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    let suppressed_evidence: std::collections::HashSet<&str> = scored
+        .findings
+        .iter()
+        .filter(|f| f.suppressed.is_some())
+        .map(|f| f.evidence.as_str())
+        .collect();
+
     let mut t_risk = Table::new();
     t_risk
         .load_preset(UTF8_FULL)
@@ -341,10 +360,19 @@ fn render_security_health(report: &AgentReport) {
         };
         t_risk.add_row(vec![Cell::new("Sudoers Permissions"), sudo_perm]);
     }
-    if !report.security.sysctl_issues.is_empty() {
+
+    // Sysctl Issues – show only those that are NOT suppressed
+    let visible_sysctl: Vec<&str> = report
+        .security
+        .sysctl_issues
+        .iter()
+        .filter(|issue| !suppressed_evidence.contains(issue.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if !visible_sysctl.is_empty() {
         t_risk.add_row(vec![
             Cell::new("Sysctl Issues"),
-            Cell::new(report.security.sysctl_issues.join("; "))
+            Cell::new(visible_sysctl.join("; "))
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold),
         ]);

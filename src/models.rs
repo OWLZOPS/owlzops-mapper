@@ -186,6 +186,8 @@ impl ContainerInfo {
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,
+    #[serde(default)]
+    pub ssh_permit_root_login_detail: Option<String>,
     pub shell_users: Vec<UserInfo>,
     pub fail2ban_active: bool,
     pub auditd_active: bool,

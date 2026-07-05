@@ -29,10 +29,6 @@ fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
-fn compute_risk_score(report: &AgentReport) -> u8 {
-    CriticalFlags::from_report(report).risk_penalty()
-}
-
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let flags = CriticalFlags::from_report(report);
 
@@ -476,7 +472,7 @@ mod tests {
                 is_security: true,
             });
         }
-        assert!(compute_risk_score(&r) <= 100);
+        assert!(scoring::score(scoring::evaluate(&r)).total <= 100);
     }
 
     #[test]
