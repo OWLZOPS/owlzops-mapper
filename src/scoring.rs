@@ -16,7 +16,14 @@ pub const RISK_SYSCTL_PER_ISSUE: u8 = 5;
 
 pub const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 
-pub const SCORING_VERSION: u8 = 3;
+// ── Docker reliability constants (v0.5.x) ─────────────────
+pub const RISK_CONTAINER_OOM: u8 = 10;
+pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
+pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
+pub const RESTART_LOOP_THRESHOLD: u64 = 3;
+
+pub const SCORING_VERSION: u8 = 4; // was 3 (DOCK-005/006)
+
 // ── New Finding model (v0.5) ───────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +60,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_NO_FIREWALL,
             evidence: "No active firewall (ufw/firewalld/nftables/iptables)".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 3.5.1.1"), // Ensure firewall is active
+            cis_ref: Some("CIS 3.5.1.1"),
         });
     }
 
@@ -76,7 +83,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight,
             evidence: format!("PermitRootLogin {}", detail),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.10"), // Ensure SSH root login is disabled
+            cis_ref: Some("CIS 5.2.10"),
         });
     }
 
@@ -102,7 +109,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight,
             evidence: format!("{} security update(s) available", count),
             suppressed: None,
-            cis_ref: Some("CIS 1.9"), // Ensure updates, patches, and additional security software are installed
+            cis_ref: Some("CIS 1.9"),
         });
     }
 
@@ -119,7 +126,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_CRITICAL_SSL_MAX,
             evidence: "One or more SSL certificates expire within 7 days".to_string(),
             suppressed: None,
-            cis_ref: None, // No direct CIS mapping
+            cis_ref: None,
         });
     }
 
@@ -140,7 +147,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 report.security.sudo_nopasswd_entries.len()
             ),
             suppressed: None,
-            cis_ref: Some("CIS 5.4.2"), // Ensure sudo commands use pty (related to logging/visibility)
+            cis_ref: Some("CIS 5.4.2"),
         });
     }
 
@@ -154,7 +161,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_SUDOERS_MODE,
             evidence: format!("sudoers mode is {:o}", mode),
             suppressed: None,
-            cis_ref: Some("CIS 1.8.2"), // Ensure sudoers file permissions are configured
+            cis_ref: Some("CIS 1.8.2"),
         });
     }
 
@@ -175,7 +182,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 weight: RISK_SYSCTL_PER_ISSUE,
                 evidence: issue.clone(),
                 suppressed,
-                cis_ref: Some("CIS 3.3.1"), // Ensure IP forwarding is disabled
+                cis_ref: Some("CIS 3.3.1"),
             });
         } else {
             let title = issue
@@ -183,7 +190,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .next()
                 .unwrap_or("sysctl issue")
                 .to_string();
-            // map other sysctl issues
             let cis = match title.as_str() {
                 "kernel.randomize_va_space" => Some("CIS 1.6.2"),
                 "net.ipv4.tcp_syncookies" => Some("CIS 3.3.8"),
@@ -212,7 +218,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_SSH_PASSWORD_AUTH,
             evidence: "PasswordAuthentication yes".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.4"), // Ensure SSH PasswordAuthentication is disabled
+            cis_ref: Some("CIS 5.2.4"),
         });
     }
 
@@ -225,7 +231,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 5,
             evidence: "PermitRootLogin enabled AND PasswordAuthentication yes".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.10/5.2.4"), // combination of both
+            cis_ref: Some("CIS 5.2.10/5.2.4"),
         });
     }
 
@@ -256,7 +262,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 5,
             evidence: "At least one container lacks a memory limit".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.3"), // Ensure containers are limited in memory usage
+            cis_ref: Some("CIS 5.2.3"),
         });
     }
     if has_cpu_limit_issue {
@@ -267,7 +273,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 3,
             evidence: "At least one container lacks a CPU limit".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.2"), // Ensure containers are limited in CPU usage
+            cis_ref: Some("CIS 5.2.2"),
         });
     }
     if has_privileged {
@@ -278,7 +284,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 10,
             evidence: "At least one container is running in privileged mode".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.4"), // Ensure containers are not run with the privileged flag
+            cis_ref: Some("CIS 5.2.4"),
         });
     }
     if has_dangerous_caps {
@@ -291,7 +297,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 "At least one container has elevated kernel capabilities (SYS_ADMIN/NET_ADMIN)"
                     .to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 5.2.5"), // Ensure sensitive host system directories are not mounted on containers (but capabilities are closely related)
+            cis_ref: Some("CIS 5.2.5"),
         });
     }
 
@@ -333,6 +339,67 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             cis_ref: Some("CIS 5.7"),
         });
     }
+
+    // ── Docker reliability ───────────────────────────────
+    let mut oom_names: Vec<&str> = Vec::new();
+    let mut loop_names: Vec<&str> = Vec::new();
+    let mut unhealthy_names: Vec<&str> = Vec::new();
+
+    for c in &report.topology.containers {
+        if c.oom_killed {
+            oom_names.push(&c.name);
+        }
+        if c.restart_count >= RESTART_LOOP_THRESHOLD || c.state == "restarting" {
+            loop_names.push(&c.name);
+        }
+        if c.health_status.as_deref() == Some("unhealthy") {
+            unhealthy_names.push(&c.name);
+        }
+    }
+
+    if !oom_names.is_empty() {
+        oom_names.sort_unstable();
+        let list = oom_names.join(", ");
+        findings.push(Finding {
+            id: "DOCK-007",
+            title: "Docker containers killed by OOM".to_string(),
+            category: Category::Reliability,
+            weight: RISK_CONTAINER_OOM,
+            evidence: format!("OOMKilled: {}", list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+    if !loop_names.is_empty() {
+        loop_names.sort_unstable();
+        let list = loop_names.join(", ");
+        findings.push(Finding {
+            id: "DOCK-008",
+            title: "Docker containers in restart loop".to_string(),
+            category: Category::Reliability,
+            weight: RISK_CONTAINER_RESTART_LOOP,
+            evidence: format!(
+                "restart_count >= {} or currently restarting: {}",
+                RESTART_LOOP_THRESHOLD, list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+    if !unhealthy_names.is_empty() {
+        unhealthy_names.sort_unstable();
+        let list = unhealthy_names.join(", ");
+        findings.push(Finding {
+            id: "DOCK-009",
+            title: "Unhealthy Docker containers (failing healthcheck)".to_string(),
+            category: Category::Reliability,
+            weight: RISK_CONTAINER_UNHEALTHY,
+            evidence: format!("unhealthy: {}", list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── Reliability ─────────────────────────────────────
 
     if report
@@ -348,7 +415,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_FAILED_SERVICES,
             evidence: format!("{} failed service(s)", report.host.failed_services.len()),
             suppressed: None,
-            cis_ref: None, // Operational concern, not directly a CIS item
+            cis_ref: None,
         });
     }
 
@@ -360,7 +427,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_NO_BACKUP,
             evidence: "No automated backup tools found".to_string(),
             suppressed: None,
-            cis_ref: None, // Backup is a policy, not specific CIS rule
+            cis_ref: None,
         });
     }
 
@@ -386,7 +453,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: RISK_NTP_NOT_SYNCED,
             evidence: "Time not synchronized".to_string(),
             suppressed: None,
-            cis_ref: Some("CIS 2.2.1.1"), // Ensure time synchronization is in use
+            cis_ref: Some("CIS 2.2.1.1"),
         });
     }
 
@@ -514,6 +581,27 @@ mod tests {
         }
     }
 
+    fn rel_container(name: &str) -> ContainerInfo {
+        ContainerInfo {
+            name: name.into(),
+            image: "img".into(),
+            state: "running".into(),
+            status: "Up 2 hours".into(),
+            size_mb: 0,
+            log_size_mb: 0,
+            ports: vec![],
+            mounts: vec![],
+            privileged: false,
+            memory_limit_mb: Some(512),
+            cpu_limit: Some(1.0),
+            cap_add: vec![],
+            sensitive_mounts: vec![],
+            restart_count: 0,
+            oom_killed: false,
+            health_status: None,
+        }
+    }
+
     #[test]
     fn risk_score_never_exceeds_100() {
         let mut r = minimal_report();
@@ -564,5 +652,33 @@ mod tests {
         assert!(findings.iter().any(|f| f.suppressed.is_some()));
         let scored = score(findings);
         assert_eq!(scored.total, 0);
+    }
+
+    #[test]
+    fn docker_reliability_findings() {
+        let mut r = minimal_report();
+        let mut oom = rel_container("db");
+        oom.oom_killed = true;
+        let mut looper = rel_container("worker");
+        looper.restart_count = 5;
+        let mut live = rel_container("api");
+        live.state = "restarting".into();
+        let mut sick = rel_container("web");
+        sick.health_status = Some("unhealthy".into());
+        let ok = rel_container("cache");
+        r.topology.containers = vec![oom, looper, live, sick, ok];
+
+        let findings = evaluate(&r);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"DOCK-007"));
+        assert!(ids.contains(&"DOCK-008"));
+        assert!(ids.contains(&"DOCK-009"));
+        assert!(
+            findings
+                .iter()
+                .filter(|f| f.id.starts_with("DOCK-00"))
+                .all(|f| !f.evidence.contains("cache"))
+        );
+        assert!(score(findings).reliability <= 30);
     }
 }

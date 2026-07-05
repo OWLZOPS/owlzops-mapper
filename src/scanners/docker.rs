@@ -13,15 +13,12 @@ use tracing::warn;
 /// Classify a host-side bind-mount source into a sensitive-mount label, if any.
 /// `writable`: from inspect Mount.rw (defaults to true = conservative when unknown).
 fn classify_mount(source: &str, writable: bool) -> Option<String> {
-    // Docker socket is host-takeover regardless of mount location inside the container
     if source == "/var/run/docker.sock" || source == "/run/docker.sock" {
         return Some("DOCKER_SOCKET".to_string());
     }
-    // Host root mount gives full filesystem access
     if source == "/" {
         return Some("HOST_ROOT".to_string());
     }
-    // Other sensitive host directories — only flag writable ones
     const SENSITIVE: &[&str] = &[
         "/etc",
         "/root",
@@ -190,7 +187,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
 
                     // Mounts, log size, security checks
                     let mut mounts_vec = Vec::new();
-                    let mut sensitive_mounts = Vec::new(); // NEW
+                    let mut sensitive_mounts = Vec::new();
                     let mut log_size_mb = 0;
                     let mut privileged = false;
                     let mut memory_limit_mb = None;
@@ -203,7 +200,6 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                                 (m.source.clone(), m.destination.clone())
                             {
                                 mounts_vec.push(format!("{} -> {}", src, dst));
-                                // NEW: classify the host-side source
                                 let writable = m.rw.unwrap_or(true);
                                 if let Some(label) = classify_mount(&src, writable) {
                                     sensitive_mounts.push(label);
@@ -232,6 +228,28 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         cap_add = host_config.cap_add.clone().unwrap_or_default();
                     }
 
+                    // --- Reliability signals (new) ---
+                    let restart_count = inspect
+                        .restart_count
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(0);
+
+                    let (oom_killed, health_status) = inspect
+                        .state
+                        .as_ref()
+                        .map(|s| {
+                            use bollard::models::HealthStatusEnum as H;
+                            let oom = s.oom_killed.unwrap_or(false);
+                            let health = s.health.as_ref().and_then(|h| match h.status {
+                                Some(H::STARTING) => Some("starting".to_string()),
+                                Some(H::HEALTHY) => Some("healthy".to_string()),
+                                Some(H::UNHEALTHY) => Some("unhealthy".to_string()),
+                                _ => None, // NONE / EMPTY / отсутствует → healthcheck не настроен
+                            });
+                            (oom, health)
+                        })
+                        .unwrap_or((false, None));
+
                     let size_mb = (container.size_rw.unwrap_or(0)
                         + container.size_root_fs.unwrap_or(0))
                         as u64
@@ -251,10 +269,16 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         memory_limit_mb,
                         cpu_limit,
                         cap_add,
-                        sensitive_mounts, // NEW
+                        restart_count, // new
+                        oom_killed,    // new
+                        health_status, // new
+                        sensitive_mounts,
                     });
                 }
             }
+
+            // Deterministic order for report stability
+            container_list.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
             let mut dangling_volumes_count = 0;
             let mut filter = HashMap::new();
