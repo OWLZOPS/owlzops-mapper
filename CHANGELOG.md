@@ -1,27 +1,21 @@
 
-## Bug Fixes
-
-- Improve async handling and error reporting for remote scans, refactor `gather_host_info` interface
-- Refactor sudo self-exclusion logic, simplify path checks and improve related tests
-- Update timeout values and adjust README for clarity in options
-- Suppress sysctl false positives for Docker/kubelet hosts
-
 ## Documentation
 
-- Update README for v0.4.10
-- Update CHANGELOG for v0.4.10
-- Clarify License section in README, expand on Commons Clause usage
-- Remove trailing space from CONTRIBUTING.md filename
+- Update CHANGELOG for v0.4.11
 
 ## Features
 
-- Resolve home directory for snapshots under sudo, update README with core features and examples
+- Introduce new scoring model and structured findings evaluation system
+- Filter suppressed sysctl issues in UI
+- Enhance security scoring with detailed conditions and Docker checks
+- Add CIS references to findings and enhance UI
 
 ## Miscellaneous
 
-- Bump version to 0.4.11, update changelog
+- Bump version to 0.5.0, update README with release highlights and risk scoring updates
+- Optimize build settings, streamline CI workflows and improve SBOM generation
 
-## style
+## Refactoring
 
-- Apply cargo fmt to runner.rs
+- Replace legacy risk scoring logic with new evaluation model
 
