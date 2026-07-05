@@ -101,17 +101,17 @@ fn render_header(report: &AgentReport) {
     );
 
     // Risk Score breakdown
-    let flags = crate::scoring::CriticalFlags::from_report(report);
-    let breakdown = flags.breakdown();
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    let active_findings: Vec<&crate::scoring::Finding> = scored
+        .findings
+        .iter()
+        .filter(|f| f.suppressed.is_none())
+        .collect();
 
-    if !breakdown.is_empty() {
-        let parts: Vec<String> = breakdown
-            .iter()
-            .map(|(name, score)| format!("  • {} (+{})", name, score))
-            .collect();
+    if !active_findings.is_empty() {
         println!("Breakdown:");
-        for part in &parts {
-            println!("{}", part);
+        for f in &active_findings {
+            println!("  • {} (+{})", f.title, f.weight);
         }
     }
 

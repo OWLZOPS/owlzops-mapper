@@ -242,24 +242,40 @@ fn gather_sysctl_issues() -> Vec<String> {
 
 pub fn gather_security_info() -> SecurityInfo {
     // --- SSH config parsing ------------------------------------------------
-    let (ssh_password_auth_enabled, ssh_root_login_enabled, ssh_config_source) =
-        match sshd_effective_config() {
-            Some(config) => {
-                let pwd = parse_sshd_directive(&config, "passwordauthentication")
-                    .map(|v| v.eq_ignore_ascii_case("yes"))
-                    .unwrap_or(true);
-                let root = parse_sshd_directive(&config, "permitrootlogin")
-                    .map(|v| !v.eq_ignore_ascii_case("no"))
-                    .unwrap_or(true);
-                (pwd, root, "sshd -T (effective)".to_string())
-            }
-            None => {
-                let mut pwd = true;
-                let mut root = true;
-                fallback_parse_main_config(&mut pwd, &mut root);
-                (pwd, root, "fallback (/etc/ssh/sshd_config)".to_string())
-            }
-        };
+    let (
+        ssh_password_auth_enabled,
+        ssh_root_login_enabled,
+        ssh_permit_root_detail,
+        ssh_config_source,
+    ) = match sshd_effective_config() {
+        Some(config) => {
+            let pwd = parse_sshd_directive(&config, "passwordauthentication")
+                .map(|v| v.eq_ignore_ascii_case("yes"))
+                .unwrap_or(true);
+            let root = parse_sshd_directive(&config, "permitrootlogin")
+                .map(|v| !v.eq_ignore_ascii_case("no"))
+                .unwrap_or(true);
+            let root_detail = parse_sshd_directive(&config, "permitrootlogin");
+            (pwd, root, root_detail, "sshd -T (effective)".to_string())
+        }
+        None => {
+            let mut pwd = true;
+            let mut root_login = true;
+            fallback_parse_main_config(&mut pwd, &mut root_login);
+            // Fallback does not provide raw value; derive from boolean.
+            let root_detail = if root_login {
+                Some("yes".to_string())
+            } else {
+                Some("no".to_string())
+            };
+            (
+                pwd,
+                root_login,
+                root_detail,
+                "fallback (/etc/ssh/sshd_config)".to_string(),
+            )
+        }
+    };
 
     // --- Shell users – collect usernames and authorized_keys counts --------
     const VALID_SHELLS: &[&str] = &[
@@ -376,6 +392,7 @@ pub fn gather_security_info() -> SecurityInfo {
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
+        ssh_permit_root_login_detail: ssh_permit_root_detail,
         shell_users,
         fail2ban_active,
         auditd_active,

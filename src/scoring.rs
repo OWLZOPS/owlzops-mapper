@@ -11,10 +11,8 @@ pub const RISK_SSH_PASSWORD_AUTH: u8 = 10;
 pub const RISK_OOM_KILLS: u8 = 10;
 pub const RISK_NO_BACKUP: u8 = 20;
 pub const RISK_NTP_NOT_SYNCED: u8 = 10;
-pub const RISK_SUDO_NOPASSWD: u8 = 10;
 pub const RISK_SUDOERS_MODE: u8 = 5;
 pub const RISK_SYSCTL_PER_ISSUE: u8 = 5;
-pub const RISK_SYSCTL_MAX: u8 = 15;
 
 pub const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 
@@ -56,17 +54,29 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // SSH root login – differentiate prohibit-password
     if report.security.ssh_root_login_enabled {
+        let detail = report
+            .security
+            .ssh_permit_root_login_detail
+            .as_deref()
+            .unwrap_or("");
+        let weight = if detail.eq_ignore_ascii_case("prohibit-password") {
+            RISK_SSH_ROOT_LOGIN / 2 // ~12
+        } else {
+            RISK_SSH_ROOT_LOGIN // 25
+        };
         findings.push(Finding {
             id: "SEC-002",
             title: "SSH root login allowed".to_string(),
             category: Category::Security,
-            weight: RISK_SSH_ROOT_LOGIN,
-            evidence: "PermitRootLogin enabled".to_string(),
+            weight,
+            evidence: format!("PermitRootLogin {}", detail),
             suppressed: None,
         });
     }
 
+    // Security updates – stepped weights
     if report.packages.upgradable.iter().any(|p| p.is_security) {
         let count = report
             .packages
@@ -74,11 +84,18 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .iter()
             .filter(|p| p.is_security)
             .count();
+        let weight = if count > 20 {
+            RISK_SECURITY_UPDATES // 20
+        } else if count > 5 {
+            15
+        } else {
+            10
+        };
         findings.push(Finding {
             id: "SEC-003",
             title: "Pending security updates".to_string(),
             category: Category::Security,
-            weight: RISK_SECURITY_UPDATES,
+            weight,
             evidence: format!("{} security update(s) available", count),
             suppressed: None,
         });
@@ -100,12 +117,18 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // Sudo NOPASSWD – distinguish ALL vs restricted
     if !report.security.sudo_nopasswd_entries.is_empty() {
+        let has_all = report.security.sudo_nopasswd_entries.iter().any(|entry| {
+            let lower = entry.to_lowercase();
+            lower.contains("nopasswd: all") || lower.ends_with("nopasswd:all")
+        });
+        let weight = if has_all { 15 } else { 5 };
         findings.push(Finding {
             id: "SEC-005",
             title: "Sudo NOPASSWD entries found".to_string(),
             category: Category::Security,
-            weight: RISK_SUDO_NOPASSWD,
+            weight,
             evidence: format!(
                 "{} NOPASSWD entries in sudoers",
                 report.security.sudo_nopasswd_entries.len()
@@ -162,6 +185,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // SSH password authentication
     if report.security.ssh_password_auth_enabled {
         findings.push(Finding {
             id: "SEC-008",
@@ -169,6 +193,80 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             category: Category::Security,
             weight: RISK_SSH_PASSWORD_AUTH,
             evidence: "PasswordAuthentication yes".to_string(),
+            suppressed: None,
+        });
+    }
+
+    // Combo penalty: root login + password auth
+    if report.security.ssh_password_auth_enabled && report.security.ssh_root_login_enabled {
+        findings.push(Finding {
+            id: "SEC-009",
+            title: "Root login with password allowed".to_string(),
+            category: Category::Security,
+            weight: 5,
+            evidence: "PermitRootLogin enabled AND PasswordAuthentication yes".to_string(),
+            suppressed: None,
+        });
+    }
+
+    // ── Docker container security issues ────────────────
+    let mut has_mem_limit_issue = false;
+    let mut has_cpu_limit_issue = false;
+    let mut has_privileged = false;
+    let mut has_dangerous_caps = false;
+
+    for container in &report.topology.containers {
+        let issues = container.security_issues();
+        for issue in issues {
+            match issue {
+                "NoMemLimit" => has_mem_limit_issue = true,
+                "NoCpuLimit" => has_cpu_limit_issue = true,
+                "PRIVILEGED" => has_privileged = true,
+                "SYS_ADMIN" | "NET_ADMIN" => has_dangerous_caps = true,
+                _ => {}
+            }
+        }
+    }
+
+    if has_mem_limit_issue {
+        findings.push(Finding {
+            id: "DOCK-001",
+            title: "Docker containers without memory limits".to_string(),
+            category: Category::Security,
+            weight: 5,
+            evidence: "At least one container lacks a memory limit".to_string(),
+            suppressed: None,
+        });
+    }
+    if has_cpu_limit_issue {
+        findings.push(Finding {
+            id: "DOCK-002",
+            title: "Docker containers without CPU limits".to_string(),
+            category: Category::Security,
+            weight: 3,
+            evidence: "At least one container lacks a CPU limit".to_string(),
+            suppressed: None,
+        });
+    }
+    if has_privileged {
+        findings.push(Finding {
+            id: "DOCK-003",
+            title: "Privileged Docker containers detected".to_string(),
+            category: Category::Security,
+            weight: 10,
+            evidence: "At least one container is running in privileged mode".to_string(),
+            suppressed: None,
+        });
+    }
+    if has_dangerous_caps {
+        findings.push(Finding {
+            id: "DOCK-004",
+            title: "Docker containers with dangerous capabilities".to_string(),
+            category: Category::Security,
+            weight: 10,
+            evidence:
+                "At least one container has elevated kernel capabilities (SYS_ADMIN/NET_ADMIN)"
+                    .to_string(),
             suppressed: None,
         });
     }
@@ -278,9 +376,6 @@ pub struct CriticalFlags {
     pub sudo_nopasswd: bool,
     pub ntp_not_synced: bool,
     pub sysctl_issues_count: usize,
-    pub ssh_password_auth: bool,
-    pub oom_kills: bool,
-    pub sudoers_bad_mode: bool,
 }
 
 impl CriticalFlags {
@@ -310,9 +405,6 @@ impl CriticalFlags {
             sudo_nopasswd: has("SEC-005"),
             ntp_not_synced: has("HYG-001"),
             sysctl_issues_count: count_sysctl,
-            ssh_password_auth: has("SEC-008"),
-            oom_kills: has("REL-003"),
-            sudoers_bad_mode: has("SEC-006"),
         }
     }
 
@@ -326,51 +418,6 @@ impl CriticalFlags {
             || self.sudo_nopasswd
             || self.ntp_not_synced
             || self.sysctl_issues_count >= SYSCTL_CRITICAL_THRESHOLD
-    }
-
-    pub fn breakdown(&self) -> Vec<(&'static str, u8)> {
-        let mut items = Vec::new();
-        if self.firewall_disabled {
-            items.push(("Firewall inactive", RISK_NO_FIREWALL));
-        }
-        if self.ssh_root_login {
-            items.push(("SSH root login allowed", RISK_SSH_ROOT_LOGIN));
-        }
-        if self.security_updates {
-            items.push(("Pending security updates", RISK_SECURITY_UPDATES));
-        }
-        if self.critical_ssl {
-            items.push(("SSL certificate expiring", RISK_CRITICAL_SSL_MAX));
-        }
-        if self.failed_services {
-            items.push(("Failed systemd services", RISK_FAILED_SERVICES));
-        }
-        if self.ssh_password_auth {
-            items.push(("SSH password auth enabled", RISK_SSH_PASSWORD_AUTH));
-        }
-        if self.oom_kills {
-            items.push(("OOM kills present", RISK_OOM_KILLS));
-        }
-        if self.no_backups {
-            items.push(("No backup tools detected", RISK_NO_BACKUP));
-        }
-        if self.ntp_not_synced {
-            items.push(("NTP not synchronized", RISK_NTP_NOT_SYNCED));
-        }
-        if self.sudo_nopasswd {
-            items.push(("Sudo NOPASSWD entries found", RISK_SUDO_NOPASSWD));
-        }
-        if self.sudoers_bad_mode {
-            items.push(("Sudoers permissions not 0440", RISK_SUDOERS_MODE));
-        }
-        let sysctl_penalty = std::cmp::min(
-            (self.sysctl_issues_count as u8).saturating_mul(RISK_SYSCTL_PER_ISSUE),
-            RISK_SYSCTL_MAX,
-        );
-        if sysctl_penalty > 0 {
-            items.push(("Sysctl security issues", sysctl_penalty));
-        }
-        items
     }
 }
 
@@ -439,13 +486,12 @@ mod tests {
     #[test]
     fn suppressed_findings_not_scored() {
         let mut r = minimal_report();
-        // Ensure only the suppressed sysctl issue contributes
         r.network.firewall_active = true;
         r.security.ssh_password_auth_enabled = false;
         r.host.backup_tools = vec!["restic".to_string()];
         r.host.ntp_synchronized = true;
         r.security.sysctl_issues = vec!["net.ipv4.ip_forward=1 (expected 0)".to_string()];
-        r.topology.docker_active = true; // triggers suppression
+        r.topology.docker_active = true;
 
         let findings = evaluate(&r);
         assert!(findings.iter().any(|f| f.suppressed.is_some()));
