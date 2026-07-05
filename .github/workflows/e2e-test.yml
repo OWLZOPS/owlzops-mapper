@@ -27,9 +27,20 @@ jobs:
 
       - name: Run Local Audit & Validate JSON
         run: |
-          sudo ./target/debug/owlzops-mapper audit --format json > audit_result.json
+          set +e
+          sudo ./target/debug/owlzops-mapper audit --format json > audit_result.json 2>/dev/null
+          MAPPER_EXIT=$?
+          set -e
+
+          # Accept exit codes 0 (clean) and 1 (findings present) — both are valid audit results
+          if [ $MAPPER_EXIT -gt 1 ]; then
+            echo "❌ Mapper crashed or failed setup with exit code: $MAPPER_EXIT"
+            cat audit_result.json 2>/dev/null || true
+            exit $MAPPER_EXIT
+          fi
+
           jq -e '.scan_id != null' audit_result.json > /dev/null
           jq -e '.risk_score != null' audit_result.json > /dev/null
           jq -e '.host.hostname != null' audit_result.json > /dev/null
           jq -e '.packages.installed_count != null' audit_result.json > /dev/null
-          echo "✅ Lightweight E2E passed successfully!"
+          echo "✅ Lightweight E2E passed! (mapper exit code: $MAPPER_EXIT)"
