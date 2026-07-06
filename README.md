@@ -41,14 +41,30 @@ sudo ./owlzops-mapper audit
 
 ## Core Features
 
-- **Multi‑host remote audit** – scan dozens of servers over SSH in parallel, with automatic binary deployment and concurrency limits.
+- **Multi‑host remote audit** – scan dozens of servers over SSH in parallel, with automatic binary deployment and concurrency limits. Supports both passwordless sudo and **password‑based sudo** (`‑‑ask‑sudo‑pass`) — no pre‑configured `NOPASSWD` required.
 - **Snapshot diff & drift monitoring** – capture server state as JSON snapshots, compare any two, and get colour‑coded Excel/terminal diffs of exactly what changed.
 - **Context‑aware Risk Score** – findings are evaluated with awareness of the environment (e.g., Docker/kubelet hosts are not penalised for `ip_forward=1`). Sub‑scores for Security, Reliability and Hygiene prevent score saturation.
+- **Deep Docker & container audit** – detects privileged containers, missing memory/CPU limits, sensitive host mounts, OOM‑killed containers, restart loops, and unhealthy healthchecks. All with CIS references.
 - **CIS Benchmark mapping** – every security finding includes a reference to the corresponding CIS Benchmark rule (e.g., `CIS 5.2.10`), ready for compliance audits.
 - **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
+---
+
+## Highlights v0.5.2 (async SSH + Docker audit)
+
+- **Async SSH engine (`russh`)** – fleet scans now support `--ask-sudo-pass` to authenticate via password without pre‑configuring `NOPASSWD` on every host. Known‑hosts TOFU verification with warnings.
+- **Progress bar for `--copy-binary`** – binary uploads show a real‑time progress bar with file size and ETA, in both legacy and async SSH paths.
+- **Docker reliability findings** – OOM‑killed containers, restart loops, and unhealthy healthchecks are now detected and scored under the Reliability category (`DOCK‑007…DOCK‑009`).
+- **Sensitive mount detection** – containers mounting the Docker socket, host root, or writable sensitive directories are flagged as high‑risk (`DOCK‑005`, `DOCK‑006`) with CIS references.
+- **Scoring version guard** – `risk_score` differences caused by formula updates are now marked as `Changed` instead of false improvements/degradations, preserving drift accuracy in `compare`.
+- **Compare v2** – metadata header with hostname, timestamps, binary version and time span; deterministic diff order; multi‑host summary with Added/Removed/Compared statuses.
+- **UX polish** – `--keep-binary` flag to skip cleanup after remote scan; emojis and ANSI colours are automatically disabled when stdout is piped; `--max-concurrent` controls fleet parallelism; file descriptor limit raised automatically.
 
 ---
+
+<details>
+<summary>Previous releases (v0.5.1, v0.5.0, v0.4.11, v0.4.10)</summary>
+
 ## Highlights v0.5.1 (compare v2)
 
 - **Rich diff metadata** – terminal and Excel diffs now show hostname, timestamps, binary version, and time span between snapshots.
@@ -58,9 +74,6 @@ sudo ./owlzops-mapper audit
 - **Extended SSL tracking** – warning‑level expiry and newly added certificates are detected.
 - **Port diff optimization** – zero‑copy O(n) comparison.
 
-<details>
-<summary>Previous release (v0.5.0)</summary>
-
 ## Highlights v0.5.0
 
 - **Context‑aware scoring** – `ip_forward` and `suid_dumpable` are no longer flagged on Docker/kubelet hosts or when systemd‑coredump is active.
@@ -69,13 +82,6 @@ sudo ./owlzops-mapper audit
 - **CIS Benchmark references** – every finding includes a CIS reference (e.g., `CIS 5.2.10`) for immediate audit compliance mapping.
 - **Sub‑scores** – Security, Reliability, and Hygiene now have individual caps (60/30/10), preventing score saturation and enabling drift visibility.
 - **Transparent Breakdown** – the terminal dashboard now shows the exact active findings with weights and CIS tags.
-
-</details>
-
----
-
-<details>
-<summary>Previous releases (v0.4.11, v0.4.10)</summary>
 
 ## Changelog (v0.4.11)
 
@@ -165,26 +171,38 @@ sudo ./owlzops-mapper audit --hosts hosts.txt --ssh-user operator --format excel
    10.0.0.20
    ```
 
-2. One‑time setup on each VPS (can be baked into cloud‑init / Terraform):
+2. **Authentication – choose the method that fits your environment:**
+
+   **Option A (passwordless, legacy)**
+   Bake this line into cloud‑init / Terraform once per host:
    ```bash
    echo "ubuntu ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper" | sudo tee /etc/sudoers.d/owlzops
    ```
+   Then run the fleet scan **without** `‑‑ask‑sudo‑pass`.
 
-3. Run the audit from your local machine – the binary copies itself, scans in parallel, and cleans up automatically:
+   **Option B (interactive password, new in v0.5.2)**
+   No sudoers changes needed – you only need regular `sudo` access.
+   The mapper will ask for your password once and forward it securely over
+   the SSH channel (`sudo -S`).  Just add `‑‑ask‑sudo‑pass` to the command
+   below.
+
+3. Run the audit from your local machine – the binary copies itself,
+   scans all 20 servers in parallel, and cleans up automatically:
    ```bash
    sudo ./owlzops-mapper audit \
      --hosts hosts.txt \
      --ssh-user ubuntu \
      --copy-binary \
+     --ask-sudo-pass \
      --format excel \
      --output fleet-report.xlsx
    ```
 
-Under the hood, `owlzops-mapper` connects to all 20 servers via SSH, uploads itself to `/tmp/owlzops-mapper`, executes the audit, collects the JSON results, removes the binary from each host, and produces a single multi‑sheet Excel report. No agent installation, no open ports beyond SSH.
-
-> **Prerequisite on remote hosts:** the user (here `operator`) must be able to run `sudo /tmp/owlzops-mapper` without a password prompt.  
-> Add to `/etc/sudoers.d/owlzops`:  
-> `operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper`
+Under the hood, `owlzops-mapper` connects to every server via SSH,
+uploads itself to `/tmp/owlzops-mapper`, executes the audit, collects
+the JSON results, removes the binary from each host, and produces a
+single multi‑sheet Excel report.  No agent installation, no open ports
+beyond SSH.
 
 ### Snapshotting & drift monitoring
 ```bash
@@ -205,11 +223,17 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 
 ![owlzops-mapper snapshot diff](ss_diff.png)
 
-*Demo: a before/after comparison of two snapshots showing improvements (firewall restored, backup added, load dropped, NTP synced), degradations (new security updates, failed docker service, OOM kills), and neutral changes (uptime, database size). Artificially crafted to illustrate the diff feature.*
+*Demo: a before/after comparison with metadata header showing host, timestamps, binary version, and time span.*
 
 ```bash
 # Compare two JSON snapshots in terminal (colored table)
 ./owlzops-mapper compare before.json after.json
+
+# Output includes metadata header:
+#   host:    owl1.owlzops.com
+#   before: 2026-07-05 17:41 UTC  (v0.5.0, risk 55)
+#   after:  2026-07-05 17:42 UTC  (v0.5.0, risk 45)
+#   span:   1m
 
 # Export diff to JSON
 ./owlzops-mapper compare before.json after.json --format json > diff.json
@@ -240,6 +264,9 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `--local-binary <PATH>` | When using `--copy-binary`, path to a local static (musl) binary to copy instead of the currently running one. Useful if you're running a debug build locally but have a release build for remote hosts. |
 | `--remote-path <PATH>` | Path where the binary is placed on remote hosts (default: `/tmp/owlzops-mapper`) |
 | `--remote-timeout-secs <SECS>` | Maximum time to wait for remote scan (default: 120 seconds) |
+| `--ask-sudo-pass` | Prompt for a sudo password and forward it securely over the SSH channel (removes the NOPASSWD requirement) |
+| `--keep-binary` | Skip cleanup — leave the binary on the remote host after the scan |
+| `--max-concurrent <N>` | Maximum number of simultaneous SSH sessions (default: 50) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
@@ -262,6 +289,8 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `1`  | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) | Any host has critical issues |
 | `2`  | Not running as root, scan warnings present, **or fleet scan produced zero reports** | Any host not running as root, **or all remote hosts failed** |
 
+> **Scoring version guard:** when comparing snapshots taken with different scoring engine versions, `risk_score` changes are marked as `~ Changed` rather than `↑ Improved` or `↓ Degraded`.
+
 You can use these codes directly in CI/CD pipelines:
 ```bash
 sudo ./owlzops-mapper audit || echo "Security scan failed – check the report"
@@ -277,7 +306,7 @@ from real findings. The score is split into three sub‑scores:
 | Category | Cap | Examples |
 |---|---|---|
 | **Security** | 60 | Firewall, SSH config, security updates, Docker risks, sysctl hardening |
-| **Reliability** | 30 | Failed services, missing backups, OOM kills |
+| **Reliability** | 30 | Failed services, missing backups, OOM kills, container health |
 | **Hygiene** | 10 | NTP synchronization |
 
 Lower scores are better. Each finding is tagged with a CIS Benchmark reference where applicable.  
@@ -302,6 +331,11 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Docker: privileged containers | +10 |
 | Docker: dangerous capabilities | +10 |
 | Root login with password (combo) | +5 |
+| Container mounts Docker socket or host root | +15 |
+| Container mounts sensitive host path (writable) | +10 |
+| Docker: containers killed by OOM | +10 |
+| Docker: containers in restart loop | +5 |
+| Docker: unhealthy containers (failing healthcheck) | +10 |
 
 ---
 
@@ -313,7 +347,7 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, **sudo NOPASSWD entries, sudoers permissions, sysctl security audit** |
 | Network | Listening ports with bind address (red = exposed on 0.0.0.0/::), firewall (ufw, firewalld, nftables, iptables), DNS, SSL certificates with expiry |
 | Storage | Disk usage, inode usage per mount |
-| Docker | Images, dangling layers, containers, mounts, log sizes, privileged flag, memory/CPU limits, dangerous capabilities |
+| Docker | Images, dangling layers, containers, mounts, log sizes, privileged flag, memory/CPU limits, dangerous capabilities, **sensitive host mounts, OOM kills, restart loops, health status** |
 | Packages | Installed count, upgradable, security updates (apt/dnf/yum/pacman/zypper) |
 | Databases | PostgreSQL, MySQL, Redis, MongoDB — versions and data sizes |
 | Internals | Cron jobs, systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
@@ -394,3 +428,4 @@ Yes. You are 100% free to use owlzops-mapper for commercial purposes, corporate 
 
 The Commons Clause simply prevents third parties from taking this codebase and directly reselling it as their own commercial software or SaaS product.
 See [LICENSE](LICENSE) for details.
+```
