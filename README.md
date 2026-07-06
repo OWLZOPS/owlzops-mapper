@@ -49,6 +49,21 @@ sudo ./owlzops-mapper audit
 - **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
+## Highlights v0.5.4 (production reliability)
+
+- **Scanner isolation restored** – `panic = "abort"` removed; individual scanner panics now degrade gracefully instead of aborting the whole scan.
+- **UDP listeners detected** – `/proc/net` parser fixed; UDP ports now appear in `listening_ports`.
+- **Clean machine‑readable output** – tracing logs now go to stderr; stdout always contains valid JSON.
+- **Fleet‑drift with streaming** – `compare --multi-host` now reads JSONL files produced by fleet scans.
+- **Input validation for russh** – host, user, and remote path are now validated before use.
+- **Miscellaneous hardening** – timeout budgets unified, keepalive added to russh, panic‑free path handling, deterministic process attribution.
+
+
+---
+
+<details>
+<summary>Previous releases (v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
+
 ## Highlights v0.5.3 (IAM, Process Attribution, DLP)
 
 - **IAM & Access Alignment** – audit SSH keys for algorithm, bit length, and policy compliance; detect `NOPASSWD: ALL` in sudoers. Both findings include CIS references.
@@ -57,8 +72,7 @@ sudo ./owlzops-mapper audit
 - **Fleet Orchestration** – `--max-concurrent` controls parallelism; global per‑host timeouts prevent stuck tasks from blocking the queue; optional JSONL streaming output for massive fleets without memory bloat.
 - **Local hosts in fleet mode** – localhost is now included in multi‑host terminal, XLSX, and JSONL reports.
 
-<details>
-<summary>Highlights v0.5.2 (async SSH + Docker audit)</summary>
+## Highlights v0.5.2 (async SSH + Docker audit)</summary>
 
 - **Async SSH engine (`russh`)** – fleet scans now support `--ask-sudo-pass` to authenticate via password without pre‑configuring `NOPASSWD` on every host. Known‑hosts TOFU verification with warnings.
 - **Progress bar for `--copy-binary`** – binary uploads show a real‑time progress bar with file size and ETA, in both legacy and async SSH paths.
@@ -68,12 +82,7 @@ sudo ./owlzops-mapper audit
 - **Compare v2** – metadata header with hostname, timestamps, binary version and time span; deterministic diff order; multi‑host summary with Added/Removed/Compared statuses.
 - **UX polish** – `--keep-binary` flag to skip cleanup after remote scan; emojis and ANSI colours are automatically disabled when stdout is piped; `--max-concurrent` controls fleet parallelism; file descriptor limit raised automatically.
 
-</details>
 
----
-
-<details>
-<summary>Previous releases (v0.5.1, v0.5.0, v0.4.11, v0.4.10)</summary>
 
 ## Highlights v0.5.1 (compare v2)
 
@@ -92,25 +101,6 @@ sudo ./owlzops-mapper audit
 - **CIS Benchmark references** – every finding includes a CIS reference (e.g., `CIS 5.2.10`) for immediate audit compliance mapping.
 - **Sub‑scores** – Security, Reliability, and Hygiene now have individual caps (60/30/10), preventing score saturation and enabling drift visibility.
 - **Transparent Breakdown** – the terminal dashboard now shows the exact active findings with weights and CIS tags.
-
-## Changelog (v0.4.11)
-
-- **Sysctl false positives fixed** – `fs.suid_dumpable` now accepts value `2` with piped `core_pattern` (systemd-coredump); `net.ipv4.ip_forward=1` is no longer flagged on Docker/kubelet hosts.
-- **Snapshot directory respects original user** – when running under `sudo`, snapshots now save to `$SUDO_USER`'s home directory instead of `/root`.
-- **Documentation improvements** – added Core Features section, demo screenshots for Excel report and snapshot diff, corrected CLI flag name.
-- **Miscellaneous hardening** – final round of code-quality fixes from the v0.4.10 audit (async consistency, timeout caps, test coverage).
-
-## Changelog (v0.4.10)
-
-- **Remote pipe‑deadlock fixed** – SSH scans producing reports larger than 64 KB no longer hang; stdout/stderr are now drained in parallel threads.
-- **Accurate package counts on RPM systems** – `installed_count` now uses `rpm -qa` instead of broken `dnf -qa`, which silently returned fake numbers.
-- **Honest exit codes for fleet scans** – a fleet scan where all hosts fail now returns exit code 2 instead of a false‑positive 0.
-- **JSON export respects `--output`** – the `--output` flag is now honoured for JSON format, and export errors are properly propagated to the exit code.
-- **Database size measurement no longer silently returns 0 GB** – `du` timeout increased to 60 s, avoiding false zero sizes on large data directories.
-- **NTP offset extraction from systemd‑timesyncd** – actual time synchronisation offset is now shown instead of a blank field on many Linux distributions.
-- **More robust SSH config parsing** – the fallback parser now follows first‑match semantics, ignores conditional `Match` blocks, and is case‑insensitive.
-- **Sudo self‑exclusion tightened** – only canonical binary paths are excluded from the NOPASSWD audit, preventing accidental blind spots.
-- **Miscellaneous hardening** – `df -P` output stability, external IP validation, removal of a double sysinfo refresh, dynamic remote timeout cap, and `saturating_mul` for risk scores.
 
 </details>
 
