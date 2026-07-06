@@ -1,3 +1,4 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh::*;
 use std::io::{IsTerminal, Read};
@@ -151,6 +152,22 @@ pub async fn upload_binary_async(
 ) -> Result<(), RemoteError> {
     let tmp_remote = format!("{}.tmp", remote_path);
 
+    // Determine file size for progress bar
+    let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
+        host: host.to_string(),
+        source: e,
+    })?;
+    let file_size = metadata.len();
+
+    // Set up progress bar
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
     // 1. Remove old temporary file (ignore errors)
     let _ = Command::new("ssh")
         .arg("-i")
@@ -166,8 +183,10 @@ pub async fn upload_binary_async(
         .status()
         .await;
 
-    // 2. Upload binary to temporary file
-    let scp_status = tokio::time::timeout(
+    // 2. Upload binary with progress bar
+    pb.set_message(format!("Uploading to {host}"));
+
+    let output = tokio::time::timeout(
         Duration::from_secs(timeout_secs / 2),
         Command::new("scp")
             .arg("-i")
@@ -176,7 +195,7 @@ pub async fn upload_binary_async(
             .arg("StrictHostKeyChecking=accept-new")
             .arg(local_bin)
             .arg(format!("{}@{}:{}", ssh_user, host, tmp_remote))
-            .status(),
+            .output(),
     )
     .await
     .map_err(|_| RemoteError::Timeout {
@@ -187,14 +206,17 @@ pub async fn upload_binary_async(
         source: e,
     })?;
 
-    if !scp_status.success() {
+    if !output.status.success() {
+        pb.finish_with_message("Upload failed");
         return Err(RemoteError::HostKeyCheck {
             host: host.to_string(),
             detail: "SCP returned non-zero exit code".to_string(),
         });
     }
 
-    // 3. Atomic replace: mv .tmp → final && chmod +x
+    pb.finish_with_message("Uploaded");
+
+    // 3. Atomic replace
     let mv_status = tokio::time::timeout(
         Duration::from_secs(10),
         Command::new("ssh")
