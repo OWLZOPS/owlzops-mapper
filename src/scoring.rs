@@ -22,7 +22,7 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
-pub const SCORING_VERSION: u8 = 4; // was 3 (DOCK-005/006)
+pub const SCORING_VERSION: u8 = 5;
 
 // ── New Finding model (v0.5) ───────────────────────────────
 
@@ -274,6 +274,35 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             ),
             suppressed: None,
             cis_ref: Some("CIS 5.3"),
+        });
+    }
+
+    // ── Shadow IT & Suspicious Listeners ───────────────────────────────
+    let mut shadow_it_ports = Vec::new();
+    for port in &report.network.listening_ports {
+        if let Some(exe) = &port.exe_path
+            && (exe.starts_with("/tmp/")
+                || exe.starts_with("/var/tmp/")
+                || exe.starts_with("/dev/shm/")
+                || exe.starts_with("/home/"))
+        {
+            shadow_it_ports.push(format!("{}/{} ({})", port.port, port.protocol, exe));
+        }
+    }
+
+    if !shadow_it_ports.is_empty() {
+        findings.push(Finding {
+            id: "SEC-013",
+            title: "Suspicious process listening on network port (Shadow IT)".to_string(),
+            category: Category::Security,
+            weight: 20,
+            evidence: format!(
+                "Found {} suspicious listeners: {}",
+                shadow_it_ports.len(),
+                shadow_it_ports.join(", ")
+            ),
+            suppressed: None,
+            cis_ref: None,
         });
     }
 

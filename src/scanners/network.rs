@@ -1,13 +1,9 @@
 use crate::models::{NetworkInfo, PortInfo, SslCertInfo};
+use crate::scanners::proc_net::{attribute_sockets, collect_listening_sockets};
 use crate::utils::run_with_timeout;
 use chrono::{NaiveDateTime, Utc};
 use std::fs;
 
-/// openssl `-enddate` always returns dates in the format
-/// "MMM D HH:MM:SS YYYY GMT", for example:
-/// "Sep 15 12:00:00 2026 GMT".
-/// The timezone is always GMT, so we parse it as a naive datetime
-/// and treat it directly as UTC.
 fn parse_openssl_enddate(raw: &str) -> Option<i64> {
     let trimmed = raw.trim().trim_end_matches("GMT").trim();
     let naive = NaiveDateTime::parse_from_str(trimmed, "%b %e %H:%M:%S %Y").ok()?;
@@ -16,30 +12,7 @@ fn parse_openssl_enddate(raw: &str) -> Option<i64> {
     Some(diff.num_days())
 }
 
-/// Extract bind address from the "Local Address:Port" column of `ss`.
-fn parse_bind_address(local_addr: &str, port: &str) -> String {
-    if local_addr.ends_with(&format!(":{}", port)) {
-        let addr_part = &local_addr[..local_addr.len() - port.len() - 1];
-        let addr_part = addr_part.trim();
-        if addr_part.starts_with('[') && addr_part.ends_with(']') {
-            addr_part[1..addr_part.len() - 1].to_string()
-        } else {
-            addr_part.to_string()
-        }
-    } else if let Some((addr, _)) = local_addr.rsplit_once(':') {
-        let addr = addr.trim();
-        if addr.starts_with('[') && addr.ends_with(']') {
-            addr[1..addr.len() - 1].to_string()
-        } else {
-            addr.to_string()
-        }
-    } else {
-        "unknown".to_string()
-    }
-}
-
 pub fn gather_network_info() -> NetworkInfo {
-    let mut listening_ports = Vec::new();
     let mut firewall_active = false;
 
     // ufw
@@ -170,40 +143,54 @@ pub fn gather_network_info() -> NetworkInfo {
         }
     }
 
-    // Listening ports via ss
-    if let Some(out) = run_with_timeout("ss", &["-tulnp"], 5) {
-        for line in out.lines().skip(1) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5 {
-                let protocol = parts[0].to_string();
-                let local_addr_col = parts[4];
-                let port = local_addr_col
-                    .split(':')
-                    .next_back()
-                    .unwrap_or("unknown")
-                    .to_string();
-                let bind_address = parse_bind_address(local_addr_col, &port);
+    // ---------- Listening ports via /proc (zero-dependency) ----------
+    let sockets = collect_listening_sockets();
+    let attrs = attribute_sockets(&sockets);
 
-                let mut process_name = "unknown".to_string();
-                if let Some(start) = line.find("users:((\"") {
-                    let proc_str = &line[start + 9..];
-                    if let Some(end) = proc_str.find('"') {
-                        process_name = proc_str[..end].to_string();
-                    }
-                }
-                if !listening_ports.iter().any(|p: &PortInfo| {
-                    p.port == port && p.protocol == protocol && p.bind_address == bind_address
-                }) {
-                    listening_ports.push(PortInfo {
-                        protocol,
-                        port,
-                        process: process_name,
-                        bind_address,
-                    });
-                }
-            }
+    let mut listening_ports = Vec::new();
+
+    for (inode, meta) in &sockets {
+        let attr = attrs.get(inode).cloned().unwrap_or_default();
+
+        let process = attr
+            .comm
+            .clone()
+            .or_else(|| {
+                attr.exe_path
+                    .as_deref()
+                    .and_then(|p| p.rsplit('/').next().map(str::to_string))
+            })
+            .unwrap_or_else(|| "unknown process".to_string());
+
+        let port_str = meta.port.to_string();
+
+        if listening_ports.iter().any(|p: &PortInfo| {
+            p.port == port_str && p.protocol == meta.proto && p.bind_address == meta.bind_address
+        }) {
+            continue;
         }
+
+        listening_ports.push(PortInfo {
+            protocol: meta.proto.to_string(),
+            port: port_str,
+            process,
+            bind_address: meta.bind_address.clone(),
+            pid: attr.pid,
+            exe_path: attr.exe_path,
+        });
     }
+
+    listening_ports.sort_unstable_by(|a, b| {
+        a.protocol
+            .cmp(&b.protocol)
+            .then_with(|| a.bind_address.cmp(&b.bind_address))
+            .then_with(|| {
+                a.port
+                    .parse::<u16>()
+                    .unwrap_or(0)
+                    .cmp(&b.port.parse::<u16>().unwrap_or(0))
+            })
+    });
 
     NetworkInfo {
         firewall_active,
@@ -217,18 +204,6 @@ pub fn gather_network_info() -> NetworkInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_bind_ipv4_standard() {
-        assert_eq!(parse_bind_address("0.0.0.0:22", "22"), "0.0.0.0");
-        assert_eq!(parse_bind_address("127.0.0.1:5432", "5432"), "127.0.0.1");
-    }
-
-    #[test]
-    fn parse_bind_ipv6_bracketed() {
-        assert_eq!(parse_bind_address("[::1]:80", "80"), "::1");
-        assert_eq!(parse_bind_address("[::]:443", "443"), "::");
-    }
 
     #[test]
     fn parse_openssl_future_date() {

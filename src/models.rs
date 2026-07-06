@@ -118,6 +118,10 @@ pub struct PortInfo {
     pub port: String,
     pub process: String,
     pub bind_address: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub exe_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
