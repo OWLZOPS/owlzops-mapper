@@ -84,7 +84,7 @@ fn render_header(report: &AgentReport) {
     let is_tty = std::io::stdout().is_terminal();
 
     let (icon_owl, icon_spy, icon_shield, color_reset) = if is_tty {
-        ("🦉  ", "🕵️‍♂️  ", "🛡️  ", "\x1b[0m")
+        ("\u{1F989}  ", "\u{1F50D}  ", "\u{1F512}  ", "\x1b[0m")
     } else {
         ("", "", "", "")
     };
