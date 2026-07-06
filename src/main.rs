@@ -18,14 +18,11 @@ use scoring::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::warn;
 use zeroize::Zeroizing;
-
-// =====================================================================
-// Helper Functions
-// =====================================================================
 
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -63,7 +60,7 @@ async fn run_remote_scan_with_timeout(
         .saturating_mul(2)
         .saturating_add(60);
     match tokio::time::timeout(
-        std::time::Duration::from_secs(cap),
+        Duration::from_secs(cap),
         tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
     )
     .await
@@ -96,10 +93,6 @@ fn raise_nofile_limit() {
     }
 }
 
-// =====================================================================
-// Main command runner (returns exit code)
-// =====================================================================
-
 async fn run_command(cli: Cli) -> i32 {
     match cli.command {
         Commands::Audit(args) => {
@@ -118,7 +111,6 @@ async fn run_command(cli: Cli) -> i32 {
                 }
             }
 
-            // Remove duplicate hosts
             let mut seen = HashSet::new();
             hosts.retain(|h| seen.insert(h.clone()));
 
@@ -152,6 +144,34 @@ async fn run_command(cli: Cli) -> i32 {
                 let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
                 let mut join_set = tokio::task::JoinSet::new();
 
+                // Enable streaming JSONL only when --format json AND --output are specified.
+                let use_streaming = args.format == OutputFormat::Json && args.output.is_some();
+
+                let mut reports: Vec<AgentReport> = Vec::new();
+                let (tx, rx_chan) = if use_streaming {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<AgentReport>(256);
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
+
+                let output_path = args.output.clone();
+                let writer_task = if let (Some(rx), Some(path)) = (rx_chan, output_path) {
+                    Some(tokio::spawn(async move {
+                        let mut rx = rx;
+                        let mut file = std::fs::File::create(&path).ok();
+                        while let Some(report) = rx.recv().await {
+                            let json = serde_json::to_string(&report).unwrap_or_default();
+                            if let Some(ref mut f) = file {
+                                let _ = std::io::Write::write_all(f, json.as_bytes());
+                                let _ = std::io::Write::write_all(f, b"\n");
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                };
+
                 for host in remote {
                     let sem = semaphore.clone();
                     let a = AuditArgs {
@@ -160,71 +180,104 @@ async fn run_command(cli: Cli) -> i32 {
                         ..args.clone()
                     };
                     let pass = sudo_pass.clone();
+                    let tx = tx.clone();
+                    let host_for_log = host.clone();
                     join_set.spawn(async move {
                         let _permit = sem.acquire_owned().await;
-                        if let Some(pw) = &pass {
-                            // If copy_binary is set, upload first via async SCP
-                            if a.copy_binary {
-                                let default_exe = std::path::PathBuf::from("./owlzops-mapper");
-                                let current_exe = std::env::current_exe().unwrap_or(default_exe);
-                                let local_bin = a
-                                    .local_binary
-                                    .as_deref()
-                                    .unwrap_or(current_exe.to_str().unwrap());
+                        let overall = Duration::from_secs(a.remote_timeout_secs.saturating_add(30));
+
+                        let result = tokio::time::timeout(overall, async {
+                            if let Some(pw) = &pass {
+                                if a.copy_binary {
+                                    let default_exe = std::path::PathBuf::from("./owlzops-mapper");
+                                    let current_exe =
+                                        std::env::current_exe().unwrap_or(default_exe);
+                                    let local_bin = a
+                                        .local_binary
+                                        .as_deref()
+                                        .unwrap_or(current_exe.to_str().unwrap());
+                                    let ssh_key_expanded =
+                                        shellexpand::tilde(&a.ssh_key).to_string();
+                                    if let Err(e) = ssh_engine::upload_binary_async(
+                                        &host,
+                                        &a.ssh_user,
+                                        &ssh_key_expanded,
+                                        local_bin,
+                                        &a.remote_path,
+                                        a.remote_timeout_secs,
+                                    )
+                                    .await
+                                    {
+                                        warn!(host = %host, error = %e, "Failed to upload binary");
+                                        return None;
+                                    }
+                                }
+
                                 let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
-                                if let Err(e) = ssh_engine::upload_binary_async(
+                                match ssh_engine::run_remote_scan_russh(
                                     &host,
                                     &a.ssh_user,
                                     &ssh_key_expanded,
-                                    local_bin,
                                     &a.remote_path,
-                                    a.remote_timeout_secs,
+                                    pw,
                                 )
                                 .await
                                 {
-                                    warn!(host = %host, error = %e, "Failed to upload binary");
-                                    return None;
+                                    Ok(stdout) => {
+                                        let stdout_str = String::from_utf8_lossy(&stdout);
+                                        serde_json::from_str::<AgentReport>(&stdout_str).ok()
+                                    }
+                                    Err(e) => {
+                                        warn!(host = %host, error = %e, "russh scan failed");
+                                        None
+                                    }
                                 }
+                            } else {
+                                run_remote_scan_with_timeout(host, a).await.ok().flatten()
                             }
+                        })
+                        .await;
 
-                            // Now run the audit via russh
-                            let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
-                            match ssh_engine::run_remote_scan_russh(
-                                &host,
-                                &a.ssh_user,
-                                &ssh_key_expanded,
-                                &a.remote_path,
-                                pw,
-                            )
-                            .await
-                            {
-                                Ok(stdout) => {
-                                    let stdout_str = String::from_utf8_lossy(&stdout);
-                                    serde_json::from_str::<AgentReport>(&stdout_str).ok()
-                                }
-                                Err(e) => {
-                                    warn!(host = %host, error = %e, "russh scan failed");
+                        match result {
+                            Ok(Some(report)) => {
+                                if let Some(tx) = &tx {
+                                    let _ = tx.send(report).await;
                                     None
+                                } else {
+                                    Some(report)
                                 }
                             }
-                        } else {
-                            // legacy system ssh
-                            run_remote_scan_with_timeout(host, a).await.ok().flatten()
+                            Ok(None) => None,
+                            Err(_elapsed) => {
+                                warn!(host = %host_for_log, "global timeout for host");
+                                None
+                            }
                         }
                     });
                 }
 
-                let mut reports = Vec::new();
                 while let Some(result) = join_set.join_next().await {
                     match result {
-                        Ok(Some(report)) => reports.push(report),
-                        Ok(None) => {} // scan failed, already warned
+                        Ok(Some(report)) => {
+                            if tx.is_none() {
+                                reports.push(report);
+                            }
+                        }
+                        Ok(None) => {}
                         Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
                         Err(e) => warn!("scan task failed: {e}"),
                     }
                 }
 
-                // exit with code 2 when fleet scan produced no reports
+                if let Some(tx) = tx {
+                    drop(tx);
+                }
+                if let Some(writer) = writer_task {
+                    let _ = writer.await;
+                    return 0;
+                }
+
+                // Fallback to legacy multi-host output (text, XLSX, etc.)
                 if reports.is_empty() {
                     warn!("fleet scan produced no reports — all hosts failed");
                     if let Err(e) = output::output_multi(
@@ -245,12 +298,11 @@ async fn run_command(cli: Cli) -> i32 {
                     warn!("output error: {e}");
                     return 2;
                 }
-                // Compute overall exit code for fleet scans
+
                 let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
                 return if worst >= 1 { worst.min(2) } else { 0 };
             }
 
-            // Single local scan
             let report = run_local_scan_async(&args).await;
             let exit_code = compute_exit_code(&report);
             if let Err(e) = output::output_single(
@@ -336,7 +388,6 @@ async fn run_command(cli: Cli) -> i32 {
         }
 
         Commands::Compare(cmp_args) => {
-            // Read both JSON reports
             let before_data = std::fs::read_to_string(&cmp_args.before).unwrap_or_else(|e| {
                 eprintln!("Failed to read 'before' file: {e}");
                 std::process::exit(1);
@@ -346,13 +397,11 @@ async fn run_command(cli: Cli) -> i32 {
                 std::process::exit(1);
             });
 
-            // Multi-host mode
             if cmp_args.multi_host {
                 let parse_array = |data: &str, label: &str| -> Vec<AgentReport> {
                     if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
                         return reports;
                     }
-                    // If single object, wrap in array
                     if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
                         return vec![report];
                     }
@@ -420,13 +469,10 @@ async fn run_command(cli: Cli) -> i32 {
                 return 0;
             }
 
-            // Accept either a single AgentReport or an array of them (take the first)
             let parse_report = |data: &str, label: &str| -> AgentReport {
-                // Try to parse as a single object
                 if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
                     return report;
                 }
-                // If that fails, try as a Vec<AgentReport>
                 if let Ok(mut reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
                     if reports.is_empty() {
                         eprintln!("Error: '{}' file contains an empty array", label);
@@ -476,10 +522,6 @@ async fn run_command(cli: Cli) -> i32 {
         }
     }
 }
-
-// =====================================================================
-// Entry point with graceful shutdown
-// =====================================================================
 
 #[tokio::main]
 async fn main() {
