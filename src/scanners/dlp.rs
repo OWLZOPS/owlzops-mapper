@@ -24,6 +24,10 @@ fn extract_process_name(pid: u32) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+fn starts_with_icase(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 pub fn scan_process_memory() -> Vec<SecretLeak> {
     let mut leaks = Vec::new();
 
@@ -77,7 +81,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 };
 
                 for &flag in SENSITIVE_FLAGS {
-                    if arg.to_lowercase().starts_with(flag) {
+                    if starts_with_icase(arg, flag) {
                         leaks.push(SecretLeak {
                             pid,
                             process: process_name.clone(),
@@ -85,6 +89,19 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                             matched_key: flag.to_string(),
                         });
                     }
+                }
+
+                // Cover `mysql -pSECRET` (without equals sign)
+                if (process_name == "mysql" || process_name == "mysqldump")
+                    && let Some(pwd) = arg.strip_prefix("-p")
+                    && !pwd.is_empty()
+                {
+                    leaks.push(SecretLeak {
+                        pid,
+                        process: process_name.clone(),
+                        source: "cmdline".to_string(),
+                        matched_key: "mysql-password".to_string(),
+                    });
                 }
             }
         }

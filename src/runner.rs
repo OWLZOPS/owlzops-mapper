@@ -211,10 +211,8 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         let current_exe = std::env::current_exe()
             .unwrap_or_else(|_| std::path::PathBuf::from("./owlzops-mapper"));
 
-        let local_bin = args
-            .local_binary
-            .as_deref()
-            .unwrap_or(current_exe.to_str().expect("Path contains invalid unicode"));
+        let current_exe_lossy = current_exe.to_string_lossy();
+        let local_bin = args.local_binary.as_deref().unwrap_or(&current_exe_lossy);
 
         // Determine file size for progress bar
         let file_size = std::fs::metadata(local_bin).map(|m| m.len()).unwrap_or(0);
@@ -228,9 +226,7 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         );
         pb.set_message(format!("Uploading to {host}"));
 
-        let tmp_remote = format!("{}.tmp", remote_path);
-
-        // 1. Remove old temporary file (ignore errors)
+        // 1. Remove old binary (owner can unlink even if running)
         let _ = crate::utils::run_child_with_timeout(
             "ssh",
             &[
@@ -243,12 +239,12 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
                 &format!("{}@{}", ssh_user, host),
                 "rm",
                 "-f",
-                &tmp_remote,
+                remote_path,
             ],
             10,
         );
 
-        // 2. Upload the fresh binary to a temporary name
+        // 2. Upload the fresh binary directly
         let status = match crate::utils::run_child_with_timeout(
             "scp",
             &[
@@ -257,7 +253,7 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 local_bin,
-                &format!("{}@{}:{}", ssh_user, host, tmp_remote),
+                &format!("{}@{}:{}", ssh_user, host, remote_path),
             ],
             args.remote_timeout_secs / 2,
         ) {
@@ -274,7 +270,7 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             return None;
         }
 
-        // 3. Make the temporary binary executable
+        // 3. Make the binary executable
         let _ = crate::utils::run_child_with_timeout(
             "ssh",
             &[
@@ -287,25 +283,6 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
                 &format!("{}@{}", ssh_user, host),
                 "chmod",
                 "+x",
-                &tmp_remote,
-            ],
-            10,
-        );
-
-        // 4. Atomically replace the old binary with the new one
-        let _ = crate::utils::run_child_with_timeout(
-            "ssh",
-            &[
-                "-i",
-                &ssh_key,
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=10",
-                &format!("{}@{}", ssh_user, host),
-                "mv",
-                "-f",
-                &tmp_remote,
                 remote_path,
             ],
             10,

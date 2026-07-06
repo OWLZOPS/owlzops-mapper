@@ -50,15 +50,16 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if flags.has_critical() { 1 } else { 0 }
 }
 
+const fn host_budget_secs(t: u64) -> u64 {
+    t.saturating_mul(2).saturating_add(60)
+}
+
 async fn run_remote_scan_with_timeout(
     host: String,
     args: AuditArgs,
 ) -> Result<Option<AgentReport>, tokio::task::JoinError> {
     let host_for_log = host.clone();
-    let cap = args
-        .remote_timeout_secs
-        .saturating_mul(2)
-        .saturating_add(60);
+    let cap = host_budget_secs(args.remote_timeout_secs);
     match tokio::time::timeout(
         Duration::from_secs(cap),
         tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
@@ -151,18 +152,39 @@ async fn run_command(cli: Cli) -> i32 {
                     (None, None)
                 };
 
+                // Fail-fast: create the output file before launching any scan
                 let output_path = args.output.clone();
-                let writer_task = if let (Some(rx), Some(path)) = (rx_chan, output_path) {
-                    Some(tokio::spawn(async move {
+                let mut jsonl_file = if use_streaming {
+                    match std::fs::File::create(output_path.as_deref().unwrap_or("report.jsonl")) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            eprintln!("Cannot create output file: {e}");
+                            return 2;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let writer_task = if let (Some(rx), Some(file)) = (rx_chan, jsonl_file.take()) {
+                    Some(tokio::task::spawn_blocking(move || {
+                        use std::io::Write;
+                        let mut file = file;
                         let mut rx = rx;
-                        let mut file = std::fs::File::create(&path).ok();
-                        while let Some(report) = rx.recv().await {
-                            let json = serde_json::to_string(&report).unwrap_or_default();
-                            if let Some(ref mut f) = file {
-                                let _ = std::io::Write::write_all(f, json.as_bytes());
-                                let _ = std::io::Write::write_all(f, b"\n");
+                        let mut written = 0usize;
+                        let mut worst = 0i32;
+                        while let Some(report) = rx.blocking_recv() {
+                            worst = worst.max(compute_exit_code(&report));
+                            match serde_json::to_string(&report) {
+                                Ok(json) => {
+                                    if writeln!(file, "{json}").is_ok() {
+                                        written += 1;
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "skipping unserializable report"),
                             }
                         }
+                        (written, worst)
                     }))
                 } else {
                     None
@@ -201,12 +223,28 @@ async fn run_command(cli: Cli) -> i32 {
                             ..args.clone()
                         };
                         let pass = sudo_pass.clone();
-                        let tx = tx.clone();
+                        let _tx = tx.clone();
                         let host_for_log = host.clone();
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
-                            let overall =
-                                Duration::from_secs(a.remote_timeout_secs.saturating_add(30));
+
+                            // R7-08: Validate inputs before using them in russh path
+                            if pass.is_some() {
+                                if let Err(e) = runner::validate_host(&host) {
+                                    warn!("{e}");
+                                    return None;
+                                }
+                                if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
+                                    warn!("{e}");
+                                    return None;
+                                }
+                                if let Err(e) = runner::validate_remote_path(&a.remote_path) {
+                                    warn!("{e}");
+                                    return None;
+                                }
+                            }
+
+                            let overall = Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
                                 if let Some(pw) = &pass {
@@ -215,10 +253,12 @@ async fn run_command(cli: Cli) -> i32 {
                                             std::path::PathBuf::from("./owlzops-mapper");
                                         let current_exe =
                                             std::env::current_exe().unwrap_or(default_exe);
+                                        // R7-10: Safe path handling
+                                        let current_exe_lossy = current_exe.to_string_lossy();
                                         let local_bin = a
                                             .local_binary
                                             .as_deref()
-                                            .unwrap_or(current_exe.to_str().unwrap());
+                                            .unwrap_or(&current_exe_lossy);
                                         let ssh_key_expanded =
                                             shellexpand::tilde(&a.ssh_key).to_string();
                                         if let Err(e) = ssh_engine::upload_binary_async(
@@ -263,14 +303,7 @@ async fn run_command(cli: Cli) -> i32 {
                                 .await;
 
                             match result {
-                                Ok(Some(report)) => {
-                                    if let Some(tx) = &tx {
-                                        let _ = tx.send(report).await;
-                                        None
-                                    } else {
-                                        Some(report)
-                                    }
-                                }
+                                Ok(Some(report)) => Some(report),
                                 Ok(None) => None,
                                 Err(_elapsed) => {
                                     warn!(host = %host_for_log, "global timeout for host");
@@ -283,7 +316,10 @@ async fn run_command(cli: Cli) -> i32 {
                     while let Some(result) = join_set.join_next().await {
                         match result {
                             Ok(Some(report)) => {
-                                if tx.is_none() {
+                                // Route report to JSONL channel if streaming, else buffer in Vec
+                                if let Some(sender) = &tx {
+                                    let _ = sender.send(report).await;
+                                } else {
                                     reports.push(report);
                                 }
                             }
@@ -298,8 +334,8 @@ async fn run_command(cli: Cli) -> i32 {
                     drop(tx);
                 }
                 if let Some(writer) = writer_task {
-                    let _ = writer.await;
-                    return 0;
+                    let (written, worst) = writer.await.unwrap_or((0, 2));
+                    return if written == 0 { 2 } else { worst.min(2) };
                 }
 
                 // Fallback to legacy multi-host output
@@ -431,6 +467,14 @@ async fn run_command(cli: Cli) -> i32 {
                     if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
                         return vec![report];
                     }
+                    let jsonl: Vec<AgentReport> = data
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect();
+                    if !jsonl.is_empty() {
+                        return jsonl;
+                    }
                     eprintln!("Invalid JSON in '{}' file", label);
                     std::process::exit(1);
                 };
@@ -559,6 +603,7 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
