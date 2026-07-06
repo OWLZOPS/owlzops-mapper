@@ -428,4 +428,3 @@ Yes. You are 100% free to use owlzops-mapper for commercial purposes, corporate 
 
 The Commons Clause simply prevents third parties from taking this codebase and directly reselling it as their own commercial software or SaaS product.
 See [LICENSE](LICENSE) for details.
-```

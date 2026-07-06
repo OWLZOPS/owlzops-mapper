@@ -22,7 +22,7 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
-pub const SCORING_VERSION: u8 = 4; // was 3 (DOCK-005/006)
+pub const SCORING_VERSION: u8 = 5;
 
 // ── New Finding model (v0.5) ───────────────────────────────
 
@@ -232,6 +232,109 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             evidence: "PermitRootLogin enabled AND PasswordAuthentication yes".to_string(),
             suppressed: None,
             cis_ref: Some("CIS 5.2.10/5.2.4"),
+        });
+    }
+
+    // ── IAM & Access Alignment ───────────────────────────────
+    let noncompliant_keys = report
+        .security
+        .access_alignment
+        .keys
+        .iter()
+        .filter(|k| !k.compliant)
+        .count();
+    if noncompliant_keys > 0 {
+        findings.push(Finding {
+            id: "SEC-011",
+            title: "SSH keys violate key-strength policy".to_string(),
+            category: Category::Security,
+            weight: 10,
+            evidence: format!(
+                "{noncompliant_keys} authorized key(s) below policy (e.g. RSA<3072, DSA, ECDSA)"
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.2"),
+        });
+    }
+
+    if !report
+        .security
+        .access_alignment
+        .sudoers_nopasswd_all
+        .is_empty()
+    {
+        findings.push(Finding {
+            id: "SEC-012",
+            title: "Passwordless sudo to ALL commands".to_string(),
+            category: Category::Security,
+            weight: 15,
+            evidence: format!(
+                "{} principal(s) with NOPASSWD: ALL",
+                report.security.access_alignment.sudoers_nopasswd_all.len()
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.3"),
+        });
+    }
+
+    // ── Shadow IT & Suspicious Listeners ───────────────────────────────
+    let mut shadow_it_ports = Vec::new();
+    for port in &report.network.listening_ports {
+        if let Some(exe) = &port.exe_path
+            && (exe.starts_with("/tmp/")
+                || exe.starts_with("/var/tmp/")
+                || exe.starts_with("/dev/shm/")
+                || exe.starts_with("/home/"))
+        {
+            shadow_it_ports.push(format!("{}/{} ({})", port.port, port.protocol, exe));
+        }
+    }
+
+    if !shadow_it_ports.is_empty() {
+        findings.push(Finding {
+            id: "SEC-013",
+            title: "Suspicious process listening on network port (Shadow IT)".to_string(),
+            category: Category::Security,
+            weight: 20,
+            evidence: format!(
+                "Found {} suspicious listeners: {}",
+                shadow_it_ports.len(),
+                shadow_it_ports.join(", ")
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── DLP & Secret Hygiene ───────────────────────────────
+    if !report.security.secret_hygiene.is_empty() {
+        let mut evidence_list = Vec::new();
+        for leak in report.security.secret_hygiene.iter().take(3) {
+            evidence_list.push(format!(
+                "'{}' in {} of {}",
+                leak.matched_key, leak.source, leak.process
+            ));
+        }
+        let mut evidence_str = evidence_list.join(", ");
+        if report.security.secret_hygiene.len() > 3 {
+            evidence_str.push_str(&format!(
+                " and {} more...",
+                report.security.secret_hygiene.len() - 3
+            ));
+        }
+
+        findings.push(Finding {
+            id: "SEC-014",
+            title: "Cleartext secrets exposed in process memory".to_string(),
+            category: Category::Security,
+            weight: 25,
+            evidence: format!(
+                "Found {} leak(s): {}",
+                report.security.secret_hygiene.len(),
+                evidence_str
+            ),
+            suppressed: None,
+            cis_ref: None,
         });
     }
 

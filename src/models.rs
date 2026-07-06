@@ -118,6 +118,10 @@ pub struct PortInfo {
     pub port: String,
     pub process: String,
     pub bind_address: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub exe_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -210,6 +214,10 @@ pub struct SecurityInfo {
     pub sudo_nopasswd_entries: Vec<String>,
     pub sudoers_mode: Option<u32>,
     pub sysctl_issues: Vec<String>,
+    #[serde(default)]
+    pub access_alignment: AccessAuditResult,
+    #[serde(default)]
+    pub secret_hygiene: Vec<SecretLeak>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -310,4 +318,43 @@ pub struct MultiHostDiff {
     pub hostname: String,
     pub status: HostDiffStatus,
     pub diff: DiffReport,
+}
+
+// --- IAM & Access Alignment Models ---
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SshKeyAudit {
+    pub user: String,
+    pub algorithm: String,
+    pub bits: u32,
+    pub comment: String,
+    pub compliant: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SudoersEntry {
+    pub principal: String,
+    pub source_file: String,
+    pub scope: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct AccessAuditResult {
+    #[serde(default)]
+    pub keys: Vec<SshKeyAudit>,
+    #[serde(default)]
+    pub coverage_warnings: Vec<String>,
+    #[serde(default)]
+    pub sudoers_nopasswd_all: Vec<SudoersEntry>,
+}
+
+// --- DLP & Secret Hygiene Models ---
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SecretLeak {
+    pub pid: u32,
+    pub process: String,
+    pub source: String,      // "environ" или "cmdline"
+    pub matched_key: String, // имя скомпрометированной переменной/флага
 }
