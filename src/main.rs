@@ -152,18 +152,39 @@ async fn run_command(cli: Cli) -> i32 {
                     (None, None)
                 };
 
+                // Fail-fast: create the output file before launching any scan
                 let output_path = args.output.clone();
-                let writer_task = if let (Some(rx), Some(path)) = (rx_chan, output_path) {
-                    Some(tokio::spawn(async move {
+                let mut jsonl_file = if use_streaming {
+                    match std::fs::File::create(output_path.as_deref().unwrap_or("report.jsonl")) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            eprintln!("Cannot create output file: {e}");
+                            return 2;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let writer_task = if let (Some(rx), Some(file)) = (rx_chan, jsonl_file.take()) {
+                    Some(tokio::task::spawn_blocking(move || {
+                        use std::io::Write;
+                        let mut file = file;
                         let mut rx = rx;
-                        let mut file = std::fs::File::create(&path).ok();
-                        while let Some(report) = rx.recv().await {
-                            let json = serde_json::to_string(&report).unwrap_or_default();
-                            if let Some(ref mut f) = file {
-                                let _ = std::io::Write::write_all(f, json.as_bytes());
-                                let _ = std::io::Write::write_all(f, b"\n");
+                        let mut written = 0usize;
+                        let mut worst = 0i32;
+                        while let Some(report) = rx.blocking_recv() {
+                            worst = worst.max(compute_exit_code(&report));
+                            match serde_json::to_string(&report) {
+                                Ok(json) => {
+                                    if writeln!(file, "{json}").is_ok() {
+                                        written += 1;
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "skipping unserializable report"),
                             }
                         }
+                        (written, worst)
                     }))
                 } else {
                     None
@@ -298,8 +319,8 @@ async fn run_command(cli: Cli) -> i32 {
                     drop(tx);
                 }
                 if let Some(writer) = writer_task {
-                    let _ = writer.await;
-                    return 0;
+                    let (written, worst) = writer.await.unwrap_or((0, 2));
+                    return if written == 0 { 2 } else { worst.min(2) };
                 }
 
                 // Fallback to legacy multi-host output
