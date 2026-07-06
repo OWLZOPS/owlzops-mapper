@@ -49,8 +49,16 @@ sudo ./owlzops-mapper audit
 - **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
+## Highlights v0.5.3 (IAM, Process Attribution, DLP)
 
-## Highlights v0.5.2 (async SSH + Docker audit)
+- **IAM & Access Alignment** – audit SSH keys for algorithm, bit length, and policy compliance; detect `NOPASSWD: ALL` in sudoers. Both findings include CIS references.
+- **Process Attribution (Zero‑Setup)** – replaced the `ss` utility with direct `/proc/net` parsing; every listening port now shows the exact binary path and PID. Suspicious listeners (Shadow IT) are flagged as critical.
+- **DLP / Secret Hygiene** – scans process memory (`/proc/*/environ`, `cmdline`) for exposed credentials (AWS keys, GitHub tokens, database URLs). Detected leaks are reported without saving secret values.
+- **Fleet Orchestration** – `--max-concurrent` controls parallelism; global per‑host timeouts prevent stuck tasks from blocking the queue; optional JSONL streaming output for massive fleets without memory bloat.
+- **Local hosts in fleet mode** – localhost is now included in multi‑host terminal, XLSX, and JSONL reports.
+
+<details>
+<summary>Highlights v0.5.2 (async SSH + Docker audit)</summary>
 
 - **Async SSH engine (`russh`)** – fleet scans now support `--ask-sudo-pass` to authenticate via password without pre‑configuring `NOPASSWD` on every host. Known‑hosts TOFU verification with warnings.
 - **Progress bar for `--copy-binary`** – binary uploads show a real‑time progress bar with file size and ETA, in both legacy and async SSH paths.
@@ -59,6 +67,8 @@ sudo ./owlzops-mapper audit
 - **Scoring version guard** – `risk_score` differences caused by formula updates are now marked as `Changed` instead of false improvements/degradations, preserving drift accuracy in `compare`.
 - **Compare v2** – metadata header with hostname, timestamps, binary version and time span; deterministic diff order; multi‑host summary with Added/Removed/Compared statuses.
 - **UX polish** – `--keep-binary` flag to skip cleanup after remote scan; emojis and ANSI colours are automatically disabled when stdout is piped; `--max-concurrent` controls fleet parallelism; file descriptor limit raised automatically.
+
+</details>
 
 ---
 
