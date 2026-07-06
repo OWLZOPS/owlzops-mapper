@@ -84,6 +84,13 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # Добавлен шаг кэширования с динамическим ключом для разделения дистрибутивов
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: ${{ matrix.container }}
+
       - name: Build
         run: cargo build --locked
       - name: Run tests
