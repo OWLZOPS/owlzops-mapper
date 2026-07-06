@@ -389,6 +389,10 @@ pub fn gather_security_info() -> SecurityInfo {
     let sudoers_mode = get_sudoers_mode();
     let sysctl_issues = gather_sysctl_issues();
 
+    let access_alignment = crate::scanners::access::gather_access_alignment(
+        &crate::scanners::access::KeyPolicy::default(),
+    );
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -400,6 +404,7 @@ pub fn gather_security_info() -> SecurityInfo {
         sudo_nopasswd_entries,
         sudoers_mode,
         sysctl_issues,
+        access_alignment,
     }
 }
 

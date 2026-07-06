@@ -210,6 +210,8 @@ pub struct SecurityInfo {
     pub sudo_nopasswd_entries: Vec<String>,
     pub sudoers_mode: Option<u32>,
     pub sysctl_issues: Vec<String>,
+    #[serde(default)]
+    pub access_alignment: AccessAuditResult,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -310,4 +312,33 @@ pub struct MultiHostDiff {
     pub hostname: String,
     pub status: HostDiffStatus,
     pub diff: DiffReport,
+}
+
+// --- IAM & Access Alignment Models ---
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SshKeyAudit {
+    pub user: String,
+    pub algorithm: String,
+    pub bits: u32,
+    pub comment: String,
+    pub compliant: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SudoersEntry {
+    pub principal: String,
+    pub source_file: String,
+    pub scope: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct AccessAuditResult {
+    #[serde(default)]
+    pub keys: Vec<SshKeyAudit>,
+    #[serde(default)]
+    pub coverage_warnings: Vec<String>,
+    #[serde(default)]
+    pub sudoers_nopasswd_all: Vec<SudoersEntry>,
 }

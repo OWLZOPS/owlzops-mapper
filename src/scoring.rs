@@ -235,6 +235,48 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── IAM & Access Alignment ───────────────────────────────
+    let noncompliant_keys = report
+        .security
+        .access_alignment
+        .keys
+        .iter()
+        .filter(|k| !k.compliant)
+        .count();
+    if noncompliant_keys > 0 {
+        findings.push(Finding {
+            id: "SEC-011",
+            title: "SSH keys violate key-strength policy".to_string(),
+            category: Category::Security,
+            weight: 10,
+            evidence: format!(
+                "{noncompliant_keys} authorized key(s) below policy (e.g. RSA<3072, DSA, ECDSA)"
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.2"),
+        });
+    }
+
+    if !report
+        .security
+        .access_alignment
+        .sudoers_nopasswd_all
+        .is_empty()
+    {
+        findings.push(Finding {
+            id: "SEC-012",
+            title: "Passwordless sudo to ALL commands".to_string(),
+            category: Category::Security,
+            weight: 15,
+            evidence: format!(
+                "{} principal(s) with NOPASSWD: ALL",
+                report.security.access_alignment.sudoers_nopasswd_all.len()
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.3"),
+        });
+    }
+
     // ── Docker container security issues ────────────────
     let mut has_mem_limit_issue = false;
     let mut has_cpu_limit_issue = false;
