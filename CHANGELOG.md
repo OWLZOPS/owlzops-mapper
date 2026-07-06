@@ -1,24 +1,28 @@
 
-## Bug Fixes
+## CI/CD
 
-- Handle mapper exit codes in E2E workflow
+- Add Rust dependencies caching in CI workflow for build optimization
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.0
+- Update CHANGELOG for v0.5.1
 
 ## Features
 
-- Integrate scoring version into reports and comparison logic
-- Improve multi-host comparison and reporting logic
-- Display hostname in terminal diff metadata header
+- Add detection of sensitive Docker mounts and update scoring version to 3
+- Add Docker reliability checks and bump SCORING_VERSION to 4
+- Add interactive sudo support and SSH concurrency configuration
+- Add progress bar for SCP uploads using `indicatif`
+- Add progress bar and optional binary cleanup flag
+- Enhance terminal output with TTY detection and risk score colorization
 
 ## Miscellaneous
 
-- Add E2E workflow for local audit smoke testing on PRs
-- Bump version to 0.5.1, update README with release highlights and fleet scan usage details
+- Allow RUSTSEC-2023-0071 advisory in deny.toml
+- Fix inconsistent icon spacing in TTY output
+- Bump version to 0.5.2, update changelo
 
 ## Refactoring
 
-- Remove redundant comments and improve width handling in XLSX exports
+- Implement atomic binary deployment and cleanup CLA integration
 
