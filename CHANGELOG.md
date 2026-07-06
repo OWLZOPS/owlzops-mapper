@@ -1,28 +1,24 @@
 
 ## CI/CD
 
-- Update CLA Assistant action to v2.4.0
-- Update CLA workflow to use contributor-assistant action
-- Update CLA Assistant action to v2.6.1
-- Update CLA Assistant action to v2.6.1
-- Add tar and gzip to apk installation in CI workflow
+- Remove unused CLA workflow configuration options
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.2
-
-## Features
-
-- Add IAM & access alignment checks for SSH key policy and sudoers
-- Improve network scanning and add shadow IT detection
-- Add DLP scanner for secrets in process memory
-- Add streaming JSONL support for audit output
+- Update CHANGELOG for v0.5.3
 
 ## Miscellaneous
 
-- Bump version to v0.5.3
+- Bump version to 0.5.4, update changelog
 
 ## Refactoring
 
-- Streamline host scanning logic and improve concurrency handling
+- Replace icons with Unicode code points for improved consistency
+- Optimize timeout handling and enhance JSON parsing fallback in scanners
+- Remove redundant JSONL parsing comment in agent report handling
+- Improve output file handling and fail-fast mechanism for report generation
+- Enhance DLP scanning logic, optimize process attribution and improve input validation in runner
+- Simplify remote binary upload by removing temporary file usage and streamline error handling in report dispatch
+- Improve code readability with formatting fixes
+- Fix inconsistent formatting and improve code readability in async block and error handler
 
