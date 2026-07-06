@@ -19,7 +19,7 @@ jobs:
     if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
     steps:
       - name: "CLA Assistant"
-        uses: cla-assistant/github-action@50b86a3b04c8fbbdb5449755ab374a58406f52e2 # v2.4.0
+        uses: contributor-assistant/github-action@50b86a3b04c8fbbdb5449755ab374a58406f52e2 # v2.4.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
