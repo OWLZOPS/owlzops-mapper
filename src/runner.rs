@@ -1,6 +1,7 @@
 use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 use chrono::Utc;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{Instrument, info, warn};
 
@@ -207,7 +208,6 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     }
 
     if args.copy_binary {
-        // Get the real path to the current executable (owlzops-mapper, not scp)
         let current_exe = std::env::current_exe()
             .unwrap_or_else(|_| std::path::PathBuf::from("./owlzops-mapper"));
 
@@ -215,6 +215,18 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             .local_binary
             .as_deref()
             .unwrap_or(current_exe.to_str().expect("Path contains invalid unicode"));
+
+        // Determine file size for progress bar
+        let file_size = std::fs::metadata(local_bin).map(|m| m.len()).unwrap_or(0);
+
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message(format!("Uploading to {host}"));
 
         let tmp_remote = format!("{}.tmp", remote_path);
 
@@ -251,11 +263,13 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         ) {
             Some(s) => s,
             None => {
+                pb.finish_with_message("Upload timed out");
                 warn!(host = %host, "SCP timed out or failed");
                 return None;
             }
         };
         if !status.status.success() {
+            pb.finish_with_message("Upload failed");
             warn!(host = %host, "SCP returned non-zero exit code");
             return None;
         }
@@ -296,6 +310,8 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             ],
             10,
         );
+
+        pb.finish_with_message("Uploaded");
     }
 
     let output = crate::utils::run_child_with_timeout(
@@ -333,23 +349,25 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Clean up the binary on the remote host (best-effort, no sudo)
-    let _ = crate::utils::run_child_with_timeout(
-        "ssh",
-        &[
-            "-i",
-            &ssh_key,
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ConnectTimeout=10",
-            &format!("{}@{}", ssh_user, host),
-            "rm",
-            "-f",
-            remote_path,
-        ],
-        10,
-    );
+    // Clean up the binary on the remote host unless --keep-binary is set
+    if !args.keep_binary {
+        let _ = crate::utils::run_child_with_timeout(
+            "ssh",
+            &[
+                "-i",
+                &ssh_key,
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=10",
+                &format!("{}@{}", ssh_user, host),
+                "rm",
+                "-f",
+                remote_path,
+            ],
+            10,
+        );
+    }
 
     if let Ok(report) = serde_json::from_str::<AgentReport>(&stdout) {
         return Some(report);

@@ -73,6 +73,10 @@ pub struct AuditArgs {
     /// Maximum concurrent SSH sessions (default: 50).
     #[arg(long, default_value_t = 50)]
     pub max_concurrent: usize,
+
+    /// Keep the binary on the remote host after the scan (skip cleanup).
+    #[arg(long, default_value_t = false)]
+    pub keep_binary: bool,
 }
 
 #[derive(Args, Debug, Clone)]
