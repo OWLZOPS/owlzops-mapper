@@ -50,15 +50,16 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     if flags.has_critical() { 1 } else { 0 }
 }
 
+const fn host_budget_secs(t: u64) -> u64 {
+    t.saturating_mul(2).saturating_add(60)
+}
+
 async fn run_remote_scan_with_timeout(
     host: String,
     args: AuditArgs,
 ) -> Result<Option<AgentReport>, tokio::task::JoinError> {
     let host_for_log = host.clone();
-    let cap = args
-        .remote_timeout_secs
-        .saturating_mul(2)
-        .saturating_add(60);
+    let cap = host_budget_secs(args.remote_timeout_secs);
     match tokio::time::timeout(
         Duration::from_secs(cap),
         tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
@@ -205,8 +206,7 @@ async fn run_command(cli: Cli) -> i32 {
                         let host_for_log = host.clone();
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
-                            let overall =
-                                Duration::from_secs(a.remote_timeout_secs.saturating_add(30));
+                            let overall = Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
                                 if let Some(pw) = &pass {
@@ -431,6 +431,15 @@ async fn run_command(cli: Cli) -> i32 {
                     if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
                         return vec![report];
                     }
+                    // JSONL fallback (one JSON object per line)
+                    let jsonl: Vec<AgentReport> = data
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect();
+                    if !jsonl.is_empty() {
+                        return jsonl;
+                    }
                     eprintln!("Invalid JSON in '{}' file", label);
                     std::process::exit(1);
                 };
@@ -559,6 +568,7 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();

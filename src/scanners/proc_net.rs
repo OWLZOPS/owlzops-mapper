@@ -95,7 +95,7 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
             Proto::Tcp | Proto::Tcp6 => state == TCP_LISTEN,
             Proto::Udp | Proto::Udp6 => {
                 state == TCP_CLOSE
-                    && f[2]
+                    && f[1]
                         .rsplit_once(':')
                         .map(|(_, p)| p != "0000")
                         .unwrap_or(false)
