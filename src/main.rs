@@ -141,10 +141,6 @@ async fn run_command(cli: Cli) -> i32 {
                     None
                 };
 
-                let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
-                let mut join_set = tokio::task::JoinSet::new();
-
-                // Enable streaming JSONL only when --format json AND --output are specified.
                 let use_streaming = args.format == OutputFormat::Json && args.output.is_some();
 
                 let mut reports: Vec<AgentReport> = Vec::new();
@@ -172,100 +168,129 @@ async fn run_command(cli: Cli) -> i32 {
                     None
                 };
 
-                for host in remote {
-                    let sem = semaphore.clone();
+                // Process local hosts synchronously (no SSH needed)
+                for _host in local {
                     let a = AuditArgs {
                         hosts: None,
                         host: Vec::new(),
+                        ssh_user: String::new(),
+                        ssh_key: String::new(),
+                        copy_binary: false,
+                        remote_path: String::new(),
+                        local_binary: None,
                         ..args.clone()
                     };
-                    let pass = sudo_pass.clone();
-                    let tx = tx.clone();
-                    let host_for_log = host.clone();
-                    join_set.spawn(async move {
-                        let _permit = sem.acquire_owned().await;
-                        let overall = Duration::from_secs(a.remote_timeout_secs.saturating_add(30));
+                    let local_report = run_local_scan_async(&a).await;
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(local_report).await;
+                    } else {
+                        reports.push(local_report);
+                    }
+                }
 
-                        let result = tokio::time::timeout(overall, async {
-                            if let Some(pw) = &pass {
-                                if a.copy_binary {
-                                    let default_exe = std::path::PathBuf::from("./owlzops-mapper");
-                                    let current_exe =
-                                        std::env::current_exe().unwrap_or(default_exe);
-                                    let local_bin = a
-                                        .local_binary
-                                        .as_deref()
-                                        .unwrap_or(current_exe.to_str().unwrap());
+                // Process remote hosts with JoinSet + Semaphore + global timeout
+                if !remote.is_empty() {
+                    let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
+                    let mut join_set = tokio::task::JoinSet::new();
+
+                    for host in remote {
+                        let sem = semaphore.clone();
+                        let a = AuditArgs {
+                            hosts: None,
+                            host: Vec::new(),
+                            ..args.clone()
+                        };
+                        let pass = sudo_pass.clone();
+                        let tx = tx.clone();
+                        let host_for_log = host.clone();
+                        join_set.spawn(async move {
+                            let _permit = sem.acquire_owned().await;
+                            let overall =
+                                Duration::from_secs(a.remote_timeout_secs.saturating_add(30));
+
+                            let result = tokio::time::timeout(overall, async {
+                                if let Some(pw) = &pass {
+                                    if a.copy_binary {
+                                        let default_exe =
+                                            std::path::PathBuf::from("./owlzops-mapper");
+                                        let current_exe =
+                                            std::env::current_exe().unwrap_or(default_exe);
+                                        let local_bin = a
+                                            .local_binary
+                                            .as_deref()
+                                            .unwrap_or(current_exe.to_str().unwrap());
+                                        let ssh_key_expanded =
+                                            shellexpand::tilde(&a.ssh_key).to_string();
+                                        if let Err(e) = ssh_engine::upload_binary_async(
+                                            &host,
+                                            &a.ssh_user,
+                                            &ssh_key_expanded,
+                                            local_bin,
+                                            &a.remote_path,
+                                            a.remote_timeout_secs,
+                                        )
+                                            .await
+                                        {
+                                            warn!(host = %host, error = %e, "Failed to upload binary");
+                                            return None;
+                                        }
+                                    }
+
                                     let ssh_key_expanded =
                                         shellexpand::tilde(&a.ssh_key).to_string();
-                                    if let Err(e) = ssh_engine::upload_binary_async(
+                                    match ssh_engine::run_remote_scan_russh(
                                         &host,
                                         &a.ssh_user,
                                         &ssh_key_expanded,
-                                        local_bin,
                                         &a.remote_path,
-                                        a.remote_timeout_secs,
+                                        pw,
                                     )
-                                    .await
+                                        .await
                                     {
-                                        warn!(host = %host, error = %e, "Failed to upload binary");
-                                        return None;
+                                        Ok(stdout) => {
+                                            let stdout_str = String::from_utf8_lossy(&stdout);
+                                            serde_json::from_str::<AgentReport>(&stdout_str).ok()
+                                        }
+                                        Err(e) => {
+                                            warn!(host = %host, error = %e, "russh scan failed");
+                                            None
+                                        }
                                     }
+                                } else {
+                                    run_remote_scan_with_timeout(host, a).await.ok().flatten()
                                 }
+                            })
+                                .await;
 
-                                let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
-                                match ssh_engine::run_remote_scan_russh(
-                                    &host,
-                                    &a.ssh_user,
-                                    &ssh_key_expanded,
-                                    &a.remote_path,
-                                    pw,
-                                )
-                                .await
-                                {
-                                    Ok(stdout) => {
-                                        let stdout_str = String::from_utf8_lossy(&stdout);
-                                        serde_json::from_str::<AgentReport>(&stdout_str).ok()
-                                    }
-                                    Err(e) => {
-                                        warn!(host = %host, error = %e, "russh scan failed");
+                            match result {
+                                Ok(Some(report)) => {
+                                    if let Some(tx) = &tx {
+                                        let _ = tx.send(report).await;
                                         None
+                                    } else {
+                                        Some(report)
                                     }
                                 }
-                            } else {
-                                run_remote_scan_with_timeout(host, a).await.ok().flatten()
+                                Ok(None) => None,
+                                Err(_elapsed) => {
+                                    warn!(host = %host_for_log, "global timeout for host");
+                                    None
+                                }
                             }
-                        })
-                        .await;
+                        });
+                    }
 
+                    while let Some(result) = join_set.join_next().await {
                         match result {
                             Ok(Some(report)) => {
-                                if let Some(tx) = &tx {
-                                    let _ = tx.send(report).await;
-                                    None
-                                } else {
-                                    Some(report)
+                                if tx.is_none() {
+                                    reports.push(report);
                                 }
                             }
-                            Ok(None) => None,
-                            Err(_elapsed) => {
-                                warn!(host = %host_for_log, "global timeout for host");
-                                None
-                            }
+                            Ok(None) => {}
+                            Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
+                            Err(e) => warn!("scan task failed: {e}"),
                         }
-                    });
-                }
-
-                while let Some(result) = join_set.join_next().await {
-                    match result {
-                        Ok(Some(report)) => {
-                            if tx.is_none() {
-                                reports.push(report);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
-                        Err(e) => warn!("scan task failed: {e}"),
                     }
                 }
 
@@ -277,7 +302,7 @@ async fn run_command(cli: Cli) -> i32 {
                     return 0;
                 }
 
-                // Fallback to legacy multi-host output (text, XLSX, etc.)
+                // Fallback to legacy multi-host output
                 if reports.is_empty() {
                     warn!("fleet scan produced no reports — all hosts failed");
                     if let Err(e) = output::output_multi(
@@ -303,6 +328,7 @@ async fn run_command(cli: Cli) -> i32 {
                 return if worst >= 1 { worst.min(2) } else { 0 };
             }
 
+            // Single local scan
             let report = run_local_scan_async(&args).await;
             let exit_code = compute_exit_code(&report);
             if let Err(e) = output::output_single(
