@@ -431,7 +431,6 @@ async fn run_command(cli: Cli) -> i32 {
                     if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
                         return vec![report];
                     }
-                    // JSONL fallback (one JSON object per line)
                     let jsonl: Vec<AgentReport> = data
                         .lines()
                         .filter(|l| !l.trim().is_empty())
