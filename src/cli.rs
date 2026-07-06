@@ -65,6 +65,14 @@ pub struct AuditArgs {
 
     #[arg(long, default_value = "120")]
     pub remote_timeout_secs: u64,
+
+    /// Ask for sudo password interactively and use russh engine (no NOPASSWD required).
+    #[arg(long, default_value_t = false)]
+    pub ask_sudo_pass: bool,
+
+    /// Maximum concurrent SSH sessions (default: 50).
+    #[arg(long, default_value_t = 50)]
+    pub max_concurrent: usize,
 }
 
 #[derive(Args, Debug, Clone)]
