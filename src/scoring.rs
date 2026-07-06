@@ -306,6 +306,38 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── DLP & Secret Hygiene ───────────────────────────────
+    if !report.security.secret_hygiene.is_empty() {
+        let mut evidence_list = Vec::new();
+        for leak in report.security.secret_hygiene.iter().take(3) {
+            evidence_list.push(format!(
+                "'{}' in {} of {}",
+                leak.matched_key, leak.source, leak.process
+            ));
+        }
+        let mut evidence_str = evidence_list.join(", ");
+        if report.security.secret_hygiene.len() > 3 {
+            evidence_str.push_str(&format!(
+                " and {} more...",
+                report.security.secret_hygiene.len() - 3
+            ));
+        }
+
+        findings.push(Finding {
+            id: "SEC-014",
+            title: "Cleartext secrets exposed in process memory".to_string(),
+            category: Category::Security,
+            weight: 25,
+            evidence: format!(
+                "Found {} leak(s): {}",
+                report.security.secret_hygiene.len(),
+                evidence_str
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── Docker container security issues ────────────────
     let mut has_mem_limit_issue = false;
     let mut has_cpu_limit_issue = false;

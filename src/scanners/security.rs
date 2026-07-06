@@ -393,6 +393,7 @@ pub fn gather_security_info() -> SecurityInfo {
         &crate::scanners::access::KeyPolicy::default(),
     );
 
+    let secret_hygiene = crate::scanners::dlp::scan_process_memory();
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -405,6 +406,7 @@ pub fn gather_security_info() -> SecurityInfo {
         sudoers_mode,
         sysctl_issues,
         access_alignment,
+        secret_hygiene,
     }
 }
 

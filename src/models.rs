@@ -216,6 +216,8 @@ pub struct SecurityInfo {
     pub sysctl_issues: Vec<String>,
     #[serde(default)]
     pub access_alignment: AccessAuditResult,
+    #[serde(default)]
+    pub secret_hygiene: Vec<SecretLeak>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -345,4 +347,14 @@ pub struct AccessAuditResult {
     pub coverage_warnings: Vec<String>,
     #[serde(default)]
     pub sudoers_nopasswd_all: Vec<SudoersEntry>,
+}
+
+// --- DLP & Secret Hygiene Models ---
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SecretLeak {
+    pub pid: u32,
+    pub process: String,
+    pub source: String,      // "environ" или "cmdline"
+    pub matched_key: String, // имя скомпрометированной переменной/флага
 }
