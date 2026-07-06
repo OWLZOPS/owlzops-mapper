@@ -211,10 +211,8 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         let current_exe = std::env::current_exe()
             .unwrap_or_else(|_| std::path::PathBuf::from("./owlzops-mapper"));
 
-        let local_bin = args
-            .local_binary
-            .as_deref()
-            .unwrap_or(current_exe.to_str().expect("Path contains invalid unicode"));
+        let current_exe_lossy = current_exe.to_string_lossy();
+        let local_bin = args.local_binary.as_deref().unwrap_or(&current_exe_lossy);
 
         // Determine file size for progress bar
         let file_size = std::fs::metadata(local_bin).map(|m| m.len()).unwrap_or(0);

@@ -149,7 +149,10 @@ pub fn gather_network_info() -> NetworkInfo {
 
     let mut listening_ports = Vec::new();
 
-    for (inode, meta) in &sockets {
+    // R7-12: Deterministic ordering to avoid random attribution drift
+    let mut entries: Vec<_> = sockets.iter().collect();
+    entries.sort_unstable_by_key(|(inode, _)| *inode);
+    for (inode, meta) in &entries {
         let attr = attrs.get(inode).cloned().unwrap_or_default();
 
         let process = attr

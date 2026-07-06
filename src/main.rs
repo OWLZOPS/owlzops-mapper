@@ -223,10 +223,27 @@ async fn run_command(cli: Cli) -> i32 {
                             ..args.clone()
                         };
                         let pass = sudo_pass.clone();
-                        let tx = tx.clone();
+                        let _tx = tx.clone();
                         let host_for_log = host.clone();
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
+
+                            // R7-08: Validate inputs before using them in russh path
+                            if pass.is_some() {
+                                if let Err(e) = runner::validate_host(&host) {
+                                    warn!("{e}");
+                                    return None;
+                                }
+                                if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
+                                    warn!("{e}");
+                                    return None;
+                                }
+                                if let Err(e) = runner::validate_remote_path(&a.remote_path) {
+                                    warn!("{e}");
+                                    return None;
+                                }
+                            }
+
                             let overall = Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
@@ -236,10 +253,12 @@ async fn run_command(cli: Cli) -> i32 {
                                             std::path::PathBuf::from("./owlzops-mapper");
                                         let current_exe =
                                             std::env::current_exe().unwrap_or(default_exe);
+                                        // R7-10: Safe path handling
+                                        let current_exe_lossy = current_exe.to_string_lossy();
                                         let local_bin = a
                                             .local_binary
                                             .as_deref()
-                                            .unwrap_or(current_exe.to_str().unwrap());
+                                            .unwrap_or(&current_exe_lossy);
                                         let ssh_key_expanded =
                                             shellexpand::tilde(&a.ssh_key).to_string();
                                         if let Err(e) = ssh_engine::upload_binary_async(
@@ -284,14 +303,7 @@ async fn run_command(cli: Cli) -> i32 {
                                 .await;
 
                             match result {
-                                Ok(Some(report)) => {
-                                    if let Some(tx) = &tx {
-                                        let _ = tx.send(report).await;
-                                        None
-                                    } else {
-                                        Some(report)
-                                    }
-                                }
+                                Ok(Some(report)) => Some(report),
                                 Ok(None) => None,
                                 Err(_elapsed) => {
                                     warn!(host = %host_for_log, "global timeout for host");
