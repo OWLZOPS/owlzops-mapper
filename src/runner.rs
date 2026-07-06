@@ -1,6 +1,7 @@
 use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 use chrono::Utc;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{Instrument, info, warn};
 
@@ -111,7 +112,6 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             packages_task,
         );
 
-        // Collect warnings from scanner failures
         let mut scan_warnings = Vec::new();
 
         let host_info = host_res.unwrap_or_else(|e| {
@@ -194,7 +194,6 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     let ssh_user = &args.ssh_user;
     let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
 
-    // Validate inputs before using them in shell commands
     if let Err(e) = validate_remote_path(remote_path) {
         warn!("{e}");
         return None;
@@ -209,7 +208,47 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     }
 
     if args.copy_binary {
-        let local_bin = args.local_binary.as_deref().unwrap_or("/proc/self/exe");
+        let current_exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("./owlzops-mapper"));
+
+        let local_bin = args
+            .local_binary
+            .as_deref()
+            .unwrap_or(current_exe.to_str().expect("Path contains invalid unicode"));
+
+        // Determine file size for progress bar
+        let file_size = std::fs::metadata(local_bin).map(|m| m.len()).unwrap_or(0);
+
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message(format!("Uploading to {host}"));
+
+        let tmp_remote = format!("{}.tmp", remote_path);
+
+        // 1. Remove old temporary file (ignore errors)
+        let _ = crate::utils::run_child_with_timeout(
+            "ssh",
+            &[
+                "-i",
+                &ssh_key,
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=10",
+                &format!("{}@{}", ssh_user, host),
+                "rm",
+                "-f",
+                &tmp_remote,
+            ],
+            10,
+        );
+
+        // 2. Upload the fresh binary to a temporary name
         let status = match crate::utils::run_child_with_timeout(
             "scp",
             &[
@@ -218,20 +257,61 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 local_bin,
-                &format!("{}@{}:{}", ssh_user, host, remote_path),
+                &format!("{}@{}:{}", ssh_user, host, tmp_remote),
             ],
             args.remote_timeout_secs / 2,
         ) {
             Some(s) => s,
             None => {
+                pb.finish_with_message("Upload timed out");
                 warn!(host = %host, "SCP timed out or failed");
                 return None;
             }
         };
         if !status.status.success() {
+            pb.finish_with_message("Upload failed");
             warn!(host = %host, "SCP returned non-zero exit code");
             return None;
         }
+
+        // 3. Make the temporary binary executable
+        let _ = crate::utils::run_child_with_timeout(
+            "ssh",
+            &[
+                "-i",
+                &ssh_key,
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=10",
+                &format!("{}@{}", ssh_user, host),
+                "chmod",
+                "+x",
+                &tmp_remote,
+            ],
+            10,
+        );
+
+        // 4. Atomically replace the old binary with the new one
+        let _ = crate::utils::run_child_with_timeout(
+            "ssh",
+            &[
+                "-i",
+                &ssh_key,
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=10",
+                &format!("{}@{}", ssh_user, host),
+                "mv",
+                "-f",
+                &tmp_remote,
+                remote_path,
+            ],
+            10,
+        );
+
+        pb.finish_with_message("Uploaded");
     }
 
     let output = crate::utils::run_child_with_timeout(
@@ -268,6 +348,27 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Clean up the binary on the remote host unless --keep-binary is set
+    if !args.keep_binary {
+        let _ = crate::utils::run_child_with_timeout(
+            "ssh",
+            &[
+                "-i",
+                &ssh_key,
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=10",
+                &format!("{}@{}", ssh_user, host),
+                "rm",
+                "-f",
+                remote_path,
+            ],
+            10,
+        );
+    }
+
     if let Ok(report) = serde_json::from_str::<AgentReport>(&stdout) {
         return Some(report);
     }
@@ -296,7 +397,6 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     };
     let output_dir = PathBuf::from(output_dir);
 
-    // Perform audit using the embedded AuditArgs (always JSON, but we serialize ourselves)
     let mut report = if !args.audit.host.is_empty() {
         let host = args.audit.host[0].clone();
         let host_for_msg = host.clone();
@@ -372,13 +472,12 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     0
 }
 
-/// Read the home directory of a user from /etc/passwd.
 fn read_user_home(username: &str) -> Option<String> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
         let mut parts = line.splitn(7, ':');
         if parts.next()? == username {
-            let home = parts.nth(4)?; // skip uid, gid, gecos
+            let home = parts.nth(4)?;
             Some(home.to_string())
         } else {
             None

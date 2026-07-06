@@ -6,6 +6,7 @@ mod output;
 mod runner;
 mod scanners;
 mod scoring;
+mod ssh_engine;
 mod ui;
 mod utils;
 
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::Semaphore;
 use tracing::warn;
+use zeroize::Zeroizing;
 
 // =====================================================================
 // Helper Functions
@@ -74,6 +76,26 @@ async fn run_remote_scan_with_timeout(
     }
 }
 
+fn raise_nofile_limit() {
+    let soft_desired = 4096u64;
+    let hard_desired = 65536u64;
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } == 0
+        && limits.rlim_cur < soft_desired
+    {
+        limits.rlim_cur = soft_desired;
+        if limits.rlim_max < hard_desired && limits.rlim_cur > limits.rlim_max {
+            limits.rlim_max = hard_desired;
+        }
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limits);
+        }
+    }
+}
+
 // =====================================================================
 // Main command runner (returns exit code)
 // =====================================================================
@@ -115,26 +137,20 @@ async fn run_command(cli: Cli) -> i32 {
                     }
                 }
 
-                let mut handles: Vec<
-                    tokio::task::JoinHandle<Result<Option<AgentReport>, tokio::task::JoinError>>,
-                > = Vec::new();
-                for _host in local {
-                    let a = AuditArgs {
-                        hosts: None,
-                        host: Vec::new(),
-                        ssh_user: String::new(),
-                        ssh_key: String::new(),
-                        copy_binary: false,
-                        remote_path: String::new(),
-                        local_binary: None,
-                        ..args.clone()
-                    };
-                    handles.push(tokio::spawn(async move {
-                        Ok(Some(run_local_scan_async(&a).await))
-                    }));
-                }
-                const MAX_CONCURRENT_SCANS: usize = 10;
-                let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS));
+                let sudo_pass: Option<Arc<Zeroizing<String>>> = if args.ask_sudo_pass {
+                    match ssh_engine::resolve_sudo_password() {
+                        Ok(p) => Some(Arc::new(p)),
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            return 2;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
+                let mut join_set = tokio::task::JoinSet::new();
 
                 for host in remote {
                     let sem = semaphore.clone();
@@ -143,25 +159,68 @@ async fn run_command(cli: Cli) -> i32 {
                         host: Vec::new(),
                         ..args.clone()
                     };
-                    handles.push(tokio::spawn(async move {
-                        let _permit = match sem.acquire().await {
-                            Ok(p) => p,
-                            Err(_) => return Ok(None),
-                        };
-                        run_remote_scan_with_timeout(host, a).await
-                    }));
+                    let pass = sudo_pass.clone();
+                    join_set.spawn(async move {
+                        let _permit = sem.acquire_owned().await;
+                        if let Some(pw) = &pass {
+                            // If copy_binary is set, upload first via async SCP
+                            if a.copy_binary {
+                                let default_exe = std::path::PathBuf::from("./owlzops-mapper");
+                                let current_exe = std::env::current_exe().unwrap_or(default_exe);
+                                let local_bin = a
+                                    .local_binary
+                                    .as_deref()
+                                    .unwrap_or(current_exe.to_str().unwrap());
+                                let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+                                if let Err(e) = ssh_engine::upload_binary_async(
+                                    &host,
+                                    &a.ssh_user,
+                                    &ssh_key_expanded,
+                                    local_bin,
+                                    &a.remote_path,
+                                    a.remote_timeout_secs,
+                                )
+                                .await
+                                {
+                                    warn!(host = %host, error = %e, "Failed to upload binary");
+                                    return None;
+                                }
+                            }
+
+                            // Now run the audit via russh
+                            let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+                            match ssh_engine::run_remote_scan_russh(
+                                &host,
+                                &a.ssh_user,
+                                &ssh_key_expanded,
+                                &a.remote_path,
+                                pw,
+                            )
+                            .await
+                            {
+                                Ok(stdout) => {
+                                    let stdout_str = String::from_utf8_lossy(&stdout);
+                                    serde_json::from_str::<AgentReport>(&stdout_str).ok()
+                                }
+                                Err(e) => {
+                                    warn!(host = %host, error = %e, "russh scan failed");
+                                    None
+                                }
+                            }
+                        } else {
+                            // legacy system ssh
+                            run_remote_scan_with_timeout(host, a).await.ok().flatten()
+                        }
+                    });
                 }
 
                 let mut reports = Vec::new();
-                for (i, handle) in handles.into_iter().enumerate() {
-                    match handle.await {
-                        Ok(inner_result) => match inner_result {
-                            Ok(Some(report)) => reports.push(report),
-                            Ok(None) => warn!(host_index = i, "scan returned no data"),
-                            Err(e) => warn!(host_index = i, "scan task failed: {e}"),
-                        },
-                        Err(e) if e.is_panic() => warn!(host_index = i, "scan task panicked: {e}"),
-                        Err(e) => warn!(host_index = i, "scan task failed: {e}"),
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok(Some(report)) => reports.push(report),
+                        Ok(None) => {} // scan failed, already warned
+                        Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
+                        Err(e) => warn!("scan task failed: {e}"),
                     }
                 }
 
@@ -424,6 +483,8 @@ async fn run_command(cli: Cli) -> i32 {
 
 #[tokio::main]
 async fn main() {
+    raise_nofile_limit();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

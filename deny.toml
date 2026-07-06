@@ -1,6 +1,12 @@
 [advisories]
 unmaintained = "transitive"
 yanked = "warn"
+ignore = [
+    # Marvin Attack in the `rsa` crate (pulled by `russh`).
+    # Acceptable risk: owlzops-mapper is a client-side CLI tool, not a server.
+    # Timing side-channel attacks are practically unexploitable in this context.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 allow = [
