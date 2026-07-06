@@ -80,20 +80,34 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
 // ---------------------------------------------------------------------------
 
 fn render_header(report: &AgentReport) {
-    println!("🦉 Owlzops Mapper v{}", report.version);
-    println!("Scan completed in {:.2}s", report.duration_secs);
+    use std::io::IsTerminal;
+    let is_tty = std::io::stdout().is_terminal();
 
-    let risk_color = if report.risk_score >= 70 {
-        "\x1b[1;31m"
-    } else if report.risk_score >= 40 {
-        "\x1b[1;33m"
+    let (icon_owl, icon_spy, icon_shield, color_reset) = if is_tty {
+        ("🦉 ", "🕵️‍♂️ ", "🛡️  ", "\x1b[0m")
     } else {
-        "\x1b[1;32m"
+        ("", "", "", "")
     };
+
+    let risk_color = if is_tty {
+        if report.risk_score >= 70 {
+            "\x1b[1;31m" // Red
+        } else if report.risk_score >= 40 {
+            "\x1b[1;33m" // Yellow
+        } else {
+            "\x1b[1;32m" // Green
+        }
+    } else {
+        ""
+    };
+
+    println!("{}Owlzops Mapper v{}", icon_owl, report.version);
+    println!("{}Scan completed in {:.2}s", icon_spy, report.duration_secs);
     println!(
-        "🛡️  Risk Score: {}{}/100\x1b[0m\n",
-        risk_color, report.risk_score
+        "{}Risk Score: {}{}/100{}\n",
+        icon_shield, risk_color, report.risk_score, color_reset
     );
+
     let scored = crate::scoring::score(crate::scoring::evaluate(report));
     println!(
         "  Security: {}/60  Reliability: {}/30  Hygiene: {}/10",
