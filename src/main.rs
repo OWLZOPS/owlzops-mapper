@@ -64,7 +64,7 @@ async fn run_remote_scan_with_timeout(
         Duration::from_secs(cap),
         tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
     )
-    .await
+        .await
     {
         Ok(inner) => inner,
         Err(_elapsed) => {
@@ -316,6 +316,7 @@ async fn run_command(cli: Cli) -> i32 {
                     while let Some(result) = join_set.join_next().await {
                         match result {
                             Ok(Some(report)) => {
+                                // Route report to JSONL channel if streaming, else buffer in Vec
                                 if let Some(sender) = &tx {
                                     let _ = sender.send(report).await;
                                 } else {
@@ -528,10 +529,10 @@ async fn run_command(cli: Cli) -> i32 {
                             &diffs,
                             path.to_str().unwrap(),
                         )
-                        .unwrap_or_else(|e| {
-                            eprintln!("Failed to write multi-host Excel diff: {e}");
-                            std::process::exit(1);
-                        });
+                            .unwrap_or_else(|e| {
+                                eprintln!("Failed to write multi-host Excel diff: {e}");
+                                std::process::exit(1);
+                            });
                         println!("Multi-host diff Excel written to {}", path.display());
                     }
                 }
