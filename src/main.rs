@@ -316,7 +316,9 @@ async fn run_command(cli: Cli) -> i32 {
                     while let Some(result) = join_set.join_next().await {
                         match result {
                             Ok(Some(report)) => {
-                                if tx.is_none() {
+                                if let Some(sender) = &tx {
+                                    let _ = sender.send(report).await;
+                                } else {
                                     reports.push(report);
                                 }
                             }
