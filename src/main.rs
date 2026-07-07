@@ -226,7 +226,6 @@ async fn run_command(cli: Cli) -> i32 {
                             ..args.clone()
                         };
                         let pass = sudo_pass.clone();
-                        let _tx = tx.clone();
                         let host_for_log = host.clone();
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
