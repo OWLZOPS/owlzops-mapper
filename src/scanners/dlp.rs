@@ -1,4 +1,5 @@
 use crate::models::SecretLeak;
+use crate::{coverage, safe_io};
 use std::fs;
 
 const SENSITIVE_KEYS: &[&str] = &[
@@ -50,7 +51,13 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         }
 
         // 1. Environment Variables
-        if let Ok(env_data) = fs::read(format!("/proc/{}/environ", pid)) {
+        let env_path = format!("/proc/{}/environ", pid);
+        if let Ok((env_data, truncated)) =
+            safe_io::read_file_bytes_capped(&env_path, safe_io::CAP_PROC_ENVIRON)
+        {
+            if truncated {
+                coverage::record(format!("/proc/{}/environ truncated", pid));
+            }
             for chunk in env_data.split(|&b| b == 0) {
                 let Ok(env_var) = std::str::from_utf8(chunk) else {
                     continue;
@@ -74,7 +81,13 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         }
 
         // 2. Command Line Arguments
-        if let Ok(cmd_data) = fs::read(format!("/proc/{}/cmdline", pid)) {
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok((cmd_data, truncated)) =
+            safe_io::read_file_bytes_capped(&cmdline_path, safe_io::CAP_PROC_ENVIRON)
+        {
+            if truncated {
+                coverage::record(format!("/proc/{}/cmdline truncated", pid));
+            }
             for chunk in cmd_data.split(|&b| b == 0) {
                 let Ok(arg) = std::str::from_utf8(chunk) else {
                     continue;
