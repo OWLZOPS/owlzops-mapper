@@ -158,21 +158,15 @@ pub async fn upload_binary_async(
 ) -> Result<(), RemoteError> {
     let tmp_remote = format!("{}.tmp", remote_path);
 
-    // Determine file size for progress bar
-    let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
-        host: host.to_string(),
-        source: e,
-    })?;
-    let file_size = metadata.len();
-
-    // Set up progress bar
-    let pb = ProgressBar::new(file_size);
+    // Set up a spinner to indicate upload in progress
+    let pb = ProgressBar::new_spinner();
     pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+        ProgressStyle::with_template("{spinner:.green} {msg}")
             .unwrap()
-            .progress_chars("#>-"),
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈"),
     );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message(format!("Uploading to {host}"));
 
     // 1. Remove old temporary file (ignore errors)
     let _ = Command::new("ssh")
@@ -189,9 +183,7 @@ pub async fn upload_binary_async(
         .status()
         .await;
 
-    // 2. Upload binary with progress bar
-    pb.set_message(format!("Uploading to {host}"));
-
+    // 2. Upload binary
     let output = tokio::time::timeout(
         Duration::from_secs(timeout_secs / 2),
         Command::new("scp")
@@ -303,15 +295,13 @@ pub async fn run_remote_scan_russh(
         user: ssh_user.to_string(),
     })?;
 
-    let rsa_hash = session
-        .best_supported_rsa_hash()
-        .await
-        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-
     let auth = session
         .authenticate_publickey(
             ssh_user.to_string(),
-            PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash.flatten()),
+            PrivateKeyWithHashAlg::new(
+                Arc::new(key),
+                session.best_supported_rsa_hash().await?.flatten(),
+            ),
         )
         .await
         .map_err(|e| RemoteError::from_russh(e, &hostname))?;
