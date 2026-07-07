@@ -1,42 +1,25 @@
 
 ## Bug Fixes
 
-- **ssh:** Log errors when writing to known_hosts instead of silently ignoring
-- **ssh:** Add keepalive support with configurable interval and max attempts
-
-## Build System
-
-- **deps:** Bump dialoguer from 0.11.0 to 0.12.0 (#43)
-- **deps:** Bump russh from 0.62.1 to 0.62.2 (#45)
-- **deps:** Bump rust_xlsxwriter from 0.77.0 to 0.96.0 (#47)
-- **deps:** Bump thiserror from 1.0.69 to 2.0.18
-
-## CI/CD
-
-- Update CLA workflow to use 'cla-signatures' branch for signatures
-- Expand CLA workflow allowlist to include additional bot patterns
-- Update CLA workflow allowlist to include `web-flow` bot
+- **russh:** Cap stdout/stderr buffers to prevent OOM (R8-01)
+- **known_hosts:** Avoid false HostKeyChanged for multi-key hosts (R8-02)
+- **utils:** Cap stderr of child processes at 1 MiB (R8-03)
+- **ssh_engine:** Improve host key error messages and IPv6 handling (R8-04, R8-05)
+- **utils:** Nullify stdin for child processes to enhance security (R8-07)
+- **safe_io:** Handle invalid UTF-8 conversion gracefully, remove unused variable in main.rs (N8-1, N8-4)
+- **ssh_engine:** Add detailed russh error context and robust error handling N8-5
+- **dlp:** Prevent OOM by capping comm file reads and log truncation events (N8-6)
+- **models:** Add #[serde(default)] for backward compatibility with older snapshots (R8-06)
+- **proc_net:** Improve parsing robustness, handle edge cases, and clean up logic (N8-2)
+- **network:** Deduplicate listening ports with HashSet (N8-3)
+- **ssh_engine:** Switch progress bar to spinner for uploads, simplify key handling (N8-7)
+- **main:** Add graceful shutdown handling with signal support (N8-8)
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.4
-
-## Features
-
-- **scanners:** Add capped I/O for safer /proc parsing; introduce truncation tracking and coverage logging
-- **scanners:** Integrate capped I/O across DLP and security scanners; enhance truncation tracking and coverage logging
-- **exporters/ui:** Add sanitization for XLSX and terminal outputs to mitigate injection risks
-- **utils:** Add hardened tool resolution and environment sanitization
+- Update CHANGELOG for v0.5.5
 
 ## Miscellaneous
 
-- Update `crossbeam-epoch` to v0.9.20 in Cargo.lock to avoid RUSTSEC-2026-0204
-- Add `Zlib` to deny.toml license exceptions
-- **deps:** Bump taiki-e/install-action from 2.82.6 to 2.82.9
-- **deps:** Bump dtolnay/rust-toolchain
-- Bump version to 0.5.5, update changelog
-
-## Refactoring
-
-- **ssh:** Introduce `KnownHostsChecker` for streamlined host key verification and TOFU handling
+- **release:** Bump version to 0.5.6, update changelog
 
