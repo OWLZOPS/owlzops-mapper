@@ -15,8 +15,14 @@ const CAP_REMOTE_STDERR: usize = 256 * 1024; // 256 KiB
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum RemoteError {
-    #[error("host key for {host} has changed! possible MITM attack. Run: ssh-keygen -R {host}")]
-    HostKeyChanged { host: String, line: String },
+    #[error(
+        "host key for {host} in {file} has changed! possible MITM attack. Run: ssh-keygen -R {host} -f {file}"
+    )]
+    HostKeyChanged {
+        host: String,
+        file: String,
+        line: String,
+    },
     #[error("host key for {host} is unknown and not in known_hosts")]
     HostKeyUnknown { host: String },
     #[error("failed to check host key for {host}: {detail}")]
@@ -106,9 +112,24 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
 }
 
 fn split_host_port(host: &str) -> (String, u16) {
+    // [addr]:port
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some((addr, tail)) = rest.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        return (addr.to_string(), port);
+    }
+    // bare IPv6 (>=2 colons, no brackets)
+    if host.matches(':').count() >= 2 {
+        return (host.to_string(), 22);
+    }
+    // host:port
     if let Some((h, p)) = host.rsplit_once(':')
-        && p.chars().all(|c| c.is_ascii_digit())
         && !p.is_empty()
+        && p.bytes().all(|b| b.is_ascii_digit())
     {
         return (h.to_string(), p.parse().unwrap_or(22));
     }

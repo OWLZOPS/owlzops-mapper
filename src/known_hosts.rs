@@ -95,8 +95,9 @@ impl KnownHostsChecker {
             });
         };
 
-        // Collect all matching host entries, keeping track of same-type matches.
-        let mut same_type_conflict: Option<String> = None;
+        // Collect all matching host entries, keeping track of same-type matches
+        // alongside the file they came from so the error message can be precise.
+        let mut same_type_conflict: Option<(String, PathBuf)> = None;
 
         for path in [&self.system_file, &self.pin_file] {
             let Ok(content) = std::fs::read_to_string(path) else {
@@ -123,14 +124,15 @@ impl KnownHostsChecker {
                 }
                 // Same type but different data – record conflict, but keep scanning
                 // because there might be another line of the same type that matches.
-                same_type_conflict.get_or_insert_with(|| line.to_string());
+                same_type_conflict.get_or_insert_with(|| (line.to_string(), path.clone()));
             }
         }
 
         // If we found any same-type entry but none matched exactly → key has changed.
-        if let Some(conflict_line) = same_type_conflict {
+        if let Some((conflict_line, conflict_file)) = same_type_conflict {
             return Err(crate::ssh_engine::RemoteError::HostKeyChanged {
                 host: self.host.clone(),
+                file: conflict_file.display().to_string(),
                 line: conflict_line,
             });
         }
