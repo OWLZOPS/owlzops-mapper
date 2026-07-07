@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+use std::fs;
+
+use chrono::{NaiveDateTime, Utc};
+
 use crate::models::{NetworkInfo, PortInfo, SslCertInfo};
 use crate::scanners::proc_net::{attribute_sockets, collect_listening_sockets};
 use crate::utils::run_with_timeout;
-use chrono::{NaiveDateTime, Utc};
-use std::fs;
 
 fn parse_openssl_enddate(raw: &str) -> Option<i64> {
     let trimmed = raw.trim().trim_end_matches("GMT").trim();
@@ -29,6 +32,7 @@ pub fn gather_network_info() -> NetworkInfo {
     {
         firewall_active = true;
     }
+    // nft
     if !firewall_active && let Some(out) = run_with_timeout("nft", &["list", "ruleset"], 5) {
         let mut in_filter_table = false;
         let mut has_input_rules = false;
@@ -47,7 +51,7 @@ pub fn gather_network_info() -> NetworkInfo {
         }
         firewall_active = has_input_rules;
     }
-
+    // iptables-save
     if !firewall_active && let Some(out) = run_with_timeout("iptables-save", &[], 5) {
         let has_input_drop_policy = out.lines().any(|l| {
             (l.starts_with(":INPUT DROP") || l.starts_with(":INPUT REJECT"))
@@ -148,8 +152,8 @@ pub fn gather_network_info() -> NetworkInfo {
     let attrs = attribute_sockets(&sockets);
 
     let mut listening_ports = Vec::new();
+    let mut seen = HashSet::new();
 
-    // R7-12: Deterministic ordering to avoid random attribution drift
     let mut entries: Vec<_> = sockets.iter().collect();
     entries.sort_unstable_by_key(|(inode, _)| *inode);
     for (inode, meta) in &entries {
@@ -167,9 +171,12 @@ pub fn gather_network_info() -> NetworkInfo {
 
         let port_str = meta.port.to_string();
 
-        if listening_ports.iter().any(|p: &PortInfo| {
-            p.port == port_str && p.protocol == meta.proto && p.bind_address == meta.bind_address
-        }) {
+        let key = (
+            meta.proto.to_string(),
+            port_str.clone(),
+            meta.bind_address.clone(),
+        );
+        if !seen.insert(key) {
             continue;
         }
 
