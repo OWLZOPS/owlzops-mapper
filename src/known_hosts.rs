@@ -122,16 +122,26 @@ impl KnownHostsChecker {
 
         // Host not found – TOFU: pin to our own file
         let entry = format!("{} {} {}\n", self.host_candidates()[0], ptype, pdata);
-        if let Some(dir) = self.pin_file.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Some(dir) = self.pin_file.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            tracing::error!(dir = %dir.display(), error = %e, "failed to create directory for known_hosts");
+            // Continue anyway – we will fail on file open below
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.pin_file)
         {
-            use std::io::Write;
-            let _ = f.write_all(entry.as_bytes());
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(entry.as_bytes()) {
+                    tracing::error!(path = %self.pin_file.display(), error = %e, "failed to write to known_hosts");
+                }
+            }
+            Err(e) => {
+                tracing::error!(path = %self.pin_file.display(), error = %e, "cannot open known_hosts for writing");
+            }
         }
         tracing::warn!(host = %self.host, "new host key — pinned to ~/.owlzops/known_hosts");
         Ok(true)
