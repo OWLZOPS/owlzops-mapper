@@ -111,7 +111,7 @@ pub fn run_child_with_timeout(
         .ok()?;
 
     let out_pipe = child.stdout.take()?;
-    let mut err_pipe = child.stderr.take()?;
+    let err_pipe = child.stderr.take()?;
 
     let prog = program.to_string();
 
@@ -128,9 +128,8 @@ pub fn run_child_with_timeout(
         data
     });
     let err_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
+        let (data, _trunc) = safe_io::read_reader_capped(err_pipe, 1024 * 1024);
+        data
     });
 
     let deadline = Duration::from_secs(timeout_secs);
