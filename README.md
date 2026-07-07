@@ -49,6 +49,29 @@ sudo ./owlzops-mapper audit
 - **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
+
+### v0.5.6 (2026-07-08)
+
+**Security**
+- R8-01: Cap remote stdout/stderr in russh path to prevent OOM from untrusted hosts.
+- R8-02: Fix false `HostKeyChanged` when multiple key types exist in known_hosts.
+- R8-05: Include exact known_hosts file path in host key error messages.
+- R8-07: Set `stdin(Stdio::null())` on child processes to prevent terminal hijacking.
+- R8-08: Handle SIGTERM and improve SIGINT with graceful shutdown.
+
+**Stability & Compatibility**
+- R8-03: Cap child stderr at 1 MiB in legacy SSH path.
+- R8-04: Support IPv6 addresses (bare and `[::1]:port`) in `split_host_port`.
+- R8-06: Add `#[serde(default)]` to `HostInfo` for forward compatibility with older snapshots.
+
+**Performance & Hygiene**
+- N8-1: Avoid extra UTF-8 allocation in `read_file_capped`.
+- N8-2: Replace `Vec<&str>` collection in `/proc/net` parser with an iterator.
+- N8-3: Deduplicate listening ports using a `HashSet`.
+- N8-5: Include accurate hostname in `RemoteError::Ssh` errors.
+- N8-6: Use `safe_io` for `/proc/<pid>/comm` reads in DLP scanner.
+- N8-7: Replace static progress bar with an animated spinner during SCP upload.
+
 ## v0.5.5 (2026-07-07)
 
 ### Security
@@ -62,6 +85,12 @@ sudo ./owlzops-mapper audit
 - Capped reads for `/proc`, `/proc/*/environ`, and child stdout/stderr to prevent OOM on untrusted inputs. Truncation events are reported as scan warnings.
 - Docker scanner: moved synchronous `fs::metadata` out of async runtime into `spawn_blocking` to avoid blocking Tokio executor.
 
+
+---
+
+<details>
+<summary>Previous releases (v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
+
 ## Highlights v0.5.4 (production reliability)
 
 - **Scanner isolation restored** – `panic = "abort"` removed; individual scanner panics now degrade gracefully instead of aborting the whole scan.
@@ -72,10 +101,6 @@ sudo ./owlzops-mapper audit
 - **Miscellaneous hardening** – timeout budgets unified, keepalive added to russh, panic‑free path handling, deterministic process attribution.
 
 
----
-
-<details>
-<summary>Previous releases (v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
 
 ## Highlights v0.5.3 (IAM, Process Attribution, DLP)
 
