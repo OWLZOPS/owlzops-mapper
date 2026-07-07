@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::coverage;
+use crate::safe_io;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proto {
     Tcp,
@@ -80,9 +83,16 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
         Proto::Udp6 => "/proc/net/udp6",
     };
 
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
+    let (content, truncated) = match safe_io::read_file_capped(path, safe_io::CAP_PROC_NET) {
+        Ok((c, t)) => (c, t),
+        Err(_) => return,
     };
+
+    if truncated {
+        coverage::record(format!(
+            "/proc/net file {path} exceeded cap and was truncated"
+        ));
+    }
 
     for line in content.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -190,9 +200,20 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
                 })
                 .clone();
 
-            let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
-                .ok()
-                .map(|s| s.trim().to_string());
+            let comm = {
+                match safe_io::read_file_capped(
+                    &format!("/proc/{pid}/comm"),
+                    4096, // safe cap for comm
+                ) {
+                    Ok((c, truncated)) => {
+                        if truncated {
+                            coverage::record(format!("/proc/{pid}/comm truncated"));
+                        }
+                        Some(c.trim().to_string())
+                    }
+                    Err(_) => None,
+                }
+            };
 
             attributed.insert(
                 inode,

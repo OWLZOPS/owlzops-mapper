@@ -4,6 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::coverage;
+use crate::safe_io;
+
 /// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
 /// If the process is still alive after the deadline, it is killed and we wait
 /// a short grace period for the kill to take effect.
@@ -38,13 +41,23 @@ pub fn run_child_with_timeout(
         .spawn()
         .ok()?;
 
-    let mut out_pipe = child.stdout.take()?;
+    let out_pipe = child.stdout.take()?;
     let mut err_pipe = child.stderr.take()?;
 
+    // Own a copy for the thread
+    let prog = program.to_string();
+
     let out_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
+        let (data, truncated) = safe_io::read_reader_capped(out_pipe, safe_io::CAP_CHILD_STDOUT);
+        if truncated {
+            coverage::record(format!(
+                "Output of '{}' exceeded {} bytes and was truncated",
+                prog,
+                safe_io::CAP_CHILD_STDOUT
+            ));
+            tracing::warn!(tool = %prog, "child stdout truncated at cap");
+        }
+        data
     });
     let err_handle = thread::spawn(move || {
         let mut buf = Vec::new();
