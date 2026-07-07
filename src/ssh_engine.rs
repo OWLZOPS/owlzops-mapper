@@ -48,11 +48,21 @@ pub enum RemoteError {
     },
 }
 
+// Required by russh::client::Handler::Error bound
 impl From<russh::Error> for RemoteError {
     fn from(source: russh::Error) -> Self {
         RemoteError::Ssh {
             host: String::new(),
             source,
+        }
+    }
+}
+
+impl RemoteError {
+    fn from_russh(err: russh::Error, host: &str) -> Self {
+        RemoteError::Ssh {
+            host: host.to_string(),
+            source: err,
         }
     }
 }
@@ -293,15 +303,18 @@ pub async fn run_remote_scan_russh(
         user: ssh_user.to_string(),
     })?;
 
+    let rsa_hash = session
+        .best_supported_rsa_hash()
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+
     let auth = session
         .authenticate_publickey(
             ssh_user.to_string(),
-            PrivateKeyWithHashAlg::new(
-                Arc::new(key),
-                session.best_supported_rsa_hash().await?.flatten(),
-            ),
+            PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash.flatten()),
         )
-        .await?;
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
     if !auth.success() {
         return Err(RemoteError::Auth {
@@ -311,7 +324,10 @@ pub async fn run_remote_scan_russh(
     }
 
     // Execute audit with sudo -S (no binary upload here — caller handles that)
-    let mut exec_channel = session.channel_open_session().await?;
+    let mut exec_channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
     exec_channel
         .exec(
             true,
@@ -320,12 +336,19 @@ pub async fn run_remote_scan_russh(
                 remote_path
             ),
         )
-        .await?;
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
     let mut line = Zeroizing::new(sudo_pass.to_string());
     line.push('\n');
-    exec_channel.data(line.as_bytes()).await?;
-    exec_channel.eof().await?;
+    exec_channel
+        .data(line.as_bytes())
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+    exec_channel
+        .eof()
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
