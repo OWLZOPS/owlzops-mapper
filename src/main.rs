@@ -1,6 +1,7 @@
 mod cli;
 mod compare;
 mod exporters;
+mod known_hosts;
 mod models;
 mod output;
 mod runner;

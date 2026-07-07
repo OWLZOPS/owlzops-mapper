@@ -2,11 +2,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh::*;
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use zeroize::Zeroizing;
+
+use crate::known_hosts::KnownHostsChecker;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -48,8 +49,7 @@ impl From<russh::Error> for RemoteError {
 }
 
 struct ClientHandler {
-    host: String,
-    known_hosts: PathBuf,
+    known_hosts_checker: KnownHostsChecker,
 }
 
 impl client::Handler for ClientHandler {
@@ -57,37 +57,9 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::ssh_key::PublicKey,
+        key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        let path = self.known_hosts.clone();
-        let host = self.host.clone();
-
-        if !path.exists() {
-            tracing::warn!(
-                "{}: ~/.ssh/known_hosts not found, accepting server key (TOFU)",
-                host
-            );
-            return Ok(true);
-        }
-
-        let contents = std::fs::read_to_string(&path).map_err(|e| RemoteError::HostKeyCheck {
-            host: host.clone(),
-            detail: e.to_string(),
-        })?;
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if line.contains(&host) || line.contains(&format!("[{}]", host)) {
-                return Ok(true);
-            }
-        }
-        tracing::warn!(
-            "{}: host not found in known_hosts, accepting server key (TOFU)",
-            host
-        );
-        Ok(true)
+        self.known_hosts_checker.verify(key)
     }
 }
 
@@ -267,10 +239,6 @@ pub async fn run_remote_scan_russh(
     sudo_pass: &Zeroizing<String>,
 ) -> Result<Vec<u8>, RemoteError> {
     let (hostname, port) = split_host_port(host);
-    let known_hosts = dirs_next::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".ssh")
-        .join("known_hosts");
 
     let stream = tokio::time::timeout(
         Duration::from_secs(15),
@@ -290,8 +258,7 @@ pub async fn run_remote_scan_russh(
         ..Default::default()
     });
     let handler = ClientHandler {
-        host: hostname.clone(),
-        known_hosts,
+        known_hosts_checker: KnownHostsChecker::new(hostname.clone(), port),
     };
     let mut session = client::connect_stream(config, stream, handler).await?;
 
