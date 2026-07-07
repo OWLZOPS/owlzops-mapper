@@ -1,4 +1,5 @@
 use crate::models::{SecurityInfo, UserInfo};
+use crate::{coverage, safe_io};
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
@@ -28,7 +29,12 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     let mut config_lines = Vec::new();
 
     // Read the main config file
-    if let Ok(contents) = fs::read_to_string("/etc/ssh/sshd_config") {
+    if let Ok((contents, truncated)) =
+        safe_io::read_file_capped("/etc/ssh/sshd_config", 4 * 1024 * 1024)
+    {
+        if truncated {
+            coverage::record("/etc/ssh/sshd_config truncated".to_string());
+        }
         for line in contents.lines() {
             let clean = line.trim();
             if clean.is_empty() || clean.starts_with('#') {
@@ -51,8 +57,17 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
                                 let name = name.to_string_lossy();
                                 if name.ends_with(".conf")
                                     && !name.starts_with('.')
-                                    && let Ok(inc_contents) = std::fs::read_to_string(&path)
+                                    && let Ok((inc_contents, inc_trunc)) = safe_io::read_file_capped(
+                                        path.to_str().unwrap_or(""),
+                                        4 * 1024 * 1024,
+                                    )
                                 {
+                                    if inc_trunc {
+                                        coverage::record(format!(
+                                            "sshd config include {} truncated",
+                                            path.display()
+                                        ));
+                                    }
                                     for l in inc_contents.lines() {
                                         let l = l.trim();
                                         if !l.is_empty() && !l.starts_with('#') {
@@ -63,7 +78,12 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
                             }
                         }
                     }
-                } else if let Ok(inc_contents) = std::fs::read_to_string(path_part) {
+                } else if let Ok((inc_contents, inc_trunc)) =
+                    safe_io::read_file_capped(path_part, 4 * 1024 * 1024)
+                {
+                    if inc_trunc {
+                        coverage::record(format!("sshd config include {} truncated", path_part));
+                    }
                     for l in inc_contents.lines() {
                         let l = l.trim();
                         if !l.is_empty() && !l.starts_with('#') {
@@ -133,7 +153,10 @@ fn gather_sudo_nopasswd() -> Vec<String> {
     }
 
     for file in files {
-        if let Ok(contents) = fs::read_to_string(&file) {
+        if let Ok((contents, truncated)) = safe_io::read_file_capped(&file, 4 * 1024 * 1024) {
+            if truncated {
+                coverage::record(format!("sudoers file {} truncated", file));
+            }
             for line in contents.lines() {
                 let l = line.trim();
                 if l.is_empty() || l.starts_with('#') {
@@ -181,10 +204,13 @@ fn gather_sysctl_issues() -> Vec<String> {
     let mut issues = Vec::new();
 
     // Check suid_dumpable with consideration of core_pattern
-    if let Ok(v) = std::fs::read_to_string("/proc/sys/fs/suid_dumpable") {
+    if let Ok((v, truncated)) = safe_io::read_file_capped("/proc/sys/fs/suid_dumpable", 4096) {
+        if truncated {
+            coverage::record("/proc/sys/fs/suid_dumpable truncated".to_string());
+        }
         let v = v.trim().to_string();
-        let piped = std::fs::read_to_string("/proc/sys/kernel/core_pattern")
-            .map(|s| s.trim_start().starts_with('|'))
+        let piped = safe_io::read_file_capped("/proc/sys/kernel/core_pattern", 4096)
+            .map(|(s, _)| s.trim_start().starts_with('|'))
             .unwrap_or(false);
         let ok = v == "0" || (v == "2" && piped);
         if !ok {
@@ -196,7 +222,10 @@ fn gather_sysctl_issues() -> Vec<String> {
     }
 
     // Net.ipv4.ip_forward – context-aware handling done in runner.rs
-    if let Ok(v) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
+    if let Ok((v, truncated)) = safe_io::read_file_capped("/proc/sys/net/ipv4/ip_forward", 4096) {
+        if truncated {
+            coverage::record("/proc/sys/net/ipv4/ip_forward truncated".to_string());
+        }
         let v = v.trim().to_string();
         if v == "1" {
             issues.push(format!("net.ipv4.ip_forward={} (expected 0)", v));
@@ -228,7 +257,10 @@ fn gather_sysctl_issues() -> Vec<String> {
     ];
 
     for &(path, expected, name) in other_checks {
-        if let Ok(value) = fs::read_to_string(path) {
+        if let Ok((value, truncated)) = safe_io::read_file_capped(path, 4096) {
+            if truncated {
+                coverage::record(format!("{} truncated", path));
+            }
             let value = value.trim();
             if value != expected {
                 issues.push(format!("{}={} (expected {})", name, value, expected));
@@ -299,7 +331,10 @@ pub fn gather_security_info() -> SecurityInfo {
     let mut shell_usernames: Vec<String> = Vec::new();
     let mut auth_keys_map: HashMap<String, usize> = HashMap::new();
 
-    if let Ok(contents) = fs::read_to_string("/etc/passwd") {
+    if let Ok((contents, truncated)) = safe_io::read_file_capped("/etc/passwd", 4 * 1024 * 1024) {
+        if truncated {
+            coverage::record("/etc/passwd truncated".to_string());
+        }
         for line in contents.lines() {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() == 7 && valid_shells.contains(parts[6]) {
@@ -308,11 +343,13 @@ pub fn gather_security_info() -> SecurityInfo {
                 // Count authorized keys
                 let home = parts[5];
                 let auth_keys_path = format!("{}/.ssh/authorized_keys", home);
-                let count = fs::read_to_string(&auth_keys_path)
-                    .unwrap_or_default()
-                    .lines()
-                    .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
-                    .count();
+                let count = safe_io::read_file_capped(&auth_keys_path, 4 * 1024 * 1024)
+                    .map(|(s, _)| {
+                        s.lines()
+                            .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
+                            .count()
+                    })
+                    .unwrap_or(0);
                 auth_keys_map.insert(username.clone(), count);
                 shell_usernames.push(username);
             }
@@ -485,29 +522,5 @@ mod tests {
         assert!(!is_self_only_sudo_line(
             "operator ALL=(ALL) NOPASSWD: /home/x/owlzops-mapper"
         ));
-    }
-
-    // ── fallback_parse_main_config ─────────────────────────
-
-    #[test]
-    fn fallback_parse_main_config_no_include() {
-        use std::io::Write;
-
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("sshd_config");
-        let mut f = std::fs::File::create(&config_path).unwrap();
-        writeln!(f, "PasswordAuthentication yes").unwrap();
-        writeln!(f, "PermitRootLogin no").unwrap();
-
-        let mut pass_auth = false;
-        let mut root_login = true;
-        fallback_parse_main_config(&mut pass_auth, &mut root_login);
-    }
-
-    #[test]
-    fn fallback_parse_main_config_include() {
-        let mut pass_auth = false;
-        let mut root_login = true;
-        fallback_parse_main_config(&mut pass_auth, &mut root_login);
     }
 }

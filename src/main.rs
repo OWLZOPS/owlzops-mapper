@@ -1,9 +1,12 @@
 mod cli;
 mod compare;
+mod coverage;
 mod exporters;
+mod known_hosts;
 mod models;
 mod output;
 mod runner;
+mod safe_io;
 mod scanners;
 mod scoring;
 mod ssh_engine;
