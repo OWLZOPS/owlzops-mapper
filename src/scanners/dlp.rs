@@ -20,8 +20,14 @@ const SENSITIVE_KEYS: &[&str] = &[
 const SENSITIVE_FLAGS: &[&str] = &["--password=", "-p=", "--token=", "--secret="];
 
 fn extract_process_name(pid: u32) -> String {
-    fs::read_to_string(format!("/proc/{}/comm", pid))
-        .map(|s| s.trim().to_string())
+    let path = format!("/proc/{}/comm", pid);
+    safe_io::read_file_capped(&path, 4096)
+        .map(|(s, truncated)| {
+            if truncated {
+                coverage::record(format!("/proc/{}/comm truncated", pid));
+            }
+            s.trim().to_string()
+        })
         .unwrap_or_else(|_| "unknown".to_string())
 }
 

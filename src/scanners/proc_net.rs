@@ -95,17 +95,24 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
     }
 
     for line in content.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() <= 9 {
-            continue;
-        }
+        let mut parts = line.split_ascii_whitespace();
 
-        let state = u8::from_str_radix(f[3], 16).unwrap_or(0);
+        // sl
+        parts.next();
+        let local = parts.next();
+        let _rem = parts.next();
+        let state_hex = parts.next();
+
+        let (Some(local), Some(state_hex)) = (local, state_hex) else {
+            continue;
+        };
+
+        let state = u8::from_str_radix(state_hex, 16).unwrap_or(0);
         let is_listening = match proto {
             Proto::Tcp | Proto::Tcp6 => state == TCP_LISTEN,
             Proto::Udp | Proto::Udp6 => {
                 state == TCP_CLOSE
-                    && f[1]
+                    && local
                         .rsplit_once(':')
                         .map(|(_, p)| p != "0000")
                         .unwrap_or(false)
@@ -115,10 +122,17 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
             continue;
         }
 
-        let Some((bind_address, port)) = parse_local(f[1], proto.is_v6()) else {
+        let Some((bind_address, port)) = parse_local(local, proto.is_v6()) else {
             continue;
         };
-        let Ok(inode) = f[9].parse::<u64>() else {
+
+        // Skip indices 4..=8 (tx_queue, rx_queue, tr, tm->when, retrnsmt)
+        for _ in 0..5 {
+            parts.next();
+        }
+        let inode_str = parts.next();
+        let Some(inode_str) = inode_str else { continue };
+        let Ok(inode) = inode_str.parse::<u64>() else {
             continue;
         };
         if inode == 0 {

@@ -8,12 +8,21 @@ use tokio::process::Command;
 use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
+use crate::safe_io;
+
+const CAP_REMOTE_STDERR: usize = 256 * 1024; // 256 KiB
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum RemoteError {
-    #[error("host key for {host} has changed! possible MITM attack. Run: ssh-keygen -R {host}")]
-    HostKeyChanged { host: String, line: String },
+    #[error(
+        "host key for {host} in {file} has changed! possible MITM attack. Run: ssh-keygen -R {host} -f {file}"
+    )]
+    HostKeyChanged {
+        host: String,
+        file: String,
+        line: String,
+    },
     #[error("host key for {host} is unknown and not in known_hosts")]
     HostKeyUnknown { host: String },
     #[error("failed to check host key for {host}: {detail}")]
@@ -39,11 +48,21 @@ pub enum RemoteError {
     },
 }
 
+// Required by russh::client::Handler::Error bound
 impl From<russh::Error> for RemoteError {
     fn from(source: russh::Error) -> Self {
         RemoteError::Ssh {
             host: String::new(),
             source,
+        }
+    }
+}
+
+impl RemoteError {
+    fn from_russh(err: russh::Error, host: &str) -> Self {
+        RemoteError::Ssh {
+            host: host.to_string(),
+            source: err,
         }
     }
 }
@@ -103,9 +122,24 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
 }
 
 fn split_host_port(host: &str) -> (String, u16) {
+    // [addr]:port
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some((addr, tail)) = rest.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        return (addr.to_string(), port);
+    }
+    // bare IPv6 (>=2 colons, no brackets)
+    if host.matches(':').count() >= 2 {
+        return (host.to_string(), 22);
+    }
+    // host:port
     if let Some((h, p)) = host.rsplit_once(':')
-        && p.chars().all(|c| c.is_ascii_digit())
         && !p.is_empty()
+        && p.bytes().all(|b| b.is_ascii_digit())
     {
         return (h.to_string(), p.parse().unwrap_or(22));
     }
@@ -124,21 +158,15 @@ pub async fn upload_binary_async(
 ) -> Result<(), RemoteError> {
     let tmp_remote = format!("{}.tmp", remote_path);
 
-    // Determine file size for progress bar
-    let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
-        host: host.to_string(),
-        source: e,
-    })?;
-    let file_size = metadata.len();
-
-    // Set up progress bar
-    let pb = ProgressBar::new(file_size);
+    // Set up a spinner to indicate upload in progress
+    let pb = ProgressBar::new_spinner();
     pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+        ProgressStyle::with_template("{spinner:.green} {msg}")
             .unwrap()
-            .progress_chars("#>-"),
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈"),
     );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message(format!("Uploading to {host}"));
 
     // 1. Remove old temporary file (ignore errors)
     let _ = Command::new("ssh")
@@ -155,9 +183,7 @@ pub async fn upload_binary_async(
         .status()
         .await;
 
-    // 2. Upload binary with progress bar
-    pb.set_message(format!("Uploading to {host}"));
-
+    // 2. Upload binary
     let output = tokio::time::timeout(
         Duration::from_secs(timeout_secs / 2),
         Command::new("scp")
@@ -277,7 +303,8 @@ pub async fn run_remote_scan_russh(
                 session.best_supported_rsa_hash().await?.flatten(),
             ),
         )
-        .await?;
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
     if !auth.success() {
         return Err(RemoteError::Auth {
@@ -287,7 +314,10 @@ pub async fn run_remote_scan_russh(
     }
 
     // Execute audit with sudo -S (no binary upload here — caller handles that)
-    let mut exec_channel = session.channel_open_session().await?;
+    let mut exec_channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
     exec_channel
         .exec(
             true,
@@ -296,21 +326,54 @@ pub async fn run_remote_scan_russh(
                 remote_path
             ),
         )
-        .await?;
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
     let mut line = Zeroizing::new(sudo_pass.to_string());
     line.push('\n');
-    exec_channel.data(line.as_bytes()).await?;
-    exec_channel.eof().await?;
+    exec_channel
+        .data(line.as_bytes())
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+    exec_channel
+        .eof()
+        .await
+        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code: Option<u32> = None;
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
 
     while let Some(msg) = exec_channel.wait().await {
         match msg {
-            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
-            ChannelMsg::ExtendedData { ref data, ext: 1 } => stderr.extend_from_slice(data),
+            ChannelMsg::Data { ref data } => {
+                let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
+                if room > 0 {
+                    stdout.extend_from_slice(&data[..data.len().min(room)]);
+                } else if !stdout_truncated {
+                    stdout_truncated = true;
+                    tracing::warn!(
+                        host = %hostname,
+                        "remote stdout exceeded cap ({} bytes), truncating",
+                        safe_io::CAP_CHILD_STDOUT
+                    );
+                }
+            }
+            ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
+                if room > 0 {
+                    stderr.extend_from_slice(&data[..data.len().min(room)]);
+                } else if !stderr_truncated {
+                    stderr_truncated = true;
+                    tracing::warn!(
+                        host = %hostname,
+                        "remote stderr exceeded cap ({} bytes), truncating",
+                        CAP_REMOTE_STDERR
+                    );
+                }
+            }
             ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
             ChannelMsg::Close => break,
             ChannelMsg::Eof => {

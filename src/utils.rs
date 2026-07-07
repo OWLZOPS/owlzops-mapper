@@ -70,7 +70,7 @@ pub fn hardened_command(program: &str, args: &[&str]) -> Command {
 }
 
 // ---------------------------------------------------------------------------
-// Child helpers (unchanged logic, now hardened)
+// Child helpers (unchanged logic, now hardened and with stdin nulled)
 // ---------------------------------------------------------------------------
 
 /// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
@@ -92,11 +92,9 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
     }
 }
 
-/// Run a child process with capped stdout/stderr, a timeout, and a
-/// hardened environment.
-///
-/// Uses `resolve_tool` to obtain an absolute path; if that fails the
-/// original short name is still executed (with `env_clear`).
+/// Run a child process with capped stdout/stderr, a timeout, a hardened
+/// environment, and **no stdin** to prevent the child from capturing the
+/// operator's terminal input (R8-07).
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
@@ -107,11 +105,12 @@ pub fn run_child_with_timeout(
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .spawn()
         .ok()?;
 
     let out_pipe = child.stdout.take()?;
-    let mut err_pipe = child.stderr.take()?;
+    let err_pipe = child.stderr.take()?;
 
     let prog = program.to_string();
 
@@ -128,9 +127,8 @@ pub fn run_child_with_timeout(
         data
     });
     let err_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
+        let (data, _trunc) = safe_io::read_reader_capped(err_pipe, 1024 * 1024);
+        data
     });
 
     let deadline = Duration::from_secs(timeout_secs);
@@ -185,6 +183,7 @@ fn run_with_timeout_inner(
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .stdin(Stdio::null())
         .spawn()
         .ok()?;
 

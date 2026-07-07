@@ -12,7 +12,9 @@ pub fn read_file_capped(path: &str, max_bytes: usize) -> io::Result<(String, boo
     if truncated {
         buf.truncate(max_bytes);
     }
-    Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
+    let text = String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, truncated))
 }
 
 /// Read a file into raw bytes, capping at `max_bytes`. Returns (bytes, truncated).

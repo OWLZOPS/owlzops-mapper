@@ -21,6 +21,7 @@ use scoring::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Semaphore;
@@ -97,7 +98,7 @@ fn raise_nofile_limit() {
     }
 }
 
-async fn run_command(cli: Cli) -> i32 {
+async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
     match cli.command {
         Commands::Audit(args) => {
             let mut hosts: Vec<String> = Vec::new();
@@ -195,6 +196,9 @@ async fn run_command(cli: Cli) -> i32 {
 
                 // Process local hosts synchronously (no SSH needed)
                 for _host in local {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let a = AuditArgs {
                         hosts: None,
                         host: Vec::new(),
@@ -219,6 +223,9 @@ async fn run_command(cli: Cli) -> i32 {
                     let mut join_set = tokio::task::JoinSet::new();
 
                     for host in remote {
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let sem = semaphore.clone();
                         let a = AuditArgs {
                             hosts: None,
@@ -226,7 +233,6 @@ async fn run_command(cli: Cli) -> i32 {
                             ..args.clone()
                         };
                         let pass = sudo_pass.clone();
-                        let _tx = tx.clone();
                         let host_for_log = host.clone();
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
@@ -317,9 +323,12 @@ async fn run_command(cli: Cli) -> i32 {
                     }
 
                     while let Some(result) = join_set.join_next().await {
+                        if shutdown.load(Ordering::Relaxed) {
+                            // Don't start any new tasks but allow current ones to finish
+                            // The join_set will drain naturally.
+                        }
                         match result {
                             Ok(Some(report)) => {
-                                // Route report to JSONL channel if streaming, else buffer in Vec
                                 if let Some(sender) = &tx {
                                     let _ = sender.send(report).await;
                                 } else {
@@ -610,12 +619,56 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    let mut cmd_handle = tokio::spawn(run_command(cli, shutdown_clone));
+
+    // Listen for SIGINT (Ctrl+C) and SIGTERM
+    let mut sig_int = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .expect("failed to install SIGINT handler");
+    let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
 
     let exit_code = tokio::select! {
-        code = run_command(cli) => code,
-        _ = signal::ctrl_c() => {
-            eprintln!("Interrupted — partial results discarded.");
-            130
+        // Command finished normally
+        res = &mut cmd_handle => {
+            match res {
+                Ok(code) => code,
+                Err(join_err) => {
+                    if join_err.is_panic() {
+                        eprintln!("Main task panicked");
+                        130
+                    } else {
+                        1
+                    }
+                }
+            }
+        }
+        // First interrupt signal – initiate graceful shutdown
+        _ = sig_int.recv() => {
+            eprintln!("Received interrupt signal, shutting down gracefully...");
+            shutdown.store(true, Ordering::Relaxed);
+            // Wait up to 5 seconds for tasks to finish, then force exit
+            match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
+                Ok(Ok(code)) => code,
+                _ => {
+                    eprintln!("Graceful shutdown timed out, forcing exit.");
+                    130
+                }
+            }
+        }
+        // First termination signal – initiate graceful shutdown
+        _ = sig_term.recv() => {
+            eprintln!("Received termination signal, shutting down gracefully...");
+            shutdown.store(true, Ordering::Relaxed);
+            match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
+                Ok(Ok(code)) => code,
+                _ => {
+                    eprintln!("Graceful shutdown timed out, forcing exit.");
+                    130
+                }
+            }
         }
     };
 
