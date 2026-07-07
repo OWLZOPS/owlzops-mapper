@@ -43,7 +43,6 @@ impl KnownHostsChecker {
             return false;
         };
         mac.update(host.as_bytes());
-        // Compare as slices: into_bytes() returns GenericArray, mac_expected is Vec<u8>
         mac.finalize()
             .into_bytes()
             .as_slice()
@@ -71,9 +70,13 @@ impl KnownHostsChecker {
     }
 
     /// Verify the presented server key.
-    /// Returns:
-    /// - Ok(true) if the key matches a known entry or was newly pinned (TOFU)
-    /// - Err(HostKeyChanged) if the key does not match an existing entry
+    ///
+    /// Logic:
+    /// 1. Collect all lines from both known_hosts files that match the host.
+    /// 2. Filter those lines to only the ones with the same key type (`ptype`).
+    /// 3. If any of those match exactly → `Ok(true)`.
+    /// 4. If there are lines of the same type but none matched → `HostKeyChanged`.
+    /// 5. If no lines of this type exist at all → TOFU (pin the new key type).
     pub fn verify(
         &self,
         key: &russh::keys::ssh_key::PublicKey,
@@ -92,41 +95,52 @@ impl KnownHostsChecker {
             });
         };
 
-        // Search for the host in both files
+        // Collect all matching host entries, keeping track of same-type matches.
+        let mut same_type_conflict: Option<String> = None;
+
         for path in [&self.system_file, &self.pin_file] {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let mut f = line.split_whitespace();
-                    let (Some(hf), Some(kt), Some(kd)) = (f.next(), f.next(), f.next()) else {
-                        continue;
-                    };
-                    if !self.line_host_matches(hf) {
-                        continue;
-                    }
-                    // Host found – compare the key
-                    if kt == ptype && kd == pdata {
-                        return Ok(true);
-                    } else {
-                        return Err(crate::ssh_engine::RemoteError::HostKeyChanged {
-                            host: self.host.clone(),
-                            line: line.to_string(),
-                        });
-                    }
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
+                let mut f = line.split_whitespace();
+                let (Some(hf), Some(kt), Some(kd)) = (f.next(), f.next(), f.next()) else {
+                    continue;
+                };
+                if !self.line_host_matches(hf) {
+                    continue;
+                }
+                // Only consider lines with the same key type.
+                if kt != ptype {
+                    continue;
+                }
+                if kd == pdata {
+                    return Ok(true); // exact match found
+                }
+                // Same type but different data – record conflict, but keep scanning
+                // because there might be another line of the same type that matches.
+                same_type_conflict.get_or_insert_with(|| line.to_string());
             }
         }
 
-        // Host not found – TOFU: pin to our own file
+        // If we found any same-type entry but none matched exactly → key has changed.
+        if let Some(conflict_line) = same_type_conflict {
+            return Err(crate::ssh_engine::RemoteError::HostKeyChanged {
+                host: self.host.clone(),
+                line: conflict_line,
+            });
+        }
+
+        // No entry for this host+type combination → TOFU: pin new key.
         let entry = format!("{} {} {}\n", self.host_candidates()[0], ptype, pdata);
         if let Some(dir) = self.pin_file.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
             tracing::error!(dir = %dir.display(), error = %e, "failed to create directory for known_hosts");
-            // Continue anyway – we will fail on file open below
         }
         match std::fs::OpenOptions::new()
             .create(true)
