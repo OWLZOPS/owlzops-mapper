@@ -1,7 +1,33 @@
+//! Terminal dashboard renderer.
+//!
+//! All strings originating from an audited host pass through
+//! [`sanitize_terminal`] before being printed, mitigating
+//! terminal escape sequence injection (C0/C1 control characters
+//! beyond `\t` are replaced with U+FFFD).
+
 use crate::models::{AgentReport, PackageManager};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, Table};
+
+// ---------------------------------------------------------------------------
+// Sanitisation helper
+// ---------------------------------------------------------------------------
+
+/// Replace control characters (except `\t`) with the Unicode
+/// replacement character so that attacker-controlled strings
+/// cannot inject ANSI escape sequences into the terminal.
+pub fn sanitize_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -51,7 +77,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
         };
 
         t.add_row(vec![
-            Cell::new(&r.host.hostname),
+            Cell::new(sanitize_terminal(&r.host.hostname)),
             score_cell,
             Cell::new(if r.network.firewall_active {
                 "on"
@@ -91,11 +117,11 @@ fn render_header(report: &AgentReport) {
 
     let risk_color = if is_tty {
         if report.risk_score >= 70 {
-            "\x1b[1;31m" // Red
+            "\x1b[1;31m"
         } else if report.risk_score >= 40 {
-            "\x1b[1;33m" // Yellow
+            "\x1b[1;33m"
         } else {
-            "\x1b[1;32m" // Green
+            "\x1b[1;32m"
         }
     } else {
         ""
@@ -114,8 +140,6 @@ fn render_header(report: &AgentReport) {
         scored.security, scored.reliability, scored.hygiene
     );
 
-    // Risk Score breakdown
-    let scored = crate::scoring::score(crate::scoring::evaluate(report));
     let active_findings: Vec<&crate::scoring::Finding> = scored
         .findings
         .iter()
@@ -164,12 +188,25 @@ fn render_system_overview(report: &AgentReport) {
             .fg(Color::Cyan),
         Cell::new("Details").add_attribute(Attribute::Bold),
     ]);
-    t_sys.add_row(vec!["Hostname", &report.host.hostname]);
-    t_sys.add_row(vec!["Provider", &report.host.hosting_provider]);
-    t_sys.add_row(vec!["External IP", &report.host.external_ipv4]);
+    t_sys.add_row(vec![
+        "Hostname",
+        sanitize_terminal(&report.host.hostname).as_str(),
+    ]);
+    t_sys.add_row(vec![
+        "Provider",
+        sanitize_terminal(&report.host.hosting_provider).as_str(),
+    ]);
+    t_sys.add_row(vec![
+        "External IP",
+        sanitize_terminal(&report.host.external_ipv4).as_str(),
+    ]);
     t_sys.add_row(vec![
         "OS & Kernel",
-        &format!("{} ({})", report.host.os_version, report.host.kernel),
+        &format!(
+            "{} ({})",
+            sanitize_terminal(&report.host.os_version),
+            sanitize_terminal(&report.host.kernel)
+        ),
     ]);
     t_sys.add_row(vec!["Uptime", &format!("{} days", report.host.uptime_days)]);
     t_sys.add_row(vec!["CPU Cores", &report.host.cpu_cores.to_string()]);
@@ -192,7 +229,13 @@ fn render_system_overview(report: &AgentReport) {
     let tech_stack_str = if report.host.tech_stack.is_empty() {
         "None detected".to_string()
     } else {
-        report.host.tech_stack.join(", ")
+        report
+            .host
+            .tech_stack
+            .iter()
+            .map(|s| sanitize_terminal(s))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     t_sys.add_row(vec![
         Cell::new("Detected Tech Stack").fg(Color::Yellow),
@@ -202,14 +245,26 @@ fn render_system_overview(report: &AgentReport) {
     let dns_str = if report.network.dns_resolvers.is_empty() {
         "Unknown".to_string()
     } else {
-        report.network.dns_resolvers.join(", ")
+        report
+            .network
+            .dns_resolvers
+            .iter()
+            .map(|s| sanitize_terminal(s))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     t_sys.add_row(vec![Cell::new("DNS Resolvers"), Cell::new(dns_str)]);
 
     let sec_mod_str = if report.host.security_modules.is_empty() {
         "None".to_string()
     } else {
-        report.host.security_modules.join(", ")
+        report
+            .host
+            .security_modules
+            .iter()
+            .map(|s| sanitize_terminal(s))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     t_sys.add_row(vec![
         Cell::new("Security Modules (LSM)"),
@@ -240,7 +295,7 @@ fn render_top_memory(report: &AgentReport) {
             mem_cell = mem_cell.fg(Color::Yellow);
         }
         t_mem.add_row(vec![
-            Cell::new(&proc.name),
+            Cell::new(sanitize_terminal(&proc.name)),
             Cell::new(proc.pid.to_string()),
             mem_cell,
         ]);
@@ -267,9 +322,9 @@ fn render_databases(report: &AgentReport) {
     for db in &report.databases {
         let db_size_gb = db.size_mb as f64 / 1024.0;
         t_dbs.add_row(vec![
-            &db.engine,
-            &db.version,
-            &db.data_dir,
+            sanitize_terminal(&db.engine).as_str(),
+            sanitize_terminal(&db.version).as_str(),
+            sanitize_terminal(&db.data_dir).as_str(),
             &format!("{:.2}", db_size_gb),
         ]);
     }
@@ -277,7 +332,6 @@ fn render_databases(report: &AgentReport) {
 }
 
 fn render_security_health(report: &AgentReport) {
-    // Build list of suppressed sysctl issues from the new finding model
     let scored = crate::scoring::score(crate::scoring::evaluate(report));
     let suppressed_evidence: std::collections::HashSet<&str> = scored
         .findings
@@ -317,7 +371,7 @@ fn render_security_health(report: &AgentReport) {
 
     t_risk.add_row(vec![
         Cell::new("SSH Config Source"),
-        Cell::new(&report.security.ssh_config_source),
+        Cell::new(sanitize_terminal(&report.security.ssh_config_source)),
     ]);
 
     let f2b = if report.security.fail2ban_active {
@@ -334,7 +388,6 @@ fn render_security_health(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("Auditd"), audit]);
 
-    // NTP row (always visible)
     let ntp_cell = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
         (true, Some(ms)) if ms > 100.0 => {
             Cell::new(format!("Synced ({:.1}ms — high offset)", ms)).fg(Color::Yellow)
@@ -375,7 +428,6 @@ fn render_security_health(report: &AgentReport) {
         t_risk.add_row(vec![Cell::new("Sudoers Permissions"), sudo_perm]);
     }
 
-    // Sysctl Issues – show only those that are NOT suppressed
     let visible_sysctl: Vec<&str> = report
         .security
         .sysctl_issues
@@ -386,9 +438,15 @@ fn render_security_health(report: &AgentReport) {
     if !visible_sysctl.is_empty() {
         t_risk.add_row(vec![
             Cell::new("Sysctl Issues"),
-            Cell::new(visible_sysctl.join("; "))
-                .fg(Color::Red)
-                .add_attribute(Attribute::Bold),
+            Cell::new(
+                visible_sysctl
+                    .iter()
+                    .map(|s| sanitize_terminal(s))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold),
         ]);
     }
 
@@ -411,14 +469,32 @@ fn render_security_health(report: &AgentReport) {
             .fg(Color::Red)
             .add_attribute(Attribute::Bold)
     } else {
-        Cell::new(report.host.backup_tools.join(", ")).fg(Color::Green)
+        Cell::new(
+            report
+                .host
+                .backup_tools
+                .iter()
+                .map(|t| sanitize_terminal(t))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+        .fg(Color::Green)
     };
     t_risk.add_row(vec![Cell::new("Backup Tools"), backup_status]);
 
     if !report.host.failed_services.is_empty() {
         t_risk.add_row(vec![
             Cell::new("Failed Services"),
-            Cell::new(report.host.failed_services.join(", ")).fg(Color::Red),
+            Cell::new(
+                report
+                    .host
+                    .failed_services
+                    .iter()
+                    .map(|s| sanitize_terminal(s))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+            .fg(Color::Red),
         ]);
     }
 
@@ -426,7 +502,7 @@ fn render_security_health(report: &AgentReport) {
     if !report.host.dmesg_errors.is_empty() {
         println!("\x1b[1;31m[!] Critical Kernel Logs (dmesg):\x1b[0m");
         for err in &report.host.dmesg_errors {
-            println!("    {}", err);
+            println!("    {}", sanitize_terminal(err));
         }
         println!();
     }
@@ -462,11 +538,11 @@ fn render_storage(report: &AgentReport) {
             .clone()
             .unwrap_or_else(|| "-".to_string());
         t_store.add_row(vec![
-            Cell::new(&disk.mount_point),
+            Cell::new(sanitize_terminal(&disk.mount_point)),
             Cell::new(disk.total_gb.to_string()),
             Cell::new(disk.used_gb.to_string()),
             usage_cell,
-            Cell::new(inode_val),
+            Cell::new(sanitize_terminal(&inode_val)),
         ]);
     }
     println!("{t_store}\n");
@@ -493,10 +569,10 @@ fn render_network_listeners(report: &AgentReport) {
             continue;
         }
         let exposed = p.bind_address == "0.0.0.0" || p.bind_address == "::";
-        let mut addr_cell = Cell::new(&p.bind_address);
+        let mut addr_cell = Cell::new(sanitize_terminal(&p.bind_address));
         let mut port_cell = Cell::new(&p.port);
         let mut proto_cell = Cell::new(&p.protocol);
-        let mut proc_cell = Cell::new(&p.process);
+        let mut proc_cell = Cell::new(sanitize_terminal(&p.process));
         if exposed {
             addr_cell = addr_cell.fg(Color::Red);
             port_cell = port_cell.fg(Color::Red);
@@ -537,8 +613,8 @@ fn render_ssl_certificates(report: &AgentReport) {
             None => Cell::new("unknown").fg(Color::DarkGrey),
         };
         t_ssl.add_row(vec![
-            Cell::new(&cert.domain),
-            Cell::new(&cert.expiry_date),
+            Cell::new(sanitize_terminal(&cert.domain)),
+            Cell::new(sanitize_terminal(&cert.expiry_date)),
             days_cell,
         ]);
     }
@@ -568,9 +644,9 @@ fn render_shell_users(report: &AgentReport) {
             keys_cell = keys_cell.fg(Color::Yellow);
         }
         t_users.add_row(vec![
-            Cell::new(&u.username),
-            Cell::new(&u.last_login),
-            Cell::new(&u.last_ssh_login),
+            Cell::new(sanitize_terminal(&u.username)),
+            Cell::new(sanitize_terminal(&u.last_login)),
+            Cell::new(sanitize_terminal(&u.last_ssh_login)),
             keys_cell,
         ]);
     }
@@ -606,14 +682,16 @@ fn render_system_internals(report: &AgentReport) {
     if !report.network.custom_host_overrides.is_empty() {
         println!("\x1b[1;33m[!] Found Custom /etc/hosts Overrides:\x1b[0m");
         for host in &report.network.custom_host_overrides {
-            println!("    - {}", host);
+            println!("    - {}", sanitize_terminal(host));
         }
         println!();
     }
     if !report.host.cron_jobs.is_empty() {
         println!("\x1b[1;33m[!] Found Shadow Cronjobs:\x1b[0m");
         for cron in &report.host.cron_jobs {
-            let display_cron = cron.replace("root", "\x1b[1;31mroot\x1b[0m");
+            // Keep the `root` highlighting intact; sanitise the whole string first
+            let safe_cron = sanitize_terminal(cron);
+            let display_cron = safe_cron.replace("root", "\x1b[1;31mroot\x1b[0m");
             println!("    - {}", display_cron);
         }
         println!();
@@ -706,9 +784,9 @@ fn render_packages(report: &AgentReport) {
                 Cell::new("-")
             };
             t_upg.add_row(vec![
-                Cell::new(&pkg.name),
-                Cell::new(&pkg.current_version),
-                Cell::new(&pkg.new_version),
+                Cell::new(sanitize_terminal(&pkg.name)),
+                Cell::new(sanitize_terminal(&pkg.current_version)),
+                Cell::new(sanitize_terminal(&pkg.new_version)),
                 sec_cell,
             ]);
         }
@@ -729,12 +807,13 @@ fn truncate_docker_mounts(mounts: &[String], max_width: usize) -> String {
     mounts
         .iter()
         .map(|m| {
-            if m.len() > max_width {
+            let safe = sanitize_terminal(m);
+            if safe.len() > max_width {
                 let trunc_len = max_width.saturating_sub(3);
-                let truncated: String = m.chars().take(trunc_len).collect();
+                let truncated: String = safe.chars().take(trunc_len).collect();
                 format!("{}...", truncated)
             } else {
-                m.clone()
+                safe
             }
         })
         .collect::<Vec<String>>()
@@ -807,7 +886,7 @@ fn render_docker(report: &AgentReport) {
             if d_size_gb > 1.0 {
                 size_cell = size_cell.fg(Color::Yellow);
             }
-            t_dang.add_row(vec![Cell::new(&d.id), size_cell]);
+            t_dang.add_row(vec![Cell::new(sanitize_terminal(&d.id)), size_cell]);
         }
         println!("Top Dangling Images:");
         println!(
@@ -832,7 +911,7 @@ fn render_docker(report: &AgentReport) {
             Cell::new("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
         ]);
         for c in &report.topology.containers {
-            let mut status_cell = Cell::new(&c.status);
+            let mut status_cell = Cell::new(sanitize_terminal(&c.status));
             if c.state == "running" {
                 status_cell = status_cell.fg(Color::Green);
             } else if c.state == "exited" {
@@ -845,7 +924,6 @@ fn render_docker(report: &AgentReport) {
                 log_cell = log_cell.fg(Color::Red);
             }
 
-            // M-2: Use the single source of truth from ContainerInfo
             let issue_list = c.security_issues();
             let issue_str = if issue_list.is_empty() {
                 "-".to_string()
@@ -855,17 +933,16 @@ fn render_docker(report: &AgentReport) {
             let issue_cell = if issue_str == "-" {
                 Cell::new(issue_str)
             } else {
-                Cell::new(issue_str)
+                Cell::new(sanitize_terminal(&issue_str))
                     .fg(Color::Red)
                     .add_attribute(Attribute::Bold)
             };
 
-            // Truncate long mount paths for terminal readability (keep beginning, cap at 80 chars)
             let mounts_display = truncate_docker_mounts(&c.mounts, 80);
             let mounts_cell = Cell::new(mounts_display).fg(Color::DarkGrey);
 
             t_docker.add_row(vec![
-                Cell::new(&c.name),
+                Cell::new(sanitize_terminal(&c.name)),
                 status_cell,
                 Cell::new(format!("{:.2}", c_size_gb)),
                 log_cell,

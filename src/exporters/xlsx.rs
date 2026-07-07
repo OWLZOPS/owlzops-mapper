@@ -1,6 +1,21 @@
 use crate::models::{AgentReport, DiffReport, MultiHostDiff, PackageManager, Severity};
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksheet, XlsxError};
 
+// ---------------------------------------------------------------------------
+// XLSX formula injection guard
+// ---------------------------------------------------------------------------
+
+/// Prefix a string with `'` if it starts with a character that might be
+/// interpreted as a formula (`=`, `+`, `-`, `@`) by Excel / LibreOffice.
+/// All attacker‑controlled strings written to a workbook MUST pass through
+/// this function (see PIVOT-2 in threat model).
+fn sanitize_xlsx(s: &str) -> String {
+    match s.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') => format!("'{}", s),
+        _ => s.to_string(),
+    }
+}
+
 // =====================================================================
 // Pre-allocated formats (single allocation for the whole workbook)
 // =====================================================================
@@ -191,8 +206,13 @@ impl<'a> SheetWriter<'a> {
 
     fn write_header(&mut self, headers: &[&str]) -> Result<(), XlsxError> {
         for (col, h) in headers.iter().enumerate() {
-            self.sheet
-                .write_string_with_format(self.row, col as u16, *h, &self.fmts.header)?;
+            // Headers are static, no injection risk, but sanitize for consistency
+            self.sheet.write_string_with_format(
+                self.row,
+                col as u16,
+                sanitize_xlsx(h),
+                &self.fmts.header,
+            )?;
             self.observe_width(col, h);
         }
         self.next_row();
@@ -207,10 +227,10 @@ impl<'a> SheetWriter<'a> {
     ) -> Result<(), XlsxError> {
         let band = self.fmts.row_band(self.row);
         self.sheet
-            .write_string_with_format(self.row, 0, key, band)?;
+            .write_string_with_format(self.row, 0, sanitize_xlsx(key), band)?;
         let fmt = value_fmt.unwrap_or(band);
         self.sheet
-            .write_string_with_format(self.row, 1, value, fmt)?;
+            .write_string_with_format(self.row, 1, sanitize_xlsx(value), fmt)?;
 
         self.observe_width(0, key);
         self.observe_width(1, value);
@@ -220,7 +240,7 @@ impl<'a> SheetWriter<'a> {
 
     fn write_string(&mut self, col: usize, value: &str, fmt: &Format) -> Result<(), XlsxError> {
         self.sheet
-            .write_string_with_format(self.row, col as u16, value, fmt)?;
+            .write_string_with_format(self.row, col as u16, sanitize_xlsx(value), fmt)?;
         self.observe_width(col, value);
         Ok(())
     }
@@ -235,8 +255,12 @@ impl<'a> SheetWriter<'a> {
 
     #[allow(dead_code)]
     fn write_section_title(&mut self, title: &str) -> Result<(), XlsxError> {
-        self.sheet
-            .write_string_with_format(self.row, 0, title, &self.fmts.header)?;
+        self.sheet.write_string_with_format(
+            self.row,
+            0,
+            sanitize_xlsx(title),
+            &self.fmts.header,
+        )?;
         self.next_row();
         Ok(())
     }
@@ -311,7 +335,7 @@ fn write_headers_at(
     header_fmt: &Format,
 ) -> Result<(), XlsxError> {
     for (col, h) in headers.iter().enumerate() {
-        sheet.write_string_with_format(row, col as u16, *h, header_fmt)?;
+        sheet.write_string_with_format(row, col as u16, sanitize_xlsx(h), header_fmt)?;
     }
     Ok(())
 }
@@ -356,7 +380,7 @@ pub fn sheet_executive_summary(
         sheet.write_string_with_format(
             current_row,
             1,
-            format!("{}/100", report.risk_score),
+            sanitize_xlsx(&format!("{}/100", report.risk_score)),
             &large_score_fmt,
         )?;
         data.push(vec![
@@ -414,13 +438,13 @@ pub fn sheet_executive_summary(
 
         for (label, value, ok) in &metrics {
             let band = fmts.row_band(current_row);
-            sheet.write_string_with_format(current_row, 0, *label, band)?;
+            sheet.write_string_with_format(current_row, 0, sanitize_xlsx(label), band)?;
             let status_fmt = if *ok {
                 fmts.ok_band(current_row)
             } else {
                 fmts.critical_band(current_row)
             };
-            sheet.write_string_with_format(current_row, 1, value, status_fmt)?;
+            sheet.write_string_with_format(current_row, 1, sanitize_xlsx(value), status_fmt)?;
             data.push(vec![label.to_string(), value.clone()]);
             current_row += 1;
         }
@@ -469,7 +493,7 @@ pub fn sheet_executive_summary(
             current_row += 1;
             for c in &criticals {
                 let band = fmts.row_band(current_row);
-                sheet.write_string_with_format(current_row, 0, *c, band)?;
+                sheet.write_string_with_format(current_row, 0, sanitize_xlsx(c), band)?;
                 data.push(vec![c.to_string(), String::new()]);
                 current_row += 1;
             }
@@ -538,7 +562,7 @@ pub fn sheet_executive_summary(
             sheet.write_string_with_format(
                 current_row,
                 0,
-                &report.host.hostname,
+                sanitize_xlsx(&report.host.hostname),
                 &host_cell_fmt,
             )?;
 
@@ -1414,9 +1438,17 @@ pub fn write_diff_sheet(
 
     for (i, change) in report.changes.iter().enumerate() {
         let row = (i + 1) as u32;
-        sheet.write(row, 0, &change.field)?;
-        sheet.write(row, 1, change.before.as_deref().unwrap_or("-"))?;
-        sheet.write(row, 2, change.after.as_deref().unwrap_or("-"))?;
+        sheet.write(row, 0, sanitize_xlsx(&change.field))?;
+        sheet.write(
+            row,
+            1,
+            sanitize_xlsx(change.before.as_deref().unwrap_or("-")),
+        )?;
+        sheet.write(
+            row,
+            2,
+            sanitize_xlsx(change.after.as_deref().unwrap_or("-")),
+        )?;
 
         let (sev_text, fmt) = match change.severity {
             Severity::Improved => ("Improved", &green),
@@ -1457,10 +1489,18 @@ pub fn write_multi_diff_xlsx(
     let mut row = 1u32;
     for mh in diffs {
         for change in &mh.diff.changes {
-            sheet.write(row, 0, &mh.hostname)?;
-            sheet.write(row, 1, &change.field)?;
-            sheet.write(row, 2, change.before.as_deref().unwrap_or("-"))?;
-            sheet.write(row, 3, change.after.as_deref().unwrap_or("-"))?;
+            sheet.write(row, 0, sanitize_xlsx(&mh.hostname))?;
+            sheet.write(row, 1, sanitize_xlsx(&change.field))?;
+            sheet.write(
+                row,
+                2,
+                sanitize_xlsx(change.before.as_deref().unwrap_or("-")),
+            )?;
+            sheet.write(
+                row,
+                3,
+                sanitize_xlsx(change.after.as_deref().unwrap_or("-")),
+            )?;
             let (sev_text, fmt) = match change.severity {
                 Severity::Improved => ("Improved", &green),
                 Severity::Degraded => ("Degraded", &red),
