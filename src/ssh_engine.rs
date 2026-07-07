@@ -8,6 +8,9 @@ use tokio::process::Command;
 use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
+use crate::safe_io;
+
+const CAP_REMOTE_STDERR: usize = 256 * 1024; // 256 KiB
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -306,11 +309,37 @@ pub async fn run_remote_scan_russh(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code: Option<u32> = None;
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
 
     while let Some(msg) = exec_channel.wait().await {
         match msg {
-            ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
-            ChannelMsg::ExtendedData { ref data, ext: 1 } => stderr.extend_from_slice(data),
+            ChannelMsg::Data { ref data } => {
+                let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
+                if room > 0 {
+                    stdout.extend_from_slice(&data[..data.len().min(room)]);
+                } else if !stdout_truncated {
+                    stdout_truncated = true;
+                    tracing::warn!(
+                        host = %hostname,
+                        "remote stdout exceeded cap ({} bytes), truncating",
+                        safe_io::CAP_CHILD_STDOUT
+                    );
+                }
+            }
+            ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
+                if room > 0 {
+                    stderr.extend_from_slice(&data[..data.len().min(room)]);
+                } else if !stderr_truncated {
+                    stderr_truncated = true;
+                    tracing::warn!(
+                        host = %hostname,
+                        "remote stderr exceeded cap ({} bytes), truncating",
+                        CAP_REMOTE_STDERR
+                    );
+                }
+            }
             ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
             ChannelMsg::Close => break,
             ChannelMsg::Eof => {
