@@ -27,6 +27,6 @@ jobs:
           path-to-document: 'https://github.com/OWLZOPS/owlzops-mapper/blob/main/CLA.md'
           branch: 'cla-signatures'
           # Bots are allowed by default. Your username is intentionally omitted here for the dogfooding test.
-          allowlist: 'allowlist: 'dependabot[bot],github-actions[bot],dependabot,bot*''
+          allowlist: 'dependabot[bot],github-actions[bot],dependabot,bot*,web-flow'
           create-file-commit-message: 'chore: update CLA signatures'
           signed-commit-message: 'chore: $contributorName has signed the CLA'
