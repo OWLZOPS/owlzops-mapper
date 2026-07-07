@@ -49,6 +49,19 @@ sudo ./owlzops-mapper audit
 - **Agentless & air‑gapped** – a single static binary with no runtime dependencies; `--offline` mode guarantees zero outbound calls for restricted environments.
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
+## v0.5.5 (2026-07-07)
+
+### Security
+- R7-05: Implement TOFU + HMAC-SHA1 verification for russh host keys. Store newly accepted keys in `~/.owlzops/known_hosts`. Detect changed keys (`HostKeyChanged`).
+- R7-09: Enable keepalive in russh client config to prevent long scans from timing out.
+- PIVOT-1: Sanitize terminal output to prevent escape sequence injection.
+- PIVOT-2: Prevent XLSX formula injection by prefixing `'` to strings starting with `=`, `+`, `-`, `@`.
+- Hardened child process environment: clear environment (`env_clear`), fixed `PATH`, resolve tools to absolute paths to block `LD_PRELOAD`/`PATH` hijacking.
+
+### Stability
+- Capped reads for `/proc`, `/proc/*/environ`, and child stdout/stderr to prevent OOM on untrusted inputs. Truncation events are reported as scan warnings.
+- Docker scanner: moved synchronous `fs::metadata` out of async runtime into `spawn_blocking` to avoid blocking Tokio executor.
+
 ## Highlights v0.5.4 (production reliability)
 
 - **Scanner isolation restored** – `panic = "abort"` removed; individual scanner panics now degrade gracefully instead of aborting the whole scan.
