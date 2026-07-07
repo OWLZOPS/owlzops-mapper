@@ -46,7 +46,10 @@ impl Default for AgentReport {
     }
 }
 
+// Added #[serde(default)] to allow older snapshot formats
+// to be deserialised even if new fields are missing.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct HostInfo {
     pub hostname: String,
     pub external_ipv4: String,
@@ -261,7 +264,7 @@ pub struct PackagesInfo {
     pub cache_refreshed: bool,
 }
 
-// ── Diff model (compare v2) ─────────────────────────────────
+// Diff model (compare v2)
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotMeta {
@@ -320,7 +323,7 @@ pub struct MultiHostDiff {
     pub diff: DiffReport,
 }
 
-// --- IAM & Access Alignment Models ---
+// IAM & Access Alignment Models
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SshKeyAudit {
@@ -349,12 +352,12 @@ pub struct AccessAuditResult {
     pub sudoers_nopasswd_all: Vec<SudoersEntry>,
 }
 
-// --- DLP & Secret Hygiene Models ---
+// DLP & Secret Hygiene Models
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SecretLeak {
     pub pid: u32,
     pub process: String,
-    pub source: String,      // "environ" или "cmdline"
-    pub matched_key: String, // имя скомпрометированной переменной/флага
+    pub source: String,      // "environ" or "cmdline"
+    pub matched_key: String, // compromised variable/flag name
 }
