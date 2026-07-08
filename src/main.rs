@@ -13,6 +13,7 @@ mod ssh_engine;
 mod ui;
 mod utils;
 
+use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use models::{AgentReport, HostDiffStatus};
@@ -52,10 +53,6 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     }
 
     if flags.has_critical() { 1 } else { 0 }
-}
-
-const fn host_budget_secs(t: u64) -> u64 {
-    t.saturating_mul(2).saturating_add(60)
 }
 
 async fn run_remote_scan_with_timeout(
