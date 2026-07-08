@@ -146,30 +146,45 @@ fn gather_sudo_nopasswd() -> Vec<String> {
     let mut files = vec!["/etc/sudoers".to_string()];
     if let Ok(dir) = fs::read_dir("/etc/sudoers.d") {
         for entry in dir.flatten() {
-            if entry.path().is_file() && !entry.file_name().to_string_lossy().starts_with('.') {
-                files.push(entry.path().display().to_string());
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Strictly follow sudoers(5): ignore files containing '.' or ending with '~'
+            if !name.contains('.') && !name.ends_with('~') {
+                files.push(path.display().to_string());
             }
         }
     }
 
     for file in files {
-        if let Ok((contents, truncated)) = safe_io::read_file_capped(&file, 4 * 1024 * 1024) {
-            if truncated {
-                coverage::record(format!("sudoers file {} truncated", file));
-            }
-            for line in contents.lines() {
-                let l = line.trim();
-                if l.is_empty() || l.starts_with('#') {
-                    continue;
+        match safe_io::read_file_capped(&file, 4 * 1024 * 1024) {
+            Ok((contents, truncated)) => {
+                if truncated {
+                    coverage::record(format!("sudoers file {} truncated", file));
                 }
-                if l.to_lowercase().contains("nopasswd") {
-                    // Exclude entries that are exclusively for the scanner itself,
-                    // to avoid flagging our own remote scanning capability.
-                    if is_self_only_sudo_line(l) {
+                for line in contents.lines() {
+                    let l = line.trim();
+                    if l.is_empty() || l.starts_with('#') {
                         continue;
                     }
-                    entries.push(format!("{}: {}", file, l));
+                    if l.to_lowercase().contains("nopasswd") {
+                        // Exclude entries that are exclusively for the scanner itself,
+                        // to avoid flagging our own remote scanning capability.
+                        if is_self_only_sudo_line(l) {
+                            continue;
+                        }
+                        entries.push(format!("{}: {}", file, l));
+                    }
                 }
+            }
+            Err(e) => {
+                // Log EACCES etc. so they appear in coverage_warnings
+                coverage::record(format!(
+                    "sudoers file {} unreadable ({}) — NOPASSWD audit incomplete",
+                    file, e
+                ));
             }
         }
     }

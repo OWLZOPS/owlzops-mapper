@@ -13,6 +13,8 @@ pub struct AgentReport {
     pub risk_score: u8,
     pub is_root_execution: bool,
     pub scan_warnings: Vec<String>,
+    #[serde(default)]
+    pub coverage_warnings: Vec<String>,
     #[serde(default = "default_scoring_version")]
     pub scoring_version: u8,
     pub host: HostInfo,
@@ -34,6 +36,7 @@ impl Default for AgentReport {
             risk_score: 0,
             is_root_execution: false,
             scan_warnings: Vec::new(),
+            coverage_warnings: Vec::new(),
             scoring_version: 1,
             host: HostInfo::default(),
             databases: Vec::new(),
