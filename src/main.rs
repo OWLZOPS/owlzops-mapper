@@ -456,7 +456,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         eprintln!("Error: --output is required for Excel format");
                         std::process::exit(1);
                     });
-                    compare::write_diff_xlsx(&diff, path.to_str().unwrap()).unwrap_or_else(|e| {
+                    compare::write_diff_xlsx(&diff, &path.to_string_lossy()).unwrap_or_else(|e| {
                         eprintln!("Failed to write Excel diff: {e}");
                         std::process::exit(1);
                     });
@@ -544,7 +544,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         });
                         crate::exporters::xlsx::write_multi_diff_xlsx(
                             &diffs,
-                            path.to_str().unwrap(),
+                            &path.to_string_lossy(),
                         )
                         .unwrap_or_else(|e| {
                             eprintln!("Failed to write multi-host Excel diff: {e}");
@@ -598,7 +598,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         eprintln!("Error: --output is required for Excel format");
                         std::process::exit(1);
                     });
-                    compare::write_diff_xlsx(&diff, path.to_str().unwrap()).unwrap_or_else(|e| {
+                    compare::write_diff_xlsx(&diff, &path.to_string_lossy()).unwrap_or_else(|e| {
                         eprintln!("Failed to write Excel diff: {e}");
                         std::process::exit(1);
                     });
