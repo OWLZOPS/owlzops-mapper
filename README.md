@@ -50,14 +50,14 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
 
-### v0.5.6 (2026-07-08)
+### v0.5.7 (2026-07-08)
 
 **Security**
 - R8-01: Cap remote stdout/stderr in russh path to prevent OOM from untrusted hosts.
 - R8-02: Fix false `HostKeyChanged` when multiple key types exist in known_hosts.
 - R8-05: Include exact known_hosts file path in host key error messages.
 - R8-07: Set `stdin(Stdio::null())` on child processes to prevent terminal hijacking.
-- R8-08: Handle SIGTERM and improve SIGINT with graceful shutdown.
+- R8-08: Handle SIGTERM and improve SIGINT with graceful shutdown, abort active SSH sessions immediately.
 
 **Stability & Compatibility**
 - R8-03: Cap child stderr at 1 MiB in legacy SSH path.
@@ -65,14 +65,24 @@ sudo ./owlzops-mapper audit
 - R8-06: Add `#[serde(default)]` to `HostInfo` for forward compatibility with older snapshots.
 
 **Performance & Hygiene**
+- Replace external SCP/SSH upload with internal russh channel – real-time progress bar, no dependency on system `scp`.
 - N8-1: Avoid extra UTF-8 allocation in `read_file_capped`.
 - N8-2: Replace `Vec<&str>` collection in `/proc/net` parser with an iterator.
 - N8-3: Deduplicate listening ports using a `HashSet`.
 - N8-5: Include accurate hostname in `RemoteError::Ssh` errors.
 - N8-6: Use `safe_io` for `/proc/<pid>/comm` reads in DLP scanner.
-- N8-7: Replace static progress bar with an animated spinner during SCP upload.
+- N8-7: Progress bar for file upload replaced with animated spinner (legacy) or real-time progress (russh).
 
-## v0.5.5 (2026-07-07)
+
+---
+
+<details>
+<summary>Previous releases (v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
+
+### v0.5.6 (2026-07-08)
+*(identical to 0.5.7 except for the SCP replacement and abort_all improvements)*
+
+### v0.5.5 (2026-07-07)
 
 ### Security
 - R7-05: Implement TOFU + HMAC-SHA1 verification for russh host keys. Store newly accepted keys in `~/.owlzops/known_hosts`. Detect changed keys (`HostKeyChanged`).
@@ -84,12 +94,6 @@ sudo ./owlzops-mapper audit
 ### Stability
 - Capped reads for `/proc`, `/proc/*/environ`, and child stdout/stderr to prevent OOM on untrusted inputs. Truncation events are reported as scan warnings.
 - Docker scanner: moved synchronous `fs::metadata` out of async runtime into `spawn_blocking` to avoid blocking Tokio executor.
-
-
----
-
-<details>
-<summary>Previous releases (v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
 
 ## Highlights v0.5.4 (production reliability)
 
