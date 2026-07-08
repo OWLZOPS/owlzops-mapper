@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
 use zeroize::Zeroizing;
 
@@ -98,7 +98,7 @@ fn raise_nofile_limit() {
     }
 }
 
-async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
+async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> i32 {
     match cli.command {
         Commands::Audit(args) => {
             let mut hosts: Vec<String> = Vec::new();
@@ -298,22 +298,33 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                         });
                     }
 
-                    while let Some(result) = join_set.join_next().await {
-                        if shutdown.load(Ordering::Relaxed) {
-                            join_set.abort_all();
-                            break;
-                        }
-                        match result {
-                            Ok(Some(report)) => {
-                                if let Some(sender) = &tx {
-                                    let _ = sender.send(report).await;
-                                } else {
-                                    reports.push(report);
+                    // Process results with immediate abort on shutdown signal
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_notify.notified() => {
+                                join_set.abort_all();
+                                break;
+                            }
+                            res = join_set.join_next() => {
+                                match res {
+                                    Some(result) => {
+                                        match result {
+                                            Ok(Some(report)) => {
+                                                if let Some(sender) = &tx {
+                                                    let _ = sender.send(report).await;
+                                                } else {
+                                                    reports.push(report);
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
+                                            Err(e) => warn!("scan task failed: {e}"),
+                                        }
+                                    }
+                                    None => break,
                                 }
                             }
-                            Ok(None) => {}
-                            Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
-                            Err(e) => warn!("scan task failed: {e}"),
                         }
                     }
                 }
@@ -322,18 +333,23 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                     drop(tx);
                 }
                 if let Some(writer) = writer_task {
-                    match tokio::time::timeout(Duration::from_secs(2), writer).await {
-                        Ok(Ok((written, worst))) => {
-                            return if written == 0 { 2 } else { worst.min(2) };
+                    let joined = if shutdown.load(Ordering::Relaxed) {
+                        match tokio::time::timeout(Duration::from_secs(2), writer).await {
+                            Ok(r) => r,
+                            Err(_) => {
+                                warn!(
+                                    "JSONL writer timed out during shutdown, output may be incomplete"
+                                );
+                                return 2;
+                            }
                         }
-                        Ok(Err(_)) => {
-                            warn!("JSONL writer task failed");
-                            return 2;
-                        }
+                    } else {
+                        writer.await
+                    };
+                    match joined {
+                        Ok((written, worst)) => return if written == 0 { 2 } else { worst.min(2) },
                         Err(_) => {
-                            warn!(
-                                "JSONL writer timed out during shutdown, output may be incomplete"
-                            );
+                            warn!("JSONL writer task failed");
                             return 2;
                         }
                     }
@@ -609,9 +625,11 @@ async fn main() {
 
     let cli = Cli::parse();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
+    let shutdown_notify_clone = shutdown_notify.clone();
 
-    let mut cmd_handle = tokio::spawn(run_command(cli, shutdown_clone));
+    let mut cmd_handle = tokio::spawn(run_command(cli, shutdown_clone, shutdown_notify_clone));
 
     // Listen for SIGINT (Ctrl+C) and SIGTERM
     let mut sig_int = signal::unix::signal(signal::unix::SignalKind::interrupt())
@@ -638,6 +656,7 @@ async fn main() {
         _ = sig_int.recv() => {
             eprintln!("Received interrupt signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
+            shutdown_notify.notify_waiters();
             // Wait up to 5 seconds for tasks to finish, then force exit
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
@@ -651,6 +670,7 @@ async fn main() {
         _ = sig_term.recv() => {
             eprintln!("Received termination signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
+            shutdown_notify.notify_waiters();
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
                 _ => {

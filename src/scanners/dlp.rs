@@ -1,5 +1,6 @@
 use crate::models::SecretLeak;
 use crate::{coverage, safe_io};
+use std::fmt::Write;
 use std::fs;
 
 const SENSITIVE_KEYS: &[&str] = &[
@@ -19,18 +20,6 @@ const SENSITIVE_KEYS: &[&str] = &[
 
 const SENSITIVE_FLAGS: &[&str] = &["--password=", "-p=", "--token=", "--secret="];
 
-fn extract_process_name(pid: u32) -> String {
-    let path = format!("/proc/{}/comm", pid);
-    safe_io::read_file_capped(&path, 4096)
-        .map(|(s, truncated)| {
-            if truncated {
-                coverage::record(format!("/proc/{}/comm truncated", pid));
-            }
-            s.trim().to_string()
-        })
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
@@ -42,6 +31,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         return leaks;
     };
 
+    // Reusable buffer for constructing /proc/<pid>/... paths
+    let mut path_buf = String::with_capacity(64);
+
     for entry in entries.flatten() {
         let Ok(file_name) = entry.file_name().into_string() else {
             continue;
@@ -50,19 +42,30 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
             continue;
         };
 
-        let process_name = extract_process_name(pid);
+        // Process name
+        path_buf.clear();
+        let _ = write!(path_buf, "/proc/{}/comm", pid);
+        let process_name = safe_io::read_file_capped(&path_buf, 4096)
+            .map(|(s, truncated)| {
+                if truncated {
+                    coverage::record(format!("{} truncated", path_buf));
+                }
+                s.trim().to_string()
+            })
+            .unwrap_or_else(|_| "unknown".to_string());
 
         if process_name.is_empty() || process_name.starts_with("kworker") {
             continue;
         }
 
         // 1. Environment Variables
-        let env_path = format!("/proc/{}/environ", pid);
+        path_buf.clear();
+        let _ = write!(path_buf, "/proc/{}/environ", pid);
         if let Ok((env_data, truncated)) =
-            safe_io::read_file_bytes_capped(&env_path, safe_io::CAP_PROC_ENVIRON)
+            safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON)
         {
             if truncated {
-                coverage::record(format!("/proc/{}/environ truncated", pid));
+                coverage::record(format!("{} truncated", path_buf));
             }
             for chunk in env_data.split(|&b| b == 0) {
                 let Ok(env_var) = std::str::from_utf8(chunk) else {
@@ -87,12 +90,13 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         }
 
         // 2. Command Line Arguments
-        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        path_buf.clear();
+        let _ = write!(path_buf, "/proc/{}/cmdline", pid);
         if let Ok((cmd_data, truncated)) =
-            safe_io::read_file_bytes_capped(&cmdline_path, safe_io::CAP_PROC_ENVIRON)
+            safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON)
         {
             if truncated {
-                coverage::record(format!("/proc/{}/cmdline truncated", pid));
+                coverage::record(format!("{} truncated", path_buf));
             }
             for chunk in cmd_data.split(|&b| b == 0) {
                 let Ok(arg) = std::str::from_utf8(chunk) else {
