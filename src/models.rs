@@ -234,7 +234,9 @@ pub struct UserInfo {
     pub authorized_keys_count: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+// PackageManager with forward-compatible deserialization:
+// unknown variants map to `Unknown` so old binaries can read future snapshots.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Default)]
 pub enum PackageManager {
     Apt,
     Dnf,
@@ -243,6 +245,23 @@ pub enum PackageManager {
     Zypper,
     #[default]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for PackageManager {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "Apt" => PackageManager::Apt,
+            "Dnf" => PackageManager::Dnf,
+            "Yum" => PackageManager::Yum,
+            "Pacman" => PackageManager::Pacman,
+            "Zypper" => PackageManager::Zypper,
+            _ => PackageManager::Unknown,
+        })
+    }
 }
 
 impl PackageManager {
