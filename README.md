@@ -50,6 +50,26 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
 
+### v0.5.9 (2026-07-08)
+
+**Observability**
+- Coverage warnings (truncated files, inaccessible /proc entries) are now displayed in both terminal and Excel reports.
+- Port attribution failures due to permission errors are now aggregated and reported as a coverage warning.
+
+**Reliability & Compatibility**
+- Fixed a lost‑signal edge case in graceful shutdown by switching from `notify_waiters` to `notify_one`.
+- Replaced `unwrap()` on output file paths with `to_string_lossy()` to prevent panics on non‑UTF‑8 paths.
+- `PackageManager` deserialization now maps unknown future variants to `Unknown` for forward compatibility.
+
+**Hygiene**
+- Removed ineffective `debug = "limited"` from the release profile.
+- Unified timeout budget calculation (`host_budget_secs`) shared between fleet orchestrator and russh engine.
+
+---
+
+<details>
+<summary>Previous releases (v0.5.8, v0.5.7, v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
+
 ### v0.5.8 (2026-07-08)
 
 **Observability & Correctness**
@@ -65,6 +85,8 @@ sudo ./owlzops-mapper audit
 - R9-06: The legacy SSH path (`run_remote_scan`) now uses `split_host_port` and passes ports explicitly to `ssh`/`scp`. IPv6 addresses are correctly bracketed for SCP.
 - R9-07: The TOFU trust store no longer falls back to `/tmp` when `$HOME` is unset. The mapper fails with a clear error instead of using a world‑writable directory.
 - DLP scanner now reuses a single `String` buffer for path construction, reducing per‑process allocations.
+
+
 
 ### v0.5.7 (2026-07-08)
 
@@ -90,10 +112,6 @@ sudo ./owlzops-mapper audit
 - N8-7: Progress bar for file upload replaced with animated spinner (legacy) or real-time progress (russh).
 
 
----
-
-<details>
-<summary>Previous releases (v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
 
 ### v0.5.6 (2026-07-08)
 *(identical to 0.5.7 except for the SCP replacement and abort_all improvements)*
