@@ -50,6 +50,22 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
 
+### v0.5.8 (2026-07-08)
+
+**Observability & Correctness**
+- R9-01: Coverage warnings (truncated files, inaccessible /proc entries) are now reported in the audit output (`coverage_warnings` field).
+- R9-02: Binary upload via the russh channel now waits for the remote command to finish and checks its exit status. Failures (disk full, permissions) are surfaced as `UploadFailed` errors.
+- R9-05: Sudoers file filtering now follows `sudoers(5)` rules exactly (files containing `.` or ending with `~` are ignored). Read errors are logged as coverage warnings.
+
+**Fleet Orchestration**
+- R9-03: The JSONL writer is no longer subject to a hard 2‑second timeout on success; it drains completely. The timeout is only applied during graceful shutdown.
+- R9-04: `SIGINT` / `SIGTERM` now immediately aborts in‑flight SSH sessions via `tokio::sync::Notify` and `JoinSet::abort_all()`, instead of waiting for a task to complete.
+
+**Security & Platform Support**
+- R9-06: The legacy SSH path (`run_remote_scan`) now uses `split_host_port` and passes ports explicitly to `ssh`/`scp`. IPv6 addresses are correctly bracketed for SCP.
+- R9-07: The TOFU trust store no longer falls back to `/tmp` when `$HOME` is unset. The mapper fails with a clear error instead of using a world‑writable directory.
+- DLP scanner now reuses a single `String` buffer for path construction, reducing per‑process allocations.
+
 ### v0.5.7 (2026-07-08)
 
 **Security**
