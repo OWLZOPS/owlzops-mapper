@@ -324,8 +324,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
 
                     while let Some(result) = join_set.join_next().await {
                         if shutdown.load(Ordering::Relaxed) {
-                            // Don't start any new tasks but allow current ones to finish
-                            // The join_set will drain naturally.
+                            join_set.abort_all();
+                            break;
                         }
                         match result {
                             Ok(Some(report)) => {
@@ -346,8 +346,21 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                     drop(tx);
                 }
                 if let Some(writer) = writer_task {
-                    let (written, worst) = writer.await.unwrap_or((0, 2));
-                    return if written == 0 { 2 } else { worst.min(2) };
+                    match tokio::time::timeout(Duration::from_secs(2), writer).await {
+                        Ok(Ok((written, worst))) => {
+                            return if written == 0 { 2 } else { worst.min(2) };
+                        }
+                        Ok(Err(_)) => {
+                            warn!("JSONL writer task failed");
+                            return 2;
+                        }
+                        Err(_) => {
+                            warn!(
+                                "JSONL writer timed out during shutdown, output may be incomplete"
+                            );
+                            return 2;
+                        }
+                    }
                 }
 
                 // Fallback to legacy multi-host output
