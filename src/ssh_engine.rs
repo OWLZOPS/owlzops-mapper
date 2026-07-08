@@ -4,7 +4,6 @@ use russh::*;
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
 use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
@@ -146,123 +145,82 @@ fn split_host_port(host: &str) -> (String, u16) {
     (host.to_string(), 22)
 }
 
-/// Upload the mapper binary to the remote host asynchronously using system scp.
-/// Uses an atomic replace pattern: upload to .tmp, then mv to final path and chmod.
-pub async fn upload_binary_async(
-    host: &str,
-    ssh_user: &str,
-    ssh_key: &str,
+/// Upload a binary file over an existing russh channel by piping `cat > path`
+/// and feeding the file in chunks. Progress bar is updated incrementally.
+async fn upload_via_channel(
+    channel: &mut Channel<client::Msg>,
     local_bin: &str,
     remote_path: &str,
-    timeout_secs: u64,
+    host: &str,
 ) -> Result<(), RemoteError> {
-    let tmp_remote = format!("{}.tmp", remote_path);
+    let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
+        host: host.to_string(),
+        source: e,
+    })?;
+    let file_size = metadata.len();
 
-    // Set up a spinner to indicate upload in progress
-    let pb = ProgressBar::new_spinner();
+    // Setup progress bar
+    let pb = ProgressBar::new(file_size);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg}")
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
             .unwrap()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈"),
+            .progress_chars("#>-"),
     );
-    pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_message(format!("Uploading to {host}"));
 
-    // 1. Remove old temporary file (ignore errors)
-    let _ = Command::new("ssh")
-        .arg("-i")
-        .arg(ssh_key)
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("{}@{}", ssh_user, host))
-        .arg("rm")
-        .arg("-f")
-        .arg(&tmp_remote)
-        .status()
-        .await;
+    // Start remote cat command
+    channel
+        .exec(
+            true,
+            format!(
+                "cat > {}.tmp && mv {}.tmp {} && chmod +x {}",
+                remote_path, remote_path, remote_path, remote_path
+            ),
+        )
+        .await
+        .map_err(|e| RemoteError::from_russh(e, host))?;
 
-    // 2. Upload binary
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_secs / 2),
-        Command::new("scp")
-            .arg("-i")
-            .arg(ssh_key)
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
-            .arg(local_bin)
-            .arg(format!("{}@{}:{}", ssh_user, host, tmp_remote))
-            .output(),
-    )
-    .await
-    .map_err(|_| RemoteError::Timeout {
-        host: host.to_string(),
-    })?
-    .map_err(|e| RemoteError::Io {
+    // Stream file content in chunks
+    let mut file = std::fs::File::open(local_bin).map_err(|e| RemoteError::Io {
         host: host.to_string(),
         source: e,
     })?;
-
-    if !output.status.success() {
-        pb.finish_with_message("Upload failed");
-        return Err(RemoteError::HostKeyCheck {
+    let mut buf = [0u8; 64 * 1024]; // 64 KiB chunks
+    loop {
+        let n = file.read(&mut buf).map_err(|e| RemoteError::Io {
             host: host.to_string(),
-            detail: "SCP returned non-zero exit code".to_string(),
-        });
+            source: e,
+        })?;
+        if n == 0 {
+            break;
+        }
+        channel
+            .data(&buf[..n])
+            .await
+            .map_err(|e| RemoteError::from_russh(e, host))?;
+        pb.inc(n as u64);
     }
-
+    channel
+        .eof()
+        .await
+        .map_err(|e| RemoteError::from_russh(e, host))?;
     pb.finish_with_message("Uploaded");
-
-    // 3. Atomic replace
-    let mv_status = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new("ssh")
-            .arg("-i")
-            .arg(ssh_key)
-            .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
-            .arg("-o")
-            .arg("ConnectTimeout=10")
-            .arg(format!("{}@{}", ssh_user, host))
-            .arg("mv")
-            .arg("-f")
-            .arg(&tmp_remote)
-            .arg(remote_path)
-            .arg("&&")
-            .arg("chmod")
-            .arg("+x")
-            .arg(remote_path)
-            .status(),
-    )
-    .await
-    .map_err(|_| RemoteError::Timeout {
-        host: host.to_string(),
-    })?
-    .map_err(|e| RemoteError::Io {
-        host: host.to_string(),
-        source: e,
-    })?;
-
-    if !mv_status.success() {
-        return Err(RemoteError::HostKeyCheck {
-            host: host.to_string(),
-            detail: "Atomic replace returned non-zero exit code".to_string(),
-        });
-    }
-
     Ok(())
 }
 
-/// Connect to a remote host via russh, execute the audit with `sudo -S`,
-/// and return the raw JSON output.
-/// Binary upload is handled by `upload_binary_async` before calling this function.
+/// Connect to a remote host via russh, upload the binary if needed,
+/// execute the audit with `sudo -S`, and return the raw JSON output.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_remote_scan_russh(
     host: &str,
     ssh_user: &str,
     ssh_key_path: &str,
     remote_path: &str,
     sudo_pass: &Zeroizing<String>,
+    copy_binary: bool,
+    local_bin: Option<&str>,
+    remote_timeout_secs: u64,
 ) -> Result<Vec<u8>, RemoteError> {
     let (hostname, port) = split_host_port(host);
 
@@ -313,105 +271,141 @@ pub async fn run_remote_scan_russh(
         });
     }
 
-    // Execute audit with sudo -S (no binary upload here — caller handles that)
-    let mut exec_channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-    exec_channel
-        .exec(
-            true,
-            format!(
-                "sudo -k -S -p '' -- {} audit --format json --offline",
-                remote_path
-            ),
-        )
-        .await
-        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+    // Apply overall timeout for the rest of the operation.
+    // Clone hostname so the outer scope can still use it for the timeout error.
+    let hostname_for_timeout = hostname.clone();
+    let overall = Duration::from_secs(remote_timeout_secs.saturating_mul(2).saturating_add(60) + 5);
 
-    let mut line = Zeroizing::new(sudo_pass.to_string());
-    line.push('\n');
-    exec_channel
-        .data(line.as_bytes())
-        .await
-        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-    exec_channel
-        .eof()
-        .await
-        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit_code: Option<u32> = None;
-    let mut stdout_truncated = false;
-    let mut stderr_truncated = false;
-
-    while let Some(msg) = exec_channel.wait().await {
-        match msg {
-            ChannelMsg::Data { ref data } => {
-                let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
-                if room > 0 {
-                    stdout.extend_from_slice(&data[..data.len().min(room)]);
-                } else if !stdout_truncated {
-                    stdout_truncated = true;
-                    tracing::warn!(
-                        host = %hostname,
-                        "remote stdout exceeded cap ({} bytes), truncating",
-                        safe_io::CAP_CHILD_STDOUT
-                    );
-                }
-            }
-            ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
-                if room > 0 {
-                    stderr.extend_from_slice(&data[..data.len().min(room)]);
-                } else if !stderr_truncated {
-                    stderr_truncated = true;
-                    tracing::warn!(
-                        host = %hostname,
-                        "remote stderr exceeded cap ({} bytes), truncating",
-                        CAP_REMOTE_STDERR
-                    );
-                }
-            }
-            ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
-            ChannelMsg::Close => break,
-            ChannelMsg::Eof => {
-                // Do not break — ExitStatus arrives after EOF
-            }
-            _ => {}
+    let result = tokio::time::timeout(overall, async {
+        // If binary copy is requested, upload via the same channel
+        if copy_binary {
+            let default_exe = std::path::PathBuf::from("./owlzops-mapper");
+            let current_exe = std::env::current_exe().unwrap_or(default_exe);
+            let current_exe_lossy = current_exe.to_string_lossy();
+            let local = local_bin.unwrap_or(&current_exe_lossy);
+            let mut upload_channel = session
+                .channel_open_session()
+                .await
+                .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+            upload_via_channel(
+                &mut upload_channel,
+                local,
+                remote_path,
+                &hostname_for_timeout,
+            )
+            .await?;
         }
-    }
 
-    match exit_code {
-        Some(code) => {
-            let se = String::from_utf8_lossy(&stderr);
+        // Execute audit with sudo -S
+        let mut exec_channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+        exec_channel
+            .exec(
+                true,
+                format!(
+                    "sudo -k -S -p '' -- {} audit --format json --offline",
+                    remote_path
+                ),
+            )
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
 
-            // 1. Check if sudo rejected the password
-            if se.contains("incorrect password")
-                || se.contains("Sorry, try again")
-                || se.contains("a password is required")
-            {
-                return Err(RemoteError::SudoAuth { host: hostname });
-            }
+        let mut line = Zeroizing::new(sudo_pass.to_string());
+        line.push('\n');
+        exec_channel
+            .data(line.as_bytes())
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+        exec_channel
+            .eof()
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
 
-            // 2. If stdout looks like JSON, the audit succeeded regardless of exit code
-            if !stdout.is_empty() && stdout.starts_with(b"{") {
-                return Ok(stdout);
-            }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code: Option<u32> = None;
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
 
-            // 3. Real failure (no binary, segfault, etc.)
-            if code != 0 {
-                let trimmed: String = se.trim().chars().take(300).collect();
-                Err(RemoteError::NonZeroExit {
-                    host: hostname,
-                    code,
-                    stderr: trimmed,
-                })
-            } else {
-                Ok(stdout)
+        while let Some(msg) = exec_channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } => {
+                    let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
+                    if room > 0 {
+                        stdout.extend_from_slice(&data[..data.len().min(room)]);
+                    } else if !stdout_truncated {
+                        stdout_truncated = true;
+                        tracing::warn!(
+                            host = %hostname_for_timeout,
+                            "remote stdout exceeded cap ({} bytes), truncating",
+                            safe_io::CAP_CHILD_STDOUT
+                        );
+                    }
+                }
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
+                    if room > 0 {
+                        stderr.extend_from_slice(&data[..data.len().min(room)]);
+                    } else if !stderr_truncated {
+                        stderr_truncated = true;
+                        tracing::warn!(
+                            host = %hostname_for_timeout,
+                            "remote stderr exceeded cap ({} bytes), truncating",
+                            CAP_REMOTE_STDERR
+                        );
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+                ChannelMsg::Close => break,
+                ChannelMsg::Eof => {
+                    // Do not break — ExitStatus arrives after EOF
+                }
+                _ => {}
             }
         }
-        None => Err(RemoteError::Timeout { host: hostname }),
+
+        match exit_code {
+            Some(code) => {
+                let se = String::from_utf8_lossy(&stderr);
+
+                // 1. Check if sudo rejected the password
+                if se.contains("incorrect password")
+                    || se.contains("Sorry, try again")
+                    || se.contains("a password is required")
+                {
+                    return Err(RemoteError::SudoAuth {
+                        host: hostname_for_timeout,
+                    });
+                }
+
+                // 2. If stdout looks like JSON, the audit succeeded regardless of exit code
+                if !stdout.is_empty() && stdout.starts_with(b"{") {
+                    return Ok(stdout);
+                }
+
+                // 3. Real failure (no binary, segfault, etc.)
+                if code != 0 {
+                    let trimmed: String = se.trim().chars().take(300).collect();
+                    Err(RemoteError::NonZeroExit {
+                        host: hostname_for_timeout,
+                        code,
+                        stderr: trimmed,
+                    })
+                } else {
+                    Ok(stdout)
+                }
+            }
+            None => Err(RemoteError::Timeout {
+                host: hostname_for_timeout,
+            }),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
     }
 }

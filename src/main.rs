@@ -253,38 +253,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                                 }
                             }
 
-                            let overall = Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
+                            let overall =
+                                Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
                                 if let Some(pw) = &pass {
-                                    if a.copy_binary {
-                                        let default_exe =
-                                            std::path::PathBuf::from("./owlzops-mapper");
-                                        let current_exe =
-                                            std::env::current_exe().unwrap_or(default_exe);
-                                        // R7-10: Safe path handling
-                                        let current_exe_lossy = current_exe.to_string_lossy();
-                                        let local_bin = a
-                                            .local_binary
-                                            .as_deref()
-                                            .unwrap_or(&current_exe_lossy);
-                                        let ssh_key_expanded =
-                                            shellexpand::tilde(&a.ssh_key).to_string();
-                                        if let Err(e) = ssh_engine::upload_binary_async(
-                                            &host,
-                                            &a.ssh_user,
-                                            &ssh_key_expanded,
-                                            local_bin,
-                                            &a.remote_path,
-                                            a.remote_timeout_secs,
-                                        )
-                                            .await
-                                        {
-                                            warn!(host = %host, error = %e, "Failed to upload binary");
-                                            return None;
-                                        }
-                                    }
-
                                     let ssh_key_expanded =
                                         shellexpand::tilde(&a.ssh_key).to_string();
                                     match ssh_engine::run_remote_scan_russh(
@@ -293,8 +266,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                                         &ssh_key_expanded,
                                         &a.remote_path,
                                         pw,
+                                        a.copy_binary,
+                                        a.local_binary.as_deref(),
+                                        a.remote_timeout_secs,
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(stdout) => {
                                             let stdout_str = String::from_utf8_lossy(&stdout);
@@ -309,7 +285,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                                     run_remote_scan_with_timeout(host, a).await.ok().flatten()
                                 }
                             })
-                                .await;
+                            .await;
 
                             match result {
                                 Ok(Some(report)) => Some(report),
@@ -324,8 +300,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
 
                     while let Some(result) = join_set.join_next().await {
                         if shutdown.load(Ordering::Relaxed) {
-                            // Don't start any new tasks but allow current ones to finish
-                            // The join_set will drain naturally.
+                            join_set.abort_all();
+                            break;
                         }
                         match result {
                             Ok(Some(report)) => {
@@ -346,8 +322,21 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                     drop(tx);
                 }
                 if let Some(writer) = writer_task {
-                    let (written, worst) = writer.await.unwrap_or((0, 2));
-                    return if written == 0 { 2 } else { worst.min(2) };
+                    match tokio::time::timeout(Duration::from_secs(2), writer).await {
+                        Ok(Ok((written, worst))) => {
+                            return if written == 0 { 2 } else { worst.min(2) };
+                        }
+                        Ok(Err(_)) => {
+                            warn!("JSONL writer task failed");
+                            return 2;
+                        }
+                        Err(_) => {
+                            warn!(
+                                "JSONL writer timed out during shutdown, output may be incomplete"
+                            );
+                            return 2;
+                        }
+                    }
                 }
 
                 // Fallback to legacy multi-host output

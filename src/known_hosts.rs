@@ -163,3 +163,43 @@ impl KnownHostsChecker {
         Ok(true)
     }
 }
+
+#[test]
+fn verify_matches_exact_key() {
+    let key = russh::keys::ssh_key::PrivateKey::random(
+        &mut rand::rng(),
+        russh::keys::ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
+    let pub_key = key.public_key();
+    let pub_line = pub_key.to_openssh().unwrap();
+    let parts: Vec<_> = pub_line.split_whitespace().collect();
+    let key_type = parts[0];
+    let key_data = parts[1];
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let kh_path = tmp_dir.path().join("known_hosts");
+    std::fs::write(&kh_path, format!("localhost {} {}\n", key_type, key_data)).unwrap();
+
+    let checker = KnownHostsChecker {
+        host: "localhost".into(),
+        port: 22,
+        system_file: kh_path.clone(),
+        pin_file: tmp_dir.path().join("pin"),
+    };
+    assert!(checker.verify(pub_key).is_ok());
+
+    // Change key and expect HostKeyChanged
+    let bad_line = format!("localhost {} AAAA...fake\n", key_type);
+    std::fs::write(&kh_path, bad_line).unwrap();
+    let checker_bad = KnownHostsChecker {
+        host: "localhost".into(),
+        port: 22,
+        system_file: kh_path,
+        pin_file: tmp_dir.path().join("pin2"),
+    };
+    assert!(matches!(
+        checker_bad.verify(pub_key),
+        Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
+    ));
+}

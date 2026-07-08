@@ -49,3 +49,69 @@ pub fn read_reader_capped<R: Read>(mut reader: R, max_bytes: usize) -> (Vec<u8>,
 pub const CAP_PROC_NET: usize = 16 * 1024 * 1024;
 pub const CAP_PROC_ENVIRON: usize = 256 * 1024;
 pub const CAP_CHILD_STDOUT: usize = 32 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_file_capped_normal() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "hello world").unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let (content, truncated) = read_file_capped(path, 100).unwrap();
+        assert_eq!(content, "hello world");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn read_file_capped_truncated() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let data = vec![b'A'; 200];
+        tmp.write_all(&data).unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let (content, truncated) = read_file_capped(path, 100).unwrap();
+        assert_eq!(content.len(), 100);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn read_file_capped_exact() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let data = vec![b'B'; 100];
+        tmp.write_all(&data).unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let (content, truncated) = read_file_capped(path, 100).unwrap();
+        assert_eq!(content.len(), 100);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn read_file_capped_invalid_utf8() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let (content, truncated) = read_file_capped(path, 10).unwrap();
+        assert!(content.contains('\u{FFFD}'));
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn read_reader_capped_truncated() {
+        let data = vec![0u8; 200];
+        let cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_reader_capped(cursor, 100);
+        assert_eq!(buf.len(), 100);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn read_reader_capped_exact() {
+        let data = vec![1u8; 100];
+        let cursor = std::io::Cursor::new(data);
+        let (buf, truncated) = read_reader_capped(cursor, 100);
+        assert_eq!(buf.len(), 100);
+        assert!(!truncated);
+    }
+}

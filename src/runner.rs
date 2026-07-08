@@ -32,11 +32,12 @@ pub fn validate_ssh_user(user: &str) -> Result<(), String> {
 }
 
 /// Validate that a hostname/IP is safe for SSH arguments.
+/// Allows square brackets to support IPv6 addresses like `[::1]:2222`.
 pub fn validate_host(host: &str) -> Result<(), String> {
     if host.is_empty() || host.starts_with('-') {
         return Err(format!("invalid host: '{host}'"));
     }
-    if host.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_.:".contains(c)) {
+    if host.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_.:[]".contains(c)) {
         return Err(format!("host contains unexpected characters: '{host}'"));
     }
     Ok(())
