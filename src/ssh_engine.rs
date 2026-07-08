@@ -122,7 +122,7 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
     Ok(Zeroizing::new(pass))
 }
 
-fn split_host_port(host: &str) -> (String, u16) {
+pub(crate) fn split_host_port(host: &str) -> (String, u16) {
     // [addr]:port
     if let Some(rest) = host.strip_prefix('[')
         && let Some((addr, tail)) = rest.split_once(']')

@@ -157,7 +157,6 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
-        // Drain coverage warnings accumulated during the scan
         let coverage_warnings = crate::coverage::drain();
 
         let duration_secs = start.elapsed().as_secs_f64();
@@ -212,6 +211,18 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         return None;
     }
 
+    // Use shared split_host_port from ssh_engine
+    let (h, port) = crate::ssh_engine::split_host_port(host);
+    let port_s = port.to_string();
+    let dest = format!("{}@{}", ssh_user, h);
+
+    // For SCP, IPv6 addresses need to be wrapped in square brackets
+    let scp_target = if h.contains(':') {
+        format!("{}@[{}]:{}", ssh_user, h, remote_path)
+    } else {
+        format!("{}@{}:{}", ssh_user, h, remote_path)
+    };
+
     if args.copy_binary {
         let current_exe = std::env::current_exe()
             .unwrap_or_else(|_| std::path::PathBuf::from("./owlzops-mapper"));
@@ -237,11 +248,13 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             &[
                 "-i",
                 &ssh_key,
+                "-p",
+                &port_s,
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-o",
                 "ConnectTimeout=10",
-                &format!("{}@{}", ssh_user, host),
+                &dest,
                 "rm",
                 "-f",
                 remote_path,
@@ -255,10 +268,12 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             &[
                 "-i",
                 &ssh_key,
+                "-P",
+                &port_s,
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 local_bin,
-                &format!("{}@{}:{}", ssh_user, host, remote_path),
+                &scp_target,
             ],
             args.remote_timeout_secs / 2,
         ) {
@@ -281,11 +296,13 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             &[
                 "-i",
                 &ssh_key,
+                "-p",
+                &port_s,
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-o",
                 "ConnectTimeout=10",
-                &format!("{}@{}", ssh_user, host),
+                &dest,
                 "chmod",
                 "+x",
                 remote_path,
@@ -301,6 +318,8 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
         &[
             "-i",
             &ssh_key,
+            "-p",
+            &port_s,
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
@@ -309,7 +328,7 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             "ServerAliveInterval=15",
             "-o",
             "ServerAliveCountMax=3",
-            &format!("{}@{}", ssh_user, host),
+            &dest,
             "--",
             "sudo",
             remote_path,
@@ -338,11 +357,13 @@ pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
             &[
                 "-i",
                 &ssh_key,
+                "-p",
+                &port_s,
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-o",
                 "ConnectTimeout=10",
-                &format!("{}@{}", ssh_user, host),
+                &dest,
                 "rm",
                 "-f",
                 remote_path,
