@@ -253,38 +253,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                                 }
                             }
 
-                            let overall = Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
+                            let overall =
+                                Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
                                 if let Some(pw) = &pass {
-                                    if a.copy_binary {
-                                        let default_exe =
-                                            std::path::PathBuf::from("./owlzops-mapper");
-                                        let current_exe =
-                                            std::env::current_exe().unwrap_or(default_exe);
-                                        // R7-10: Safe path handling
-                                        let current_exe_lossy = current_exe.to_string_lossy();
-                                        let local_bin = a
-                                            .local_binary
-                                            .as_deref()
-                                            .unwrap_or(&current_exe_lossy);
-                                        let ssh_key_expanded =
-                                            shellexpand::tilde(&a.ssh_key).to_string();
-                                        if let Err(e) = ssh_engine::upload_binary_async(
-                                            &host,
-                                            &a.ssh_user,
-                                            &ssh_key_expanded,
-                                            local_bin,
-                                            &a.remote_path,
-                                            a.remote_timeout_secs,
-                                        )
-                                            .await
-                                        {
-                                            warn!(host = %host, error = %e, "Failed to upload binary");
-                                            return None;
-                                        }
-                                    }
-
                                     let ssh_key_expanded =
                                         shellexpand::tilde(&a.ssh_key).to_string();
                                     match ssh_engine::run_remote_scan_russh(
@@ -293,8 +266,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                                         &ssh_key_expanded,
                                         &a.remote_path,
                                         pw,
+                                        a.copy_binary,
+                                        a.local_binary.as_deref(),
+                                        a.remote_timeout_secs,
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(stdout) => {
                                             let stdout_str = String::from_utf8_lossy(&stdout);
@@ -309,7 +285,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>) -> i32 {
                                     run_remote_scan_with_timeout(host, a).await.ok().flatten()
                                 }
                             })
-                                .await;
+                            .await;
 
                             match result {
                                 Ok(Some(report)) => Some(report),
