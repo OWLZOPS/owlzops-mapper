@@ -673,6 +673,7 @@ mod tests {
             risk_score: 0,
             is_root_execution: true,
             scan_warnings: Vec::new(),
+            coverage_warnings: Vec::new(),
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),

@@ -157,6 +157,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
+        // Drain coverage warnings accumulated during the scan
+        let coverage_warnings = crate::coverage::drain();
+
         let duration_secs = start.elapsed().as_secs_f64();
 
         let mut report = AgentReport {
@@ -167,6 +170,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             risk_score: 0,
             is_root_execution: is_root,
             scan_warnings,
+            coverage_warnings,
             host: host_info,
             databases: dbs,
             network: network_info,

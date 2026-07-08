@@ -16,7 +16,6 @@ pub fn record(msg: impl Into<String>) {
 }
 
 /// Drain all recorded warnings (call once per scan in the runner).
-#[allow(dead_code)]
 pub fn drain() -> Vec<String> {
     sink()
         .lock()

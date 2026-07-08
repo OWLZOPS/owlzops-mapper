@@ -45,6 +45,8 @@ pub enum RemoteError {
         code: u32,
         stderr: String,
     },
+    #[error("binary upload to {host} failed: {detail}")]
+    UploadFailed { host: String, detail: String },
 }
 
 // Required by russh::client::Handler::Error bound
@@ -147,6 +149,7 @@ fn split_host_port(host: &str) -> (String, u16) {
 
 /// Upload a binary file over an existing russh channel by piping `cat > path`
 /// and feeding the file in chunks. Progress bar is updated incrementally.
+/// After EOF we wait for the remote command to finish and check its exit status.
 async fn upload_via_channel(
     channel: &mut Channel<client::Msg>,
     local_bin: &str,
@@ -205,8 +208,30 @@ async fn upload_via_channel(
         .eof()
         .await
         .map_err(|e| RemoteError::from_russh(e, host))?;
-    pb.finish_with_message("Uploaded");
-    Ok(())
+
+    // Wait for the remote command to complete and verify success
+    let mut exit: Option<u32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    match exit {
+        Some(0) => {
+            pb.finish_with_message("Uploaded");
+            Ok(())
+        }
+        Some(code) => Err(RemoteError::UploadFailed {
+            host: host.to_string(),
+            detail: format!("remote command exited {code} (disk full / permissions?)"),
+        }),
+        None => Err(RemoteError::UploadFailed {
+            host: host.to_string(),
+            detail: "channel closed without exit status".into(),
+        }),
+    }
 }
 
 /// Connect to a remote host via russh, upload the binary if needed,
