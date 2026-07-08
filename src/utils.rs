@@ -69,6 +69,12 @@ pub fn hardened_command(program: &str, args: &[&str]) -> Command {
     cmd
 }
 
+/// Single source of truth for per‑host timeout budget.
+/// Used by both the fleet orchestrator and the internal russh path.
+pub(crate) const fn host_budget_secs(t: u64) -> u64 {
+    t.saturating_mul(2).saturating_add(60)
+}
+
 // ---------------------------------------------------------------------------
 // Child helpers (unchanged logic, now hardened and with stdin nulled)
 // ---------------------------------------------------------------------------

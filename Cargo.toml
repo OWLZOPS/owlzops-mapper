@@ -48,7 +48,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-debug = "limited"
 
 [profile.dev]
 opt-level = 0

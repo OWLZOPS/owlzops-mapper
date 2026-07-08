@@ -305,7 +305,7 @@ pub async fn run_remote_scan_russh(
     // Apply overall timeout for the rest of the operation.
     // Clone hostname so the outer scope can still use it for the timeout error.
     let hostname_for_timeout = hostname.clone();
-    let overall = Duration::from_secs(remote_timeout_secs.saturating_mul(2).saturating_add(60) + 5);
+    let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
 
     let result = tokio::time::timeout(overall, async {
         // If binary copy is requested, upload via the same channel

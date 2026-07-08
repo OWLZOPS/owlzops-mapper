@@ -13,6 +13,7 @@ mod ssh_engine;
 mod ui;
 mod utils;
 
+use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use models::{AgentReport, HostDiffStatus};
@@ -52,10 +53,6 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     }
 
     if flags.has_critical() { 1 } else { 0 }
-}
-
-const fn host_budget_secs(t: u64) -> u64 {
-    t.saturating_mul(2).saturating_add(60)
 }
 
 async fn run_remote_scan_with_timeout(
@@ -456,7 +453,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         eprintln!("Error: --output is required for Excel format");
                         std::process::exit(1);
                     });
-                    compare::write_diff_xlsx(&diff, path.to_str().unwrap()).unwrap_or_else(|e| {
+                    compare::write_diff_xlsx(&diff, &path.to_string_lossy()).unwrap_or_else(|e| {
                         eprintln!("Failed to write Excel diff: {e}");
                         std::process::exit(1);
                     });
@@ -544,7 +541,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         });
                         crate::exporters::xlsx::write_multi_diff_xlsx(
                             &diffs,
-                            path.to_str().unwrap(),
+                            &path.to_string_lossy(),
                         )
                         .unwrap_or_else(|e| {
                             eprintln!("Failed to write multi-host Excel diff: {e}");
@@ -598,7 +595,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         eprintln!("Error: --output is required for Excel format");
                         std::process::exit(1);
                     });
-                    compare::write_diff_xlsx(&diff, path.to_str().unwrap()).unwrap_or_else(|e| {
+                    compare::write_diff_xlsx(&diff, &path.to_string_lossy()).unwrap_or_else(|e| {
                         eprintln!("Failed to write Excel diff: {e}");
                         std::process::exit(1);
                     });
@@ -656,7 +653,7 @@ async fn main() {
         _ = sig_int.recv() => {
             eprintln!("Received interrupt signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
-            shutdown_notify.notify_waiters();
+            shutdown_notify.notify_one();
             // Wait up to 5 seconds for tasks to finish, then force exit
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
@@ -670,7 +667,7 @@ async fn main() {
         _ = sig_term.recv() => {
             eprintln!("Received termination signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
-            shutdown_notify.notify_waiters();
+            shutdown_notify.notify_one();
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
                 _ => {

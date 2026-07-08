@@ -182,6 +182,8 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
     }
     pids.sort_unstable();
 
+    let mut denied = 0usize;
+
     for pid in pids {
         if attributed.len() == wanted.len() {
             break;
@@ -189,6 +191,7 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
 
         let fd_dir = format!("/proc/{pid}/fd");
         let Ok(fds) = fs::read_dir(&fd_dir) else {
+            denied += 1;
             continue;
         };
 
@@ -215,10 +218,7 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
                 .clone();
 
             let comm = {
-                match safe_io::read_file_capped(
-                    &format!("/proc/{pid}/comm"),
-                    4096, // safe cap for comm
-                ) {
+                match safe_io::read_file_capped(&format!("/proc/{pid}/comm"), 4096) {
                     Ok((c, truncated)) => {
                         if truncated {
                             coverage::record(format!("/proc/{pid}/comm truncated"));
@@ -239,5 +239,21 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
             );
         }
     }
+
+    if attributed.len() < wanted.len() {
+        let hint = if !crate::is_running_as_root() {
+            " — run as root for full attribution"
+        } else {
+            ""
+        };
+        coverage::record(format!(
+            "port attribution incomplete: {}/{} sockets attributed, {} /proc/<pid>/fd unreadable{}",
+            attributed.len(),
+            wanted.len(),
+            denied,
+            hint
+        ));
+    }
+
     attributed
 }

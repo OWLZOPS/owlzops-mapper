@@ -46,6 +46,14 @@ pub fn render_dashboard(report: &AgentReport) {
     render_system_internals(report);
     render_packages(report);
     render_docker(report);
+
+    if !report.coverage_warnings.is_empty() {
+        println!("\n⚠ Coverage Warnings (incomplete data):");
+        for w in &report.coverage_warnings {
+            println!("   - {}", sanitize_terminal(w));
+        }
+    }
+
     render_footer();
 }
 

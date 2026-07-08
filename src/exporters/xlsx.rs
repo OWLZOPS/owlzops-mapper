@@ -1339,6 +1339,15 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
         w.write_kv_row(key, value, *value_fmt)?;
     }
 
+    if !report.coverage_warnings.is_empty() {
+        w.write_section_title("Coverage Warnings")?;
+        for cw in &report.coverage_warnings {
+            let band = fmts.row_band(w.current_row());
+            w.write_string(0, cw, band)?;
+            w.next_row();
+        }
+    }
+
     w.next_row();
 
     let subtle = &fmts.subtle;
