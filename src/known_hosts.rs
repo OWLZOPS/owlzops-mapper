@@ -14,14 +14,23 @@ pub struct KnownHostsChecker {
 }
 
 impl KnownHostsChecker {
-    pub fn new(host: String, port: u16) -> Self {
-        let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        Self {
+    /// Create a new checker.
+    ///
+    /// # Errors
+    /// Returns `HostKeyCheck` if `HOME` is not set, because we refuse to
+    /// place the trust store in a world‑writable directory like `/tmp`.
+    pub fn new(host: String, port: u16) -> Result<Self, crate::ssh_engine::RemoteError> {
+        let home =
+            dirs_next::home_dir().ok_or_else(|| crate::ssh_engine::RemoteError::HostKeyCheck {
+                host: host.clone(),
+                detail: "HOME unset — cannot locate known_hosts trust store".into(),
+            })?;
+        Ok(Self {
             host,
             port,
             system_file: home.join(".ssh/known_hosts"),
             pin_file: home.join(".owlzops/known_hosts"),
-        }
+        })
     }
 
     fn host_candidates(&self) -> Vec<String> {
@@ -164,42 +173,54 @@ impl KnownHostsChecker {
     }
 }
 
-#[test]
-fn verify_matches_exact_key() {
-    let key = russh::keys::ssh_key::PrivateKey::random(
-        &mut rand::rng(),
-        russh::keys::ssh_key::Algorithm::Ed25519,
-    )
-    .unwrap();
-    let pub_key = key.public_key();
-    let pub_line = pub_key.to_openssh().unwrap();
-    let parts: Vec<_> = pub_line.split_whitespace().collect();
-    let key_type = parts[0];
-    let key_data = parts[1];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let kh_path = tmp_dir.path().join("known_hosts");
-    std::fs::write(&kh_path, format!("localhost {} {}\n", key_type, key_data)).unwrap();
+    #[test]
+    fn plain_host_matches() {
+        let checker = KnownHostsChecker::new("example.com".into(), 22).expect("HOME must be set");
+        assert!(checker.line_host_matches("example.com,other.example.com"));
+        assert!(!checker.line_host_matches("evil.com"));
+    }
 
-    let checker = KnownHostsChecker {
-        host: "localhost".into(),
-        port: 22,
-        system_file: kh_path.clone(),
-        pin_file: tmp_dir.path().join("pin"),
-    };
-    assert!(checker.verify(pub_key).is_ok());
+    #[test]
+    fn verify_matches_exact_key() {
+        let key = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pub_key = key.public_key();
+        let pub_line = pub_key.to_openssh().unwrap();
+        let parts: Vec<_> = pub_line.split_whitespace().collect();
+        let key_type = parts[0];
+        let key_data = parts[1];
 
-    // Change key and expect HostKeyChanged
-    let bad_line = format!("localhost {} AAAA...fake\n", key_type);
-    std::fs::write(&kh_path, bad_line).unwrap();
-    let checker_bad = KnownHostsChecker {
-        host: "localhost".into(),
-        port: 22,
-        system_file: kh_path,
-        pin_file: tmp_dir.path().join("pin2"),
-    };
-    assert!(matches!(
-        checker_bad.verify(pub_key),
-        Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
-    ));
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        std::fs::write(&kh_path, format!("localhost {} {}\n", key_type, key_data)).unwrap();
+
+        let checker = KnownHostsChecker {
+            host: "localhost".into(),
+            port: 22,
+            system_file: kh_path.clone(),
+            pin_file: tmp_dir.path().join("pin"),
+        };
+        assert!(checker.verify(pub_key).is_ok());
+
+        // Change key and expect HostKeyChanged
+        let bad_line = format!("localhost {} AAAA...fake\n", key_type);
+        std::fs::write(&kh_path, bad_line).unwrap();
+        let checker_bad = KnownHostsChecker {
+            host: "localhost".into(),
+            port: 22,
+            system_file: kh_path,
+            pin_file: tmp_dir.path().join("pin2"),
+        };
+        assert!(matches!(
+            checker_bad.verify(pub_key),
+            Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
+        ));
+    }
 }

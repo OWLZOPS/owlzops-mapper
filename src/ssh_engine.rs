@@ -268,8 +268,14 @@ pub async fn run_remote_scan_russh(
         keepalive_max: 3,
         ..Default::default()
     });
+
     let handler = ClientHandler {
-        known_hosts_checker: KnownHostsChecker::new(hostname.clone(), port),
+        known_hosts_checker: KnownHostsChecker::new(hostname.clone(), port).map_err(|e| {
+            RemoteError::HostKeyCheck {
+                host: hostname.clone(),
+                detail: e.to_string(),
+            }
+        })?,
     };
     let mut session = client::connect_stream(config, stream, handler).await?;
 
