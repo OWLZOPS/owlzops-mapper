@@ -656,7 +656,7 @@ async fn main() {
         _ = sig_int.recv() => {
             eprintln!("Received interrupt signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
-            shutdown_notify.notify_waiters();
+            shutdown_notify.notify_one();
             // Wait up to 5 seconds for tasks to finish, then force exit
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
@@ -670,7 +670,7 @@ async fn main() {
         _ = sig_term.recv() => {
             eprintln!("Received termination signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
-            shutdown_notify.notify_waiters();
+            shutdown_notify.notify_one();
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
                 _ => {
