@@ -344,7 +344,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             }
                         }
                     } else {
-                        writer.await
+                        writer.await // channel is closed, completion is guaranteed
                     };
                     match joined {
                         Ok((written, worst)) => return if written == 0 { 2 } else { worst.min(2) },
