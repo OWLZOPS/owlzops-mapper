@@ -817,22 +817,23 @@ fn write_storage_section(
         "Inodes %",
     ])?;
     for disk in &report.storage.disks {
-        if disk.total_gb == 0 {
+        if disk.total_mb == 0 {
             continue;
         }
-        let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
+        let size_gb = disk.total_mb as f64 / 1024.0;
+        let used_gb = disk.used_mb as f64 / 1024.0;
         let band = w.fmts.row_band(w.current_row());
         w.write_string(0, &disk.mount_point, band)?;
-        w.write_number(1, disk.total_gb as f64, &w.fmts.number)?;
-        w.write_number(2, disk.used_gb as f64, &w.fmts.number)?;
-        let usage_fmt = if usage_pct > 90.0 {
+        w.write_number(1, size_gb, &w.fmts.number)?;
+        w.write_number(2, used_gb, &w.fmts.number)?;
+        let usage_fmt = if disk.usage_pct > 90.0 {
             w.fmts.critical_band(w.current_row())
-        } else if usage_pct > 75.0 {
+        } else if disk.usage_pct > 75.0 {
             w.fmts.warning_band(w.current_row())
         } else {
             w.fmts.ok_band(w.current_row())
         };
-        w.write_number(3, usage_pct, usage_fmt)?;
+        w.write_number(3, disk.usage_pct, usage_fmt)?;
         let inode_str = disk
             .inode_usage_percent
             .clone()

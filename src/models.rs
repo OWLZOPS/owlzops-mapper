@@ -138,8 +138,9 @@ pub struct StorageInfo {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DiskInfo {
     pub mount_point: String,
-    pub total_gb: u64,
-    pub used_gb: u64,
+    pub total_mb: u64,
+    pub used_mb: u64,
+    pub usage_pct: f64,
     pub inode_usage_percent: Option<String>,
 }
 

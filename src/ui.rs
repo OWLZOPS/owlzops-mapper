@@ -531,14 +531,15 @@ fn render_storage(report: &AgentReport) {
         Cell::new("Inodes %").add_attribute(Attribute::Bold),
     ]);
     for disk in &report.storage.disks {
-        if disk.total_gb == 0 {
+        if disk.total_mb == 0 {
             continue;
         }
-        let usage = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
-        let mut usage_cell = Cell::new(format!("{:.1}%", usage));
-        if usage > 90.0 {
+        let size_gb = disk.total_mb as f64 / 1024.0;
+        let used_gb = disk.used_mb as f64 / 1024.0;
+        let mut usage_cell = Cell::new(format!("{:.1}%", disk.usage_pct));
+        if disk.usage_pct > 90.0 {
             usage_cell = usage_cell.fg(Color::Red).add_attribute(Attribute::Bold);
-        } else if usage > 75.0 {
+        } else if disk.usage_pct > 75.0 {
             usage_cell = usage_cell.fg(Color::Yellow);
         }
         let inode_val = disk
@@ -547,8 +548,8 @@ fn render_storage(report: &AgentReport) {
             .unwrap_or_else(|| "-".to_string());
         t_store.add_row(vec![
             Cell::new(sanitize_terminal(&disk.mount_point)),
-            Cell::new(disk.total_gb.to_string()),
-            Cell::new(disk.used_gb.to_string()),
+            Cell::new(format!("{:.2}", size_gb)),
+            Cell::new(format!("{:.2}", used_gb)),
             usage_cell,
             Cell::new(sanitize_terminal(&inode_val)),
         ]);
