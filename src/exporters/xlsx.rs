@@ -1003,11 +1003,16 @@ fn write_network_section(
         &report.network.firewall_active.to_string(),
         fw_fmt,
     )?;
-    w.write_kv_row(
-        "DNS Resolvers",
-        &report.network.dns_resolvers.join(", "),
-        None,
-    )?;
+    let dns_str = if !report.network.dns_upstreams.is_empty() {
+        format!(
+            "{}  →  {}",
+            report.network.dns_resolvers.join(", "),
+            report.network.dns_upstreams.join(", ")
+        )
+    } else {
+        report.network.dns_resolvers.join(", ")
+    };
+    w.write_kv_row("DNS Resolvers", &dns_str, None)?;
     w.next_row();
 
     w.write_header(&["Protocol", "Port", "Process", "Bind Address"])?;

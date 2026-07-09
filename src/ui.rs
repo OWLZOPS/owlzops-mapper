@@ -261,7 +261,20 @@ fn render_system_overview(report: &AgentReport) {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    t_sys.add_row(vec![Cell::new("DNS Resolvers"), Cell::new(dns_str)]);
+
+    let dns_cell = if !report.network.dns_upstreams.is_empty() {
+        let upstreams = report
+            .network
+            .dns_upstreams
+            .iter()
+            .map(|s| sanitize_terminal(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Cell::new(format!("{}  →  {}", dns_str, sanitize_terminal(&upstreams)))
+    } else {
+        Cell::new(dns_str)
+    };
+    t_sys.add_row(vec![Cell::new("DNS Resolvers"), dns_cell]);
 
     let sec_mod_str = if report.host.security_modules.is_empty() {
         "None".to_string()

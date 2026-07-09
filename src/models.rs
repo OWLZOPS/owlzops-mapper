@@ -107,6 +107,8 @@ pub struct NetworkInfo {
     pub custom_host_overrides: Vec<String>,
     pub ssl_certificates: Vec<SslCertInfo>,
     pub listening_ports: Vec<PortInfo>,
+    #[serde(default)]
+    pub dns_upstreams: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
