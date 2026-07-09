@@ -959,7 +959,7 @@ fn render_docker(report: &AgentReport) {
         &report.topology.images_count.to_string(),
     ]);
     t_dock_sum.add_row(vec![
-        "Total Size (All Images)",
+        "Real Disk Size (Images)",
         &format!("{:.2} GB", total_img_gb),
     ]);
 
@@ -1010,7 +1010,7 @@ fn render_docker(report: &AgentReport) {
             Cell::new("Dangling Image ID")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("Size (GB)").add_attribute(Attribute::Bold),
+            Cell::new("Virtual Size (GB)").add_attribute(Attribute::Bold),
         ]);
         for d in &report.topology.dangling_images {
             let d_size_gb = d.size_mb as f64 / 1024.0;

@@ -1155,6 +1155,13 @@ fn write_docker_section(
         None,
     )?;
 
+    let total_unique_gb = report.topology.total_images_size_mb as f64 / 1024.0;
+    w.write_kv_row(
+        "Total Unique Size (GB)",
+        &format!("{:.2}", total_unique_gb),
+        None,
+    )?;
+
     let dangling_count = report.topology.dangling_images_count.to_string();
     let dangling_size = format!(
         "{:.2}",
@@ -1189,7 +1196,7 @@ fn write_docker_section(
             "Image",
             "State",
             "Status",
-            "Size (GB)",
+            "Unique Size (GB)",
             "Log Size (GB)",
             "Mounts",
             "Security Issues",

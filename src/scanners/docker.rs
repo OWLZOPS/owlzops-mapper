@@ -62,7 +62,9 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             if let Ok(Ok(images)) = images_result {
                 for img in images {
                     images_count += 1;
-                    let size_mb = (img.size / (1024 * 1024)) as u64;
+
+                    let size_mb = (img.size.max(0) / (1024 * 1024)) as u64;
+
                     total_images_size_mb += size_mb;
 
                     if img.repo_tags.is_empty()
@@ -300,11 +302,15 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             let mut build_cache_reclaimable_mb = 0u64;
 
             if let Ok(Ok(df)) = tokio::time::timeout(Duration::from_secs(10), docker.df()).await {
+                if let Some(layers) = df.layers_size {
+                    total_images_size_mb = (layers.max(0) / (1024 * 1024)) as u64;
+                }
+
                 if let Some(images) = df.images {
                     let mut reclaim_bytes = 0i64;
                     for img in images {
                         if img.containers == 0 {
-                            reclaim_bytes += img.size.saturating_sub(img.shared_size);
+                            reclaim_bytes += img.size.max(0).saturating_sub(img.shared_size.max(0));
                         }
                     }
                     images_reclaimable_mb = (reclaim_bytes / (1024 * 1024)) as u64;
