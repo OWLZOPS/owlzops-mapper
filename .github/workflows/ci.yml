@@ -19,8 +19,8 @@ jobs:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     env:
-      CC: clang
-      CFLAGS: "-std=c11"
+      CC: gcc
+      CXX: g++
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +36,7 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
-          prefix-key: "v2-c11-fix"
+          prefix-key: "v3-gcc-force"
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy (warnings as errors)
