@@ -190,6 +190,13 @@ fn gather_process_and_tech(
     sys: &System,
 ) -> (Vec<ProcessInfo>, usize, Vec<String>, Vec<ZombieInfo>) {
     let prefix_targets: &[(&str, &str)] = &[
+        ("dockerd", "Docker"),
+        ("docker-proxy", "Docker"),
+        ("containerd", "containerd"),
+        ("kubelet", "Kubernetes"),
+        ("kube-apiserver", "Kubernetes"),
+        ("k3s", "K3s"),
+        ("k0s", "k0s"),
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
         ("redis-server", "Redis"),
