@@ -671,6 +671,19 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 
 pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
     let reboot_required = Path::new("/var/run/reboot-required").exists();
+    let mut reboot_required_pkgs = Vec::new();
+    if reboot_required
+        && let Ok((content, _truncated)) =
+            crate::safe_io::read_file_capped("/var/run/reboot-required.pkgs", 16 * 1024)
+    {
+        let mut seen = std::collections::HashSet::new();
+        for line in content.lines() {
+            let pkg = line.trim().to_string();
+            if !pkg.is_empty() && seen.insert(pkg.clone()) {
+                reboot_required_pkgs.push(pkg);
+            }
+        }
+    }
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);
 
@@ -714,5 +727,6 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
         last_restic_snapshot,
         ntp_synchronized,
         time_offset_ms,
+        reboot_required_pkgs,
     }
 }

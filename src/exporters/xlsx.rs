@@ -737,11 +737,28 @@ fn sheet_host_combined(
         }),
     )?;
     w.write_kv_row("Uptime (days)", &report.host.uptime_days.to_string(), None)?;
-    w.write_kv_row(
-        "Reboot required",
-        &report.host.reboot_required.to_string(),
-        None,
-    )?;
+    let reboot_str = if report.host.reboot_required {
+        if report.host.reboot_required_pkgs.is_empty() {
+            "yes".to_string()
+        } else {
+            let first: Vec<_> = report
+                .host
+                .reboot_required_pkgs
+                .iter()
+                .take(5)
+                .cloned()
+                .collect();
+            let more = if report.host.reboot_required_pkgs.len() > 5 {
+                format!(" +{}", report.host.reboot_required_pkgs.len() - 5)
+            } else {
+                String::new()
+            };
+            format!("yes ({}{})", first.join(", "), more)
+        }
+    } else {
+        "no".to_string()
+    };
+    w.write_kv_row("Reboot required", &reboot_str, None)?;
     w.write_kv_row("CPU cores", &report.host.cpu_cores.to_string(), None)?;
     w.write_kv_row(
         "RAM total (GB)",
@@ -1277,6 +1294,28 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
         report.host.backup_tools.join(", ")
     };
 
+    let reboot_str = if report.host.reboot_required {
+        if report.host.reboot_required_pkgs.is_empty() {
+            "yes".to_string()
+        } else {
+            let first: Vec<_> = report
+                .host
+                .reboot_required_pkgs
+                .iter()
+                .take(5)
+                .cloned()
+                .collect();
+            let more = if report.host.reboot_required_pkgs.len() > 5 {
+                format!(" +{}", report.host.reboot_required_pkgs.len() - 5)
+            } else {
+                String::new()
+            };
+            format!("yes ({}{})", first.join(", "), more)
+        }
+    } else {
+        "no".to_string()
+    };
+
     let rows: Vec<(&str, String, Option<&Format>)> = vec![
         ("Risk Score", format!("{}/100", report.risk_score), {
             if report.risk_score >= 70 {
@@ -1303,11 +1342,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
             }
         }),
         ("Uptime (days)", report.host.uptime_days.to_string(), None),
-        (
-            "Reboot required",
-            report.host.reboot_required.to_string(),
-            None,
-        ),
+        ("Reboot required", reboot_str, None),
         ("CPU cores", report.host.cpu_cores.to_string(), None),
         (
             "RAM total (GB)",

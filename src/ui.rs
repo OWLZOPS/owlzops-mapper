@@ -173,10 +173,24 @@ fn render_header(report: &AgentReport) {
     }
 
     if report.host.reboot_required {
+        let pkgs = &report.host.reboot_required_pkgs;
+        let suffix = if pkgs.is_empty() {
+            String::new()
+        } else {
+            let first: Vec<_> = pkgs.iter().take(5).map(|s| sanitize_terminal(s)).collect();
+            let more = if pkgs.len() > 5 {
+                format!(", +{}", pkgs.len() - 5)
+            } else {
+                String::new()
+            };
+            format!(" ({}{})", first.join(", "), more)
+        };
         println!(
-            "\x1b[1;41;37m[CRITICAL] SYSTEM REBOOT REQUIRED (Security patches pending)\x1b[0m\n"
+            "\x1b[1;41;37m[CRITICAL] SYSTEM REBOOT REQUIRED{}\x1b[0m\n",
+            suffix
         );
     }
+
     if !report.scan_warnings.is_empty() {
         println!(
             "\x1b[1;31m[!] Scan incomplete — {} scanner(s) failed. Report may be unreliable.\x1b[0m\n",

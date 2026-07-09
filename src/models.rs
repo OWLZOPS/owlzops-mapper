@@ -83,6 +83,8 @@ pub struct HostInfo {
     pub last_restic_snapshot: Option<String>,
     pub ntp_synchronized: bool,
     pub time_offset_ms: Option<f64>,
+    #[serde(default)]
+    pub reboot_required_pkgs: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
