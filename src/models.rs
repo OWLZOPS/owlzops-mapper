@@ -85,6 +85,8 @@ pub struct HostInfo {
     pub time_offset_ms: Option<f64>,
     #[serde(default)]
     pub reboot_required_pkgs: Vec<String>,
+    #[serde(default)]
+    pub zombie_details: Vec<ZombieInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -387,4 +389,12 @@ pub struct SecretLeak {
     pub process: String,
     pub source: String,      // "environ" or "cmdline"
     pub matched_key: String, // compromised variable/flag name
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ZombieInfo {
+    pub pid: u32,
+    pub name: String,
+    pub ppid: u32,
+    pub parent_name: String,
 }

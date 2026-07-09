@@ -779,11 +779,54 @@ fn sheet_host_combined(
         None,
     )?;
     w.write_kv_row("OOM kills", &report.host.oom_kills.to_string(), None)?;
-    w.write_kv_row(
-        "Zombie processes",
-        &report.host.zombie_processes.to_string(),
-        None,
-    )?;
+
+    // Zombie processes with parent details
+    let zombie_value = if report.host.zombie_processes > 0 {
+        let details = &report.host.zombie_details;
+        if details.is_empty() {
+            format!("{} (WARNING)", report.host.zombie_processes)
+        } else {
+            let mut parent_counts: std::collections::HashMap<(&str, u32), usize> =
+                std::collections::HashMap::new();
+            for z in details {
+                let key = (z.parent_name.as_str(), z.ppid);
+                *parent_counts.entry(key).or_insert(0) += 1;
+            }
+            let mut parents: Vec<_> = parent_counts.into_iter().collect();
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1));
+            let parts: Vec<_> = parents
+                .iter()
+                .take(3)
+                .map(|((name, ppid), count)| {
+                    if *count > 1 {
+                        format!("{}[{}] ×{}", sanitize_xlsx(name), ppid, count)
+                    } else {
+                        format!("{}[{}]", sanitize_xlsx(name), ppid)
+                    }
+                })
+                .collect();
+            let more = if parents.len() > 3 {
+                format!(", +{} more", parents.len() - 3)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} (WARNING: unreaped by: {}{})",
+                report.host.zombie_processes,
+                parts.join(", "),
+                more
+            )
+        }
+    } else {
+        "0".to_string()
+    };
+    let zombie_fmt = if report.host.zombie_processes > 0 {
+        Some(fmts.warning_band(w.current_row()))
+    } else {
+        None
+    };
+    w.write_kv_row("Zombie processes", &zombie_value, zombie_fmt)?;
+
     w.write_kv_row(
         "Security modules (LSM)",
         &report.host.security_modules.join(", "),
@@ -1316,6 +1359,46 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
         "no".to_string()
     };
 
+    let zombie_value = if report.host.zombie_processes > 0 {
+        let details = &report.host.zombie_details;
+        if details.is_empty() {
+            format!("{} (WARNING)", report.host.zombie_processes)
+        } else {
+            let mut parent_counts: std::collections::HashMap<(&str, u32), usize> =
+                std::collections::HashMap::new();
+            for z in details {
+                let key = (z.parent_name.as_str(), z.ppid);
+                *parent_counts.entry(key).or_insert(0) += 1;
+            }
+            let mut parents: Vec<_> = parent_counts.into_iter().collect();
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1));
+            let parts: Vec<_> = parents
+                .iter()
+                .take(3)
+                .map(|((name, ppid), count)| {
+                    if *count > 1 {
+                        format!("{}[{}] ×{}", sanitize_xlsx(name), ppid, count)
+                    } else {
+                        format!("{}[{}]", sanitize_xlsx(name), ppid)
+                    }
+                })
+                .collect();
+            let more = if parents.len() > 3 {
+                format!(", +{} more", parents.len() - 3)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} (WARNING: unreaped by: {}{})",
+                report.host.zombie_processes,
+                parts.join(", "),
+                more
+            )
+        }
+    } else {
+        "0".to_string()
+    };
+
     let rows: Vec<(&str, String, Option<&Format>)> = vec![
         ("Risk Score", format!("{}/100", report.risk_score), {
             if report.risk_score >= 70 {
@@ -1363,11 +1446,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
             None,
         ),
         ("OOM kills", report.host.oom_kills.to_string(), None),
-        (
-            "Zombie processes",
-            report.host.zombie_processes.to_string(),
-            None,
-        ),
+        ("Zombie processes", zombie_value, None),
         (
             "Security modules (LSM)",
             report.host.security_modules.join(", "),

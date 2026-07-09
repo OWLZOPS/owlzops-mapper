@@ -5,6 +5,8 @@
 //! terminal escape sequence injection (C0/C1 control characters
 //! beyond `\t` are replaced with U+FFFD).
 
+use std::collections::HashMap;
+
 use crate::models::{AgentReport, PackageManager};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
@@ -523,8 +525,44 @@ fn render_security_health(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("OOM Kills (Memory)"), oom_cell]);
 
+    // Zombie processes with parent grouping
     let zombie_cell = if report.host.zombie_processes > 0 {
-        Cell::new(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
+        let details = &report.host.zombie_details;
+        if details.is_empty() {
+            Cell::new(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
+        } else {
+            // Group by parent
+            let mut parent_counts: HashMap<(&str, u32), usize> = HashMap::new();
+            for z in details {
+                let key = (z.parent_name.as_str(), z.ppid);
+                *parent_counts.entry(key).or_insert(0) += 1;
+            }
+            let mut parents: Vec<_> = parent_counts.into_iter().collect();
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1)); // most zombies first
+            let parts: Vec<_> = parents
+                .iter()
+                .take(3)
+                .map(|((name, ppid), count)| {
+                    if *count > 1 {
+                        format!("{}[{}] ×{}", sanitize_terminal(name), ppid, count)
+                    } else {
+                        format!("{}[{}]", sanitize_terminal(name), ppid)
+                    }
+                })
+                .collect();
+            let more = if parents.len() > 3 {
+                format!(", +{} more", parents.len() - 3)
+            } else {
+                String::new()
+            };
+            Cell::new(format!(
+                "{} (WARNING: unreaped by: {}{})",
+                report.host.zombie_processes,
+                parts.join(", "),
+                more
+            ))
+            .fg(Color::Yellow)
+        }
     } else {
         Cell::new("0").fg(Color::Green)
     };

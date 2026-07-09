@@ -1,5 +1,5 @@
-use crate::models::{DatabaseInfo, HostInfo, ProcessInfo};
-use std::collections::{BinaryHeap, HashSet};
+use crate::models::{DatabaseInfo, HostInfo, ProcessInfo, ZombieInfo};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use sysinfo::{ProcessStatus, System};
@@ -184,8 +184,11 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
     }
 }
 
-/// Returns top‑5 memory processes, zombie count, and detected tech stack.
-fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String>) {
+/// Returns top‑5 memory processes, zombie count, detected tech stack,
+/// and per‑zombie details (capped at 10 entries).
+fn gather_process_and_tech(
+    sys: &System,
+) -> (Vec<ProcessInfo>, usize, Vec<String>, Vec<ZombieInfo>) {
     let prefix_targets: &[(&str, &str)] = &[
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
@@ -213,13 +216,30 @@ fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String
     let mut found_tech: HashSet<&'static str> = HashSet::new();
     let mut tech_stack = Vec::new();
 
+    // Build PID → (name, ppid) map for parent resolution
+    let mut pid_info: HashMap<u32, (String, u32)> = HashMap::new();
+
+    let mut zombie_details: Vec<ZombieInfo> = Vec::new();
+
     for (pid, proc) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        let name = proc.name().to_string();
+        let ppid = proc.parent().map_or(0, |p| p.as_u32());
+        pid_info.insert(pid_u32, (name.clone(), ppid));
+
         if proc.status() == ProcessStatus::Zombie {
             zombie_processes += 1;
+            if zombie_details.len() < 10 {
+                zombie_details.push(ZombieInfo {
+                    pid: pid_u32,
+                    name: name.clone(),
+                    ppid,
+                    parent_name: String::new(), // filled later
+                });
+            }
         }
-        let name = proc.name();
-        let name_lower = name.to_ascii_lowercase();
 
+        let name_lower = name.to_ascii_lowercase();
         for &(prefix, display) in prefix_targets {
             if name_lower.starts_with(prefix) && found_tech.insert(display) {
                 tech_stack.push(display.to_string());
@@ -232,13 +252,18 @@ fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String
         }
 
         let mem = proc.memory() / (1024 * 1024);
-        top5.push(std::cmp::Reverse((
-            mem,
-            pid.as_u32(),
-            proc.name().to_string(),
-        )));
+        top5.push(std::cmp::Reverse((mem, pid_u32, name.clone())));
         if top5.len() > 5 {
             top5.pop();
+        }
+    }
+
+    // Resolve parent names for zombie entries
+    for z in &mut zombie_details {
+        if let Some((parent_name, _)) = pid_info.get(&z.ppid) {
+            z.parent_name = parent_name.clone();
+        } else {
+            z.parent_name = "unknown".to_string();
         }
     }
 
@@ -259,7 +284,7 @@ fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String
         })
         .collect();
 
-    (process_list, zombie_processes, tech_stack)
+    (process_list, zombie_processes, tech_stack, zombie_details)
 }
 
 /// Reads `/proc/self/limits`, dmesg, lspci, and security modules.
@@ -687,7 +712,8 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);
 
-    let (top_memory_processes, zombie_processes, tech_stack) = gather_process_and_tech(sys);
+    let (top_memory_processes, zombie_processes, tech_stack, zombie_details) =
+        gather_process_and_tech(sys);
 
     let (open_files_limit, oom_kills, dmesg_errors, gpu_devices, security_modules) =
         gather_kernel_and_hardware();
@@ -728,5 +754,6 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
         ntp_synchronized,
         time_offset_ms,
         reboot_required_pkgs,
+        zombie_details,
     }
 }
