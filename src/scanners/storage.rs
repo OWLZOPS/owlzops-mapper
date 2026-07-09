@@ -24,10 +24,21 @@ pub fn gather_storage_info() -> StorageInfo {
             }
         }
 
+        // Compute exact sizes in MiB and percentage from raw bytes
+        let total_space = disk.total_space();
+        let available = disk.available_space();
+        let used = total_space.saturating_sub(available);
+        let usage_pct = if total_space > 0 {
+            (used as f64 / total_space as f64) * 100.0
+        } else {
+            0.0
+        };
+
         disks.push(DiskInfo {
             mount_point,
-            total_gb: disk.total_space() / (1024 * 1024 * 1024),
-            used_gb: (disk.total_space() - disk.available_space()) / (1024 * 1024 * 1024),
+            total_mb: total_space / (1024 * 1024),
+            used_mb: used / (1024 * 1024),
+            usage_pct,
             inode_usage_percent: inode_usage,
         });
     }

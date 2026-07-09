@@ -62,7 +62,9 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             if let Ok(Ok(images)) = images_result {
                 for img in images {
                     images_count += 1;
-                    let size_mb = (img.size / (1024 * 1024)) as u64;
+
+                    let size_mb = (img.size.max(0) / (1024 * 1024)) as u64;
+
                     total_images_size_mb += size_mb;
 
                     if img.repo_tags.is_empty()
@@ -244,12 +246,13 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                                 Some(H::STARTING) => Some("starting".to_string()),
                                 Some(H::HEALTHY) => Some("healthy".to_string()),
                                 Some(H::UNHEALTHY) => Some("unhealthy".to_string()),
-                                _ => None, // NONE / EMPTY / отсутствует → healthcheck не настроен
+                                _ => None, // NONE / EMPTY / absent → healthcheck not configured
                             });
                             (oom, health)
                         })
                         .unwrap_or((false, None));
 
+                    let rw_size_mb = (container.size_rw.unwrap_or(0).max(0) as u64) / (1024 * 1024);
                     let size_mb = (container.size_rw.unwrap_or(0)
                         + container.size_root_fs.unwrap_or(0))
                         as u64
@@ -269,10 +272,11 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         memory_limit_mb,
                         cpu_limit,
                         cap_add,
-                        restart_count, // new
-                        oom_killed,    // new
-                        health_status, // new
+                        restart_count,
+                        oom_killed,
+                        health_status,
                         sensitive_mounts,
+                        rw_size_mb,
                     });
                 }
             }
@@ -293,6 +297,36 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                 dangling_volumes_count = vols.len();
             }
 
+            // Fetch reclaimable space via system_info_df
+            let mut images_reclaimable_mb = 0u64;
+            let mut build_cache_reclaimable_mb = 0u64;
+
+            if let Ok(Ok(df)) = tokio::time::timeout(Duration::from_secs(10), docker.df()).await {
+                if let Some(layers) = df.layers_size {
+                    total_images_size_mb = (layers.max(0) / (1024 * 1024)) as u64;
+                }
+
+                if let Some(images) = df.images {
+                    let mut reclaim_bytes = 0i64;
+                    for img in images {
+                        if img.containers == 0 {
+                            reclaim_bytes += img.size.max(0).saturating_sub(img.shared_size.max(0));
+                        }
+                    }
+                    images_reclaimable_mb = (reclaim_bytes / (1024 * 1024)) as u64;
+                }
+
+                if let Some(build_cache) = df.build_cache {
+                    let mut reclaim_bytes = 0i64;
+                    for cache in build_cache {
+                        if cache.in_use == Some(false) {
+                            reclaim_bytes += cache.size.unwrap_or(0);
+                        }
+                    }
+                    build_cache_reclaimable_mb = (reclaim_bytes / (1024 * 1024)) as u64;
+                }
+            }
+
             TopologyInfo {
                 docker_active: true,
                 images_count,
@@ -302,6 +336,8 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                 dangling_volumes_count,
                 dangling_images,
                 containers: container_list,
+                images_reclaimable_mb,
+                build_cache_reclaimable_mb,
             }
         }
         Err(_) => TopologyInfo {
@@ -313,6 +349,8 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             dangling_volumes_count: 0,
             dangling_images: vec![],
             containers: vec![],
+            images_reclaimable_mb: 0,
+            build_cache_reclaimable_mb: 0,
         },
     }
 }

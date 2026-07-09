@@ -737,11 +737,28 @@ fn sheet_host_combined(
         }),
     )?;
     w.write_kv_row("Uptime (days)", &report.host.uptime_days.to_string(), None)?;
-    w.write_kv_row(
-        "Reboot required",
-        &report.host.reboot_required.to_string(),
-        None,
-    )?;
+    let reboot_str = if report.host.reboot_required {
+        if report.host.reboot_required_pkgs.is_empty() {
+            "yes".to_string()
+        } else {
+            let first: Vec<_> = report
+                .host
+                .reboot_required_pkgs
+                .iter()
+                .take(5)
+                .cloned()
+                .collect();
+            let more = if report.host.reboot_required_pkgs.len() > 5 {
+                format!(" +{}", report.host.reboot_required_pkgs.len() - 5)
+            } else {
+                String::new()
+            };
+            format!("yes ({}{})", first.join(", "), more)
+        }
+    } else {
+        "no".to_string()
+    };
+    w.write_kv_row("Reboot required", &reboot_str, None)?;
     w.write_kv_row("CPU cores", &report.host.cpu_cores.to_string(), None)?;
     w.write_kv_row(
         "RAM total (GB)",
@@ -762,11 +779,54 @@ fn sheet_host_combined(
         None,
     )?;
     w.write_kv_row("OOM kills", &report.host.oom_kills.to_string(), None)?;
-    w.write_kv_row(
-        "Zombie processes",
-        &report.host.zombie_processes.to_string(),
-        None,
-    )?;
+
+    // Zombie processes with parent details
+    let zombie_value = if report.host.zombie_processes > 0 {
+        let details = &report.host.zombie_details;
+        if details.is_empty() {
+            format!("{} (WARNING)", report.host.zombie_processes)
+        } else {
+            let mut parent_counts: std::collections::HashMap<(&str, u32), usize> =
+                std::collections::HashMap::new();
+            for z in details {
+                let key = (z.parent_name.as_str(), z.ppid);
+                *parent_counts.entry(key).or_insert(0) += 1;
+            }
+            let mut parents: Vec<_> = parent_counts.into_iter().collect();
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1));
+            let parts: Vec<_> = parents
+                .iter()
+                .take(3)
+                .map(|((name, ppid), count)| {
+                    if *count > 1 {
+                        format!("{}[{}] ×{}", sanitize_xlsx(name), ppid, count)
+                    } else {
+                        format!("{}[{}]", sanitize_xlsx(name), ppid)
+                    }
+                })
+                .collect();
+            let more = if parents.len() > 3 {
+                format!(", +{} more", parents.len() - 3)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} (WARNING: unreaped by: {}{})",
+                report.host.zombie_processes,
+                parts.join(", "),
+                more
+            )
+        }
+    } else {
+        "0".to_string()
+    };
+    let zombie_fmt = if report.host.zombie_processes > 0 {
+        Some(fmts.warning_band(w.current_row()))
+    } else {
+        None
+    };
+    w.write_kv_row("Zombie processes", &zombie_value, zombie_fmt)?;
+
     w.write_kv_row(
         "Security modules (LSM)",
         &report.host.security_modules.join(", "),
@@ -817,22 +877,23 @@ fn write_storage_section(
         "Inodes %",
     ])?;
     for disk in &report.storage.disks {
-        if disk.total_gb == 0 {
+        if disk.total_mb == 0 {
             continue;
         }
-        let usage_pct = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
+        let size_gb = disk.total_mb as f64 / 1024.0;
+        let used_gb = disk.used_mb as f64 / 1024.0;
         let band = w.fmts.row_band(w.current_row());
         w.write_string(0, &disk.mount_point, band)?;
-        w.write_number(1, disk.total_gb as f64, &w.fmts.number)?;
-        w.write_number(2, disk.used_gb as f64, &w.fmts.number)?;
-        let usage_fmt = if usage_pct > 90.0 {
+        w.write_number(1, size_gb, &w.fmts.number)?;
+        w.write_number(2, used_gb, &w.fmts.number)?;
+        let usage_fmt = if disk.usage_pct > 90.0 {
             w.fmts.critical_band(w.current_row())
-        } else if usage_pct > 75.0 {
+        } else if disk.usage_pct > 75.0 {
             w.fmts.warning_band(w.current_row())
         } else {
             w.fmts.ok_band(w.current_row())
         };
-        w.write_number(3, usage_pct, usage_fmt)?;
+        w.write_number(3, disk.usage_pct, usage_fmt)?;
         let inode_str = disk
             .inode_usage_percent
             .clone()
@@ -1002,11 +1063,16 @@ fn write_network_section(
         &report.network.firewall_active.to_string(),
         fw_fmt,
     )?;
-    w.write_kv_row(
-        "DNS Resolvers",
-        &report.network.dns_resolvers.join(", "),
-        None,
-    )?;
+    let dns_str = if !report.network.dns_upstreams.is_empty() {
+        format!(
+            "{}  →  {}",
+            report.network.dns_resolvers.join(", "),
+            report.network.dns_upstreams.join(", ")
+        )
+    } else {
+        report.network.dns_resolvers.join(", ")
+    };
+    w.write_kv_row("DNS Resolvers", &dns_str, None)?;
     w.next_row();
 
     w.write_header(&["Protocol", "Port", "Process", "Bind Address"])?;
@@ -1089,6 +1155,13 @@ fn write_docker_section(
         None,
     )?;
 
+    let total_unique_gb = report.topology.total_images_size_mb as f64 / 1024.0;
+    w.write_kv_row(
+        "Total Unique Size (GB)",
+        &format!("{:.2}", total_unique_gb),
+        None,
+    )?;
+
     let dangling_count = report.topology.dangling_images_count.to_string();
     let dangling_size = format!(
         "{:.2}",
@@ -1123,7 +1196,7 @@ fn write_docker_section(
             "Image",
             "State",
             "Status",
-            "Size (GB)",
+            "Unique Size (GB)",
             "Log Size (GB)",
             "Mounts",
             "Security Issues",
@@ -1271,6 +1344,68 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
         report.host.backup_tools.join(", ")
     };
 
+    let reboot_str = if report.host.reboot_required {
+        if report.host.reboot_required_pkgs.is_empty() {
+            "yes".to_string()
+        } else {
+            let first: Vec<_> = report
+                .host
+                .reboot_required_pkgs
+                .iter()
+                .take(5)
+                .cloned()
+                .collect();
+            let more = if report.host.reboot_required_pkgs.len() > 5 {
+                format!(" +{}", report.host.reboot_required_pkgs.len() - 5)
+            } else {
+                String::new()
+            };
+            format!("yes ({}{})", first.join(", "), more)
+        }
+    } else {
+        "no".to_string()
+    };
+
+    let zombie_value = if report.host.zombie_processes > 0 {
+        let details = &report.host.zombie_details;
+        if details.is_empty() {
+            format!("{} (WARNING)", report.host.zombie_processes)
+        } else {
+            let mut parent_counts: std::collections::HashMap<(&str, u32), usize> =
+                std::collections::HashMap::new();
+            for z in details {
+                let key = (z.parent_name.as_str(), z.ppid);
+                *parent_counts.entry(key).or_insert(0) += 1;
+            }
+            let mut parents: Vec<_> = parent_counts.into_iter().collect();
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1));
+            let parts: Vec<_> = parents
+                .iter()
+                .take(3)
+                .map(|((name, ppid), count)| {
+                    if *count > 1 {
+                        format!("{}[{}] ×{}", sanitize_xlsx(name), ppid, count)
+                    } else {
+                        format!("{}[{}]", sanitize_xlsx(name), ppid)
+                    }
+                })
+                .collect();
+            let more = if parents.len() > 3 {
+                format!(", +{} more", parents.len() - 3)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} (WARNING: unreaped by: {}{})",
+                report.host.zombie_processes,
+                parts.join(", "),
+                more
+            )
+        }
+    } else {
+        "0".to_string()
+    };
+
     let rows: Vec<(&str, String, Option<&Format>)> = vec![
         ("Risk Score", format!("{}/100", report.risk_score), {
             if report.risk_score >= 70 {
@@ -1297,11 +1432,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
             }
         }),
         ("Uptime (days)", report.host.uptime_days.to_string(), None),
-        (
-            "Reboot required",
-            report.host.reboot_required.to_string(),
-            None,
-        ),
+        ("Reboot required", reboot_str, None),
         ("CPU cores", report.host.cpu_cores.to_string(), None),
         (
             "RAM total (GB)",
@@ -1322,11 +1453,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
             None,
         ),
         ("OOM kills", report.host.oom_kills.to_string(), None),
-        (
-            "Zombie processes",
-            report.host.zombie_processes.to_string(),
-            None,
-        ),
+        ("Zombie processes", zombie_value, None),
         (
             "Security modules (LSM)",
             report.host.security_modules.join(", "),

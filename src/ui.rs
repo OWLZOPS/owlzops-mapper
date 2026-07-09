@@ -5,6 +5,8 @@
 //! terminal escape sequence injection (C0/C1 control characters
 //! beyond `\t` are replaced with U+FFFD).
 
+use std::collections::HashMap;
+
 use crate::models::{AgentReport, PackageManager};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
@@ -27,6 +29,25 @@ pub fn sanitize_terminal(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Common patterns that indicate a suspicious cron job
+/// (executables from writable locations, hidden directories, etc.).
+const SUSPICIOUS_CRON_PATTERNS: &[&str] = &[
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/home/",
+    "curl",
+    "wget",
+    "base64 -d",
+    "sh -c",
+    "bash -c",
+];
+
+fn is_suspicious_cron(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    SUSPICIOUS_CRON_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +144,15 @@ fn render_header(report: &AgentReport) {
         ("", "", "", "")
     };
 
+    // ---------- Risk Score with visual penalty notation ----------
+    let risk_label = if report.risk_score < 40 {
+        "Healthy"
+    } else if report.risk_score < 70 {
+        "At Risk"
+    } else {
+        "Critical"
+    };
+
     let risk_color = if is_tty {
         if report.risk_score >= 70 {
             "\x1b[1;31m"
@@ -138,13 +168,13 @@ fn render_header(report: &AgentReport) {
     println!("{}Owlzops Mapper v{}", icon_owl, report.version);
     println!("{}Scan completed in {:.2}s", icon_spy, report.duration_secs);
     println!(
-        "{}Risk Score: {}{}/100{}\n",
-        icon_shield, risk_color, report.risk_score, color_reset
+        "{}Risk Score: {}{}/100{}  ({}) \n",
+        icon_shield, risk_color, report.risk_score, color_reset, risk_label
     );
 
     let scored = crate::scoring::score(crate::scoring::evaluate(report));
     println!(
-        "  Security: {}/60  Reliability: {}/30  Hygiene: {}/10",
+        "  Security −{}  Reliability −{}  Hygiene −{}",
         scored.security, scored.reliability, scored.hygiene
     );
 
@@ -163,6 +193,9 @@ fn render_header(report: &AgentReport) {
                 String::new()
             };
             println!("  • {} (+{}){}", f.title, f.weight, cis_note);
+            if !f.evidence.is_empty() {
+                println!("    └─ {}", sanitize_terminal(&f.evidence));
+            }
         }
     }
 
@@ -173,10 +206,24 @@ fn render_header(report: &AgentReport) {
     }
 
     if report.host.reboot_required {
+        let pkgs = &report.host.reboot_required_pkgs;
+        let suffix = if pkgs.is_empty() {
+            String::new()
+        } else {
+            let first: Vec<_> = pkgs.iter().take(5).map(|s| sanitize_terminal(s)).collect();
+            let more = if pkgs.len() > 5 {
+                format!(", +{}", pkgs.len() - 5)
+            } else {
+                String::new()
+            };
+            format!(" ({}{})", first.join(", "), more)
+        };
         println!(
-            "\x1b[1;41;37m[CRITICAL] SYSTEM REBOOT REQUIRED (Security patches pending)\x1b[0m\n"
+            "\x1b[1;41;37m[CRITICAL] SYSTEM REBOOT REQUIRED{}\x1b[0m\n",
+            suffix
         );
     }
+
     if !report.scan_warnings.is_empty() {
         println!(
             "\x1b[1;31m[!] Scan incomplete — {} scanner(s) failed. Report may be unreliable.\x1b[0m\n",
@@ -261,7 +308,20 @@ fn render_system_overview(report: &AgentReport) {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    t_sys.add_row(vec![Cell::new("DNS Resolvers"), Cell::new(dns_str)]);
+
+    let dns_cell = if !report.network.dns_upstreams.is_empty() {
+        let upstreams = report
+            .network
+            .dns_upstreams
+            .iter()
+            .map(|s| sanitize_terminal(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Cell::new(format!("{}  →  {}", dns_str, sanitize_terminal(&upstreams)))
+    } else {
+        Cell::new(dns_str)
+    };
+    t_sys.add_row(vec![Cell::new("DNS Resolvers"), dns_cell]);
 
     let sec_mod_str = if report.host.security_modules.is_empty() {
         "None".to_string()
@@ -302,8 +362,17 @@ fn render_top_memory(report: &AgentReport) {
         if proc.memory_mb > 1024 {
             mem_cell = mem_cell.fg(Color::Yellow);
         }
+        let name = if proc.instances > 1 {
+            format!(
+                "{} (×{} workers)",
+                sanitize_terminal(&proc.name),
+                proc.instances
+            )
+        } else {
+            sanitize_terminal(&proc.name)
+        };
         t_mem.add_row(vec![
-            Cell::new(sanitize_terminal(&proc.name)),
+            Cell::new(name),
             Cell::new(proc.pid.to_string()),
             mem_cell,
         ]);
@@ -465,8 +534,44 @@ fn render_security_health(report: &AgentReport) {
     };
     t_risk.add_row(vec![Cell::new("OOM Kills (Memory)"), oom_cell]);
 
+    // Zombie processes with parent grouping
     let zombie_cell = if report.host.zombie_processes > 0 {
-        Cell::new(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
+        let details = &report.host.zombie_details;
+        if details.is_empty() {
+            Cell::new(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
+        } else {
+            // Group by parent
+            let mut parent_counts: HashMap<(&str, u32), usize> = HashMap::new();
+            for z in details {
+                let key = (z.parent_name.as_str(), z.ppid);
+                *parent_counts.entry(key).or_insert(0) += 1;
+            }
+            let mut parents: Vec<_> = parent_counts.into_iter().collect();
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1)); // most zombies first
+            let parts: Vec<_> = parents
+                .iter()
+                .take(3)
+                .map(|((name, ppid), count)| {
+                    if *count > 1 {
+                        format!("{}[{}] ×{}", sanitize_terminal(name), ppid, count)
+                    } else {
+                        format!("{}[{}]", sanitize_terminal(name), ppid)
+                    }
+                })
+                .collect();
+            let more = if parents.len() > 3 {
+                format!(", +{} more", parents.len() - 3)
+            } else {
+                String::new()
+            };
+            Cell::new(format!(
+                "{} (WARNING: unreaped by: {}{})",
+                report.host.zombie_processes,
+                parts.join(", "),
+                more
+            ))
+            .fg(Color::Yellow)
+        }
     } else {
         Cell::new("0").fg(Color::Green)
     };
@@ -531,14 +636,15 @@ fn render_storage(report: &AgentReport) {
         Cell::new("Inodes %").add_attribute(Attribute::Bold),
     ]);
     for disk in &report.storage.disks {
-        if disk.total_gb == 0 {
+        if disk.total_mb == 0 {
             continue;
         }
-        let usage = (disk.used_gb as f64 / disk.total_gb as f64) * 100.0;
-        let mut usage_cell = Cell::new(format!("{:.1}%", usage));
-        if usage > 90.0 {
+        let size_gb = disk.total_mb as f64 / 1024.0;
+        let used_gb = disk.used_mb as f64 / 1024.0;
+        let mut usage_cell = Cell::new(format!("{:.1}%", disk.usage_pct));
+        if disk.usage_pct > 90.0 {
             usage_cell = usage_cell.fg(Color::Red).add_attribute(Attribute::Bold);
-        } else if usage > 75.0 {
+        } else if disk.usage_pct > 75.0 {
             usage_cell = usage_cell.fg(Color::Yellow);
         }
         let inode_val = disk
@@ -547,8 +653,8 @@ fn render_storage(report: &AgentReport) {
             .unwrap_or_else(|| "-".to_string());
         t_store.add_row(vec![
             Cell::new(sanitize_terminal(&disk.mount_point)),
-            Cell::new(disk.total_gb.to_string()),
-            Cell::new(disk.used_gb.to_string()),
+            Cell::new(format!("{:.2}", size_gb)),
+            Cell::new(format!("{:.2}", used_gb)),
             usage_cell,
             Cell::new(sanitize_terminal(&inode_val)),
         ]);
@@ -674,7 +780,7 @@ fn render_system_internals(report: &AgentReport) {
         Cell::new("Count").add_attribute(Attribute::Bold),
     ]);
     t_internals.add_row(vec![
-        "Shadow Cronjobs",
+        "System & Custom Cronjobs",
         &report.host.cron_jobs.len().to_string(),
     ]);
     t_internals.add_row(vec![
@@ -695,12 +801,14 @@ fn render_system_internals(report: &AgentReport) {
         println!();
     }
     if !report.host.cron_jobs.is_empty() {
-        println!("\x1b[1;33m[!] Found Shadow Cronjobs:\x1b[0m");
+        println!("System & Custom Cronjobs:");
         for cron in &report.host.cron_jobs {
-            // Keep the `root` highlighting intact; sanitise the whole string first
             let safe_cron = sanitize_terminal(cron);
-            let display_cron = safe_cron.replace("root", "\x1b[1;31mroot\x1b[0m");
-            println!("    - {}", display_cron);
+            if is_suspicious_cron(&safe_cron) {
+                println!("\x1b[1;31m[!]  {}\x1b[0m", safe_cron);
+            } else {
+                println!("    - {}", safe_cron);
+            }
         }
         println!();
     }
@@ -833,7 +941,8 @@ fn render_docker(report: &AgentReport) {
         return;
     }
     let total_img_gb = report.topology.total_images_size_mb as f64 / 1024.0;
-    let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
+    let reclaimable_gb = report.topology.images_reclaimable_mb as f64 / 1024.0;
+    let build_cache_gb = report.topology.build_cache_reclaimable_mb as f64 / 1024.0;
 
     let mut t_dock_sum = Table::new();
     t_dock_sum
@@ -850,26 +959,40 @@ fn render_docker(report: &AgentReport) {
         &report.topology.images_count.to_string(),
     ]);
     t_dock_sum.add_row(vec![
-        "Total Size (All Images)",
+        "Real Disk Size (Images)",
         &format!("{:.2} GB", total_img_gb),
     ]);
 
-    let mut dang_count_cell = Cell::new(report.topology.dangling_images_count.to_string());
-    let mut dang_size_cell = Cell::new(format!("{:.2} GB", dang_img_gb));
-    if report.topology.dangling_images_count > 0 {
-        dang_count_cell = dang_count_cell
-            .fg(Color::Yellow)
-            .add_attribute(Attribute::Bold);
-        if dang_img_gb > 5.0 {
-            dang_size_cell = dang_size_cell.fg(Color::Red).add_attribute(Attribute::Bold);
-        } else {
-            dang_size_cell = dang_size_cell
+    if reclaimable_gb > 0.0 || build_cache_gb > 0.0 {
+        t_dock_sum.add_row(vec![
+            "Reclaimable Space (Prune)",
+            &format!("{:.2} GB", reclaimable_gb),
+        ]);
+        t_dock_sum.add_row(vec![
+            "Build Cache Reclaimable",
+            &format!("{:.2} GB", build_cache_gb),
+        ]);
+    } else {
+        // Fallback to dangling count for systems without system_df support
+        let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
+        let mut dang_count_cell = Cell::new(report.topology.dangling_images_count.to_string());
+        let mut dang_size_cell = Cell::new(format!("{:.2} GB", dang_img_gb));
+        if report.topology.dangling_images_count > 0 {
+            dang_count_cell = dang_count_cell
                 .fg(Color::Yellow)
                 .add_attribute(Attribute::Bold);
+            if dang_img_gb > 5.0 {
+                dang_size_cell = dang_size_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            } else {
+                dang_size_cell = dang_size_cell
+                    .fg(Color::Yellow)
+                    .add_attribute(Attribute::Bold);
+            }
         }
+        t_dock_sum.add_row(vec![Cell::new("Dangling (Unused) Images"), dang_count_cell]);
+        t_dock_sum.add_row(vec![Cell::new("Dangling Wasted Space"), dang_size_cell]);
     }
-    t_dock_sum.add_row(vec![Cell::new("Dangling (Unused) Images"), dang_count_cell]);
-    t_dock_sum.add_row(vec![Cell::new("Dangling Wasted Space"), dang_size_cell]);
+
     t_dock_sum.add_row(vec![
         "Dangling Volumes",
         &report.topology.dangling_volumes_count.to_string(),
@@ -877,6 +1000,7 @@ fn render_docker(report: &AgentReport) {
     println!("Docker Images & Volumes:");
     println!("{t_dock_sum}\n");
 
+    // Dangling images list remains unchanged
     if !report.topology.dangling_images.is_empty() {
         let mut t_dang = Table::new();
         t_dang
@@ -886,7 +1010,7 @@ fn render_docker(report: &AgentReport) {
             Cell::new("Dangling Image ID")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("Size (GB)").add_attribute(Attribute::Bold),
+            Cell::new("Virtual Size (GB)").add_attribute(Attribute::Bold),
         ]);
         for d in &report.topology.dangling_images {
             let d_size_gb = d.size_mb as f64 / 1024.0;
@@ -903,6 +1027,7 @@ fn render_docker(report: &AgentReport) {
         println!("{t_dang}\n");
     }
 
+    // Containers with RW size
     if !report.topology.containers.is_empty() {
         let mut t_docker = Table::new();
         t_docker
@@ -914,6 +1039,7 @@ fn render_docker(report: &AgentReport) {
                 .fg(Color::Cyan),
             Cell::new("Uptime / Status").add_attribute(Attribute::Bold),
             Cell::new("Size (GB)").add_attribute(Attribute::Bold),
+            Cell::new("RW Size (MB)").add_attribute(Attribute::Bold),
             Cell::new("Log Size (GB)").add_attribute(Attribute::Bold),
             Cell::new("Security Issues").add_attribute(Attribute::Bold),
             Cell::new("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
@@ -926,6 +1052,7 @@ fn render_docker(report: &AgentReport) {
                 status_cell = status_cell.fg(Color::Yellow);
             }
             let c_size_gb = c.size_mb as f64 / 1024.0;
+            let rw_size_mb = c.rw_size_mb;
             let c_log_gb = c.log_size_mb as f64 / 1024.0;
             let mut log_cell = Cell::new(format!("{:.2}", c_log_gb));
             if c_log_gb > 1.0 {
@@ -953,6 +1080,7 @@ fn render_docker(report: &AgentReport) {
                 Cell::new(sanitize_terminal(&c.name)),
                 status_cell,
                 Cell::new(format!("{:.2}", c_size_gb)),
+                Cell::new(rw_size_mb.to_string()),
                 log_cell,
                 issue_cell,
                 mounts_cell,

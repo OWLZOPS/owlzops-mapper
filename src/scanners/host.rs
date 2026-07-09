@@ -1,5 +1,5 @@
-use crate::models::{DatabaseInfo, HostInfo, ProcessInfo};
-use std::collections::{BinaryHeap, HashSet};
+use crate::models::{DatabaseInfo, HostInfo, ProcessInfo, ZombieInfo};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use sysinfo::{ProcessStatus, System};
@@ -184,9 +184,19 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
     }
 }
 
-/// Returns top‑5 memory processes, zombie count, and detected tech stack.
-fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String>) {
+/// Returns top‑5 memory processes (aggregated by name), zombie count,
+/// detected tech stack, and per‑zombie details.
+fn gather_process_and_tech(
+    sys: &System,
+) -> (Vec<ProcessInfo>, usize, Vec<String>, Vec<ZombieInfo>) {
     let prefix_targets: &[(&str, &str)] = &[
+        ("dockerd", "Docker"),
+        ("docker-proxy", "Docker"),
+        ("containerd", "containerd"),
+        ("kubelet", "Kubernetes"),
+        ("kube-apiserver", "Kubernetes"),
+        ("k3s", "K3s"),
+        ("k0s", "k0s"),
         ("postgres", "PostgreSQL"),
         ("mysqld", "MySQL"),
         ("redis-server", "Redis"),
@@ -208,18 +218,34 @@ fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String
         ("rust", "Rust Binary"),
     ];
 
-    let mut top5: BinaryHeap<std::cmp::Reverse<(u64, u32, String)>> = BinaryHeap::with_capacity(6);
+    let mut aggregated: HashMap<String, (u64, u32, u32)> = HashMap::new();
     let mut zombie_processes = 0;
     let mut found_tech: HashSet<&'static str> = HashSet::new();
     let mut tech_stack = Vec::new();
 
+    // Build PID → (name, ppid) map for parent resolution
+    let mut pid_info: HashMap<u32, (String, u32)> = HashMap::new();
+    let mut zombie_details: Vec<ZombieInfo> = Vec::new();
+
     for (pid, proc) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        let name = proc.name().to_string();
+        let ppid = proc.parent().map_or(0, |p| p.as_u32());
+        pid_info.insert(pid_u32, (name.clone(), ppid));
+
         if proc.status() == ProcessStatus::Zombie {
             zombie_processes += 1;
+            if zombie_details.len() < 10 {
+                zombie_details.push(ZombieInfo {
+                    pid: pid_u32,
+                    name: name.clone(),
+                    ppid,
+                    parent_name: String::new(), // filled later
+                });
+            }
         }
-        let name = proc.name();
-        let name_lower = name.to_ascii_lowercase();
 
+        let name_lower = name.to_ascii_lowercase();
         for &(prefix, display) in prefix_targets {
             if name_lower.starts_with(prefix) && found_tech.insert(display) {
                 tech_stack.push(display.to_string());
@@ -232,13 +258,20 @@ fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String
         }
 
         let mem = proc.memory() / (1024 * 1024);
-        top5.push(std::cmp::Reverse((
-            mem,
-            pid.as_u32(),
-            proc.name().to_string(),
-        )));
-        if top5.len() > 5 {
-            top5.pop();
+        let entry = aggregated.entry(name.clone()).or_insert((0, pid_u32, 0));
+        if mem > entry.0 {
+            entry.0 = mem; // keep max RSS among instances
+            entry.1 = pid_u32; // PID of the largest instance (updated when max changes)
+        }
+        entry.2 += 1; // count of instances with this name
+    }
+
+    // Resolve parent names for zombie entries
+    for z in &mut zombie_details {
+        if let Some((parent_name, _)) = pid_info.get(&z.ppid) {
+            z.parent_name = parent_name.clone();
+        } else {
+            z.parent_name = "unknown".to_string();
         }
     }
 
@@ -249,17 +282,28 @@ fn gather_process_and_tech(sys: &System) -> (Vec<ProcessInfo>, usize, Vec<String
     }
     tech_stack.sort();
 
-    let process_list: Vec<ProcessInfo> = top5
+    // Heap of top 5 by max RSS (aggregated)
+    let mut heap: BinaryHeap<std::cmp::Reverse<(u64, u32, String, u32)>> =
+        BinaryHeap::with_capacity(6);
+    for (name, (max_rss, max_pid, count)) in aggregated {
+        heap.push(std::cmp::Reverse((max_rss, max_pid, name, count)));
+        if heap.len() > 5 {
+            heap.pop();
+        }
+    }
+
+    let process_list: Vec<ProcessInfo> = heap
         .into_sorted_vec()
         .into_iter()
-        .map(|std::cmp::Reverse((mem, pid, name))| ProcessInfo {
+        .map(|std::cmp::Reverse((mem, pid, name, count))| ProcessInfo {
             name,
             pid,
             memory_mb: mem,
+            instances: count,
         })
         .collect();
 
-    (process_list, zombie_processes, tech_stack)
+    (process_list, zombie_processes, tech_stack, zombie_details)
 }
 
 /// Reads `/proc/self/limits`, dmesg, lspci, and security modules.
@@ -671,10 +715,24 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 
 pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
     let reboot_required = Path::new("/var/run/reboot-required").exists();
+    let mut reboot_required_pkgs = Vec::new();
+    if reboot_required
+        && let Ok((content, _truncated)) =
+            crate::safe_io::read_file_capped("/var/run/reboot-required.pkgs", 16 * 1024)
+    {
+        let mut seen = std::collections::HashSet::new();
+        for line in content.lines() {
+            let pkg = line.trim().to_string();
+            if !pkg.is_empty() && seen.insert(pkg.clone()) {
+                reboot_required_pkgs.push(pkg);
+            }
+        }
+    }
 
     let basics = gather_system_basics_values(sys, fetch_external_ip);
 
-    let (top_memory_processes, zombie_processes, tech_stack) = gather_process_and_tech(sys);
+    let (top_memory_processes, zombie_processes, tech_stack, zombie_details) =
+        gather_process_and_tech(sys);
 
     let (open_files_limit, oom_kills, dmesg_errors, gpu_devices, security_modules) =
         gather_kernel_and_hardware();
@@ -714,5 +772,7 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
         last_restic_snapshot,
         ntp_synchronized,
         time_offset_ms,
+        reboot_required_pkgs,
+        zombie_details,
     }
 }

@@ -311,8 +311,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let mut evidence_list = Vec::new();
         for leak in report.security.secret_hygiene.iter().take(3) {
             evidence_list.push(format!(
-                "'{}' in {} of {}",
-                leak.matched_key, leak.source, leak.process
+                "'{}' in {} of {} (pid {})",
+                leak.matched_key, leak.source, leak.process, leak.pid
             ));
         }
         let mut evidence_str = evidence_list.join(", ");
@@ -703,6 +703,7 @@ mod tests {
             restart_count: 0,
             oom_killed: false,
             health_status: None,
+            rw_size_mb: 0,
         }
     }
 

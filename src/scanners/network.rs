@@ -4,6 +4,7 @@ use std::fs;
 use chrono::{NaiveDateTime, Utc};
 
 use crate::models::{NetworkInfo, PortInfo, SslCertInfo};
+use crate::safe_io;
 use crate::scanners::proc_net::{attribute_sockets, collect_listening_sockets};
 use crate::utils::run_with_timeout;
 
@@ -202,12 +203,34 @@ pub fn gather_network_info() -> NetworkInfo {
             })
     });
 
+    // Detect real DNS upstreams behind systemd-resolved stub
+    let mut dns_upstreams = Vec::new();
+    if (dns_resolvers.contains(&"127.0.0.53".to_string())
+        || dns_resolvers.contains(&"127.0.0.54".to_string()))
+        && let Ok((content, _truncated)) =
+            safe_io::read_file_capped("/run/systemd/resolve/resolv.conf", 4096)
+    {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("nameserver") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let ip = parts[1].to_string();
+                    if ip != "127.0.0.53" && ip != "127.0.0.54" {
+                        dns_upstreams.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
     NetworkInfo {
         firewall_active,
         dns_resolvers,
         custom_host_overrides,
         ssl_certificates,
         listening_ports,
+        dns_upstreams,
     }
 }
 
