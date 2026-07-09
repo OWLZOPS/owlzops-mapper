@@ -246,6 +246,8 @@ pub struct SecurityInfo {
     pub access_alignment: AccessAuditResult,
     #[serde(default)]
     pub secret_hygiene: Vec<SecretLeak>,
+    #[serde(default)]
+    pub capability_audit: Vec<ProcCapFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -402,4 +404,20 @@ pub struct SecretLeak {
     pub process: String,
     pub source: String,
     pub matched_key: String,
+}
+
+// Process Capability Audit Models
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ProcCapFinding {
+    pub pid: u32,
+    pub comm: String,
+    pub euid: u32,
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
+    pub bounding: u64,
+    #[serde(default)]
+    pub ambient: u64,
+    pub critical_caps: Vec<String>,
 }

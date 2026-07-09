@@ -1,4 +1,5 @@
 mod access;
+pub mod capabilities;
 mod dlp;
 pub mod docker;
 pub mod host;

@@ -338,6 +338,22 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── Non-root processes with critical kernel capabilities ──
+    if !report.security.capability_audit.is_empty() {
+        findings.push(Finding {
+            id: "CAP-001",
+            title: "Non-root processes hold critical kernel capabilities".to_string(),
+            category: Category::Security,
+            weight: 8,
+            evidence: format!(
+                "{} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets",
+                report.security.capability_audit.len()
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── Docker container security issues ────────────────
     let mut has_mem_limit_issue = false;
     let mut has_cpu_limit_issue = false;

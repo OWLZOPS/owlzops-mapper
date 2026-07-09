@@ -67,6 +67,7 @@ pub fn render_dashboard(report: &AgentReport) {
     render_system_internals(report);
     render_packages(report);
     render_docker(report);
+    render_capability_audit(report);
 
     if !report.coverage_warnings.is_empty() {
         println!("\n⚠ Coverage Warnings (incomplete data):");
@@ -1089,6 +1090,29 @@ fn render_docker(report: &AgentReport) {
         println!("Docker Containers & Data Persistency:");
         println!("{t_docker}\n");
     }
+}
+
+fn render_capability_audit(report: &AgentReport) {
+    if report.security.capability_audit.is_empty() {
+        return;
+    }
+    println!("\nNon‑root processes with elevated capabilities:");
+    for f in &report.security.capability_audit {
+        let cap_list = if f.critical_caps.is_empty() {
+            let ambient_names = crate::scanners::capabilities::decode_mask(f.ambient);
+            format!("ambient: {}", ambient_names.join(", "))
+        } else {
+            f.critical_caps.join(", ")
+        };
+        println!(
+            "  • {} (pid {}, euid {}) — {}",
+            sanitize_terminal(&f.comm),
+            f.pid,
+            f.euid,
+            cap_list
+        );
+    }
+    println!();
 }
 
 fn render_footer() {
