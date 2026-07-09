@@ -50,6 +50,42 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
 
+### v0.5.10 (2026-07-09)
+
+**Observability & Correctness**
+- Coverage warnings (truncated files, inaccessible /proc entries) are now displayed in both terminal and Excel reports.
+- Port attribution failures due to permission errors are now aggregated and reported as a coverage warning.
+- Binary upload via the russh channel now waits for the remote command to finish and checks its exit status. Failures (disk full, permissions) are surfaced as `UploadFailed` errors.
+
+**Fleet Orchestration**
+- JSONL writer uses a conditional 2‑second timeout only during shutdown.
+- `SIGINT` / `SIGTERM` immediately abort in‑flight SSH sessions via `tokio::sync::Notify` + `JoinSet::abort_all()`. Fixed lost‑signal edge case by switching from `notify_waiters` to `notify_one`.
+
+**Security & Platform Support**
+- Sudoers file filtering now follows `sudoers(5)` rules exactly (files containing `.` or ending with `~` are ignored). Read errors are logged as coverage warnings.
+- TOFU trust store fails closed when `$HOME` is unset (no `/tmp` fallback).
+- Legacy SSH path (`run_remote_scan`) now uses `split_host_port` and passes ports explicitly to `ssh`/`scp`. IPv6 addresses are correctly bracketed for SCP.
+
+**UX Improvements**
+- DNS upstreams: when `systemd-resolved` stub is detected, real upstream servers are shown alongside the stub.
+- Reboot reason: the packages triggering a reboot request are listed.
+- DLP context: secret leak findings now include the PID and process name.
+- Cronjobs: renamed to “System & Custom Cronjobs”; suspicious entries are highlighted, ordinary system cron is no longer marked as dangerous.
+- Risk Score: switched to penalty notation (e.g. `Security −60`) with a verbal health label (Healthy / At Risk / Critical).
+
+**Docker Metrics Migration**
+- Reclaimable Space: uses `docker system df` (bollard `df()`) to report real reclaimable space instead of summing virtual sizes.
+- Image sizes: total size now uses `df.layers_size` (real disk usage), dangling images show their virtual size for context, and container sizes include `SizeRw` (writable layer).
+- UI/Excel: headers updated to “Real Disk Size (Images)” and “Dangling Virtual Size (GB)”.
+
+**Container Runtime & Orchestrator Detection**
+- Added recognition of `dockerd`, `containerd`, and Kubernetes‑related processes in host scanning.
+
+---
+
+<details>
+<summary>Previous releases (v0.5.9, v0.5.8, v0.5.7, v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
+
 ### v0.5.9 (2026-07-08)
 
 **Observability**
@@ -64,11 +100,6 @@ sudo ./owlzops-mapper audit
 **Hygiene**
 - Removed ineffective `debug = "limited"` from the release profile.
 - Unified timeout budget calculation (`host_budget_secs`) shared between fleet orchestrator and russh engine.
-
----
-
-<details>
-<summary>Previous releases (v0.5.8, v0.5.7, v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
 
 ### v0.5.8 (2026-07-08)
 
@@ -85,8 +116,6 @@ sudo ./owlzops-mapper audit
 - R9-06: The legacy SSH path (`run_remote_scan`) now uses `split_host_port` and passes ports explicitly to `ssh`/`scp`. IPv6 addresses are correctly bracketed for SCP.
 - R9-07: The TOFU trust store no longer falls back to `/tmp` when `$HOME` is unset. The mapper fails with a clear error instead of using a world‑writable directory.
 - DLP scanner now reuses a single `String` buffer for path construction, reducing per‑process allocations.
-
-
 
 ### v0.5.7 (2026-07-08)
 
@@ -110,8 +139,6 @@ sudo ./owlzops-mapper audit
 - N8-5: Include accurate hostname in `RemoteError::Ssh` errors.
 - N8-6: Use `safe_io` for `/proc/<pid>/comm` reads in DLP scanner.
 - N8-7: Progress bar for file upload replaced with animated spinner (legacy) or real-time progress (russh).
-
-
 
 ### v0.5.6 (2026-07-08)
 *(identical to 0.5.7 except for the SCP replacement and abort_all improvements)*
@@ -138,8 +165,6 @@ sudo ./owlzops-mapper audit
 - **Input validation for russh** – host, user, and remote path are now validated before use.
 - **Miscellaneous hardening** – timeout budgets unified, keepalive added to russh, panic‑free path handling, deterministic process attribution.
 
-
-
 ## Highlights v0.5.3 (IAM, Process Attribution, DLP)
 
 - **IAM & Access Alignment** – audit SSH keys for algorithm, bit length, and policy compliance; detect `NOPASSWD: ALL` in sudoers. Both findings include CIS references.
@@ -157,8 +182,6 @@ sudo ./owlzops-mapper audit
 - **Scoring version guard** – `risk_score` differences caused by formula updates are now marked as `Changed` instead of false improvements/degradations, preserving drift accuracy in `compare`.
 - **Compare v2** – metadata header with hostname, timestamps, binary version and time span; deterministic diff order; multi‑host summary with Added/Removed/Compared statuses.
 - **UX polish** – `--keep-binary` flag to skip cleanup after remote scan; emojis and ANSI colours are automatically disabled when stdout is piped; `--max-concurrent` controls fleet parallelism; file descriptor limit raised automatically.
-
-
 
 ## Highlights v0.5.1 (compare v2)
 
