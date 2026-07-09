@@ -291,6 +291,39 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // Exposure escalation: same (proto,port) but bind changed from local to wildcard
+    {
+        let mut bb: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for p in &before.network.listening_ports {
+            bb.entry((p.protocol.as_str(), p.port.as_str()))
+                .or_default()
+                .push(p.bind_address.as_str());
+        }
+        let mut aa: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for p in &after.network.listening_ports {
+            aa.entry((p.protocol.as_str(), p.port.as_str()))
+                .or_default()
+                .push(p.bind_address.as_str());
+        }
+
+        for ((proto, port), before_binds) in &bb {
+            if let Some(after_binds) = aa.get(&(*proto, *port)) {
+                let before_has_local = before_binds
+                    .iter()
+                    .any(|b| *b == "127.0.0.1" || *b == "::1");
+                let after_has_wildcard = after_binds.iter().any(|b| *b == "0.0.0.0" || *b == "::");
+                if before_has_local && after_has_wildcard {
+                    changes.push(Change {
+                        field: format!("network.listening_ports.{}.{}.exposure", proto, port),
+                        before: Some("local only".to_string()),
+                        after: Some("exposed on 0.0.0.0/::".to_string()),
+                        severity: Severity::Degraded,
+                    });
+                }
+            }
+        }
+    }
+
     // --- packages.upgradable (key: package name) ---
     let before_pkgs: HashSet<&str> = before
         .packages
