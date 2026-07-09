@@ -29,6 +29,25 @@ pub fn sanitize_terminal(s: &str) -> String {
         .collect()
 }
 
+/// Common patterns that indicate a suspicious cron job
+/// (executables from writable locations, hidden directories, etc.).
+const SUSPICIOUS_CRON_PATTERNS: &[&str] = &[
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/home/",
+    "curl",
+    "wget",
+    "base64 -d",
+    "sh -c",
+    "bash -c",
+];
+
+fn is_suspicious_cron(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    SUSPICIOUS_CRON_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -123,6 +142,15 @@ fn render_header(report: &AgentReport) {
         ("", "", "", "")
     };
 
+    // ---------- Risk Score with visual penalty notation ----------
+    let risk_label = if report.risk_score < 40 {
+        "Healthy"
+    } else if report.risk_score < 70 {
+        "At Risk"
+    } else {
+        "Critical"
+    };
+
     let risk_color = if is_tty {
         if report.risk_score >= 70 {
             "\x1b[1;31m"
@@ -138,13 +166,13 @@ fn render_header(report: &AgentReport) {
     println!("{}Owlzops Mapper v{}", icon_owl, report.version);
     println!("{}Scan completed in {:.2}s", icon_spy, report.duration_secs);
     println!(
-        "{}Risk Score: {}{}/100{}\n",
-        icon_shield, risk_color, report.risk_score, color_reset
+        "{}Risk Score: {}{}/100{}  ({}) \n",
+        icon_shield, risk_color, report.risk_score, color_reset, risk_label
     );
 
     let scored = crate::scoring::score(crate::scoring::evaluate(report));
     println!(
-        "  Security: {}/60  Reliability: {}/30  Hygiene: {}/10",
+        "  Security −{}  Reliability −{}  Hygiene −{}",
         scored.security, scored.reliability, scored.hygiene
     );
 
@@ -163,6 +191,9 @@ fn render_header(report: &AgentReport) {
                 String::new()
             };
             println!("  • {} (+{}){}", f.title, f.weight, cis_note);
+            if !f.evidence.is_empty() {
+                println!("    └─ {}", sanitize_terminal(&f.evidence));
+            }
         }
     }
 
@@ -702,7 +733,7 @@ fn render_system_internals(report: &AgentReport) {
         Cell::new("Count").add_attribute(Attribute::Bold),
     ]);
     t_internals.add_row(vec![
-        "Shadow Cronjobs",
+        "System & Custom Cronjobs",
         &report.host.cron_jobs.len().to_string(),
     ]);
     t_internals.add_row(vec![
@@ -723,12 +754,14 @@ fn render_system_internals(report: &AgentReport) {
         println!();
     }
     if !report.host.cron_jobs.is_empty() {
-        println!("\x1b[1;33m[!] Found Shadow Cronjobs:\x1b[0m");
+        println!("System & Custom Cronjobs:");
         for cron in &report.host.cron_jobs {
-            // Keep the `root` highlighting intact; sanitise the whole string first
             let safe_cron = sanitize_terminal(cron);
-            let display_cron = safe_cron.replace("root", "\x1b[1;31mroot\x1b[0m");
-            println!("    - {}", display_cron);
+            if is_suspicious_cron(&safe_cron) {
+                println!("\x1b[1;31m[!]  {}\x1b[0m", safe_cron);
+            } else {
+                println!("    - {}", safe_cron);
+            }
         }
         println!();
     }
