@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 fn default_scoring_version() -> u8 {
     1
 }
+fn one() -> u32 {
+    1
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentReport {
@@ -49,8 +52,6 @@ impl Default for AgentReport {
     }
 }
 
-// Added #[serde(default)] to allow older snapshot formats
-// to be deserialised even if new fields are missing.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct HostInfo {
@@ -83,9 +84,7 @@ pub struct HostInfo {
     pub last_restic_snapshot: Option<String>,
     pub ntp_synchronized: bool,
     pub time_offset_ms: Option<f64>,
-    #[serde(default)]
     pub reboot_required_pkgs: Vec<String>,
-    #[serde(default)]
     pub zombie_details: Vec<ZombieInfo>,
 }
 
@@ -94,6 +93,16 @@ pub struct ProcessInfo {
     pub name: String,
     pub pid: u32,
     pub memory_mb: u64,
+    #[serde(default = "one")]
+    pub instances: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ZombieInfo {
+    pub pid: u32,
+    pub name: String,
+    pub ppid: u32,
+    pub parent_name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -160,6 +169,10 @@ pub struct TopologyInfo {
     pub dangling_volumes_count: usize,
     pub dangling_images: Vec<DanglingImageInfo>,
     pub containers: Vec<ContainerInfo>,
+    #[serde(default)]
+    pub images_reclaimable_mb: u64,
+    #[serde(default)]
+    pub build_cache_reclaimable_mb: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -190,6 +203,8 @@ pub struct ContainerInfo {
     pub oom_killed: bool,
     #[serde(default)]
     pub health_status: Option<String>,
+    #[serde(default)]
+    pub rw_size_mb: u64,
 }
 
 impl ContainerInfo {
@@ -241,8 +256,6 @@ pub struct UserInfo {
     pub authorized_keys_count: usize,
 }
 
-// PackageManager with forward-compatible deserialization:
-// unknown variants map to `Unknown` so old binaries can read future snapshots.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Default)]
 pub enum PackageManager {
     Apt,
@@ -387,14 +400,6 @@ pub struct AccessAuditResult {
 pub struct SecretLeak {
     pub pid: u32,
     pub process: String,
-    pub source: String,      // "environ" or "cmdline"
-    pub matched_key: String, // compromised variable/flag name
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct ZombieInfo {
-    pub pid: u32,
-    pub name: String,
-    pub ppid: u32,
-    pub parent_name: String,
+    pub source: String,
+    pub matched_key: String,
 }

@@ -184,8 +184,8 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
     }
 }
 
-/// Returns top‑5 memory processes, zombie count, detected tech stack,
-/// and per‑zombie details (capped at 10 entries).
+/// Returns top‑5 memory processes (aggregated by name), zombie count,
+/// detected tech stack, and per‑zombie details.
 fn gather_process_and_tech(
     sys: &System,
 ) -> (Vec<ProcessInfo>, usize, Vec<String>, Vec<ZombieInfo>) {
@@ -211,14 +211,13 @@ fn gather_process_and_tech(
         ("rust", "Rust Binary"),
     ];
 
-    let mut top5: BinaryHeap<std::cmp::Reverse<(u64, u32, String)>> = BinaryHeap::with_capacity(6);
+    let mut aggregated: HashMap<String, (u64, u32, u32)> = HashMap::new();
     let mut zombie_processes = 0;
     let mut found_tech: HashSet<&'static str> = HashSet::new();
     let mut tech_stack = Vec::new();
 
     // Build PID → (name, ppid) map for parent resolution
     let mut pid_info: HashMap<u32, (String, u32)> = HashMap::new();
-
     let mut zombie_details: Vec<ZombieInfo> = Vec::new();
 
     for (pid, proc) in sys.processes() {
@@ -252,10 +251,12 @@ fn gather_process_and_tech(
         }
 
         let mem = proc.memory() / (1024 * 1024);
-        top5.push(std::cmp::Reverse((mem, pid_u32, name.clone())));
-        if top5.len() > 5 {
-            top5.pop();
+        let entry = aggregated.entry(name.clone()).or_insert((0, pid_u32, 0));
+        if mem > entry.0 {
+            entry.0 = mem; // keep max RSS among instances
+            entry.1 = pid_u32; // PID of the largest instance (updated when max changes)
         }
+        entry.2 += 1; // count of instances with this name
     }
 
     // Resolve parent names for zombie entries
@@ -274,13 +275,24 @@ fn gather_process_and_tech(
     }
     tech_stack.sort();
 
-    let process_list: Vec<ProcessInfo> = top5
+    // Heap of top 5 by max RSS (aggregated)
+    let mut heap: BinaryHeap<std::cmp::Reverse<(u64, u32, String, u32)>> =
+        BinaryHeap::with_capacity(6);
+    for (name, (max_rss, max_pid, count)) in aggregated {
+        heap.push(std::cmp::Reverse((max_rss, max_pid, name, count)));
+        if heap.len() > 5 {
+            heap.pop();
+        }
+    }
+
+    let process_list: Vec<ProcessInfo> = heap
         .into_sorted_vec()
         .into_iter()
-        .map(|std::cmp::Reverse((mem, pid, name))| ProcessInfo {
+        .map(|std::cmp::Reverse((mem, pid, name, count))| ProcessInfo {
             name,
             pid,
             memory_mb: mem,
+            instances: count,
         })
         .collect();
 

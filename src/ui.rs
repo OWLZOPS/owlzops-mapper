@@ -362,8 +362,17 @@ fn render_top_memory(report: &AgentReport) {
         if proc.memory_mb > 1024 {
             mem_cell = mem_cell.fg(Color::Yellow);
         }
+        let name = if proc.instances > 1 {
+            format!(
+                "{} (×{} workers)",
+                sanitize_terminal(&proc.name),
+                proc.instances
+            )
+        } else {
+            sanitize_terminal(&proc.name)
+        };
         t_mem.add_row(vec![
-            Cell::new(sanitize_terminal(&proc.name)),
+            Cell::new(name),
             Cell::new(proc.pid.to_string()),
             mem_cell,
         ]);
@@ -932,7 +941,8 @@ fn render_docker(report: &AgentReport) {
         return;
     }
     let total_img_gb = report.topology.total_images_size_mb as f64 / 1024.0;
-    let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
+    let reclaimable_gb = report.topology.images_reclaimable_mb as f64 / 1024.0;
+    let build_cache_gb = report.topology.build_cache_reclaimable_mb as f64 / 1024.0;
 
     let mut t_dock_sum = Table::new();
     t_dock_sum
@@ -953,22 +963,36 @@ fn render_docker(report: &AgentReport) {
         &format!("{:.2} GB", total_img_gb),
     ]);
 
-    let mut dang_count_cell = Cell::new(report.topology.dangling_images_count.to_string());
-    let mut dang_size_cell = Cell::new(format!("{:.2} GB", dang_img_gb));
-    if report.topology.dangling_images_count > 0 {
-        dang_count_cell = dang_count_cell
-            .fg(Color::Yellow)
-            .add_attribute(Attribute::Bold);
-        if dang_img_gb > 5.0 {
-            dang_size_cell = dang_size_cell.fg(Color::Red).add_attribute(Attribute::Bold);
-        } else {
-            dang_size_cell = dang_size_cell
+    if reclaimable_gb > 0.0 || build_cache_gb > 0.0 {
+        t_dock_sum.add_row(vec![
+            "Reclaimable Space (Prune)",
+            &format!("{:.2} GB", reclaimable_gb),
+        ]);
+        t_dock_sum.add_row(vec![
+            "Build Cache Reclaimable",
+            &format!("{:.2} GB", build_cache_gb),
+        ]);
+    } else {
+        // Fallback to dangling count for systems without system_df support
+        let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
+        let mut dang_count_cell = Cell::new(report.topology.dangling_images_count.to_string());
+        let mut dang_size_cell = Cell::new(format!("{:.2} GB", dang_img_gb));
+        if report.topology.dangling_images_count > 0 {
+            dang_count_cell = dang_count_cell
                 .fg(Color::Yellow)
                 .add_attribute(Attribute::Bold);
+            if dang_img_gb > 5.0 {
+                dang_size_cell = dang_size_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            } else {
+                dang_size_cell = dang_size_cell
+                    .fg(Color::Yellow)
+                    .add_attribute(Attribute::Bold);
+            }
         }
+        t_dock_sum.add_row(vec![Cell::new("Dangling (Unused) Images"), dang_count_cell]);
+        t_dock_sum.add_row(vec![Cell::new("Dangling Wasted Space"), dang_size_cell]);
     }
-    t_dock_sum.add_row(vec![Cell::new("Dangling (Unused) Images"), dang_count_cell]);
-    t_dock_sum.add_row(vec![Cell::new("Dangling Wasted Space"), dang_size_cell]);
+
     t_dock_sum.add_row(vec![
         "Dangling Volumes",
         &report.topology.dangling_volumes_count.to_string(),
@@ -976,6 +1000,7 @@ fn render_docker(report: &AgentReport) {
     println!("Docker Images & Volumes:");
     println!("{t_dock_sum}\n");
 
+    // Dangling images list remains unchanged
     if !report.topology.dangling_images.is_empty() {
         let mut t_dang = Table::new();
         t_dang
@@ -1002,6 +1027,7 @@ fn render_docker(report: &AgentReport) {
         println!("{t_dang}\n");
     }
 
+    // Containers with RW size
     if !report.topology.containers.is_empty() {
         let mut t_docker = Table::new();
         t_docker
@@ -1013,6 +1039,7 @@ fn render_docker(report: &AgentReport) {
                 .fg(Color::Cyan),
             Cell::new("Uptime / Status").add_attribute(Attribute::Bold),
             Cell::new("Size (GB)").add_attribute(Attribute::Bold),
+            Cell::new("RW Size (MB)").add_attribute(Attribute::Bold),
             Cell::new("Log Size (GB)").add_attribute(Attribute::Bold),
             Cell::new("Security Issues").add_attribute(Attribute::Bold),
             Cell::new("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
@@ -1025,6 +1052,7 @@ fn render_docker(report: &AgentReport) {
                 status_cell = status_cell.fg(Color::Yellow);
             }
             let c_size_gb = c.size_mb as f64 / 1024.0;
+            let rw_size_mb = c.rw_size_mb;
             let c_log_gb = c.log_size_mb as f64 / 1024.0;
             let mut log_cell = Cell::new(format!("{:.2}", c_log_gb));
             if c_log_gb > 1.0 {
@@ -1052,6 +1080,7 @@ fn render_docker(report: &AgentReport) {
                 Cell::new(sanitize_terminal(&c.name)),
                 status_cell,
                 Cell::new(format!("{:.2}", c_size_gb)),
+                Cell::new(rw_size_mb.to_string()),
                 log_cell,
                 issue_cell,
                 mounts_cell,

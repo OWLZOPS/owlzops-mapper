@@ -703,6 +703,7 @@ mod tests {
             restart_count: 0,
             oom_killed: false,
             health_status: None,
+            rw_size_mb: 0,
         }
     }
 
