@@ -216,7 +216,7 @@ fn run_with_timeout_inner(
         }
         Err(_timeout) => {
             let _ = child.kill();
-            poll_wait(&mut child, Duration::from_secs(1));
+            let _ = child.wait();
             None
         }
     }
