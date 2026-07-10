@@ -178,25 +178,28 @@ fn render_header(report: &AgentReport) {
     if !active_findings.is_empty() {
         println!("\nRisk Breakdown:");
 
+        let (icon_sec, icon_rel, icon_hyg) = if is_tty {
+            ("\u{1F6E1} ", "\u{2699} ", "\u{1F9F9} ")
+        } else {
+            ("", "", "")
+        };
+
         let categories = [
             (
                 crate::scoring::Category::Security,
-                "\u{1F6E1} Security Findings",
-                Color::Cyan,
+                format!("{}Security Findings", icon_sec),
             ),
             (
                 crate::scoring::Category::Reliability,
-                "\u{2699} Reliability Findings",
-                Color::Yellow,
+                format!("{}Reliability Findings", icon_rel),
             ),
             (
                 crate::scoring::Category::Hygiene,
-                "\u{1F9F9} Hygiene Findings",
-                Color::Green,
+                format!("{}Hygiene Findings", icon_hyg),
             ),
         ];
 
-        for (cat, label, _color) in categories {
+        for (cat, label) in categories {
             let cat_findings: Vec<_> = active_findings
                 .iter()
                 .filter(|f| f.category == cat)
