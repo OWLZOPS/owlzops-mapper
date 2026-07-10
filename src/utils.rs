@@ -91,11 +91,21 @@ pub fn is_wildcard_bind(addr: &str) -> bool {
 
 /// Single source of truth for "loopback" bind addresses.
 ///
-/// Matches canonical loopback forms: IPv4 loopback, IPv6 loopback, and the
-/// IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) that the kernel reports
-/// for AF_INET6 sockets bound to 127.0.0.1.
+/// Unlike the wildcard case, exact literals cannot be total here: IPv4
+/// loopback is the whole 127.0.0.0/8 block (systemd-resolved alone binds
+/// 127.0.0.53/127.0.0.54), so both v4 families — native and IPv4-mapped —
+/// are matched by canonical prefix with a digits/dots tail check, keeping
+/// padded or alphanumeric garbage out. `::1` stays an exact `matches!` arm:
+/// IPv6 loopback is a single address. Zero-copy throughout.
 pub fn is_loopback_bind(addr: &str) -> bool {
-    matches!(addr, "127.0.0.1" | "::1" | "::ffff:127.0.0.1")
+    fn v4_loopback(s: &str) -> bool {
+        s.strip_prefix("127.").is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        })
+    }
+    matches!(addr, "::1")
+        || v4_loopback(addr)
+        || addr.strip_prefix("::ffff:").is_some_and(v4_loopback)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,8 +278,6 @@ mod tests {
     fn wildcard_bind_matches_canonical_forms() {
         assert!(is_wildcard_bind("0.0.0.0"));
         assert!(is_wildcard_bind("::"));
-        // AF_INET6 socket bound to all v4 interfaces, as canonicalized by
-        // std Ipv6Addr Display — the only spelling decode_v6 can produce.
         assert!(is_wildcard_bind("::ffff:0.0.0.0"));
     }
 
@@ -289,17 +297,26 @@ mod tests {
     #[test]
     fn loopback_bind_matches_canonical_forms() {
         assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("127.0.0.53")); // systemd-resolved stub
+        assert!(is_loopback_bind("127.0.1.1")); // full /8 — same semantics as is_local_ip
         assert!(is_loopback_bind("::1"));
-        assert!(is_loopback_bind("::ffff:127.0.0.1"));
+        assert!(is_loopback_bind("::ffff:127.0.0.1")); // mapped loopback
+        assert!(is_loopback_bind("::ffff:127.0.0.53"));
     }
 
     #[test]
     fn loopback_bind_rejects_everything_else() {
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!is_loopback_bind("::"));
-        assert!(!is_loopback_bind("::ffff:0.0.0.0"));
+        assert!(!is_loopback_bind("::ffff:0.0.0.0")); // wildcard family, not loopback
         assert!(!is_loopback_bind("10.0.0.1"));
-        assert!(!is_loopback_bind("127.0.0.2"));
+        assert!(!is_loopback_bind("128.0.0.1")); // /8 boundary
+        assert!(!is_loopback_bind("1127.0.0.1")); // prefix, not substring
+        assert!(!is_loopback_bind("127.")); // empty tail
+        assert!(!is_loopback_bind("127.0.0.1 ")); // padded input stays rejected
+        assert!(!is_loopback_bind("::ffff:10.0.0.1")); // mapped non-loopback
         assert!(!is_loopback_bind("::2"));
+        assert!(!is_loopback_bind("localhost")); // names are not bind strings
+        assert!(!is_loopback_bind(""));
     }
 }

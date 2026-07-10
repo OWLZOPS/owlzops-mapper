@@ -311,10 +311,15 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                 let before_has_local = before_binds
                     .iter()
                     .any(|b| crate::utils::is_loopback_bind(b));
+                let before_has_wildcard = before_binds
+                    .iter()
+                    .any(|b| crate::utils::is_wildcard_bind(b));
                 let after_has_wildcard = after_binds
                     .iter()
                     .any(|b| crate::utils::is_wildcard_bind(b));
-                if before_has_local && after_has_wildcard {
+
+                // Only escalate if wildcard appeared, and wasn't already present alongside loopback
+                if before_has_local && !before_has_wildcard && after_has_wildcard {
                     changes.push(Change {
                         field: format!("network.listening_ports.{}.{}.exposure", proto, port),
                         before: Some("local only".to_string()),
@@ -853,5 +858,35 @@ mod tests {
         assert_eq!(escalation.severity, Severity::Degraded);
         assert!(escalation.before.as_deref() == Some("local only"));
         assert!(escalation.after.as_deref().unwrap().contains("wildcard"));
+    }
+
+    #[test]
+    fn no_false_escalation_when_wildcard_already_present() {
+        // before: both loopback and wildcard on the same port (typical dual-stack)
+        let mut before = test_report();
+        before.network.listening_ports = vec![
+            PortInfo {
+                protocol: "tcp".into(),
+                bind_address: "127.0.0.1".into(),
+                port: "80".into(),
+                process: "nginx".into(),
+                pid: Some(1),
+                exe_path: None,
+            },
+            PortInfo {
+                protocol: "tcp".into(),
+                bind_address: "::".into(),
+                port: "80".into(),
+                process: "nginx".into(),
+                pid: Some(1),
+                exe_path: None,
+            },
+        ];
+        let after = before.clone(); // no change
+        let diff = compare_reports(&before, &after);
+        assert!(
+            !diff.changes.iter().any(|c| c.field.contains("exposure")),
+            "Should not report escalation when config is unchanged"
+        );
     }
 }
