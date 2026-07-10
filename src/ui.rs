@@ -1104,13 +1104,43 @@ fn render_capability_audit(report: &AgentReport) {
         } else {
             f.critical_caps.join(", ")
         };
-        println!(
-            "  • {} (pid {}, euid {}) — {}",
-            sanitize_terminal(&f.comm),
-            f.pid,
-            f.euid,
-            cap_list
-        );
+        let nnp = match f.no_new_privs {
+            Some(false) => "NNP=open",
+            Some(true) => "NNP=1",
+            None => "",
+        };
+        let secc = match f.seccomp {
+            Some(2) => "Seccomp=2",
+            Some(0) => "Seccomp=off",
+            Some(1) => "Seccomp=strict",
+            _ => "",
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        if !nnp.is_empty() {
+            parts.push(nnp);
+        }
+        if !secc.is_empty() {
+            parts.push(secc);
+        }
+        let extra = parts.join(" ");
+        if extra.is_empty() {
+            println!(
+                "  • {} (pid {}, euid {}) — {}",
+                sanitize_terminal(&f.comm),
+                f.pid,
+                f.euid,
+                cap_list
+            );
+        } else {
+            println!(
+                "  • {} (pid {}, euid {}) — {} [{}]",
+                sanitize_terminal(&f.comm),
+                f.pid,
+                f.euid,
+                cap_list,
+                extra
+            );
+        }
     }
     println!();
 }

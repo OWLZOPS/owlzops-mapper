@@ -1241,7 +1241,14 @@ fn write_capability_section(w: &mut SheetWriter, report: &AgentReport) -> Result
         return Ok(());
     }
     w.write_section_title("Elevated Capabilities (non‑root)")?;
-    w.write_header(&["PID", "Process", "EUID", "Critical Caps"])?;
+    w.write_header(&[
+        "PID",
+        "Process",
+        "EUID",
+        "Critical Caps",
+        "NoNewPrivs",
+        "Seccomp",
+    ])?;
     for f in &report.security.capability_audit {
         let band = w.fmts.row_band(w.current_row());
         w.write_number(0, f.pid as f64, &w.fmts.number)?;
@@ -1253,6 +1260,20 @@ fn write_capability_section(w: &mut SheetWriter, report: &AgentReport) -> Result
             f.critical_caps.join(", ")
         };
         w.write_string(3, &cap_text, band)?;
+        let nnp_text = match f.no_new_privs {
+            Some(false) => "open",
+            Some(true) => "1",
+            None => "-",
+        };
+        w.write_string(4, nnp_text, band)?;
+        let secc_text = match f.seccomp {
+            Some(0) => "off",
+            Some(1) => "strict",
+            Some(2) => "2",
+            Some(_) => "?",
+            None => "-",
+        };
+        w.write_string(5, secc_text, band)?;
         w.next_row();
     }
     Ok(())
