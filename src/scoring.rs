@@ -22,7 +22,7 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
-pub const SCORING_VERSION: u8 = 5;
+pub const SCORING_VERSION: u8 = 6;
 
 // ── New Finding model (v0.5) ───────────────────────────────
 
@@ -348,6 +348,30 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .filter(|f| f.no_new_privs == Some(false))
             .count();
 
+        // Join privileged non‑root processes with live listeners
+        let ports = &report.network.listening_ports;
+        let is_global = |addr: &str| addr == "0.0.0.0" || addr == "::";
+        let (listening, exposed) =
+            report
+                .security
+                .capability_audit
+                .iter()
+                .fold((0usize, 0usize), |(l, e), f| {
+                    let pid = Some(f.pid);
+                    let mut on_net = false;
+                    let mut global = false;
+                    for p in ports {
+                        if p.pid == pid {
+                            on_net = true;
+                            if is_global(&p.bind_address) {
+                                global = true;
+                                break;
+                            }
+                        }
+                    }
+                    (l + on_net as usize, e + global as usize)
+                });
+
         let mut evidence = format!(
             "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets"
         );
@@ -356,12 +380,29 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 "; {nnp_open} of them with NoNewPrivs=0 — setuid execve escalation path open"
             ));
         }
+        if listening > 0 {
+            if exposed > 0 {
+                evidence.push_str(&format!(
+                    "; WARNING: {listening} of these listening on the network ({exposed} exposed globally on 0.0.0.0/::)"
+                ));
+            } else {
+                evidence.push_str(&format!(
+                    "; WARNING: {listening} of these listening on the network (none exposed globally)"
+                ));
+            }
+        }
+
+        // RCE→LPE chain: a globally reachable privileged non‑root process
+        // requires a heavier weight (parity with SEC‑013).  The weight change
+        // is paired with a SCORING_VERSION bump so that compare v2 marks the
+        // delta as ~ Changed instead of ↓ Degraded.
+        let weight = if exposed > 0 { 20 } else { 8 };
 
         findings.push(Finding {
             id: "CAP-001",
             title: "Non-root processes hold critical kernel capabilities".to_string(),
             category: Category::Security,
-            weight: 8,
+            weight,
             evidence,
             suppressed: None,
             cis_ref: None,
@@ -815,5 +856,48 @@ mod tests {
                 .all(|f| !f.evidence.contains("cache"))
         );
         assert!(score(findings).reliability <= 30);
+    }
+
+    #[test]
+    fn cap001_weight_escalates_on_global_exposure() {
+        use crate::models::{PortInfo, ProcCapFinding};
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![ProcCapFinding {
+            pid: 4242,
+            comm: "nginx".into(),
+            euid: 101,
+            effective: 0xa804_25fb,
+            permitted: 0xa804_25fb,
+            inheritable: 0,
+            bounding: 0xa804_25fb,
+            ambient: 0,
+            no_new_privs: Some(false),
+            seccomp: Some(2),
+            critical_caps: vec!["CAP_NET_RAW".into()],
+        }];
+        r.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            port: "8080".into(),
+            process: "nginx".into(),
+            bind_address: "0.0.0.0".into(),
+            pid: Some(4242),
+            exe_path: None,
+        }];
+        let cap = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-001")
+            .expect("CAP-001 present");
+        assert_eq!(cap.weight, 20);
+        assert!(cap.evidence.contains("1 exposed globally"));
+
+        // Same finding, but bound to loopback → no escalation, weight stays 8.
+        r.network.listening_ports[0].bind_address = "127.0.0.1".into();
+        let cap = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-001")
+            .unwrap();
+        assert_eq!(cap.weight, 8);
+        assert!(cap.evidence.contains("1 of these listening"));
+        assert!(!cap.evidence.contains("exposed globally on"));
     }
 }
