@@ -483,6 +483,38 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-020 — process masquerading as a kernel thread ──
+    // is_mimic is set upstream only for a kthread-looking comm with a non-empty
+    // cmdline (real kthreads have empty cmdline) — a userspace impostor.
+    let mimics: Vec<&crate::models::SuspiciousProcess> = report
+        .security
+        .suspicious_processes
+        .iter()
+        .filter(|p| p.is_mimic)
+        .collect();
+    if !mimics.is_empty() {
+        let list = mimics
+            .iter()
+            .map(|p| match p.exe_path.as_deref() {
+                Some(exe) => format!("{} (pid {}, real exe {})", p.name, p.pid, exe),
+                None => format!(
+                    "{} (pid {}, kernel-thread name with userspace cmdline)",
+                    p.name, p.pid
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-020",
+            title: "ACTIVE COMPROMISE: process masquerading as kernel thread".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!("{} masquerading process(es): {}", mimics.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── SEC-018 – Malicious cron job detected ────────────────
     // (formerly SEC-017; renumbered to avoid conflict with fileless detection)
     if let Some(_critical) = report
@@ -944,7 +976,9 @@ impl CriticalFlags {
         };
         // Active-compromise (IoC) finding IDs. SEC-018 is deliberately excluded:
         // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
-        const IOC_IDS: [&str; 5] = ["SEC-015", "SEC-016", "SEC-017", "SEC-019", "DOCK-010"];
+        const IOC_IDS: [&str; 6] = [
+            "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "DOCK-010",
+        ];
         let count_sysctl = findings
             .iter()
             .filter(|f| f.id == "SEC-007" && f.suppressed.is_none())
@@ -1261,6 +1295,7 @@ mod tests {
                 exe_path: Some("/dev/shm/loader".into()),
                 is_deleted: true,
                 euid: 1000, // non-root, original semantics preserved
+                is_mimic: false,
             },
             // known miner, live → SEC-016 only
             SuspiciousProcess {
@@ -1269,6 +1304,7 @@ mod tests {
                 exe_path: Some("/tmp/xmrig".into()),
                 is_deleted: false,
                 euid: 1000,
+                is_mimic: false,
             },
         ];
         let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
@@ -1302,21 +1338,23 @@ mod tests {
         use crate::models::SuspiciousProcess;
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![
-            // обычный fileless: удалённый файл из /tmp
+            // fileless on-disk /tmp
             SuspiciousProcess {
                 pid: 10,
                 name: "malware".into(),
                 exe_path: Some("/tmp/malware".into()),
                 is_deleted: true,
                 euid: 1000,
+                is_mimic: false,
             },
-            // memfd-процесс
+            // memfd process
             SuspiciousProcess {
                 pid: 20,
                 name: "stealth".into(),
                 exe_path: Some("/memfd:stealth".into()),
                 is_deleted: true,
                 euid: 1000,
+                is_mimic: false,
             },
         ];
         let sec017 = evaluate(&r)
@@ -1425,6 +1463,7 @@ mod tests {
             exe_path: exe.map(Into::into),
             is_deleted: true,
             euid,
+            is_mimic: false,
         };
 
         // Branch A — ROOT fileless, capability_audit EMPTY → SEC-019 still fires.
@@ -1529,6 +1568,29 @@ mod tests {
         assert!(
             !cf.compromised_host,
             "cron persistence is not an active compromise"
+        );
+    }
+
+    #[test]
+    fn sec020_mimic_sets_compromised_host() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![SuspiciousProcess {
+            pid: 100,
+            name: "kworker/0:1".into(),
+            exe_path: Some("/tmp/kdevtmpfsi".into()),
+            is_mimic: true,
+            ..Default::default()
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-020")
+            .expect("SEC-020 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("kworker/0:1") && f.evidence.contains("/tmp/kdevtmpfsi"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "mimic must set compromise"
         );
     }
 }

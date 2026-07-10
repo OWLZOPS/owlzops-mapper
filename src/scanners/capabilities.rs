@@ -277,6 +277,32 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
     })
 }
 
+// ── Kernel thread mimicry helper ────────────────────────────────────────
+
+/// Does this comm match a Linux kernel-thread naming pattern? Kernel threads
+/// have no mm, so their cmdline is always empty; a kthread-looking comm WITH a
+/// cmdline is a userspace impostor. A leading '[' (impostor/ps-style wrapping)
+/// is stripped before matching. Curated toward the commonly-forged names
+/// (kworker/ dominates real-world miner disguises); extend as needed.
+fn is_kthread_comm(comm: &str) -> bool {
+    let t = comm.trim();
+    let c = t.strip_prefix('[').unwrap_or(t);
+    const KTHREAD_PREFIXES: &[&str] = &[
+        "kworker/",
+        "ksoftirqd/",
+        "migration/",
+        "watchdog/",
+        "irq/",
+        "rcu_",
+        "rcuo",
+        "kthreadd",
+        "kswapd",
+        "kcompactd",
+        "khugepaged",
+    ];
+    KTHREAD_PREFIXES.iter().any(|p| c.starts_with(p))
+}
+
 // ── Suspicious process classification ────────────────────────────────────
 
 /// Hard cap on stored suspicious processes — keeps JSONL flat under a fork-bomb
@@ -288,7 +314,8 @@ const MAX_SUSPICIOUS: usize = 64;
 /// Two independent triggers, name-independent for the deleted case:
 ///   * deleted executable whose *base* path is ephemeral (fileless implant);
 ///   * name in the malware blocklist (explicit always; ambiguous only when
-///     the clean exe path is ephemeral).
+///     the clean exe path is ephemeral);
+///   * kthread-looking comm with a non-empty cmdline (userspace impostor).
 ///
 /// Returns the record (if any) plus a flag: an ambiguous name whose exe could
 /// not be resolved (so the caller can aggregate a coverage warning).
@@ -299,6 +326,7 @@ fn classify_suspicious(
     pid: u32,
     euid: u32,
     exe_link: Option<&str>,
+    cmdline: Option<&str>,
 ) -> (Option<SuspiciousProcess>, bool) {
     // Split the kernel's " (deleted)" suffix off the true base path.
     let (base_path, deleted) = match exe_link {
@@ -315,12 +343,15 @@ fn classify_suspicious(
     //   (b) a /memfd: base path — memfd_create-backed, in-memory-only — which is
     //       intrinsically fileless whether or not the kernel appended the
     //       " (deleted)" suffix (some kernels/configs omit it).
-    // NOTE: `deleted_ephemeral` is now a slight misnomer — it means "fileless"
-    // (cf. the is_deleted Note from the SEC-017 session); kept for continuity
-    // with the field it feeds. Zero-copy: starts_with / is_some_and, no alloc.
     let deleted_ephemeral = base_path.is_some_and(|p| {
         (deleted && crate::utils::is_ephemeral_exec_path(p)) || p.starts_with("/memfd:")
     });
+
+    // Mimicry: kthread-looking comm with a non-empty cmdline. Real kernel threads
+    // have no mm ⇒ empty cmdline, so any argv content proves a userspace impostor.
+    // Stronger/lower-FP than matching cmdline prefixes. cmdline == Some("") is a
+    // real kthread (not a mimic); None (unreadable) is inconclusive (not a mimic).
+    let is_mimic = is_kthread_comm(comm) && cmdline.is_some_and(|argv0| !argv0.trim().is_empty());
 
     // Trigger 2 — name blocklist.
     let name_recorded = if crate::utils::is_known_malware(comm) {
@@ -328,14 +359,17 @@ fn classify_suspicious(
     } else if crate::utils::is_ambiguous_malware(comm) {
         match base_path {
             Some(p) if crate::utils::is_ephemeral_exec_path(p) => true,
-            Some(_) => false,            // ambiguous name, legit path → not flagged
-            None => return (None, true), // ambiguous name, exe unresolved → dropped
+            Some(_) => false,
+            // Ambiguous name + unresolved exe is normally dropped — but if it is
+            // also a mimic we record below, so only bail when NOT a mimic.
+            None if !is_mimic => return (None, true),
+            None => false,
         }
     } else {
         false
     };
 
-    if name_recorded || deleted_ephemeral {
+    if name_recorded || deleted_ephemeral || is_mimic {
         (
             Some(SuspiciousProcess {
                 pid,
@@ -343,6 +377,7 @@ fn classify_suspicious(
                 exe_path: base_path.map(str::to_string), // cleaned of the suffix
                 is_deleted: deleted_ephemeral,
                 euid,
+                is_mimic,
             }),
             false,
         )
@@ -397,8 +432,6 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         let (content, truncated) = match safe_io::read_file_capped(&path_buf, CAP_PROC_STATUS) {
             Ok(v) => v,
             Err(_) => {
-                // TOCTOU exit churn (dir gone) is normal; a still-present but
-                // unreadable status means hidepid/LSM restriction — count it.
                 if entry.path().exists() {
                     denied += 1;
                 }
@@ -420,7 +453,26 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         let exe_link = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let (record, dropped) = classify_suspicious(&st.name, pid, st.euid, exe_link.as_deref());
+
+        // Mimicry gate: only touch cmdline for kthread-looking comms (cheap prefix
+        // check first avoids a read for the ~99% of normal processes). argv0 =
+        // bytes up to the first NUL (empty string for a real kthread).
+        let cmdline_argv0 = if is_kthread_comm(&st.name) {
+            let cpath = format!("{}/{pid}/cmdline", proc_root.display());
+            safe_io::read_file_capped(&cpath, 4096)
+                .ok()
+                .map(|(content, _)| content.split('\0').next().unwrap_or("").to_string())
+        } else {
+            None
+        };
+
+        let (record, dropped) = classify_suspicious(
+            &st.name,
+            pid,
+            st.euid,
+            exe_link.as_deref(),
+            cmdline_argv0.as_deref(),
+        );
         if dropped {
             ambiguous_dropped += 1;
         }
@@ -539,10 +591,10 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
         assert_eq!(parse_hex_mask(" ff "), Some(0xff));
         assert_eq!(parse_hex_mask(""), None);
         assert_eq!(parse_hex_mask("\t"), None);
-        assert_eq!(parse_hex_mask("0x1f"), None); // no radix prefixes
-        assert_eq!(parse_hex_mask("+ff"), None); // from_str_radix alone accepts this
+        assert_eq!(parse_hex_mask("0x1f"), None);
+        assert_eq!(parse_hex_mask("+ff"), None);
         assert_eq!(parse_hex_mask("zzzz"), None);
-        assert_eq!(parse_hex_mask("00000000000000000"), None); // 17 chars
+        assert_eq!(parse_hex_mask("00000000000000000"), None);
     }
 
     #[test]
@@ -551,10 +603,10 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
         assert_eq!(parse_u8_field(" 0 "), Some(0));
         assert_eq!(parse_u8_field("03"), Some(3));
         assert_eq!(parse_u8_field(""), None);
-        assert_eq!(parse_u8_field("+1"), None); // bare str::parse would accept this
+        assert_eq!(parse_u8_field("+1"), None);
         assert_eq!(parse_u8_field("-1"), None);
         assert_eq!(parse_u8_field("x"), None);
-        assert_eq!(parse_u8_field("256"), None); // u8 overflow
+        assert_eq!(parse_u8_field("256"), None);
     }
 
     #[test]
@@ -565,7 +617,6 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
 
     #[test]
     fn missing_capamb_is_tolerated() {
-        // Kernels < 4.3 emit no CapAmb line.
         let legacy = FULL_ROOT.replace("CapAmb:\t0000000000000000\n", "");
         let st = parse_status(&legacy).expect("parse");
         assert_eq!(st.caps.ambient, 0);
@@ -573,7 +624,6 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
 
     #[test]
     fn missing_nnp_and_seccomp_lines_are_none() {
-        // Kernels < 4.10 / no CONFIG_SECCOMP: lines absent, parse must succeed.
         let legacy = FULL_ROOT
             .replace("NoNewPrivs:\t0\n", "")
             .replace("Seccomp:\t0\n", "");
@@ -592,9 +642,9 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
     #[test]
     fn walker_flags_nonroot_and_suppresses_root() {
         let tmp = tempfile::tempdir().unwrap();
-        write_proc(tmp.path(), 1, FULL_ROOT); // root — suppressed by design
+        write_proc(tmp.path(), 1, FULL_ROOT);
         write_proc(tmp.path(), 4242, DOCKER_DEFAULT_NONROOT);
-        fs::create_dir_all(tmp.path().join("sys")).unwrap(); // non-PID entry
+        fs::create_dir_all(tmp.path().join("sys")).unwrap();
         fs::write(tmp.path().join("uptime"), "1 1").unwrap();
 
         let (findings, _) = audit_host_processes(tmp.path());
@@ -611,7 +661,6 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
 
     #[test]
     fn nonroot_without_caps_is_clean() {
-        // Invariant: full default CapBnd must NOT trigger a finding.
         let tmp = tempfile::tempdir().unwrap();
         write_proc(
             tmp.path(),
@@ -627,7 +676,6 @@ NoNewPrivs:\t0\nSeccomp:\t0\n",
 
     #[test]
     fn ambient_set_is_flagged_even_without_critical_caps() {
-        // e.g. systemd AmbientCapabilities=CAP_NET_BIND_SERVICE (bit 10)
         let tmp = tempfile::tempdir().unwrap();
         write_proc(
             tmp.path(),
@@ -648,7 +696,7 @@ NoNewPrivs:\t1\nSeccomp:\t2\n",
     #[test]
     fn unreadable_status_is_counted_not_fatal() {
         if unsafe { libc::geteuid() } == 0 {
-            return; // root bypasses mode bits — nothing to assert
+            return;
         }
         let tmp = tempfile::tempdir().unwrap();
         write_proc(tmp.path(), 55, FULL_ROOT);
@@ -657,7 +705,6 @@ NoNewPrivs:\t1\nSeccomp:\t2\n",
             fs::Permissions::from_mode(0o000),
         )
         .unwrap();
-        // Graceful degradation: no panic, empty result, denial aggregated.
         let (findings, _) = audit_host_processes(tmp.path());
         assert!(findings.is_empty());
     }
@@ -680,14 +727,14 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
             }
         };
 
-        mk(10, "xmrig", "0", Some("/usr/bin/xmrig")); // explicit + ROOT → caught
+        mk(10, "xmrig", "0", Some("/usr/bin/xmrig"));
         mk(
             20,
             "networkservice",
             "1000",
             Some("/usr/bin/networkservice"),
-        ); // legit path → NOT
-        mk(30, "networkservice", "1000", Some("/tmp/networkservice")); // ephemeral → caught
+        );
+        mk(30, "networkservice", "1000", Some("/tmp/networkservice"));
 
         let (_caps, suspicious) = audit_host_processes(tmp.path());
         let pids: Vec<u32> = suspicious.iter().map(|s| s.pid).collect();
@@ -704,34 +751,37 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
 
     #[test]
     fn deleted_exe_flags_ephemeral_not_system() {
-        // Legit: service binary deleted by apt upgrade — system path → NOT flagged.
         let (rec, dropped) =
-            classify_suspicious("nginx", 100, 1000, Some("/usr/sbin/nginx (deleted)"));
+            classify_suspicious("nginx", 100, 1000, Some("/usr/sbin/nginx (deleted)"), None);
         assert!(rec.is_none(), "system-path deletion must not flag (apt FP)");
         assert!(!dropped);
 
-        // Fileless: unknown-named binary deleted from /dev/shm → flagged,
-        // is_deleted, suffix stripped, name-independent.
-        let (rec, _) =
-            classify_suspicious("systemd-worker", 200, 1000, Some("/dev/shm/x (deleted)"));
+        let (rec, _) = classify_suspicious(
+            "systemd-worker",
+            200,
+            1000,
+            Some("/dev/shm/x (deleted)"),
+            None,
+        );
         let r = rec.expect("ephemeral deletion must be recorded");
         assert!(r.is_deleted);
-        assert_eq!(r.exe_path.as_deref(), Some("/dev/shm/x")); // suffix cleaned
+        assert_eq!(r.exe_path.as_deref(), Some("/dev/shm/x"));
         assert_eq!(r.pid, 200);
         assert_eq!(r.euid, 1000);
 
-        // Known miner, live (not deleted) — recorded by name, is_deleted=false.
-        let (rec, _) = classify_suspicious("xmrig", 300, 1000, Some("/tmp/xmrig"));
+        let (rec, _) = classify_suspicious("xmrig", 300, 1000, Some("/tmp/xmrig"), None);
         assert!(!rec.unwrap().is_deleted);
 
-        // Known miner deleted from ephemeral → single record, is_deleted=true.
-        let (rec, _) = classify_suspicious("xmrig", 400, 1000, Some("/tmp/xmrig (deleted)"));
+        let (rec, _) = classify_suspicious("xmrig", 400, 1000, Some("/tmp/xmrig (deleted)"), None);
         assert!(rec.unwrap().is_deleted);
 
-        // Known miner deleted from SYSTEM path → recorded by name, is_deleted=false
-        // (SEC-017 must not fire; SEC-016 catches it by name).
-        let (rec, _) =
-            classify_suspicious("kinsing", 500, 1000, Some("/usr/bin/kinsing (deleted)"));
+        let (rec, _) = classify_suspicious(
+            "kinsing",
+            500,
+            1000,
+            Some("/usr/bin/kinsing (deleted)"),
+            None,
+        );
         assert!(!rec.unwrap().is_deleted);
     }
 
@@ -760,23 +810,20 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
 
     #[test]
     fn memfd_is_fileless_without_deleted_suffix() {
-        // Raw memfd link, NO " (deleted)", name not in any blocklist → still flagged.
-        let (rec, _) = classify_suspicious("stealth", 900, 1000, Some("/memfd:stealth"));
+        let (rec, _) = classify_suspicious("stealth", 900, 1000, Some("/memfd:stealth"), None);
         let r = rec.expect("memfd execution must be recorded even without the suffix");
         assert!(r.is_deleted, "memfd is intrinsically fileless");
         assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth"));
         assert_eq!(r.pid, 900);
         assert_eq!(r.euid, 1000);
 
-        // memfd WITH the suffix → stripped, still fileless.
-        let (rec, _) = classify_suspicious("stealth", 901, 1000, Some("/memfd:stealth (deleted)"));
+        let (rec, _) =
+            classify_suspicious("stealth", 901, 1000, Some("/memfd:stealth (deleted)"), None);
         let r = rec.unwrap();
         assert!(r.is_deleted);
-        assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth")); // suffix cleaned
+        assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth"));
 
-        // Regression guard: a live on-disk /tmp binary (no name, not deleted)
-        // must NOT be fileless — broadening memfd must not leak into this case.
-        let (rec, _) = classify_suspicious("harmless", 902, 1000, Some("/tmp/harmless"));
+        let (rec, _) = classify_suspicious("harmless", 902, 1000, Some("/tmp/harmless"), None);
         assert!(rec.is_none());
     }
 
@@ -790,24 +837,89 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
             (1 << 13) | (1 << 19)
         );
         assert_eq!(cap_add_to_mask(&["ALL".into()]), u64::MAX);
-        assert_eq!(cap_add_to_mask(&["BOGUS".into()]), 0); // unknown ignored
+        assert_eq!(cap_add_to_mask(&["BOGUS".into()]), 0);
         assert_eq!(cap_add_to_mask(&[]), 0);
     }
 
     #[test]
     fn undeclared_escape_detects_tamper_not_default() {
         let moby = MOBY_DEFAULT_CAPS;
-        assert!(undeclared_escape_caps(moby, &[]).is_empty()); // clean default
+        assert!(undeclared_escape_caps(moby, &[]).is_empty());
         assert_eq!(
             undeclared_escape_caps(moby | (1 << 21), &[]),
-            vec!["CAP_SYS_ADMIN".to_string()] // beyond default, undeclared
+            vec!["CAP_SYS_ADMIN".to_string()]
         );
-        assert!(undeclared_escape_caps(moby | (1 << 21), &["SYS_ADMIN".into()]).is_empty()); // declared
-        // NET_RAW lives in the default → never surfaces as a tamper trigger.
+        assert!(undeclared_escape_caps(moby | (1 << 21), &["SYS_ADMIN".into()]).is_empty());
         assert!(
             undeclared_escape_caps(moby, &[])
                 .iter()
                 .all(|c| c != "CAP_NET_RAW")
+        );
+    }
+
+    #[test]
+    fn mimic_detection_kthread_comm_with_cmdline() {
+        // kthread comm + userspace cmdline → mimic, recorded unconditionally
+        // (no exe link, not in blocklist, not fileless).
+        let (rec, _) = classify_suspicious("kworker/0:1", 100, 0, None, Some("/tmp/xmrig"));
+        let r = rec.expect("mimic must be recorded on its own");
+        assert!(r.is_mimic);
+        assert_eq!(r.pid, 100);
+
+        // Bracketed impostor name still detected.
+        let (rec, _) = classify_suspicious("[kworker/0:1]", 101, 0, None, Some("/dev/shm/x"));
+        assert!(rec.unwrap().is_mimic);
+
+        // REAL kthread: kthread comm + EMPTY cmdline → NOT a mimic (the FP guard).
+        let (rec, _) = classify_suspicious("kworker/0:1", 102, 0, None, Some(""));
+        assert!(
+            rec.is_none(),
+            "real kthread (empty cmdline) must not be flagged"
+        );
+
+        // Unreadable cmdline → inconclusive → not a mimic.
+        let (rec, _) = classify_suspicious("ksoftirqd/0", 103, 0, None, None);
+        assert!(rec.is_none());
+
+        // Non-kthread comm with cmdline → not a mimic.
+        let (rec, _) = classify_suspicious(
+            "nginx",
+            104,
+            1000,
+            Some("/usr/sbin/nginx"),
+            Some("/usr/sbin/nginx"),
+        );
+        assert!(rec.is_none());
+    }
+
+    #[test]
+    fn walker_detects_kthread_mimic_via_cmdline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |pid: u32, name: &str, cmdline: &[u8]| {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("status"),
+                format!(
+                    "Name:\t{name}\nUid:\t0\t0\t0\t0\n\
+CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(d.join("cmdline"), cmdline).unwrap();
+        };
+        mk(100, "kworker/0:1", b"/tmp/kdevtmpfsi\0"); // impostor
+        mk(101, "kworker/1:0", b""); // real kthread: empty cmdline
+
+        let (_caps, suspicious) = audit_host_processes(tmp.path());
+        let m = suspicious
+            .iter()
+            .find(|s| s.pid == 100)
+            .expect("mimic flagged");
+        assert!(m.is_mimic);
+        assert!(
+            !suspicious.iter().any(|s| s.pid == 101),
+            "real kthread must not be flagged"
         );
     }
 }

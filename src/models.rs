@@ -453,6 +453,8 @@ pub struct SuspiciousProcess {
     pub is_deleted: bool,
     #[serde(default)]
     pub euid: u32,
+    #[serde(default)]
+    pub is_mimic: bool,
 }
 
 // Process Capability Audit Models
