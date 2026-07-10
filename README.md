@@ -50,6 +50,29 @@ sudo ./owlzops-mapper audit
 - **Rich Excel & terminal output** – dashboard‑style terminal report plus professional Excel workbooks with Executive Summary, per‑host sheets, and colour‑coded comparisons.
 ---
 
+### v0.5.11 (2026-07-10)
+
+**Indicators of Compromise (IoC) Detection Pipeline**
+- **SEC‑015 – Privileged non‑root implant on network** – flags processes holding critical kernel capabilities, listening on a wildcard address, and running from an ephemeral path (`/tmp`, `/dev/shm`, `/home`, `/var/tmp`). Weight: 60.
+- **SEC‑016 – Known malicious process names** – full `/proc` sweep against a compile‑time blocklist (`xmrig`, `kinsing`, `kdevtmpfsi`, `sysupdate`, `networkservice`). Explicit names are flagged unconditionally; ambiguous names (e.g., `networkservice`) require ephemeral‑path corroboration. Weight: 60.
+- **SEC‑017 – Fileless malware detection** – detects processes whose on‑disk executable has been deleted or that never touched the disk (`memfd_create`). FP‑protection excludes system‑path deletions (e.g., `apt upgrade`). Evidence differentiates “deleted from …” from “executing in‑memory (memfd)”. Weight: 60.
+- **SEC‑018 – Suspicious cron jobs** – cron entries are classified into `Ok`, `Warning`, `Critical` tiers during collection. Critical patterns (reverse shells, downloads) raise a finding. Weight: 20. JSON export includes severity per cron job.
+
+**Scoring & Predicate Hardening**
+- **CAP‑001 dynamic weight** – escalates from 8 to 20 when a privileged non‑root process listens on a wildcard address, aligning severity with SEC‑013.
+- **Unified network & path predicates** – `is_wildcard_bind`, `is_loopback_bind` (now covers full `127.0.0.0/8` and `::ffff:…`), and `is_ephemeral_exec_path` (includes `/memfd:`) extracted to `utils.rs`; all modules share a single source of truth.
+- **Exposure escalation guard** – compare logic now correctly ignores dual‑stack configurations where a wildcard was already present, preventing false drift alerts.
+- **Scoring version guard** – `SCORING_VERSION` bumped to **7** so fleet‑compare marks score changes from the expanded predicate coverage as `~ Changed` instead of false degradations.
+
+**UI & Export Improvements**
+- **Categorised Risk Breakdown** – findings are displayed in separate tables (🛡 Security, ⚙ Reliability, 🧹 Hygiene) for instant visual triage.
+- **Dynamic table widths** – all long‑content tables (Cron, Docker, Capabilities) use `ContentArrangement::Dynamic` with a safe fallback; borders never break in piped SSH sessions.
+- **Cron job classification in UI** – each cron entry is colour‑coded by severity (OK / Review / Suspicious!).
+- **Non‑root capability table** – replaced plain‑text listing with a structured table showing process, PID/EUID, capabilities, and security flags.
+
+<details>
+<summary>Previous releases (v0.5.10, v0.5.9, v0.5.8, v0.5.7, v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0)</summary>
+
 ### v0.5.10 (2026-07-09)
 
 **Observability & Correctness**
@@ -80,11 +103,6 @@ sudo ./owlzops-mapper audit
 
 **Container Runtime & Orchestrator Detection**
 - Added recognition of `dockerd`, `containerd`, and Kubernetes‑related processes in host scanning.
-
----
-
-<details>
-<summary>Previous releases (v0.5.9, v0.5.8, v0.5.7, v0.5.6, v0.5.5, v0.5.4, v0.5.3, v0.5.2, v0.5.1, v0.5.0 )</summary>
 
 ### v0.5.9 (2026-07-08)
 
@@ -173,7 +191,7 @@ sudo ./owlzops-mapper audit
 - **Fleet Orchestration** – `--max-concurrent` controls parallelism; global per‑host timeouts prevent stuck tasks from blocking the queue; optional JSONL streaming output for massive fleets without memory bloat.
 - **Local hosts in fleet mode** – localhost is now included in multi‑host terminal, XLSX, and JSONL reports.
 
-## Highlights v0.5.2 (async SSH + Docker audit)</summary>
+## Highlights v0.5.2 (async SSH + Docker audit)
 
 - **Async SSH engine (`russh`)** – fleet scans now support `--ask-sudo-pass` to authenticate via password without pre‑configuring `NOPASSWD` on every host. Known‑hosts TOFU verification with warnings.
 - **Progress bar for `--copy-binary`** – binary uploads show a real‑time progress bar with file size and ETA, in both legacy and async SSH paths.
@@ -404,7 +422,7 @@ from real findings. The score is split into three sub‑scores:
 
 | Category | Cap | Examples |
 |---|---|---|
-| **Security** | 60 | Firewall, SSH config, security updates, Docker risks, sysctl hardening |
+| **Security** | 60 | Firewall, SSH config, security updates, Docker risks, sysctl hardening, malware & intrusion detection |
 | **Reliability** | 30 | Failed services, missing backups, OOM kills, container health |
 | **Hygiene** | 10 | NTP synchronization |
 
@@ -435,6 +453,11 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Docker: containers killed by OOM | +10 |
 | Docker: containers in restart loop | +5 |
 | Docker: unhealthy containers (failing healthcheck) | +10 |
+| **SEC‑015 – Privileged non‑root implant on network** | **+60** |
+| **SEC‑016 – Known malicious process (by name)** | **+60** |
+| **SEC‑017 – Fileless malware (deleted executable / memfd)** | **+60** |
+| **SEC‑018 – Suspicious cron job (persistence)** | **+20** |
+| **CAP‑001 (dynamic) – Non‑root with critical capabilities** | **+8 (loopback) / +20 (wildcard exposure)** |
 
 ---
 
@@ -443,15 +466,16 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Category | Details |
 |---|---|
 | System | OS, kernel, uptime, CPU, RAM, load average, LSM modules |
-| Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, **sudo NOPASSWD entries, sudoers permissions, sysctl security audit** |
+| Security | SSH config (effective and fallback), root login, password auth, users, authorized keys, login history, fail2ban & auditd presence, **sudo NOPASSWD entries, sudoers permissions, sysctl security audit, malware/intrusion detection** |
 | Network | Listening ports with bind address (red = exposed on 0.0.0.0/::), firewall (ufw, firewalld, nftables, iptables), DNS, SSL certificates with expiry |
 | Storage | Disk usage, inode usage per mount |
 | Docker | Images, dangling layers, containers, mounts, log sizes, privileged flag, memory/CPU limits, dangerous capabilities, **sensitive host mounts, OOM kills, restart loops, health status** |
 | Packages | Installed count, upgradable, security updates (apt/dnf/yum/pacman/zypper) |
 | Databases | PostgreSQL, MySQL, Redis, MongoDB — versions and data sizes |
-| Internals | Cron jobs, systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
+| Internals | Cron jobs (with severity classification), systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
 | Backups | Detection of restic, borg, duplicati, rsync/backup in cron |
 | NTP | Time synchronization status and offset |
+| **Malware & Intrusion** | **Full /proc sweep for known malicious process names, detection of deleted (fileless) executables and memfd‑based implants, cross‑correlation of privileged processes on ephemeral paths with network listeners** |
 
 ---
 
@@ -466,6 +490,7 @@ Owlzops provides fixed-price engineering packages to fix the architectural issue
 | **Failed systemd / OOM kills** | Production stability is compromised. Services are crashing or starving for resources. | [Production Reliability Sprint](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_table#services:~:text=Production%20Reliability%20Sprint) |
 | **Security updates pending** | The system is accumulating technical debt and unpatched vulnerabilities. | [Reliability Retainer](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_table#services:~:text=Reliability%20Retainer) |
 | **Firewall disabled / SSH root** | Critical authentication weaknesses. The host is exposed to the public internet. | [Free Mapper Consultation](https://owlzops.com/contact?utm_source=github&utm_medium=readme&utm_campaign=mapper_table) |
+| **Active compromise detected (SEC‑015…018)** | The scanner has found evidence of a potential rootkit, backdoor, or fileless malware. Immediate incident response is required. | [Emergency Triage](https://owlzops.com/contact?utm_source=github&utm_medium=readme&utm_campaign=mapper_table) |
 
 If owlzops-mapper flagged critical issues, we can review your JSON report and provide a concrete remediation plan.
 

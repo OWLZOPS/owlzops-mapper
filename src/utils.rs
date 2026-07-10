@@ -109,6 +109,7 @@ pub fn is_ambiguous_malware(comm: &str) -> bool {
 // Child helpers (unchanged)
 // ---------------------------------------------------------------------------
 
+/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
 fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
     loop {
@@ -119,8 +120,7 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
             }
             Ok(None) => {
                 let _ = child.kill();
-                thread::sleep(Duration::from_millis(100));
-                return child.try_wait().ok().flatten();
+                return child.wait().ok();
             }
             Err(_) => return None,
         }
