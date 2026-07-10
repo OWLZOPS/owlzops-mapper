@@ -36,6 +36,18 @@ fn is_running_as_root() -> bool {
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let flags = CriticalFlags::from_report(report);
 
+    // Active compromise takes precedence over incompleteness and hygiene: a
+    // detected IoC is the single most actionable signal. Distinct code 3 — NOT 2,
+    // which already means "incomplete/not-root" — so pipelines can trigger paging
+    // separately from a normal build failure.
+    // Exit ladder: 3 = compromised > 2 = incomplete/degraded > 1 = critical > 0 = clean.
+    if flags.compromised_host {
+        warn!(
+            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019 or DOCK-010; exiting 3"
+        );
+        return 3;
+    }
+
     if !report.is_root_execution {
         if flags.has_critical() {
             warn!(
@@ -344,7 +356,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         writer.await // channel is closed, completion is guaranteed
                     };
                     match joined {
-                        Ok((written, worst)) => return if written == 0 { 2 } else { worst.min(2) },
+                        Ok((written, worst)) => return if written == 0 { 2 } else { worst },
                         Err(_) => {
                             warn!("JSONL writer task failed");
                             return 2;
@@ -375,7 +387,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 }
 
                 let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
-                return if worst >= 1 { worst.min(2) } else { 0 };
+                return worst;
             }
 
             // Single local scan
@@ -762,5 +774,18 @@ mod tests {
         r.host.backup_tools = vec![];
         r.host.ntp_synchronized = true;
         assert_eq!(compute_exit_code(&r), 1);
+    }
+
+    #[test]
+    fn exit_code_3_on_compromise() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![SuspiciousProcess {
+            pid: 1337,
+            name: "xmrig".into(),
+            exe_path: Some("/tmp/xmrig".into()),
+            ..Default::default()
+        }];
+        assert_eq!(compute_exit_code(&r), 3);
     }
 }

