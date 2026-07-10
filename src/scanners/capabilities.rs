@@ -210,45 +210,66 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
     })
 }
 
-// ── Malware sweep ────────────────────────────────────────────────────────
+// ── Suspicious process classification ────────────────────────────────────
 
 /// Hard cap on stored suspicious processes — keeps JSONL flat under a fork-bomb
 /// of a matched implant name.
 const MAX_SUSPICIOUS: usize = 64;
 
-/// Check one comm against the blocklist; on a hit, record a SuspiciousProcess.
-/// Explicit names flag unconditionally; ambiguous names require ephemeral-path
-/// corroboration. `/proc/<pid>/exe` is read lazily — only on a name hit.
-/// Returns `true` iff an ambiguous match was dropped for an unresolvable exe
-/// (so the caller can surface an aggregate coverage warning).
-fn check_malware(comm: &str, pid: u32, proc_root: &Path, out: &mut Vec<SuspiciousProcess>) -> bool {
-    let explicit = crate::utils::is_known_malware(comm);
-    let ambiguous = crate::utils::is_ambiguous_malware(comm);
-    if !explicit && !ambiguous {
-        return false; // fast path: no allocation, no readlink for the 99.9%
-    }
+/// Classify one process from its comm and (already-resolved) exe link.
+///
+/// Two independent triggers, name-independent for the deleted case:
+///   * deleted executable whose *base* path is ephemeral (fileless implant);
+///   * name in the malware blocklist (explicit always; ambiguous only when
+///     the clean exe path is ephemeral).
+///
+/// Returns the record (if any) plus a flag: an ambiguous name whose exe could
+/// not be resolved (so the caller can aggregate a coverage warning).
+///
+/// Pure & zero-copy: only the final record allocates.
+fn classify_suspicious(
+    comm: &str,
+    pid: u32,
+    exe_link: Option<&str>,
+) -> (Option<SuspiciousProcess>, bool) {
+    // Split the kernel's " (deleted)" suffix off the true base path.
+    let (base_path, deleted) = match exe_link {
+        Some(l) => match l.strip_suffix(" (deleted)") {
+            Some(base) => (Some(base), true),
+            None => (Some(l), false),
+        },
+        None => (None, false),
+    };
 
-    let exe_path = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
+    // Trigger 1 — FP-protected: only ephemeral base paths count as fileless.
+    let deleted_ephemeral = deleted && base_path.is_some_and(crate::utils::is_ephemeral_exec_path);
 
-    // Ambiguous-only match must be corroborated by an ephemeral exe path.
-    if ambiguous && !explicit {
-        match exe_path.as_deref() {
-            Some(p) if crate::utils::is_ephemeral_exec_path(p) => {}
-            Some(_) => return false, // legit system path → not an implant
-            None => return true,     // exe unreadable → can't corroborate; signal
+    // Trigger 2 — name blocklist.
+    let name_recorded = if crate::utils::is_known_malware(comm) {
+        true
+    } else if crate::utils::is_ambiguous_malware(comm) {
+        match base_path {
+            Some(p) if crate::utils::is_ephemeral_exec_path(p) => true,
+            Some(_) => false,            // ambiguous name, legit path → not flagged
+            None => return (None, true), // ambiguous name, exe unresolved → dropped
         }
-    }
+    } else {
+        false
+    };
 
-    if out.len() < MAX_SUSPICIOUS {
-        out.push(SuspiciousProcess {
-            pid,
-            name: comm.trim().to_string(),
-            exe_path,
-        });
+    if name_recorded || deleted_ephemeral {
+        (
+            Some(SuspiciousProcess {
+                pid,
+                name: comm.trim().to_string(),
+                exe_path: base_path.map(str::to_string), // cleaned of the suffix
+                is_deleted: deleted_ephemeral,
+            }),
+            false,
+        )
+    } else {
+        (None, false)
     }
-    false
 }
 
 // ── Walker ───────────────────────────────────────────────────────────────
@@ -314,9 +335,20 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
             continue;
         };
 
-        // ── Malware sweep ── runs for EVERY process (including root)
-        if check_malware(&st.name, pid, proc_root, &mut suspicious) {
+        // Suspicious-process sweep — runs for EVERY process (root included),
+        // BEFORE the capability euid==0 suppression. One readlink per process
+        // (required for fileless detection), reused for name exe_path.
+        let exe_link = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        let (record, dropped) = classify_suspicious(&st.name, pid, exe_link.as_deref());
+        if dropped {
             ambiguous_dropped += 1;
+        }
+        if let Some(sp) = record
+            && suspicious.len() < MAX_SUSPICIOUS
+        {
+            suspicious.push(sp);
         }
 
         if st.euid == 0 {
@@ -589,5 +621,56 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
             !pids.contains(&20),
             "ambiguous name from /usr/bin must be suppressed"
         );
+    }
+
+    #[test]
+    fn deleted_exe_flags_ephemeral_not_system() {
+        // Legit: service binary deleted by apt upgrade — system path → NOT flagged.
+        let (rec, dropped) = classify_suspicious("nginx", 100, Some("/usr/sbin/nginx (deleted)"));
+        assert!(rec.is_none(), "system-path deletion must not flag (apt FP)");
+        assert!(!dropped);
+
+        // Fileless: unknown-named binary deleted from /dev/shm → flagged,
+        // is_deleted, suffix stripped, name-independent.
+        let (rec, _) = classify_suspicious("systemd-worker", 200, Some("/dev/shm/x (deleted)"));
+        let r = rec.expect("ephemeral deletion must be recorded");
+        assert!(r.is_deleted);
+        assert_eq!(r.exe_path.as_deref(), Some("/dev/shm/x")); // suffix cleaned
+        assert_eq!(r.pid, 200);
+
+        // Known miner, live (not deleted) — recorded by name, is_deleted=false.
+        let (rec, _) = classify_suspicious("xmrig", 300, Some("/tmp/xmrig"));
+        assert!(!rec.unwrap().is_deleted);
+
+        // Known miner deleted from ephemeral → single record, is_deleted=true.
+        let (rec, _) = classify_suspicious("xmrig", 400, Some("/tmp/xmrig (deleted)"));
+        assert!(rec.unwrap().is_deleted);
+
+        // Known miner deleted from SYSTEM path → recorded by name, is_deleted=false
+        // (SEC-017 must not fire; SEC-016 catches it by name).
+        let (rec, _) = classify_suspicious("kinsing", 500, Some("/usr/bin/kinsing (deleted)"));
+        assert!(!rec.unwrap().is_deleted);
+    }
+
+    #[test]
+    fn walker_records_fileless_from_ephemeral() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("42");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("status"),
+            "Name:\tobfuscated\nUid:\t0\t0\t0\t0\n\
+CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
+        )
+        .unwrap();
+        symlink("/dev/shm/loader (deleted)", d.join("exe")).unwrap();
+
+        let (_caps, suspicious) = audit_host_processes(tmp.path());
+        let f = suspicious
+            .iter()
+            .find(|s| s.pid == 42)
+            .expect("fileless flagged");
+        assert!(f.is_deleted);
+        assert_eq!(f.exe_path.as_deref(), Some("/dev/shm/loader"));
     }
 }

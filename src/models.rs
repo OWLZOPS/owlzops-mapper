@@ -444,6 +444,8 @@ pub struct SuspiciousProcess {
     pub name: String,
     #[serde(default)]
     pub exe_path: Option<String>,
+    #[serde(default)]
+    pub is_deleted: bool,
 }
 
 // Process Capability Audit Models

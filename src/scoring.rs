@@ -356,11 +356,19 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-016 — known malware/miner processes (full /proc sweep) ──
-    if !report.security.suspicious_processes.is_empty() {
-        let list = report
-            .security
-            .suspicious_processes
+    // ── SEC-016 — known malware/miner processes (name-recognized subset) ──
+    // Filter by name: the sweep vector now also holds name-independent fileless
+    // entries (SEC-017), which must NOT be mislabeled "known malicious" here.
+    let name_hits: Vec<&crate::models::SuspiciousProcess> = report
+        .security
+        .suspicious_processes
+        .iter()
+        .filter(|p| {
+            crate::utils::is_known_malware(&p.name) || crate::utils::is_ambiguous_malware(&p.name)
+        })
+        .collect();
+    if !name_hits.is_empty() {
+        let list = name_hits
             .iter()
             .map(|p| match &p.exe_path {
                 Some(exe) => format!("{} (pid {}, {})", p.name, p.pid, exe),
@@ -373,17 +381,43 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             title: "ACTIVE COMPROMISE: known malicious process detected".to_string(),
             category: Category::Security,
             weight: 60,
-            evidence: format!(
-                "{} known-bad process(es): {}",
-                report.security.suspicious_processes.len(),
-                list
-            ),
+            evidence: format!("{} known-bad process(es): {}", name_hits.len(), list),
             suppressed: None,
             cis_ref: None,
         });
     }
 
-    // ── SEC-017 – Malicious cron job detected ────────────────
+    // ── SEC-017 — fileless malware executing from an ephemeral path ──
+    // is_deleted is already FP-protected upstream (deleted AND ephemeral base),
+    // so a system-path deletion from apt upgrade never reaches here.
+    let fileless: Vec<&crate::models::SuspiciousProcess> = report
+        .security
+        .suspicious_processes
+        .iter()
+        .filter(|p| p.is_deleted)
+        .collect();
+    if !fileless.is_empty() {
+        let list = fileless
+            .iter()
+            .map(|p| match &p.exe_path {
+                Some(exe) => format!("{} (pid {}, deleted from {})", p.name, p.pid, exe),
+                None => format!("{} (pid {}, deleted)", p.name, p.pid),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(Finding {
+            id: "SEC-017",
+            title: "ACTIVE COMPROMISE: fileless malware executing from ephemeral path".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!("{} fileless process(es): {}", fileless.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-018 – Malicious cron job detected ────────────────
+    // (formerly SEC-017; renumbered to avoid conflict with fileless detection)
     if let Some(_critical) = report
         .host
         .cron_jobs
@@ -399,7 +433,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .collect();
 
         findings.push(Finding {
-            id: "SEC-017",
+            id: "SEC-018",
             title: "Suspicious cron job detected (possible persistence)".to_string(),
             category: Category::Security,
             weight: 20,
@@ -1074,6 +1108,7 @@ mod tests {
             pid: 1337,
             name: "xmrig".into(),
             exe_path: Some("/tmp/xmrig".into()),
+            ..Default::default()
         }];
         let f = evaluate(&r)
             .into_iter()
@@ -1091,7 +1126,53 @@ mod tests {
     }
 
     #[test]
-    fn sec017_detects_critical_cron() {
+    fn sec017_flags_fileless_and_sec016_excludes_it() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![
+            // fileless, name NOT in blocklist → SEC-017 only
+            SuspiciousProcess {
+                pid: 42,
+                name: "obfuscated".into(),
+                exe_path: Some("/dev/shm/loader".into()),
+                is_deleted: true,
+            },
+            // known miner, live → SEC-016 only
+            SuspiciousProcess {
+                pid: 7,
+                name: "xmrig".into(),
+                exe_path: Some("/tmp/xmrig".into()),
+                is_deleted: false,
+            },
+        ];
+        let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"SEC-016"));
+        assert!(ids.contains(&"SEC-017"));
+
+        let sec016 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-016")
+            .unwrap();
+        assert!(sec016.evidence.contains("xmrig"));
+        assert!(
+            !sec016.evidence.contains("obfuscated"),
+            "fileless non-name must not be in SEC-016"
+        );
+        let sec017 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-017")
+            .unwrap();
+        assert!(
+            sec017.evidence.contains("obfuscated") && sec017.evidence.contains("/dev/shm/loader")
+        );
+        assert!(
+            !sec017.evidence.contains("xmrig"),
+            "live miner must not be in SEC-017"
+        );
+    }
+
+    #[test]
+    fn sec018_detects_critical_cron() {
         use crate::models::{CronJob, CronSeverity};
         let mut r = minimal_report();
         r.host.cron_jobs = vec![
@@ -1106,8 +1187,8 @@ mod tests {
         ];
         let f = evaluate(&r)
             .into_iter()
-            .find(|f| f.id == "SEC-017")
-            .expect("SEC-017 missing");
+            .find(|f| f.id == "SEC-018")
+            .expect("SEC-018 missing");
         assert_eq!(f.weight, 20);
         assert!(f.evidence.contains("curl"));
     }
