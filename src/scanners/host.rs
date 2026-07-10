@@ -1,4 +1,4 @@
-use crate::models::{DatabaseInfo, HostInfo, ProcessInfo, ZombieInfo};
+use crate::models::{CronJob, CronSeverity, DatabaseInfo, HostInfo, ProcessInfo, ZombieInfo};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -23,6 +23,36 @@ fn is_cron_env(line: &str) -> bool {
         return false;
     }
     line.contains('=') && !line.contains(' ')
+}
+
+// ── Cron classification patterns ──────────────────────────
+
+/// Patterns that indicate a clear compromise (reverse shells, downloads, etc.).
+const CRITICAL_CRON_PATTERNS: &[&str] = &[
+    "base64 -d",
+    "curl ",
+    "wget ",
+    "nc ",
+    "ncat ",
+    "bash -c",
+    "sh -c",
+    "/dev/shm/",
+    "/tmp/",
+];
+
+/// Patterns that may be legitimate but should be reviewed.
+const WARNING_CRON_PATTERNS: &[&str] = &["/home/", "/opt/", "/var/www/"];
+
+/// Determine the severity of a single cron line.
+fn classify_cron(command: &str) -> CronSeverity {
+    let lower = command.to_lowercase();
+    if CRITICAL_CRON_PATTERNS.iter().any(|p| lower.contains(p)) {
+        CronSeverity::Critical
+    } else if WARNING_CRON_PATTERNS.iter().any(|p| lower.contains(p)) {
+        CronSeverity::Warning
+    } else {
+        CronSeverity::Ok
+    }
 }
 
 // ── structure for basic OS facts (replaces 12-tuple) ──────
@@ -119,7 +149,6 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
 
 // ── sub‑collectors for gather_host_info ────────────────────
 
-/// Basic OS / hardware facts that don't require iterating over processes.
 fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemBasics {
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
     let os_version = System::long_os_version().unwrap_or_else(|| "unknown".to_string());
@@ -184,8 +213,6 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
     }
 }
 
-/// Returns top‑5 memory processes (aggregated by name), zombie count,
-/// detected tech stack, and per‑zombie details.
 fn gather_process_and_tech(
     sys: &System,
 ) -> (Vec<ProcessInfo>, usize, Vec<String>, Vec<ZombieInfo>) {
@@ -223,7 +250,6 @@ fn gather_process_and_tech(
     let mut found_tech: HashSet<&'static str> = HashSet::new();
     let mut tech_stack = Vec::new();
 
-    // Build PID → (name, ppid) map for parent resolution
     let mut pid_info: HashMap<u32, (String, u32)> = HashMap::new();
     let mut zombie_details: Vec<ZombieInfo> = Vec::new();
 
@@ -240,7 +266,7 @@ fn gather_process_and_tech(
                     pid: pid_u32,
                     name: name.clone(),
                     ppid,
-                    parent_name: String::new(), // filled later
+                    parent_name: String::new(),
                 });
             }
         }
@@ -260,13 +286,12 @@ fn gather_process_and_tech(
         let mem = proc.memory() / (1024 * 1024);
         let entry = aggregated.entry(name.clone()).or_insert((0, pid_u32, 0));
         if mem > entry.0 {
-            entry.0 = mem; // keep max RSS among instances
-            entry.1 = pid_u32; // PID of the largest instance (updated when max changes)
+            entry.0 = mem;
+            entry.1 = pid_u32;
         }
-        entry.2 += 1; // count of instances with this name
+        entry.2 += 1;
     }
 
-    // Resolve parent names for zombie entries
     for z in &mut zombie_details {
         if let Some((parent_name, _)) = pid_info.get(&z.ppid) {
             z.parent_name = parent_name.clone();
@@ -282,7 +307,6 @@ fn gather_process_and_tech(
     }
     tech_stack.sort();
 
-    // Heap of top 5 by max RSS (aggregated)
     let mut heap: BinaryHeap<std::cmp::Reverse<(u64, u32, String, u32)>> =
         BinaryHeap::with_capacity(6);
     for (name, (max_rss, max_pid, count)) in aggregated {
@@ -306,8 +330,6 @@ fn gather_process_and_tech(
     (process_list, zombie_processes, tech_stack, zombie_details)
 }
 
-/// Reads `/proc/self/limits`, dmesg, lspci, and security modules.
-#[allow(clippy::type_complexity)]
 fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec<String>) {
     let open_files_limit = std::fs::read_to_string("/proc/self/limits")
         .ok()
@@ -318,7 +340,6 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Single dmesg call reused for both OOM kills and error detection
     let dmesg_raw = crate::utils::run_with_timeout("dmesg", &["--ctime"], 5)
         .or_else(|| crate::utils::run_with_timeout("dmesg", &["-T"], 5))
         .unwrap_or_default();
@@ -381,9 +402,8 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
     )
 }
 
-/// Collects running services, failed services, cron jobs, and systemd timers.
-#[allow(clippy::type_complexity)]
-fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+/// Collects running services, failed services, cron jobs (classified), and systemd timers.
+fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
     // running native services
     let native_services = crate::utils::run_with_timeout(
         "systemctl",
@@ -429,13 +449,13 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     })
     .unwrap_or_default();
 
-    // cron jobs (all sources)
-    let mut cron_jobs = Vec::new();
+    // cron jobs (all sources) – now classified
+    let mut raw_lines = Vec::new();
     if let Ok(ct) = fs::read_to_string("/etc/crontab") {
         for l in ct.lines() {
             let l = l.trim();
             if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
-                cron_jobs.push(format!("/etc/crontab: {}", l));
+                raw_lines.push(format!("/etc/crontab: {}", l));
             }
         }
     }
@@ -460,7 +480,7 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
-                        cron_jobs.push(format!("/etc/cron.d/{}: {}", name, l));
+                        raw_lines.push(format!("/etc/cron.d/{}: {}", name, l));
                     }
                 }
             }
@@ -473,25 +493,24 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
-                        cron_jobs.push(format!("user {}: {}", user, l));
+                        raw_lines.push(format!("user {}: {}", user, l));
                     }
                 }
             }
         }
     }
-    // RHEL/CentOS/Fedora user crontabs (without 'crontabs' subdirectory)
     if let Ok(spool) = fs::read_dir("/var/spool/cron") {
         for entry in spool.flatten() {
             let path = entry.path();
             if !path.is_file() {
-                continue; // skip subdirectory crontabs/ (already handled above)
+                continue;
             }
             let user = entry.file_name().to_string_lossy().to_string();
             if let Ok(contents) = fs::read_to_string(&path) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
-                        cron_jobs.push(format!("user {}: {}", user, l));
+                        raw_lines.push(format!("user {}: {}", user, l));
                     }
                 }
             }
@@ -503,9 +522,17 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
             if l.is_empty() || l.starts_with('#') || is_cron_env(l) {
                 continue;
             }
-            cron_jobs.push(format!("/etc/anacrontab: {}", l));
+            raw_lines.push(format!("/etc/anacrontab: {}", l));
         }
     }
+
+    let cron_jobs: Vec<CronJob> = raw_lines
+        .into_iter()
+        .map(|line| CronJob {
+            severity: classify_cron(&line),
+            command: line,
+        })
+        .collect();
 
     // systemd timers
     let systemd_timers = crate::utils::run_with_timeout(
@@ -530,7 +557,7 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
 
 /// Detect backup tools and last Restic snapshot.
 fn gather_backup_info(
-    cron_jobs: &[String],
+    cron_jobs: &[CronJob],
     systemd_timers: &[String],
 ) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
@@ -594,7 +621,7 @@ fn gather_backup_info(
     }
 
     let backup_in_cron = cron_jobs.iter().any(|job| {
-        let l = job.to_lowercase();
+        let l = job.command.to_lowercase();
         l.contains("restic") || l.contains("borg") || l.contains("rsync") || l.contains("backup")
     });
 
@@ -617,7 +644,6 @@ fn gather_backup_info(
     (tools, last_restic)
 }
 
-/// Parse a timesync offset string like "+1.200ms", "-340us", "+0.004s" into milliseconds (absolute).
 fn parse_offset_to_ms(raw: &str) -> Option<f64> {
     let s = raw.trim();
     if s.is_empty() {
@@ -632,7 +658,6 @@ fn parse_offset_to_ms(raw: &str) -> Option<f64> {
         (1.0, s)
     };
 
-    // Separate numeric part and unit
     let (num_str, unit) = if let Some(pos) = rest.find(|c: char| !c.is_ascii_digit() && c != '.') {
         (&rest[..pos], &rest[pos..])
     } else {
@@ -645,21 +670,17 @@ fn parse_offset_to_ms(raw: &str) -> Option<f64> {
         "ms" | "msec" | "milliseconds" => value,
         "us" | "usec" | "microseconds" => value / 1000.0,
         "ns" | "nsec" | "nanoseconds" => value / 1_000_000.0,
-        _ => return None, // unknown unit
+        _ => return None,
     };
-    Some((sign * ms).abs()) // always return positive offset magnitude
+    Some((sign * ms).abs())
 }
 
-/// Determine NTP synchronization status and time offset.
-/// Handles containers without systemd gracefully.
 fn gather_ntp_info() -> (bool, Option<f64>) {
-    // 1. timedatectl (systemd-timesyncd)
     if let Some(td_out) = crate::utils::run_with_timeout("timedatectl", &["status"], 5) {
         let synchronized = td_out.lines().any(|l| {
             (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
         });
         if synchronized {
-            // Extract actual offset from timesync-status
             let offset = crate::utils::run_with_timeout("timedatectl", &["timesync-status"], 5)
                 .and_then(|ts_out| {
                     ts_out.lines().find_map(|line| {
@@ -671,7 +692,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
         }
     }
 
-    // 2. chronyc tracking
     if let Some(chrony_out) = crate::utils::run_with_timeout("chronyc", &["tracking"], 5) {
         let synced = chrony_out
             .lines()
@@ -692,7 +712,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
         return (synced, offset);
     }
 
-    // 3. ntpq
     if let Some(ntpq_out) = crate::utils::run_with_timeout("ntpq", &["-p", "-n"], 5) {
         for line in ntpq_out.lines() {
             if line.starts_with('*') {
@@ -707,7 +726,6 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
         return (false, None);
     }
 
-    // No NTP tools available: assume unsynchronized (conservative default)
     (false, None)
 }
 

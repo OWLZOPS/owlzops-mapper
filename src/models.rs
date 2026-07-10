@@ -52,6 +52,33 @@ impl Default for AgentReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cron severity classification (shared between scanner and scoring)
+// ---------------------------------------------------------------------------
+
+/// Severity of a cron job based on its content.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum CronSeverity {
+    /// No suspicious patterns found.
+    #[default]
+    Ok,
+    /// Uses custom paths or tools that may be legitimate but should be reviewed.
+    Warning,
+    /// Contains clear indicators of compromise (reverse shells, downloads, etc.).
+    Critical,
+}
+
+/// A single cron job with its classification.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CronJob {
+    pub command: String,
+    pub severity: CronSeverity,
+}
+
+// ---------------------------------------------------------------------------
+// HostInfo
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct HostInfo {
@@ -75,7 +102,10 @@ pub struct HostInfo {
     pub dmesg_errors: Vec<String>,
     pub gpu_devices: Vec<String>,
     pub native_services: Vec<String>,
-    pub cron_jobs: Vec<String>,
+
+    /// Cron jobs collected from the system, each classified by severity.
+    pub cron_jobs: Vec<CronJob>,
+
     pub systemd_timers: Vec<String>,
     pub tech_stack: Vec<String>,
     pub top_memory_processes: Vec<ProcessInfo>,

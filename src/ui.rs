@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::models::{AgentReport, PackageManager};
+use crate::models::{AgentReport, CronSeverity, PackageManager};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -23,25 +23,6 @@ pub fn sanitize_terminal(s: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
-}
-
-/// Common patterns that indicate a suspicious cron job
-/// (executables from writable locations, hidden directories, etc.).
-const SUSPICIOUS_CRON_PATTERNS: &[&str] = &[
-    "/tmp/",
-    "/var/tmp/",
-    "/dev/shm/",
-    "/home/",
-    "curl",
-    "wget",
-    "base64 -d",
-    "sh -c",
-    "bash -c",
-];
-
-fn is_suspicious_cron(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    SUSPICIOUS_CRON_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +198,7 @@ fn render_header(report: &AgentReport) {
                 Cell::new(sanitize_terminal(&f.evidence)),
             ]);
         }
-        println!("Risk Breakdown:");
+        println!("\nRisk Breakdown:");
         println!("{t_breakdown}\n");
     }
 
@@ -836,19 +817,25 @@ fn render_system_internals(report: &AgentReport) {
                 .fg(Color::Cyan),
             Cell::new("Status").add_attribute(Attribute::Bold),
         ]);
+
         for cron in &report.host.cron_jobs {
-            let safe_cron = sanitize_terminal(cron);
-            if is_suspicious_cron(&safe_cron) {
-                t_cron.add_row(vec![
-                    Cell::new(safe_cron).fg(Color::Red),
+            let safe_cmd = sanitize_terminal(&cron.command);
+            let (status_cell, cmd_cell) = match cron.severity {
+                CronSeverity::Critical => (
                     Cell::new("Suspicious!")
                         .fg(Color::Red)
                         .add_attribute(Attribute::Bold),
-                ]);
-            } else {
-                t_cron.add_row(vec![Cell::new(safe_cron), Cell::new("OK").fg(Color::Green)]);
-            }
+                    Cell::new(safe_cmd).fg(Color::Red),
+                ),
+                CronSeverity::Warning => (
+                    Cell::new("Review").fg(Color::Yellow),
+                    Cell::new(safe_cmd).fg(Color::Yellow),
+                ),
+                CronSeverity::Ok => (Cell::new("OK").fg(Color::Green), Cell::new(safe_cmd)),
+            };
+            t_cron.add_row(vec![cmd_cell, status_cell]);
         }
+
         println!("System & Custom Cronjobs:");
         println!("{t_cron}\n");
     }

