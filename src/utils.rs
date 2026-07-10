@@ -12,36 +12,24 @@ use crate::safe_io;
 // Hardened tool resolution
 // ---------------------------------------------------------------------------
 
-/// Global cache of absolute paths resolved against a trusted `PATH`.
 fn tool_cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Resolve a short tool name (`dmesg`, `sshd`, …) to an absolute path using a
-/// **trusted** `PATH` and a clean environment. The result is cached for the
-/// lifetime of the process.
-///
-/// Returns `None` when the tool cannot be found, but the caller should still
-/// attempt to spawn it using a hardened command (the short name will be used
-/// as a fallback).
 pub fn resolve_tool(tool: &str) -> Option<String> {
-    // Look up in cache first
     {
         let cache = tool_cache().lock().unwrap();
         if let Some(path) = cache.get(tool) {
             return Some(path.clone());
         }
     }
-
-    // Resolve with a safe `which` call
     let output = Command::new("which")
         .arg(tool)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .output()
         .ok()?;
-
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !path.is_empty() {
@@ -50,16 +38,9 @@ pub fn resolve_tool(tool: &str) -> Option<String> {
             return Some(path);
         }
     }
-
     None
 }
 
-/// Create a `Command` hardened against `PATH`‑hijack and `LD_PRELOAD`.
-///
-/// * The environment is **completely emptied** and only `PATH` and `LC_ALL`
-///   are set to known‑safe values.
-/// * The caller is expected to pass an **absolute** path obtained from
-///   [`resolve_tool`], but a short name is also accepted as a fallback.
 pub fn hardened_command(program: &str, args: &[&str]) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -69,17 +50,65 @@ pub fn hardened_command(program: &str, args: &[&str]) -> Command {
     cmd
 }
 
-/// Single source of truth for per‑host timeout budget.
-/// Used by both the fleet orchestrator and the internal russh path.
 pub(crate) const fn host_budget_secs(t: u64) -> u64 {
     t.saturating_mul(2).saturating_add(60)
 }
 
 // ---------------------------------------------------------------------------
-// Child helpers (unchanged logic, now hardened and with stdin nulled)
+// Network predicates
 // ---------------------------------------------------------------------------
 
-/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
+pub fn is_wildcard_bind(addr: &str) -> bool {
+    matches!(addr, "0.0.0.0" | "::" | "::ffff:0.0.0.0")
+}
+
+pub fn is_loopback_bind(addr: &str) -> bool {
+    fn v4_loopback(s: &str) -> bool {
+        s.strip_prefix("127.").is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        })
+    }
+    matches!(addr, "::1")
+        || v4_loopback(addr)
+        || addr.strip_prefix("::ffff:").is_some_and(v4_loopback)
+}
+
+/// Executables served from writable/ephemeral locations — a shared signal
+/// for shadow-IT (SEC-013), IoC (SEC-015) and ambiguous-malware corroboration.
+///
+/// `/memfd:` covers `memfd_create`-backed execution (fully in-memory implants);
+/// the kernel renders such exe links as `/memfd:<name> (deleted)`. Prefix match
+/// is deletion-suffix agnostic, so this holds whether called on the raw link
+/// or on the base path after the ` (deleted)` suffix is stripped.
+pub fn is_ephemeral_exec_path(path: &str) -> bool {
+    path.starts_with("/tmp/")
+        || path.starts_with("/var/tmp/")
+        || path.starts_with("/dev/shm/")
+        || path.starts_with("/home/")
+        || path.starts_with("/memfd:")
+}
+
+// ---------------------------------------------------------------------------
+// Known malware / miner process names
+// ---------------------------------------------------------------------------
+
+pub const KNOWN_MALWARE: &[&str] = &["kdevtmpfsi", "kinsing", "xmrig", "sysupdate"];
+pub const AMBIGUOUS_MALWARE: &[&str] = &["networkservice"];
+
+pub fn is_known_malware(comm: &str) -> bool {
+    let c = comm.trim();
+    KNOWN_MALWARE.iter().any(|m| c.eq_ignore_ascii_case(m))
+}
+
+pub fn is_ambiguous_malware(comm: &str) -> bool {
+    let c = comm.trim();
+    AMBIGUOUS_MALWARE.iter().any(|m| c.eq_ignore_ascii_case(m))
+}
+
+// ---------------------------------------------------------------------------
+// Child helpers (unchanged)
+// ---------------------------------------------------------------------------
+
 fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
     loop {
@@ -98,16 +127,12 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
     }
 }
 
-/// Run a child process with capped stdout/stderr, a timeout, a hardened
-/// environment, and **no stdin** to prevent the child from capturing the
-/// operator's terminal input (R8-07).
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
     timeout_secs: u64,
 ) -> Option<std::process::Output> {
     let resolved = resolve_tool(program).unwrap_or_else(|| program.to_string());
-
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -117,7 +142,6 @@ pub fn run_child_with_timeout(
 
     let out_pipe = child.stdout.take()?;
     let err_pipe = child.stderr.take()?;
-
     let prog = program.to_string();
 
     let out_handle = thread::spawn(move || {
@@ -139,7 +163,6 @@ pub fn run_child_with_timeout(
 
     let deadline = Duration::from_secs(timeout_secs);
     let start = Instant::now();
-
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -163,13 +186,10 @@ pub fn run_child_with_timeout(
     })
 }
 
-/// Execute a command with a timeout.
-/// See [`run_with_timeout_inner`].
 pub fn run_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
     run_with_timeout_inner(program, args, timeout_secs, true)
 }
 
-/// Execute a command with a timeout, accepting any exit code.
 pub fn run_with_timeout_any_exit(
     program: &str,
     args: &[&str],
@@ -185,7 +205,6 @@ fn run_with_timeout_inner(
     require_success: bool,
 ) -> Option<String> {
     let resolved = resolve_tool(program).unwrap_or_else(|| program.to_string());
-
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -195,7 +214,6 @@ fn run_with_timeout_inner(
 
     let (tx, rx) = mpsc::channel();
     let mut child_stdout = child.stdout.take()?;
-
     thread::spawn(move || {
         let mut buf = String::new();
         let _ = child_stdout.read_to_string(&mut buf);
@@ -229,7 +247,7 @@ mod tests {
     #[test]
     fn run_child_with_timeout_large_stdout_does_not_deadlock() {
         let result = run_child_with_timeout("sh", &["-c", "head -c 200000 /dev/zero | base64"], 10);
-        assert!(result.is_some(), "Process should not time out");
+        assert!(result.is_some());
         let output = result.unwrap();
         assert!(output.status.success());
         assert!(output.stdout.len() > 100_000);
@@ -239,5 +257,111 @@ mod tests {
     fn run_child_with_timeout_timeout_kills_child() {
         let result = run_child_with_timeout("sleep", &["60"], 1);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn wildcard_bind_matches_canonical_forms() {
+        assert!(is_wildcard_bind("0.0.0.0"));
+        assert!(is_wildcard_bind("::"));
+        assert!(is_wildcard_bind("::ffff:0.0.0.0"));
+    }
+
+    #[test]
+    fn wildcard_bind_rejects_everything_else() {
+        assert!(!is_wildcard_bind("127.0.0.1"));
+        assert!(!is_wildcard_bind("::1"));
+        assert!(!is_wildcard_bind("10.0.0.1"));
+        assert!(!is_wildcard_bind("::ffff:127.0.0.1"));
+        assert!(!is_wildcard_bind(""));
+        assert!(!is_wildcard_bind("0.0.0.0 "));
+        assert!(!is_wildcard_bind("[::]"));
+        assert!(!is_wildcard_bind("*"));
+        assert!(!is_wildcard_bind("::ffff:0:0"));
+    }
+
+    #[test]
+    fn loopback_bind_matches_canonical_forms() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("127.0.0.53"));
+        assert!(is_loopback_bind("127.0.1.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("::ffff:127.0.0.1"));
+        assert!(is_loopback_bind("::ffff:127.0.0.53"));
+    }
+
+    #[test]
+    fn loopback_bind_rejects_everything_else() {
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("::"));
+        assert!(!is_loopback_bind("::ffff:0.0.0.0"));
+        assert!(!is_loopback_bind("10.0.0.1"));
+        assert!(!is_loopback_bind("128.0.0.1"));
+        assert!(!is_loopback_bind("1127.0.0.1"));
+        assert!(!is_loopback_bind("127."));
+        assert!(!is_loopback_bind("127.0.0.1 "));
+        assert!(!is_loopback_bind("::ffff:10.0.0.1"));
+        assert!(!is_loopback_bind("::2"));
+        assert!(!is_loopback_bind("localhost"));
+        assert!(!is_loopback_bind(""));
+    }
+
+    #[test]
+    fn ephemeral_exec_path_matches_expected_directories() {
+        assert!(is_ephemeral_exec_path("/tmp/malware"));
+        assert!(is_ephemeral_exec_path("/var/tmp/.hidden"));
+        assert!(is_ephemeral_exec_path("/dev/shm/session"));
+        assert!(is_ephemeral_exec_path("/home/user/script"));
+    }
+
+    #[test]
+    fn ephemeral_exec_path_rejects_system_paths() {
+        assert!(!is_ephemeral_exec_path("/usr/bin/ls"));
+        assert!(!is_ephemeral_exec_path("/bin/bash"));
+        assert!(!is_ephemeral_exec_path("/opt/tmp/bin"));
+        assert!(!is_ephemeral_exec_path("/etc/cron.d/backup"));
+        assert!(!is_ephemeral_exec_path(""));
+        assert!(!is_ephemeral_exec_path("/tmp"));
+        assert!(!is_ephemeral_exec_path("/tmp "));
+    }
+
+    #[test]
+    fn ephemeral_exec_path_boundary_cases() {
+        assert!(is_ephemeral_exec_path("/tmp/"));
+        assert!(!is_ephemeral_exec_path("/tmp"));
+        assert!(!is_ephemeral_exec_path("/var/log/syslog"));
+        assert!(!is_ephemeral_exec_path("/dev/null"));
+        assert!(is_ephemeral_exec_path("/home/user/.local/share/something"));
+    }
+
+    #[test]
+    fn ephemeral_path_matches_memfd() {
+        // Base path after ` (deleted)` is stripped (classify_suspicious order).
+        assert!(is_ephemeral_exec_path("/memfd:kdevtmpfsi"));
+        // Raw readlink form, suffix still attached — prefix match is robust to it.
+        assert!(is_ephemeral_exec_path("/memfd:kdevtmpfsi (deleted)"));
+        assert!(is_ephemeral_exec_path("/memfd:x"));
+        // Regression guard: a legit file literally named "memfd:" without the
+        // leading slash, or a system path mentioning memfd, must NOT match.
+        assert!(!is_ephemeral_exec_path("/usr/bin/memfd:tool"));
+        assert!(!is_ephemeral_exec_path("memfd:foo")); // no leading slash
+        assert!(!is_ephemeral_exec_path("/opt/memfd:app")); // memfd not at root
+    }
+
+    #[test]
+    fn known_malware_exact_case_insensitive() {
+        assert!(is_known_malware("xmrig"));
+        assert!(is_known_malware("KDevTmpFSi"));
+        assert!(is_known_malware("  kinsing  "));
+        assert!(!is_known_malware("xmrigd"));
+        assert!(!is_known_malware("networkservice"));
+        assert!(!is_known_malware("nginx"));
+        assert!(!is_known_malware(""));
+    }
+
+    #[test]
+    fn ambiguous_malware_is_separate_tier() {
+        assert!(is_ambiguous_malware("networkservice"));
+        assert!(!is_ambiguous_malware("NetworkManager"));
+        assert!(!is_known_malware("networkservice"));
     }
 }

@@ -52,6 +52,33 @@ impl Default for AgentReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cron severity classification (shared between scanner and scoring)
+// ---------------------------------------------------------------------------
+
+/// Severity of a cron job based on its content.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub enum CronSeverity {
+    /// No suspicious patterns found.
+    #[default]
+    Ok,
+    /// Uses custom paths or tools that may be legitimate but should be reviewed.
+    Warning,
+    /// Contains clear indicators of compromise (reverse shells, downloads, etc.).
+    Critical,
+}
+
+/// A single cron job with its classification.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CronJob {
+    pub command: String,
+    pub severity: CronSeverity,
+}
+
+// ---------------------------------------------------------------------------
+// HostInfo
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct HostInfo {
@@ -75,7 +102,10 @@ pub struct HostInfo {
     pub dmesg_errors: Vec<String>,
     pub gpu_devices: Vec<String>,
     pub native_services: Vec<String>,
-    pub cron_jobs: Vec<String>,
+
+    /// Cron jobs collected from the system, each classified by severity.
+    pub cron_jobs: Vec<CronJob>,
+
     pub systemd_timers: Vec<String>,
     pub tech_stack: Vec<String>,
     pub top_memory_processes: Vec<ProcessInfo>,
@@ -246,6 +276,10 @@ pub struct SecurityInfo {
     pub access_alignment: AccessAuditResult,
     #[serde(default)]
     pub secret_hygiene: Vec<SecretLeak>,
+    #[serde(default)]
+    pub capability_audit: Vec<ProcCapFinding>,
+    #[serde(default)]
+    pub suspicious_processes: Vec<SuspiciousProcess>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -402,4 +436,36 @@ pub struct SecretLeak {
     pub process: String,
     pub source: String,
     pub matched_key: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SuspiciousProcess {
+    pub pid: u32,
+    pub name: String,
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    #[serde(default)]
+    pub is_deleted: bool,
+}
+
+// Process Capability Audit Models
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ProcCapFinding {
+    pub pid: u32,
+    pub comm: String,
+    pub euid: u32,
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
+    pub bounding: u64,
+    #[serde(default)]
+    pub ambient: u64,
+    /// None = line absent (kernel < 4.10) or snapshot predates this field.
+    #[serde(default)]
+    pub no_new_privs: Option<bool>,
+    /// 0 disabled / 1 strict / 2 filter; None = no CONFIG_SECCOMP or old snapshot.
+    #[serde(default)]
+    pub seccomp: Option<u8>,
+    pub critical_caps: Vec<String>,
 }

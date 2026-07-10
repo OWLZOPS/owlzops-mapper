@@ -206,7 +206,6 @@ impl<'a> SheetWriter<'a> {
 
     fn write_header(&mut self, headers: &[&str]) -> Result<(), XlsxError> {
         for (col, h) in headers.iter().enumerate() {
-            // Headers are static, no injection risk, but sanitize for consistency
             self.sheet.write_string_with_format(
                 self.row,
                 col as u16,
@@ -855,6 +854,7 @@ fn sheet_host_combined(
     w.next_row();
     write_docker_section(&mut w, report, false)?;
     w.next_row();
+    write_capability_section(&mut w, report)?;
     write_packages_section(&mut w, report, false)?;
 
     w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
@@ -1081,7 +1081,7 @@ fn write_network_section(
         w.write_string(0, &p.protocol, band)?;
         w.write_string(1, &p.port, band)?;
         w.write_string(2, &p.process, band)?;
-        let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
+        let addr_fmt = if crate::utils::is_wildcard_bind(&p.bind_address) {
             w.fmts.critical_band(w.current_row())
         } else {
             w.fmts.ok_band(w.current_row())
@@ -1157,7 +1157,7 @@ fn write_docker_section(
 
     let total_unique_gb = report.topology.total_images_size_mb as f64 / 1024.0;
     w.write_kv_row(
-        "Total Unique Size (GB)",
+        "Real Disk Size (Images)",
         &format!("{:.2}", total_unique_gb),
         None,
     )?;
@@ -1174,13 +1174,13 @@ fn write_docker_section(
             Some(w.fmts.warning_band(w.current_row())),
         )?;
         w.write_kv_row(
-            "Dangling Wasted Space (GB)",
+            "Dangling Virtual Size (GB)",
             &dangling_size,
             Some(w.fmts.warning_band(w.current_row())),
         )?;
     } else {
         w.write_kv_row("Dangling (Unused) Images", &dangling_count, None)?;
-        w.write_kv_row("Dangling Wasted Space (GB)", &dangling_size, None)?;
+        w.write_kv_row("Dangling Virtual Size (GB)", &dangling_size, None)?;
     }
 
     w.write_kv_row(
@@ -1196,7 +1196,7 @@ fn write_docker_section(
             "Image",
             "State",
             "Status",
-            "Unique Size (GB)",
+            "Size (GB)",
             "Log Size (GB)",
             "Mounts",
             "Security Issues",
@@ -1234,6 +1234,49 @@ fn sheet_docker(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxE
     write_docker_section(&mut w, report, true)?;
     w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
     Ok(sheet)
+}
+
+fn write_capability_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
+    if report.security.capability_audit.is_empty() {
+        return Ok(());
+    }
+    w.write_section_title("Elevated Capabilities (non‑root)")?;
+    w.write_header(&[
+        "PID",
+        "Process",
+        "EUID",
+        "Critical Caps",
+        "NoNewPrivs",
+        "Seccomp",
+    ])?;
+    for f in &report.security.capability_audit {
+        let band = w.fmts.row_band(w.current_row());
+        w.write_number(0, f.pid as f64, &w.fmts.number)?;
+        w.write_string(1, &f.comm, band)?;
+        w.write_number(2, f.euid as f64, &w.fmts.number)?;
+        let cap_text = if f.critical_caps.is_empty() {
+            format!("ambient set: 0x{:016x}", f.ambient)
+        } else {
+            f.critical_caps.join(", ")
+        };
+        w.write_string(3, &cap_text, band)?;
+        let nnp_text = match f.no_new_privs {
+            Some(false) => "open",
+            Some(true) => "1",
+            None => "-",
+        };
+        w.write_string(4, nnp_text, band)?;
+        let secc_text = match f.seccomp {
+            Some(0) => "off",
+            Some(1) => "strict",
+            Some(2) => "2",
+            Some(_) => "?",
+            None => "-",
+        };
+        w.write_string(5, secc_text, band)?;
+        w.next_row();
+    }
+    Ok(())
 }
 
 fn write_packages_section(
@@ -1474,6 +1517,8 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
             w.next_row();
         }
     }
+
+    write_capability_section(&mut w, report)?;
 
     w.next_row();
 

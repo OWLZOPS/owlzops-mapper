@@ -7,47 +7,38 @@
 
 use std::collections::HashMap;
 
-use crate::models::{AgentReport, PackageManager};
+use crate::models::{AgentReport, CronSeverity, PackageManager};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Attribute, Cell, Color, Table};
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 
 // ---------------------------------------------------------------------------
 // Sanitisation helper
 // ---------------------------------------------------------------------------
 
-/// Replace control characters (except `\t`) with the Unicode
-/// replacement character so that attacker-controlled strings
-/// cannot inject ANSI escape sequences into the terminal.
+/// Replace control characters with the Unicode replacement character.
+/// Tabs (\t) are converted to 4 spaces to fix comfy_table border alignment calculations.
 pub fn sanitize_terminal(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() && c != '\t' {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
+    s.replace('\t', "    ")
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
 }
 
-/// Common patterns that indicate a suspicious cron job
-/// (executables from writable locations, hidden directories, etc.).
-const SUSPICIOUS_CRON_PATTERNS: &[&str] = &[
-    "/tmp/",
-    "/var/tmp/",
-    "/dev/shm/",
-    "/home/",
-    "curl",
-    "wget",
-    "base64 -d",
-    "sh -c",
-    "bash -c",
-];
+// ---------------------------------------------------------------------------
+// Helper: table with dynamic column width (no forced width)
+// ---------------------------------------------------------------------------
 
-fn is_suspicious_cron(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    SUSPICIOUS_CRON_PATTERNS.iter().any(|p| lower.contains(p))
+/// Create a `Table` preset for sections that contain potentially long text.
+/// Uses `ContentArrangement::Dynamic` so columns resize to fit the content,
+/// while `comfy_table`'s internal fallback (80 columns) guarantees no runaway
+/// lines when no terminal is present (e.g. automated SSH calls).
+fn create_dynamic_table() -> Table {
+    let mut t = Table::new();
+    t.load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    t
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +58,7 @@ pub fn render_dashboard(report: &AgentReport) {
     render_system_internals(report);
     render_packages(report);
     render_docker(report);
+    render_capability_audit(report);
 
     if !report.coverage_warnings.is_empty() {
         println!("\n⚠ Coverage Warnings (incomplete data):");
@@ -126,7 +118,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
         ]);
     }
 
-    println!("🦉 Owlzops Multi‑Host Audit Summary\n");
+    println!("\u{1F989} Owlzops Multi‑Host Audit Summary\n");
     println!("{t}\n");
 }
 
@@ -144,7 +136,6 @@ fn render_header(report: &AgentReport) {
         ("", "", "", "")
     };
 
-    // ---------- Risk Score with visual penalty notation ----------
     let risk_label = if report.risk_score < 40 {
         "Healthy"
     } else if report.risk_score < 70 {
@@ -185,18 +176,63 @@ fn render_header(report: &AgentReport) {
         .collect();
 
     if !active_findings.is_empty() {
-        println!("Breakdown:");
-        for f in &active_findings {
-            let cis_note = if let Some(cis) = f.cis_ref {
-                format!(" [{}]", cis)
-            } else {
-                String::new()
-            };
-            println!("  • {} (+{}){}", f.title, f.weight, cis_note);
-            if !f.evidence.is_empty() {
-                println!("    └─ {}", sanitize_terminal(&f.evidence));
+        println!("\nRisk Breakdown:");
+
+        let (icon_sec, icon_rel, icon_hyg) = if is_tty {
+            ("\u{1F6E1} ", "\u{2699} ", "\u{1F9F9} ")
+        } else {
+            ("", "", "")
+        };
+
+        let categories = [
+            (
+                crate::scoring::Category::Security,
+                format!("{}Security Findings", icon_sec),
+            ),
+            (
+                crate::scoring::Category::Reliability,
+                format!("{}Reliability Findings", icon_rel),
+            ),
+            (
+                crate::scoring::Category::Hygiene,
+                format!("{}Hygiene Findings", icon_hyg),
+            ),
+        ];
+
+        for (cat, label) in categories {
+            let cat_findings: Vec<_> = active_findings
+                .iter()
+                .filter(|f| f.category == cat)
+                .collect();
+
+            if !cat_findings.is_empty() {
+                println!("\n  {}", label);
+
+                let mut t_cat = create_dynamic_table();
+                t_cat.set_header(vec![
+                    Cell::new("CIS / Ref")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Cyan),
+                    Cell::new("Penalty")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Red),
+                    Cell::new("Finding").add_attribute(Attribute::Bold),
+                    Cell::new("Evidence").add_attribute(Attribute::Bold),
+                ]);
+
+                for f in cat_findings {
+                    let cis_note = f.cis_ref.unwrap_or("-");
+                    t_cat.add_row(vec![
+                        Cell::new(cis_note).fg(Color::DarkGrey),
+                        Cell::new(format!("-{}", f.weight)).fg(Color::Red),
+                        Cell::new(&f.title),
+                        Cell::new(sanitize_terminal(&f.evidence)),
+                    ]);
+                }
+                println!("{t_cat}");
             }
         }
+        println!();
     }
 
     if !report.is_root_execution {
@@ -682,7 +718,7 @@ fn render_network_listeners(report: &AgentReport) {
         if p.port == "0" || p.port == "*" {
             continue;
         }
-        let exposed = p.bind_address == "0.0.0.0" || p.bind_address == "::";
+        let exposed = crate::utils::is_wildcard_bind(&p.bind_address);
         let mut addr_cell = Cell::new(sanitize_terminal(&p.bind_address));
         let mut port_cell = Cell::new(&p.port);
         let mut proto_cell = Cell::new(&p.protocol);
@@ -794,23 +830,47 @@ fn render_system_internals(report: &AgentReport) {
     println!("{t_internals}\n");
 
     if !report.network.custom_host_overrides.is_empty() {
-        println!("\x1b[1;33m[!] Found Custom /etc/hosts Overrides:\x1b[0m");
+        let mut t_hosts = create_dynamic_table();
+        t_hosts.set_header(vec![
+            Cell::new("Custom /etc/hosts Overrides")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Yellow),
+        ]);
         for host in &report.network.custom_host_overrides {
-            println!("    - {}", sanitize_terminal(host));
+            t_hosts.add_row(vec![Cell::new(sanitize_terminal(host))]);
         }
-        println!();
+        println!("{t_hosts}\n");
     }
+
     if !report.host.cron_jobs.is_empty() {
-        println!("System & Custom Cronjobs:");
+        let mut t_cron = create_dynamic_table();
+        t_cron.set_header(vec![
+            Cell::new("Cronjob Rule")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("Status").add_attribute(Attribute::Bold),
+        ]);
+
         for cron in &report.host.cron_jobs {
-            let safe_cron = sanitize_terminal(cron);
-            if is_suspicious_cron(&safe_cron) {
-                println!("\x1b[1;31m[!]  {}\x1b[0m", safe_cron);
-            } else {
-                println!("    - {}", safe_cron);
-            }
+            let safe_cmd = sanitize_terminal(&cron.command);
+            let (status_cell, cmd_cell) = match cron.severity {
+                CronSeverity::Critical => (
+                    Cell::new("Suspicious!")
+                        .fg(Color::Red)
+                        .add_attribute(Attribute::Bold),
+                    Cell::new(safe_cmd).fg(Color::Red),
+                ),
+                CronSeverity::Warning => (
+                    Cell::new("Review").fg(Color::Yellow),
+                    Cell::new(safe_cmd).fg(Color::Yellow),
+                ),
+                CronSeverity::Ok => (Cell::new("OK").fg(Color::Green), Cell::new(safe_cmd)),
+            };
+            t_cron.add_row(vec![cmd_cell, status_cell]);
         }
-        println!();
+
+        println!("System & Custom Cronjobs:");
+        println!("{t_cron}\n");
     }
 }
 
@@ -917,8 +977,6 @@ fn render_packages(report: &AgentReport) {
     }
 }
 
-/// Truncate each Docker mount string to at most `max_width` characters,
-/// appending "..." if truncated. Keeps the beginning of the path intact.
 fn truncate_docker_mounts(mounts: &[String], max_width: usize) -> String {
     mounts
         .iter()
@@ -973,7 +1031,6 @@ fn render_docker(report: &AgentReport) {
             &format!("{:.2} GB", build_cache_gb),
         ]);
     } else {
-        // Fallback to dangling count for systems without system_df support
         let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
         let mut dang_count_cell = Cell::new(report.topology.dangling_images_count.to_string());
         let mut dang_size_cell = Cell::new(format!("{:.2} GB", dang_img_gb));
@@ -1000,7 +1057,6 @@ fn render_docker(report: &AgentReport) {
     println!("Docker Images & Volumes:");
     println!("{t_dock_sum}\n");
 
-    // Dangling images list remains unchanged
     if !report.topology.dangling_images.is_empty() {
         let mut t_dang = Table::new();
         t_dang
@@ -1027,12 +1083,8 @@ fn render_docker(report: &AgentReport) {
         println!("{t_dang}\n");
     }
 
-    // Containers with RW size
     if !report.topology.containers.is_empty() {
-        let mut t_docker = Table::new();
-        t_docker
-            .load_preset(UTF8_FULL)
-            .apply_modifier(UTF8_ROUND_CORNERS);
+        let mut t_docker = create_dynamic_table();
         t_docker.set_header(vec![
             Cell::new("Container Name")
                 .add_attribute(Attribute::Bold)
@@ -1089,6 +1141,67 @@ fn render_docker(report: &AgentReport) {
         println!("Docker Containers & Data Persistency:");
         println!("{t_docker}\n");
     }
+}
+
+fn render_capability_audit(report: &AgentReport) {
+    if report.security.capability_audit.is_empty() {
+        return;
+    }
+
+    let mut t_caps = create_dynamic_table();
+    t_caps.set_header(vec![
+        Cell::new("Process")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("PID / EUID").add_attribute(Attribute::Bold),
+        Cell::new("Capabilities").add_attribute(Attribute::Bold),
+        Cell::new("Security Flags").add_attribute(Attribute::Bold),
+    ]);
+
+    for f in &report.security.capability_audit {
+        let cap_list = if f.critical_caps.is_empty() {
+            let ambient_names = crate::scanners::capabilities::decode_mask(f.ambient);
+            format!("ambient: {}", ambient_names.join(", "))
+        } else {
+            f.critical_caps.join(", ")
+        };
+
+        let nnp = match f.no_new_privs {
+            Some(false) => "NNP=open",
+            Some(true) => "NNP=1",
+            None => "-",
+        };
+        let secc = match f.seccomp {
+            Some(2) => "Seccomp=2",
+            Some(0) => "Seccomp=off",
+            Some(1) => "Seccomp=strict",
+            _ => "-",
+        };
+
+        let mut flags = Vec::new();
+        if nnp != "-" {
+            flags.push(nnp);
+        }
+        if secc != "-" {
+            flags.push(secc);
+        }
+
+        let flags_display = if flags.is_empty() {
+            String::from("-")
+        } else {
+            flags.join("\n")
+        };
+
+        t_caps.add_row(vec![
+            Cell::new(sanitize_terminal(&f.comm)),
+            Cell::new(format!("{} / {}", f.pid, f.euid)),
+            Cell::new(cap_list).fg(Color::Red),
+            Cell::new(flags_display).fg(Color::DarkGrey),
+        ]);
+    }
+
+    println!("Non-root processes with elevated capabilities:");
+    println!("{t_caps}\n");
 }
 
 fn render_footer() {
