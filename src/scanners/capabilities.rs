@@ -241,8 +241,18 @@ fn classify_suspicious(
         None => (None, false),
     };
 
-    // Trigger 1 — FP-protected: only ephemeral base paths count as fileless.
-    let deleted_ephemeral = deleted && base_path.is_some_and(crate::utils::is_ephemeral_exec_path);
+    // Trigger 1 — fileless execution, two forms:
+    //   (a) deleted executable whose base path is ephemeral — FP-protected:
+    //       system-path deletions (apt upgrade) are excluded; OR
+    //   (b) a /memfd: base path — memfd_create-backed, in-memory-only — which is
+    //       intrinsically fileless whether or not the kernel appended the
+    //       " (deleted)" suffix (some kernels/configs omit it).
+    // NOTE: `deleted_ephemeral` is now a slight misnomer — it means "fileless"
+    // (cf. the is_deleted Note from the SEC-017 session); kept for continuity
+    // with the field it feeds. Zero-copy: starts_with / is_some_and, no alloc.
+    let deleted_ephemeral = base_path.is_some_and(|p| {
+        (deleted && crate::utils::is_ephemeral_exec_path(p)) || p.starts_with("/memfd:")
+    });
 
     // Trigger 2 — name blocklist.
     let name_recorded = if crate::utils::is_known_malware(comm) {
@@ -672,5 +682,26 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
             .expect("fileless flagged");
         assert!(f.is_deleted);
         assert_eq!(f.exe_path.as_deref(), Some("/dev/shm/loader"));
+    }
+
+    #[test]
+    fn memfd_is_fileless_without_deleted_suffix() {
+        // Raw memfd link, NO " (deleted)", name not in any blocklist → still flagged.
+        let (rec, _) = classify_suspicious("stealth", 900, Some("/memfd:stealth"));
+        let r = rec.expect("memfd execution must be recorded even without the suffix");
+        assert!(r.is_deleted, "memfd is intrinsically fileless");
+        assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth"));
+        assert_eq!(r.pid, 900);
+
+        // memfd WITH the suffix → stripped, still fileless.
+        let (rec, _) = classify_suspicious("stealth", 901, Some("/memfd:stealth (deleted)"));
+        let r = rec.unwrap();
+        assert!(r.is_deleted);
+        assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth")); // suffix cleaned
+
+        // Regression guard: a live on-disk /tmp binary (no name, not deleted)
+        // must NOT be fileless — broadening memfd must not leak into this case.
+        let (rec, _) = classify_suspicious("harmless", 902, Some("/tmp/harmless"));
+        assert!(rec.is_none());
     }
 }
