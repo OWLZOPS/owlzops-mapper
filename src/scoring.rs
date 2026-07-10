@@ -22,7 +22,7 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
-pub const SCORING_VERSION: u8 = 6;
+pub const SCORING_VERSION: u8 = 7;
 
 // ── New Finding model (v0.5) ───────────────────────────────
 

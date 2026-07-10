@@ -12,36 +12,24 @@ use crate::safe_io;
 // Hardened tool resolution
 // ---------------------------------------------------------------------------
 
-/// Global cache of absolute paths resolved against a trusted `PATH`.
 fn tool_cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Resolve a short tool name (`dmesg`, `sshd`, …) to an absolute path using a
-/// **trusted** `PATH` and a clean environment. The result is cached for the
-/// lifetime of the process.
-///
-/// Returns `None` when the tool cannot be found, but the caller should still
-/// attempt to spawn it using a hardened command (the short name will be used
-/// as a fallback).
 pub fn resolve_tool(tool: &str) -> Option<String> {
-    // Look up in cache first
     {
         let cache = tool_cache().lock().unwrap();
         if let Some(path) = cache.get(tool) {
             return Some(path.clone());
         }
     }
-
-    // Resolve with a safe `which` call
     let output = Command::new("which")
         .arg(tool)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .output()
         .ok()?;
-
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !path.is_empty() {
@@ -50,16 +38,9 @@ pub fn resolve_tool(tool: &str) -> Option<String> {
             return Some(path);
         }
     }
-
     None
 }
 
-/// Create a `Command` hardened against `PATH`‑hijack and `LD_PRELOAD`.
-///
-/// * The environment is **completely emptied** and only `PATH` and `LC_ALL`
-///   are set to known‑safe values.
-/// * The caller is expected to pass an **absolute** path obtained from
-///   [`resolve_tool`], but a short name is also accepted as a fallback.
 pub fn hardened_command(program: &str, args: &[&str]) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -69,8 +50,6 @@ pub fn hardened_command(program: &str, args: &[&str]) -> Command {
     cmd
 }
 
-/// Single source of truth for per‑host timeout budget.
-/// Used by both the fleet orchestrator and the internal russh path.
 pub(crate) const fn host_budget_secs(t: u64) -> u64 {
     t.saturating_mul(2).saturating_add(60)
 }
@@ -79,24 +58,10 @@ pub(crate) const fn host_budget_secs(t: u64) -> u64 {
 // Network predicates
 // ---------------------------------------------------------------------------
 
-/// Single source of truth for "globally exposed" bind addresses.
-///
-/// Matches the canonical wildcard forms our `/proc/net` decoders can emit
-/// (plain IPv4/IPv6 wildcards plus the IPv4-mapped IPv6 wildcard reported
-/// for AF_INET6 sockets bound to all v4 interfaces). Comparison is exact
-/// by design – the decoders never pad or alias.
 pub fn is_wildcard_bind(addr: &str) -> bool {
     matches!(addr, "0.0.0.0" | "::" | "::ffff:0.0.0.0")
 }
 
-/// Single source of truth for "loopback" bind addresses.
-///
-/// Unlike the wildcard case, exact literals cannot be total here: IPv4
-/// loopback is the whole 127.0.0.0/8 block (systemd-resolved alone binds
-/// 127.0.0.53/127.0.0.54), so both v4 families — native and IPv4-mapped —
-/// are matched by canonical prefix with a digits/dots tail check, keeping
-/// padded or alphanumeric garbage out. `::1` stays an exact `matches!` arm:
-/// IPv6 loopback is a single address. Zero-copy throughout.
 pub fn is_loopback_bind(addr: &str) -> bool {
     fn v4_loopback(s: &str) -> bool {
         s.strip_prefix("127.").is_some_and(|rest| {
@@ -109,50 +74,41 @@ pub fn is_loopback_bind(addr: &str) -> bool {
 }
 
 /// Executables served from writable/ephemeral locations — a shared signal
-/// for shadow-IT (SEC-013) and active-compromise (SEC-015) detection.
+/// for shadow-IT (SEC-013), IoC (SEC-015) and ambiguous-malware corroboration.
+///
+/// `/memfd:` covers `memfd_create`-backed execution (fully in-memory implants);
+/// the kernel renders such exe links as `/memfd:<name> (deleted)`. Prefix match
+/// is deletion-suffix agnostic, so this holds whether called on the raw link
+/// or on the base path after the ` (deleted)` suffix is stripped.
 pub fn is_ephemeral_exec_path(path: &str) -> bool {
-    matches!(
-        path.split('/').nth(1),
-        Some("tmp") | Some("dev") | Some("home") | Some("var")
-    ) && (path.starts_with("/tmp/")
+    path.starts_with("/tmp/")
         || path.starts_with("/var/tmp/")
         || path.starts_with("/dev/shm/")
-        || path.starts_with("/home/"))
+        || path.starts_with("/home/")
+        || path.starts_with("/memfd:")
 }
 
 // ---------------------------------------------------------------------------
 // Known malware / miner process names
 // ---------------------------------------------------------------------------
 
-/// Explicit, high-confidence malware/miner comm names. Exact, case-insensitive
-/// match only (never substring) so legit binaries are never clobbered. Every
-/// entry MUST be ≤15 chars — the kernel truncates comm to TASK_COMM_LEN-1 (15);
-/// a longer signature could never match a truncated comm.
 pub const KNOWN_MALWARE: &[&str] = &["kdevtmpfsi", "kinsing", "xmrig", "sysupdate"];
-
-/// Ambiguous names resembling legitimate services. A name match here is NOT
-/// sufficient on its own — the caller must corroborate via an ephemeral
-/// exe_path before flagging (see [`is_ephemeral_exec_path`]).
 pub const AMBIGUOUS_MALWARE: &[&str] = &["networkservice"];
 
-/// Exact case-insensitive match against the high-confidence blocklist.
-/// Zero-copy: `eq_ignore_ascii_case` allocates nothing (unlike `to_lowercase`).
 pub fn is_known_malware(comm: &str) -> bool {
     let c = comm.trim();
     KNOWN_MALWARE.iter().any(|m| c.eq_ignore_ascii_case(m))
 }
 
-/// Exact case-insensitive match against the corroboration-required tier.
 pub fn is_ambiguous_malware(comm: &str) -> bool {
     let c = comm.trim();
     AMBIGUOUS_MALWARE.iter().any(|m| c.eq_ignore_ascii_case(m))
 }
 
 // ---------------------------------------------------------------------------
-// Child helpers (unchanged logic, now hardened and with stdin nulled)
+// Child helpers (unchanged)
 // ---------------------------------------------------------------------------
 
-/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
 fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
     loop {
@@ -171,16 +127,12 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
     }
 }
 
-/// Run a child process with capped stdout/stderr, a timeout, a hardened
-/// environment, and **no stdin** to prevent the child from capturing the
-/// operator's terminal input (R8-07).
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
     timeout_secs: u64,
 ) -> Option<std::process::Output> {
     let resolved = resolve_tool(program).unwrap_or_else(|| program.to_string());
-
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -190,7 +142,6 @@ pub fn run_child_with_timeout(
 
     let out_pipe = child.stdout.take()?;
     let err_pipe = child.stderr.take()?;
-
     let prog = program.to_string();
 
     let out_handle = thread::spawn(move || {
@@ -212,7 +163,6 @@ pub fn run_child_with_timeout(
 
     let deadline = Duration::from_secs(timeout_secs);
     let start = Instant::now();
-
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -236,13 +186,10 @@ pub fn run_child_with_timeout(
     })
 }
 
-/// Execute a command with a timeout.
-/// See [`run_with_timeout_inner`].
 pub fn run_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
     run_with_timeout_inner(program, args, timeout_secs, true)
 }
 
-/// Execute a command with a timeout, accepting any exit code.
 pub fn run_with_timeout_any_exit(
     program: &str,
     args: &[&str],
@@ -258,7 +205,6 @@ fn run_with_timeout_inner(
     require_success: bool,
 ) -> Option<String> {
     let resolved = resolve_tool(program).unwrap_or_else(|| program.to_string());
-
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -268,7 +214,6 @@ fn run_with_timeout_inner(
 
     let (tx, rx) = mpsc::channel();
     let mut child_stdout = child.stdout.take()?;
-
     thread::spawn(move || {
         let mut buf = String::new();
         let _ = child_stdout.read_to_string(&mut buf);
@@ -302,7 +247,7 @@ mod tests {
     #[test]
     fn run_child_with_timeout_large_stdout_does_not_deadlock() {
         let result = run_child_with_timeout("sh", &["-c", "head -c 200000 /dev/zero | base64"], 10);
-        assert!(result.is_some(), "Process should not time out");
+        assert!(result.is_some());
         let output = result.unwrap();
         assert!(output.status.success());
         assert!(output.stdout.len() > 100_000);
@@ -337,10 +282,10 @@ mod tests {
     #[test]
     fn loopback_bind_matches_canonical_forms() {
         assert!(is_loopback_bind("127.0.0.1"));
-        assert!(is_loopback_bind("127.0.0.53")); // systemd-resolved stub
-        assert!(is_loopback_bind("127.0.1.1")); // full /8 — same semantics as is_local_ip
+        assert!(is_loopback_bind("127.0.0.53"));
+        assert!(is_loopback_bind("127.0.1.1"));
         assert!(is_loopback_bind("::1"));
-        assert!(is_loopback_bind("::ffff:127.0.0.1")); // mapped loopback
+        assert!(is_loopback_bind("::ffff:127.0.0.1"));
         assert!(is_loopback_bind("::ffff:127.0.0.53"));
     }
 
@@ -348,15 +293,15 @@ mod tests {
     fn loopback_bind_rejects_everything_else() {
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!is_loopback_bind("::"));
-        assert!(!is_loopback_bind("::ffff:0.0.0.0")); // wildcard family, not loopback
+        assert!(!is_loopback_bind("::ffff:0.0.0.0"));
         assert!(!is_loopback_bind("10.0.0.1"));
-        assert!(!is_loopback_bind("128.0.0.1")); // /8 boundary
-        assert!(!is_loopback_bind("1127.0.0.1")); // prefix, not substring
-        assert!(!is_loopback_bind("127.")); // empty tail
-        assert!(!is_loopback_bind("127.0.0.1 ")); // padded input stays rejected
-        assert!(!is_loopback_bind("::ffff:10.0.0.1")); // mapped non-loopback
+        assert!(!is_loopback_bind("128.0.0.1"));
+        assert!(!is_loopback_bind("1127.0.0.1"));
+        assert!(!is_loopback_bind("127."));
+        assert!(!is_loopback_bind("127.0.0.1 "));
+        assert!(!is_loopback_bind("::ffff:10.0.0.1"));
         assert!(!is_loopback_bind("::2"));
-        assert!(!is_loopback_bind("localhost")); // names are not bind strings
+        assert!(!is_loopback_bind("localhost"));
         assert!(!is_loopback_bind(""));
     }
 
@@ -372,24 +317,34 @@ mod tests {
     fn ephemeral_exec_path_rejects_system_paths() {
         assert!(!is_ephemeral_exec_path("/usr/bin/ls"));
         assert!(!is_ephemeral_exec_path("/bin/bash"));
-        assert!(!is_ephemeral_exec_path("/opt/tmp/bin")); // /opt/... not in list
+        assert!(!is_ephemeral_exec_path("/opt/tmp/bin"));
         assert!(!is_ephemeral_exec_path("/etc/cron.d/backup"));
-        assert!(!is_ephemeral_exec_path("")); // empty path
-        assert!(!is_ephemeral_exec_path("/tmp")); // no trailing slash
-        assert!(!is_ephemeral_exec_path("/tmp ")); // trailing space
+        assert!(!is_ephemeral_exec_path(""));
+        assert!(!is_ephemeral_exec_path("/tmp"));
+        assert!(!is_ephemeral_exec_path("/tmp "));
     }
 
     #[test]
     fn ephemeral_exec_path_boundary_cases() {
-        // edge cases: path must have trailing content
         assert!(is_ephemeral_exec_path("/tmp/"));
         assert!(!is_ephemeral_exec_path("/tmp"));
-        // /var alone is not ephemeral, need /var/tmp/
         assert!(!is_ephemeral_exec_path("/var/log/syslog"));
-        // /dev/null is not /dev/shm/
         assert!(!is_ephemeral_exec_path("/dev/null"));
-        // /home alone is valid
         assert!(is_ephemeral_exec_path("/home/user/.local/share/something"));
+    }
+
+    #[test]
+    fn ephemeral_path_matches_memfd() {
+        // Base path after ` (deleted)` is stripped (classify_suspicious order).
+        assert!(is_ephemeral_exec_path("/memfd:kdevtmpfsi"));
+        // Raw readlink form, suffix still attached — prefix match is robust to it.
+        assert!(is_ephemeral_exec_path("/memfd:kdevtmpfsi (deleted)"));
+        assert!(is_ephemeral_exec_path("/memfd:x"));
+        // Regression guard: a legit file literally named "memfd:" without the
+        // leading slash, or a system path mentioning memfd, must NOT match.
+        assert!(!is_ephemeral_exec_path("/usr/bin/memfd:tool"));
+        assert!(!is_ephemeral_exec_path("memfd:foo")); // no leading slash
+        assert!(!is_ephemeral_exec_path("/opt/memfd:app")); // memfd not at root
     }
 
     #[test]
@@ -397,8 +352,8 @@ mod tests {
         assert!(is_known_malware("xmrig"));
         assert!(is_known_malware("KDevTmpFSi"));
         assert!(is_known_malware("  kinsing  "));
-        assert!(!is_known_malware("xmrigd")); // substring must NOT match
-        assert!(!is_known_malware("networkservice")); // ambiguous tier ≠ explicit
+        assert!(!is_known_malware("xmrigd"));
+        assert!(!is_known_malware("networkservice"));
         assert!(!is_known_malware("nginx"));
         assert!(!is_known_malware(""));
     }
@@ -406,7 +361,7 @@ mod tests {
     #[test]
     fn ambiguous_malware_is_separate_tier() {
         assert!(is_ambiguous_malware("networkservice"));
-        assert!(!is_ambiguous_malware("NetworkManager")); // exact, not substring
-        assert!(!is_known_malware("networkservice")); // never in explicit tier
+        assert!(!is_ambiguous_malware("NetworkManager"));
+        assert!(!is_known_malware("networkservice"));
     }
 }
