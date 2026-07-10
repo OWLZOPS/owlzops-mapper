@@ -235,6 +235,11 @@ pub struct ContainerInfo {
     pub health_status: Option<String>,
     #[serde(default)]
     pub rw_size_mb: u64,
+    /// Live CapBnd of the container's init process (host pid), read from the
+    /// kernel at scan time. None = container not running or /proc unreadable
+    /// (non-root scan). Ground truth for the DOCK-010 runtime-tamper delta.
+    #[serde(default)]
+    pub runtime_bounding_caps: Option<u64>,
 }
 
 impl ContainerInfo {

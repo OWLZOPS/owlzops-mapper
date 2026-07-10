@@ -252,6 +252,24 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         })
                         .unwrap_or((false, None));
 
+                    // --- Runtime ground truth for DOCK-010 ---
+                    // Read the live CapBnd of the container's init process via its HOST pid.
+                    // None when: not running (no pid), pid ≤ 0, or /proc unreadable (non-root).
+                    let runtime_bounding_caps = inspect
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.pid)
+                        .filter(|&pid| pid > 0)
+                        .and_then(|pid| {
+                            let path = format!("/proc/{pid}/status");
+                            crate::safe_io::read_file_capped(&path, 16 * 1024)
+                                .ok()
+                                .and_then(|(content, _)| {
+                                    crate::scanners::capabilities::parse_status(&content)
+                                })
+                                .map(|st| st.caps.bounding)
+                        });
+
                     let rw_size_mb = (container.size_rw.unwrap_or(0).max(0) as u64) / (1024 * 1024);
                     let size_mb = (container.size_rw.unwrap_or(0)
                         + container.size_root_fs.unwrap_or(0))
@@ -277,6 +295,7 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         health_status,
                         sensitive_mounts,
                         rw_size_mb,
+                        runtime_bounding_caps,
                     });
                 }
             }

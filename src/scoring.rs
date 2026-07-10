@@ -616,6 +616,46 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── DOCK-010 — runtime capability ground truth (container escape) ──
+    // Each running container's LIVE bounding set (kernel truth from its init's
+    // host pid) vs Moby default + declared cap_add. Undeclared escape-grade caps
+    // ⇒ tampered daemon / malicious runtime shim / plugin. Privileged containers
+    // are suppressed (full caps expected — DOCK-003 covers them). None
+    // runtime_bounding_caps (not running / non-root scan) is skipped, not flagged.
+    let mut tampered: Vec<String> = Vec::new();
+    for c in &report.topology.containers {
+        if c.privileged {
+            continue;
+        }
+        let Some(bnd) = c.runtime_bounding_caps else {
+            continue;
+        };
+        let undeclared = crate::scanners::capabilities::undeclared_escape_caps(bnd, &c.cap_add);
+        if !undeclared.is_empty() {
+            tampered.push(format!(
+                "{} holds undeclared [{}]",
+                c.name,
+                undeclared.join(", ")
+            ));
+        }
+    }
+    if !tampered.is_empty() {
+        findings.push(Finding {
+            id: "DOCK-010",
+            title: "ACTIVE COMPROMISE: container runtime capabilities exceed declared config"
+                .to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!(
+                "{} container(s) with runtime cap tampering: {}",
+                tampered.len(),
+                tampered.join("; ")
+            ),
+            suppressed: None,
+            cis_ref: Some("CIS 5.2.5"),
+        });
+    }
+
     // ── Sensitive host mounts (Docker breakout surface) ──
     let mut has_socket_or_root = false;
     let mut has_sensitive_rw = false;
@@ -916,6 +956,7 @@ mod tests {
             oom_killed: false,
             health_status: None,
             rw_size_mb: 0,
+            runtime_bounding_caps: None,
         }
     }
 
@@ -1226,5 +1267,57 @@ mod tests {
             .expect("SEC-018 missing");
         assert_eq!(f.weight, 20);
         assert!(f.evidence.contains("curl"));
+    }
+
+    #[test]
+    fn dock010_flags_undeclared_runtime_caps() {
+        use crate::models::ContainerInfo;
+        let base = |bnd: Option<u64>, cap_add: Vec<String>, privileged: bool| ContainerInfo {
+            name: "web".into(),
+            image: "nginx".into(),
+            state: "running".into(),
+            status: "Up".into(),
+            size_mb: 0,
+            log_size_mb: 0,
+            ports: vec![],
+            mounts: vec![],
+            privileged,
+            memory_limit_mb: None,
+            cpu_limit: None,
+            cap_add,
+            sensitive_mounts: vec![],
+            restart_count: 0,
+            oom_killed: false,
+            health_status: None,
+            rw_size_mb: 0,
+            runtime_bounding_caps: bnd,
+        };
+        let tampered = 0x0000_0000_a804_25fb | (1u64 << 21); // Moby default + SYS_ADMIN
+
+        // Empty cap_add but SYS_ADMIN live → tamper, weight 60.
+        let mut r = minimal_report();
+        r.topology.containers = vec![base(Some(tampered), vec![], false)];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "DOCK-010")
+            .expect("DOCK-010 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("web") && f.evidence.contains("CAP_SYS_ADMIN"));
+
+        // Declared via cap_add → not undeclared → no finding.
+        r.topology.containers = vec![base(Some(tampered), vec!["SYS_ADMIN".into()], false)];
+        assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
+
+        // Privileged → suppressed (DOCK-003 territory).
+        r.topology.containers = vec![base(Some(tampered), vec![], true)];
+        assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
+
+        // Clean default bounding → no finding.
+        r.topology.containers = vec![base(Some(0x0000_0000_a804_25fb), vec![], false)];
+        assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
+
+        // Not running / non-root (None) → skipped.
+        r.topology.containers = vec![base(None, vec![], false)];
+        assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
     }
 }

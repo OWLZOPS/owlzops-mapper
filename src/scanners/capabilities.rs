@@ -23,6 +23,73 @@ pub const CRITICAL_CAPS: &[(u32, &str)] = &[
     (CAP_NET_RAW, "CAP_NET_RAW"),
 ];
 
+/// Default Moby (Docker) bounding set — 14 caps granted to every non-privileged
+/// container unless overridden. Ground-truth baseline for the DOCK-010 delta.
+pub const MOBY_DEFAULT_CAPS: u64 = 0x0000_0000_a804_25fb;
+
+/// Escape-grade capabilities for a *container* bounding set — broader than
+/// CRITICAL_CAPS (host processes). DAC_OVERRIDE/NET_RAW are intentionally
+/// absent: they are in MOBY_DEFAULT and can never appear in the undeclared delta.
+pub const CONTAINER_ESCAPE_CAPS: &[(u32, &str)] = &[
+    (2, "CAP_DAC_READ_SEARCH"),
+    (16, "CAP_SYS_MODULE"),
+    (17, "CAP_SYS_RAWIO"),
+    (19, "CAP_SYS_PTRACE"),
+    (21, "CAP_SYS_ADMIN"),
+    (39, "CAP_BPF"),
+    (40, "CAP_CHECKPOINT_RESTORE"),
+];
+
+/// Resolve a capability name (with/without `CAP_` prefix, any case) to its bit.
+/// Zero-copy: no allocation, prefix strip via slicing.
+pub fn cap_name_to_bit(name: &str) -> Option<u32> {
+    let n = name.trim();
+    let bare = match n.get(..4) {
+        Some(p) if p.eq_ignore_ascii_case("CAP_") => &n[4..],
+        _ => n,
+    };
+    CAP_NAMES
+        .iter()
+        .position(|full| {
+            full.get(4..)
+                .is_some_and(|fb| fb.eq_ignore_ascii_case(bare))
+        })
+        .map(|i| i as u32)
+}
+
+/// Convert a container's declared cap_add into a bitmask. `ALL` (any form)
+/// yields the full mask; unknown names are ignored (forward-compat).
+pub fn cap_add_to_mask(cap_add: &[String]) -> u64 {
+    let mut mask = 0u64;
+    for entry in cap_add {
+        let e = entry.trim();
+        let bare = match e.get(..4) {
+            Some(p) if p.eq_ignore_ascii_case("CAP_") => &e[4..],
+            _ => e,
+        };
+        if bare.eq_ignore_ascii_case("ALL") {
+            return u64::MAX;
+        }
+        if let Some(b) = cap_name_to_bit(e) {
+            mask |= 1u64 << b;
+        }
+    }
+    mask
+}
+
+/// Escape-grade caps present in the live bounding set but neither in the Moby
+/// default nor declared via cap_add. Non-empty ⇒ the runtime granted more than
+/// Docker was asked for (tampered daemon / malicious shim / plugin).
+pub fn undeclared_escape_caps(runtime_bounding: u64, cap_add: &[String]) -> Vec<String> {
+    let declared = MOBY_DEFAULT_CAPS | cap_add_to_mask(cap_add);
+    let undeclared = runtime_bounding & !declared;
+    CONTAINER_ESCAPE_CAPS
+        .iter()
+        .filter(|&&(b, _)| undeclared & (1u64 << b) != 0)
+        .map(|&(_, name)| name.to_string())
+        .collect()
+}
+
 /// index == capability number; CAP_LAST_CAP = 40 as of Linux 5.9+.
 pub const CAP_NAMES: [&str; 41] = [
     "CAP_CHOWN",
@@ -703,5 +770,36 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
         // must NOT be fileless — broadening memfd must not leak into this case.
         let (rec, _) = classify_suspicious("harmless", 902, Some("/tmp/harmless"));
         assert!(rec.is_none());
+    }
+
+    #[test]
+    fn cap_add_mask_prefix_agnostic() {
+        assert_eq!(cap_add_to_mask(&["SYS_ADMIN".into()]), 1 << 21);
+        assert_eq!(cap_add_to_mask(&["CAP_SYS_ADMIN".into()]), 1 << 21);
+        assert_eq!(cap_add_to_mask(&["cap_sys_admin".into()]), 1 << 21);
+        assert_eq!(
+            cap_add_to_mask(&["NET_RAW".into(), "SYS_PTRACE".into()]),
+            (1 << 13) | (1 << 19)
+        );
+        assert_eq!(cap_add_to_mask(&["ALL".into()]), u64::MAX);
+        assert_eq!(cap_add_to_mask(&["BOGUS".into()]), 0); // unknown ignored
+        assert_eq!(cap_add_to_mask(&[]), 0);
+    }
+
+    #[test]
+    fn undeclared_escape_detects_tamper_not_default() {
+        let moby = MOBY_DEFAULT_CAPS;
+        assert!(undeclared_escape_caps(moby, &[]).is_empty()); // clean default
+        assert_eq!(
+            undeclared_escape_caps(moby | (1 << 21), &[]),
+            vec!["CAP_SYS_ADMIN".to_string()] // beyond default, undeclared
+        );
+        assert!(undeclared_escape_caps(moby | (1 << 21), &["SYS_ADMIN".into()]).is_empty()); // declared
+        // NET_RAW lives in the default → never surfaces as a tamper trigger.
+        assert!(
+            undeclared_escape_caps(moby, &[])
+                .iter()
+                .all(|c| c != "CAP_NET_RAW")
+        );
     }
 }
