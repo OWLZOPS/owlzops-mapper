@@ -108,6 +108,18 @@ pub fn is_loopback_bind(addr: &str) -> bool {
         || addr.strip_prefix("::ffff:").is_some_and(v4_loopback)
 }
 
+/// Executables served from writable/ephemeral locations — a shared signal
+/// for shadow-IT (SEC-013) and active-compromise (SEC-015) detection.
+pub fn is_ephemeral_exec_path(path: &str) -> bool {
+    matches!(
+        path.split('/').nth(1),
+        Some("tmp") | Some("dev") | Some("home") | Some("var")
+    ) && (path.starts_with("/tmp/")
+        || path.starts_with("/var/tmp/")
+        || path.starts_with("/dev/shm/")
+        || path.starts_with("/home/"))
+}
+
 // ---------------------------------------------------------------------------
 // Child helpers (unchanged logic, now hardened and with stdin nulled)
 // ---------------------------------------------------------------------------
@@ -318,5 +330,37 @@ mod tests {
         assert!(!is_loopback_bind("::2"));
         assert!(!is_loopback_bind("localhost")); // names are not bind strings
         assert!(!is_loopback_bind(""));
+    }
+
+    #[test]
+    fn ephemeral_exec_path_matches_expected_directories() {
+        assert!(is_ephemeral_exec_path("/tmp/malware"));
+        assert!(is_ephemeral_exec_path("/var/tmp/.hidden"));
+        assert!(is_ephemeral_exec_path("/dev/shm/session"));
+        assert!(is_ephemeral_exec_path("/home/user/script"));
+    }
+
+    #[test]
+    fn ephemeral_exec_path_rejects_system_paths() {
+        assert!(!is_ephemeral_exec_path("/usr/bin/ls"));
+        assert!(!is_ephemeral_exec_path("/bin/bash"));
+        assert!(!is_ephemeral_exec_path("/opt/tmp/bin")); // /opt/... not in list
+        assert!(!is_ephemeral_exec_path("/etc/cron.d/backup"));
+        assert!(!is_ephemeral_exec_path("")); // empty path
+        assert!(!is_ephemeral_exec_path("/tmp")); // no trailing slash
+        assert!(!is_ephemeral_exec_path("/tmp ")); // trailing space
+    }
+
+    #[test]
+    fn ephemeral_exec_path_boundary_cases() {
+        // edge cases: path must have trailing content
+        assert!(is_ephemeral_exec_path("/tmp/"));
+        assert!(!is_ephemeral_exec_path("/tmp"));
+        // /var alone is not ephemeral, need /var/tmp/
+        assert!(!is_ephemeral_exec_path("/var/log/syslog"));
+        // /dev/null is not /dev/shm/
+        assert!(!is_ephemeral_exec_path("/dev/null"));
+        // /home alone is valid
+        assert!(is_ephemeral_exec_path("/home/user/.local/share/something"));
     }
 }

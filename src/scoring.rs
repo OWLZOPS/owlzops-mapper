@@ -281,10 +281,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut shadow_it_ports = Vec::new();
     for port in &report.network.listening_ports {
         if let Some(exe) = &port.exe_path
-            && (exe.starts_with("/tmp/")
-                || exe.starts_with("/var/tmp/")
-                || exe.starts_with("/dev/shm/")
-                || exe.starts_with("/home/"))
+            && crate::utils::is_ephemeral_exec_path(exe)
         {
             shadow_it_ports.push(format!("{}/{} ({})", port.port, port.protocol, exe));
         }
@@ -304,6 +301,68 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             suppressed: None,
             cis_ref: None,
         });
+    }
+
+    // ── SEC-015 — IoC: privileged non-root implant reachable on the network ──
+    // Intersection of three independent signals; each alone is lower-severity,
+    // together they are a strong active-compromise indicator (reachable
+    // rootkit/miner), not hygiene. All three legs must hold:
+    //   1. globally-reachable bind      (is_wildcard_bind)
+    //   2. executable in an ephemeral / writable path (is_ephemeral_exec_path)
+    //   3. process holds critical kernel caps (present in capability_audit)
+    // Join is on pid; zero-copy analysis — only the evidence strings allocate.
+    // Host-controlled strings (comm, exe) are sanitized at render time (PIVOT-1),
+    // so they are embedded raw here by design.
+    {
+        let mut ioc_evidence: Vec<String> = Vec::new();
+        for port in &report.network.listening_ports {
+            if !crate::utils::is_wildcard_bind(&port.bind_address) {
+                continue; // leg 1: not globally reachable
+            }
+            let Some(exe) = port.exe_path.as_deref() else {
+                continue; // no exe path → cannot classify (SEC-013 has same gate)
+            };
+            if !crate::utils::is_ephemeral_exec_path(exe) {
+                continue; // leg 2: not an ephemeral/writable path
+            }
+            let Some(pid) = port.pid else {
+                continue; // unattributed socket (non-root scan) — honest skip
+            };
+            let Some(cap) = report
+                .security
+                .capability_audit
+                .iter()
+                .find(|c| c.pid == pid)
+            else {
+                continue; // leg 3: pid not privileged → this is SEC-013, not SEC-015
+            };
+
+            ioc_evidence.push(format!(
+                "pid {} ({}) exe {} listening on {} holds [{}]",
+                cap.pid,
+                cap.comm,
+                exe,
+                port.bind_address,
+                cap.critical_caps.join(", ")
+            ));
+        }
+
+        if !ioc_evidence.is_empty() {
+            findings.push(Finding {
+                id: "SEC-015",
+                title: "ACTIVE COMPROMISE: privileged non-root process on ephemeral path listening on network"
+                    .to_string(),
+                category: Category::Security,
+                weight: 60,
+                evidence: format!(
+                    "{} reachable implant(s): {}",
+                    ioc_evidence.len(),
+                    ioc_evidence.join("; ")
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
     }
 
     // ── DLP & Secret Hygiene ───────────────────────────────
@@ -352,9 +411,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let ports = &report.network.listening_ports;
         // Exposure predicate: crate::utils::is_wildcard_bind — the single
         // source shared with ui.rs, xlsx.rs and compare.rs.
-        // Ports with pid == None (unattributed — non-root scan) don't match;
-        // that incomplete-attribution case is already a coverage warning from
-        // attribute_sockets, so this is an honest undercount, not a silent gap.
         let (listening, exposed) =
             report
                 .security
@@ -396,10 +452,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // RCE→LPE chain: a globally reachable privileged non‑root process
-        // requires a heavier weight (parity with SEC‑013).  The weight change
-        // is paired with a SCORING_VERSION bump so that compare v2 marks the
-        // delta as ~ Changed instead of ↓ Degraded.
         let weight = if exposed > 0 { 20 } else { 8 };
 
         findings.push(Finding {
@@ -911,5 +963,61 @@ mod tests {
             .find(|f| f.id == "CAP-001")
             .unwrap();
         assert_eq!(cap.weight, 20);
+    }
+
+    #[test]
+    fn sec015_fires_only_on_full_ioc_triad() {
+        use crate::models::{PortInfo, ProcCapFinding};
+        let cap = |pid| ProcCapFinding {
+            pid,
+            comm: "kdevtmpfsi".into(),
+            euid: 1000,
+            effective: 0x20_0000,
+            permitted: 0x20_0000,
+            inheritable: 0,
+            bounding: 0x20_0000,
+            ambient: 0,
+            no_new_privs: Some(false),
+            seccomp: Some(0),
+            critical_caps: vec!["CAP_SYS_ADMIN".into()],
+        };
+        let port = |bind: &str, exe: Option<&str>, pid| PortInfo {
+            protocol: "tcp".into(),
+            port: "31337".into(),
+            process: "x".into(),
+            bind_address: bind.into(),
+            pid,
+            exe_path: exe.map(Into::into),
+        };
+        let fires = |r: &AgentReport| evaluate(r).iter().any(|f| f.id == "SEC-015");
+
+        // Full triad → fires, weight 60, evidence carries pid/exe/caps.
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![cap(4242)];
+        r.network.listening_ports = vec![port("0.0.0.0", Some("/tmp/kdevtmpfsi"), Some(4242))];
+        assert!(fires(&r));
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-015")
+            .unwrap();
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("4242"));
+        assert!(f.evidence.contains("/tmp/kdevtmpfsi"));
+        assert!(f.evidence.contains("CAP_SYS_ADMIN"));
+
+        // Each missing leg suppresses the IoC:
+        r.network.listening_ports = vec![port("127.0.0.1", Some("/tmp/kdevtmpfsi"), Some(4242))];
+        assert!(!fires(&r), "loopback bind is not reachable");
+        r.network.listening_ports = vec![port("0.0.0.0", Some("/usr/bin/nginx"), Some(4242))];
+        assert!(!fires(&r), "system path is not ephemeral");
+        r.network.listening_ports = vec![port("0.0.0.0", Some("/tmp/kdevtmpfsi"), Some(9999))];
+        assert!(
+            !fires(&r),
+            "pid absent from capability_audit is only SEC-013"
+        );
+
+        // Mapped wildcard counts too (shares is_wildcard_bind contract).
+        r.network.listening_ports = vec![port("::ffff:0.0.0.0", Some("/dev/shm/x"), Some(4242))];
+        assert!(fires(&r));
     }
 }
