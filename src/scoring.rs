@@ -423,57 +423,50 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-019 — fileless implant that also holds critical kernel caps ──
-    // ID is 019, not 018: SEC-018 is already the cron-persistence finding.
-    // Intersection of SEC-017 (is_deleted) and CAP-001 (capability_audit),
-    // joined on pid. Both vectors are ≤64 entries (MAX_SUSPICIOUS/MAX_FINDINGS),
-    // so a nested `.find()` beats building a map; zero-copy — only evidence allocates.
-    //
-    // SCOPE (deliberate, documented): capability_audit suppresses euid==0, so this
-    // finding covers NON-ROOT fileless implants only. A root-run fileless implant is
-    // still caught by SEC-017 at the same weight (60) — no score is lost, only the
-    // privilege attribution. Entries flagged solely for a non-empty ambient set are
-    // skipped: their critical_caps is empty and the title would misstate the evidence.
-    let fileless_privileged: Vec<(
-        &crate::models::SuspiciousProcess,
-        &crate::models::ProcCapFinding,
-    )> = report
+    // ID 019 (SEC-018 is cron-persistence). Two branches over is_deleted procs:
+    //   A (root, euid==0): flag immediately — full kernel caps are the default,
+    //       and capability_audit suppresses root so a join would never match.
+    //   B (non-root): join capability_audit on pid; require non-empty
+    //       critical_caps (an ambient-only entry would make the title lie).
+    // Both vectors ≤64 entries; zero-copy — only evidence allocates. Score-neutral:
+    // every entry here is is_deleted ⇒ already in SEC-017 (60), Security caps at 60.
+    let mut fileless_priv: Vec<String> = Vec::new();
+    for p in report
         .security
         .suspicious_processes
         .iter()
         .filter(|p| p.is_deleted)
-        .filter_map(|p| {
-            report
-                .security
-                .capability_audit
-                .iter()
-                .find(|c| c.pid == p.pid && !c.critical_caps.is_empty())
-                .map(|c| (p, c))
-        })
-        .collect();
-
-    if !fileless_privileged.is_empty() {
-        let list = fileless_privileged
+    {
+        let where_ = match p.exe_path.as_deref() {
+            // memfd_create-backed: never touched disk — phrasing matches SEC-017.
+            Some(exe) if exe.starts_with("/memfd:") => "executing in-memory (memfd)".to_string(),
+            Some(exe) => format!("deleted from {exe}"),
+            None => "deleted".to_string(),
+        };
+        if p.euid == 0 {
+            // Branch A — root: no join, caps are full by default.
+            fileless_priv.push(format!(
+                "{} (pid {}, {}) (root-run fileless implant, full kernel capabilities by default)",
+                p.name, p.pid, where_
+            ));
+        } else if let Some(c) = report
+            .security
+            .capability_audit
             .iter()
-            .map(|(p, c)| {
-                let where_ = match p.exe_path.as_deref() {
-                    // memfd_create-backed: never touched disk — phrasing matches SEC-017.
-                    Some(exe) if exe.starts_with("/memfd:") => {
-                        "executing in-memory (memfd)".to_string()
-                    }
-                    Some(exe) => format!("deleted from {exe}"),
-                    None => "deleted".to_string(),
-                };
-                format!(
-                    "{} (pid {}, {}) holds [{}]",
-                    p.name,
-                    p.pid,
-                    where_,
-                    c.critical_caps.join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+            .find(|c| c.pid == p.pid && !c.critical_caps.is_empty())
+        {
+            // Branch B — non-root: must actually hold critical caps.
+            fileless_priv.push(format!(
+                "{} (pid {}, {}) holds [{}]",
+                p.name,
+                p.pid,
+                where_,
+                c.critical_caps.join(", ")
+            ));
+        }
+    }
 
+    if !fileless_priv.is_empty() {
         findings.push(Finding {
             id: "SEC-019",
             title: "ACTIVE COMPROMISE: fileless malware holds critical kernel capabilities"
@@ -482,8 +475,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 60,
             evidence: format!(
                 "{} privileged fileless process(es): {}",
-                fileless_privileged.len(),
-                list
+                fileless_priv.len(),
+                fileless_priv.join("; ")
             ),
             suppressed: None,
             cis_ref: None,
@@ -1251,6 +1244,7 @@ mod tests {
                 name: "obfuscated".into(),
                 exe_path: Some("/dev/shm/loader".into()),
                 is_deleted: true,
+                euid: 1000, // non-root, original semantics preserved
             },
             // known miner, live → SEC-016 only
             SuspiciousProcess {
@@ -1258,6 +1252,7 @@ mod tests {
                 name: "xmrig".into(),
                 exe_path: Some("/tmp/xmrig".into()),
                 is_deleted: false,
+                euid: 1000,
             },
         ];
         let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
@@ -1297,6 +1292,7 @@ mod tests {
                 name: "malware".into(),
                 exe_path: Some("/tmp/malware".into()),
                 is_deleted: true,
+                euid: 1000,
             },
             // memfd-процесс
             SuspiciousProcess {
@@ -1304,6 +1300,7 @@ mod tests {
                 name: "stealth".into(),
                 exe_path: Some("/memfd:stealth".into()),
                 is_deleted: true,
+                euid: 1000,
             },
         ];
         let sec017 = evaluate(&r)
@@ -1390,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn sec019_fileless_with_caps_fires_and_suppresses_without() {
+    fn sec019_root_fileless_fires_without_audit_and_nonroot_joins() {
         use crate::models::{ProcCapFinding, SuspiciousProcess};
         let fires = |r: &AgentReport| evaluate(r).iter().any(|f| f.id == "SEC-019");
         let cap = |pid: u32, caps: Vec<String>| ProcCapFinding {
@@ -1406,54 +1403,65 @@ mod tests {
             seccomp: Some(0),
             critical_caps: caps,
         };
-        let fileless = |pid: u32, exe: Option<&str>| SuspiciousProcess {
+        let fileless = |pid: u32, euid: u32, exe: Option<&str>| SuspiciousProcess {
             pid,
             name: "obfuscated".into(),
             exe_path: exe.map(Into::into),
             is_deleted: true,
+            euid,
         };
 
-        // Fileless + critical caps → SEC-019 fires, weight 60, evidence carries all three.
+        // Branch A — ROOT fileless, capability_audit EMPTY → SEC-019 still fires.
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, Some("/dev/shm/loader"))];
+        r.security.suspicious_processes = vec![fileless(1, 0, Some("/dev/shm/loader"))];
+        // deliberately no capability_audit entry (root is suppressed there anyway)
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-019")
+            .expect("root fileless must fire SEC-019 without a join");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("pid 1"));
+        assert!(
+            f.evidence
+                .contains("root-run fileless implant, full kernel capabilities by default")
+        );
+        assert!(f.evidence.contains("deleted from /dev/shm/loader"));
+
+        // Branch B — non-root fileless WITH critical caps → fires with cap list.
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"))];
         r.security.capability_audit = vec![cap(42, vec!["CAP_SYS_ADMIN".into(), "CAP_BPF".into()])];
         let f = evaluate(&r)
             .into_iter()
             .find(|f| f.id == "SEC-019")
-            .expect("SEC-019 fires");
-        assert_eq!(f.weight, 60);
-        assert!(f.evidence.contains("pid 42"));
-        assert!(f.evidence.contains("deleted from /dev/shm/loader"));
-        assert!(f.evidence.contains("CAP_SYS_ADMIN, CAP_BPF"));
+            .unwrap();
+        assert!(f.evidence.contains("holds [CAP_SYS_ADMIN, CAP_BPF]"));
+        assert!(!f.evidence.contains("root-run"));
 
-        // Fileless WITHOUT caps → suppressed (SEC-017 still fires alone).
+        // Branch B — non-root fileless WITHOUT caps → suppressed (SEC-017 still fires).
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, Some("/dev/shm/loader"))];
-        assert!(!fires(&r), "fileless without caps must not raise SEC-019");
+        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"))];
+        assert!(
+            !fires(&r),
+            "non-root fileless without caps must not raise SEC-019"
+        );
         assert!(evaluate(&r).iter().any(|f| f.id == "SEC-017"));
 
-        // Capability entry flagged only via ambient (empty critical_caps) → suppressed:
-        // the title would otherwise misstate the evidence.
+        // Branch B — non-root, ambient-only audit entry (empty critical_caps) → suppressed.
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, Some("/dev/shm/loader"))];
+        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"))];
         r.security.capability_audit = vec![cap(42, vec![])];
         assert!(!fires(&r), "ambient-only entry must not raise SEC-019");
 
-        // memfd phrasing matches SEC-017 wording, not "deleted from".
+        // Branch A — memfd root: phrasing matches SEC-017, no "deleted from".
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(900, Some("/memfd:stealth"))];
-        r.security.capability_audit = vec![cap(900, vec!["CAP_SYS_ADMIN".into()])];
+        r.security.suspicious_processes = vec![fileless(900, 0, Some("/memfd:stealth"))];
         let f = evaluate(&r)
             .into_iter()
             .find(|f| f.id == "SEC-019")
             .unwrap();
         assert!(f.evidence.contains("executing in-memory (memfd)"));
+        assert!(f.evidence.contains("root-run fileless implant"));
         assert!(!f.evidence.contains("deleted from /memfd:"));
-
-        // Pid mismatch → no join, no finding.
-        let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, Some("/tmp/x"))];
-        r.security.capability_audit = vec![cap(99, vec!["CAP_SYS_ADMIN".into()])];
-        assert!(!fires(&r));
     }
 }

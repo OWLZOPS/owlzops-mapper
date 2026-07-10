@@ -297,6 +297,7 @@ const MAX_SUSPICIOUS: usize = 64;
 fn classify_suspicious(
     comm: &str,
     pid: u32,
+    euid: u32,
     exe_link: Option<&str>,
 ) -> (Option<SuspiciousProcess>, bool) {
     // Split the kernel's " (deleted)" suffix off the true base path.
@@ -341,6 +342,7 @@ fn classify_suspicious(
                 name: comm.trim().to_string(),
                 exe_path: base_path.map(str::to_string), // cleaned of the suffix
                 is_deleted: deleted_ephemeral,
+                euid,
             }),
             false,
         )
@@ -418,7 +420,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         let exe_link = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let (record, dropped) = classify_suspicious(&st.name, pid, exe_link.as_deref());
+        let (record, dropped) = classify_suspicious(&st.name, pid, st.euid, exe_link.as_deref());
         if dropped {
             ambiguous_dropped += 1;
         }
@@ -703,29 +705,33 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
     #[test]
     fn deleted_exe_flags_ephemeral_not_system() {
         // Legit: service binary deleted by apt upgrade — system path → NOT flagged.
-        let (rec, dropped) = classify_suspicious("nginx", 100, Some("/usr/sbin/nginx (deleted)"));
+        let (rec, dropped) =
+            classify_suspicious("nginx", 100, 1000, Some("/usr/sbin/nginx (deleted)"));
         assert!(rec.is_none(), "system-path deletion must not flag (apt FP)");
         assert!(!dropped);
 
         // Fileless: unknown-named binary deleted from /dev/shm → flagged,
         // is_deleted, suffix stripped, name-independent.
-        let (rec, _) = classify_suspicious("systemd-worker", 200, Some("/dev/shm/x (deleted)"));
+        let (rec, _) =
+            classify_suspicious("systemd-worker", 200, 1000, Some("/dev/shm/x (deleted)"));
         let r = rec.expect("ephemeral deletion must be recorded");
         assert!(r.is_deleted);
         assert_eq!(r.exe_path.as_deref(), Some("/dev/shm/x")); // suffix cleaned
         assert_eq!(r.pid, 200);
+        assert_eq!(r.euid, 1000);
 
         // Known miner, live (not deleted) — recorded by name, is_deleted=false.
-        let (rec, _) = classify_suspicious("xmrig", 300, Some("/tmp/xmrig"));
+        let (rec, _) = classify_suspicious("xmrig", 300, 1000, Some("/tmp/xmrig"));
         assert!(!rec.unwrap().is_deleted);
 
         // Known miner deleted from ephemeral → single record, is_deleted=true.
-        let (rec, _) = classify_suspicious("xmrig", 400, Some("/tmp/xmrig (deleted)"));
+        let (rec, _) = classify_suspicious("xmrig", 400, 1000, Some("/tmp/xmrig (deleted)"));
         assert!(rec.unwrap().is_deleted);
 
         // Known miner deleted from SYSTEM path → recorded by name, is_deleted=false
         // (SEC-017 must not fire; SEC-016 catches it by name).
-        let (rec, _) = classify_suspicious("kinsing", 500, Some("/usr/bin/kinsing (deleted)"));
+        let (rec, _) =
+            classify_suspicious("kinsing", 500, 1000, Some("/usr/bin/kinsing (deleted)"));
         assert!(!rec.unwrap().is_deleted);
     }
 
@@ -736,7 +742,7 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("status"),
-            "Name:\tobfuscated\nUid:\t0\t0\t0\t0\n\
+            "Name:\tobfuscated\nUid:\t1000\t1000\t1000\t1000\n\
 CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
         )
         .unwrap();
@@ -749,26 +755,28 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
             .expect("fileless flagged");
         assert!(f.is_deleted);
         assert_eq!(f.exe_path.as_deref(), Some("/dev/shm/loader"));
+        assert_eq!(f.euid, 1000);
     }
 
     #[test]
     fn memfd_is_fileless_without_deleted_suffix() {
         // Raw memfd link, NO " (deleted)", name not in any blocklist → still flagged.
-        let (rec, _) = classify_suspicious("stealth", 900, Some("/memfd:stealth"));
+        let (rec, _) = classify_suspicious("stealth", 900, 1000, Some("/memfd:stealth"));
         let r = rec.expect("memfd execution must be recorded even without the suffix");
         assert!(r.is_deleted, "memfd is intrinsically fileless");
         assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth"));
         assert_eq!(r.pid, 900);
+        assert_eq!(r.euid, 1000);
 
         // memfd WITH the suffix → stripped, still fileless.
-        let (rec, _) = classify_suspicious("stealth", 901, Some("/memfd:stealth (deleted)"));
+        let (rec, _) = classify_suspicious("stealth", 901, 1000, Some("/memfd:stealth (deleted)"));
         let r = rec.unwrap();
         assert!(r.is_deleted);
         assert_eq!(r.exe_path.as_deref(), Some("/memfd:stealth")); // suffix cleaned
 
         // Regression guard: a live on-disk /tmp binary (no name, not deleted)
         // must NOT be fileless — broadening memfd must not leak into this case.
-        let (rec, _) = classify_suspicious("harmless", 902, Some("/tmp/harmless"));
+        let (rec, _) = classify_suspicious("harmless", 902, 1000, Some("/tmp/harmless"));
         assert!(rec.is_none());
     }
 

@@ -451,6 +451,8 @@ pub struct SuspiciousProcess {
     pub exe_path: Option<String>,
     #[serde(default)]
     pub is_deleted: bool,
+    #[serde(default)]
+    pub euid: u32,
 }
 
 // Process Capability Audit Models
