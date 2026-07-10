@@ -76,6 +76,29 @@ pub(crate) const fn host_budget_secs(t: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Network predicates
+// ---------------------------------------------------------------------------
+
+/// Single source of truth for "globally exposed" bind addresses.
+///
+/// Matches the canonical wildcard forms our `/proc/net` decoders can emit
+/// (plain IPv4/IPv6 wildcards plus the IPv4-mapped IPv6 wildcard reported
+/// for AF_INET6 sockets bound to all v4 interfaces). Comparison is exact
+/// by design – the decoders never pad or alias.
+pub fn is_wildcard_bind(addr: &str) -> bool {
+    matches!(addr, "0.0.0.0" | "::" | "::ffff:0.0.0.0")
+}
+
+/// Single source of truth for "loopback" bind addresses.
+///
+/// Matches canonical loopback forms: IPv4 loopback, IPv6 loopback, and the
+/// IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) that the kernel reports
+/// for AF_INET6 sockets bound to 127.0.0.1.
+pub fn is_loopback_bind(addr: &str) -> bool {
+    matches!(addr, "127.0.0.1" | "::1" | "::ffff:127.0.0.1")
+}
+
+// ---------------------------------------------------------------------------
 // Child helpers (unchanged logic, now hardened and with stdin nulled)
 // ---------------------------------------------------------------------------
 
@@ -239,5 +262,44 @@ mod tests {
     fn run_child_with_timeout_timeout_kills_child() {
         let result = run_child_with_timeout("sleep", &["60"], 1);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn wildcard_bind_matches_canonical_forms() {
+        assert!(is_wildcard_bind("0.0.0.0"));
+        assert!(is_wildcard_bind("::"));
+        // AF_INET6 socket bound to all v4 interfaces, as canonicalized by
+        // std Ipv6Addr Display — the only spelling decode_v6 can produce.
+        assert!(is_wildcard_bind("::ffff:0.0.0.0"));
+    }
+
+    #[test]
+    fn wildcard_bind_rejects_everything_else() {
+        assert!(!is_wildcard_bind("127.0.0.1"));
+        assert!(!is_wildcard_bind("::1"));
+        assert!(!is_wildcard_bind("10.0.0.1"));
+        assert!(!is_wildcard_bind("::ffff:127.0.0.1"));
+        assert!(!is_wildcard_bind(""));
+        assert!(!is_wildcard_bind("0.0.0.0 "));
+        assert!(!is_wildcard_bind("[::]"));
+        assert!(!is_wildcard_bind("*"));
+        assert!(!is_wildcard_bind("::ffff:0:0"));
+    }
+
+    #[test]
+    fn loopback_bind_matches_canonical_forms() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("::ffff:127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_bind_rejects_everything_else() {
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("::"));
+        assert!(!is_loopback_bind("::ffff:0.0.0.0"));
+        assert!(!is_loopback_bind("10.0.0.1"));
+        assert!(!is_loopback_bind("127.0.0.2"));
+        assert!(!is_loopback_bind("::2"));
     }
 }

@@ -683,7 +683,7 @@ fn render_network_listeners(report: &AgentReport) {
         if p.port == "0" || p.port == "*" {
             continue;
         }
-        let exposed = p.bind_address == "0.0.0.0" || p.bind_address == "::";
+        let exposed = crate::utils::is_wildcard_bind(&p.bind_address);
         let mut addr_cell = Cell::new(sanitize_terminal(&p.bind_address));
         let mut port_cell = Cell::new(&p.port);
         let mut proto_cell = Cell::new(&p.protocol);

@@ -350,7 +350,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         // Join privileged non‑root processes with live listeners
         let ports = &report.network.listening_ports;
-        let is_global = |addr: &str| addr == "0.0.0.0" || addr == "::";
+        // Exposure predicate: crate::utils::is_wildcard_bind — the single
+        // source shared with ui.rs, xlsx.rs and compare.rs.
+        // Ports with pid == None (unattributed — non-root scan) don't match;
+        // that incomplete-attribution case is already a coverage warning from
+        // attribute_sockets, so this is an honest undercount, not a silent gap.
         let (listening, exposed) =
             report
                 .security
@@ -363,7 +367,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     for p in ports {
                         if p.pid == pid {
                             on_net = true;
-                            if is_global(&p.bind_address) {
+                            if crate::utils::is_wildcard_bind(&p.bind_address) {
                                 global = true;
                                 break;
                             }
@@ -899,5 +903,13 @@ mod tests {
         assert_eq!(cap.weight, 8);
         assert!(cap.evidence.contains("1 of these listening"));
         assert!(!cap.evidence.contains("exposed globally on"));
+
+        // IPv4-mapped IPv6 wildcard must count as global exposure too.
+        r.network.listening_ports[0].bind_address = "::ffff:0.0.0.0".into();
+        let cap = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-001")
+            .unwrap();
+        assert_eq!(cap.weight, 20);
     }
 }

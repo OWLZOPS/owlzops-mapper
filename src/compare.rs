@@ -310,13 +310,15 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             if let Some(after_binds) = aa.get(&(*proto, *port)) {
                 let before_has_local = before_binds
                     .iter()
-                    .any(|b| *b == "127.0.0.1" || *b == "::1");
-                let after_has_wildcard = after_binds.iter().any(|b| *b == "0.0.0.0" || *b == "::");
+                    .any(|b| crate::utils::is_loopback_bind(b));
+                let after_has_wildcard = after_binds
+                    .iter()
+                    .any(|b| crate::utils::is_wildcard_bind(b));
                 if before_has_local && after_has_wildcard {
                     changes.push(Change {
                         field: format!("network.listening_ports.{}.{}.exposure", proto, port),
                         before: Some("local only".to_string()),
-                        after: Some("exposed on 0.0.0.0/::".to_string()),
+                        after: Some("exposed on wildcard bind".to_string()),
                         severity: Severity::Degraded,
                     });
                 }
@@ -817,5 +819,39 @@ mod tests {
         let after = test_report();
         let diff = compare_reports(&before, &after);
         assert!(diff.changes.is_empty(), "Expected no changes");
+    }
+
+    #[test]
+    fn detect_loopback_mapped_to_wildcard_escalation() {
+        let mut before = test_report();
+        before.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            bind_address: "::ffff:127.0.0.1".into(),
+            port: "8080".into(),
+            process: "test".into(),
+            pid: Some(1234),
+            exe_path: None,
+        }];
+
+        let mut after = test_report();
+        after.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            bind_address: "0.0.0.0".into(),
+            port: "8080".into(),
+            process: "test".into(),
+            pid: Some(1234),
+            exe_path: None,
+        }];
+
+        let diff = compare_reports(&before, &after);
+        let escalation = diff
+            .changes
+            .iter()
+            .find(|c| c.field.contains("exposure"))
+            .expect("Mapped-loopback → wildcard escalation not detected");
+
+        assert_eq!(escalation.severity, Severity::Degraded);
+        assert!(escalation.before.as_deref() == Some("local only"));
+        assert!(escalation.after.as_deref().unwrap().contains("wildcard"));
     }
 }

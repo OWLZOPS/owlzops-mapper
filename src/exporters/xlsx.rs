@@ -1081,7 +1081,7 @@ fn write_network_section(
         w.write_string(0, &p.protocol, band)?;
         w.write_string(1, &p.port, band)?;
         w.write_string(2, &p.process, band)?;
-        let addr_fmt = if p.bind_address == "0.0.0.0" || p.bind_address == "::" {
+        let addr_fmt = if crate::utils::is_wildcard_bind(&p.bind_address) {
             w.fmts.critical_band(w.current_row())
         } else {
             w.fmts.ok_band(w.current_row())
