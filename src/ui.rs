@@ -118,7 +118,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
         ]);
     }
 
-    println!("🦉 Owlzops Multi‑Host Audit Summary\n");
+    println!("\u{1F989} Owlzops Multi‑Host Audit Summary\n");
     println!("{t}\n");
 }
 
@@ -176,30 +176,60 @@ fn render_header(report: &AgentReport) {
         .collect();
 
     if !active_findings.is_empty() {
-        let mut t_breakdown = create_dynamic_table();
-
-        t_breakdown.set_header(vec![
-            Cell::new("CIS / Ref")
-                .add_attribute(Attribute::Bold)
-                .fg(Color::Cyan),
-            Cell::new("Penalty")
-                .add_attribute(Attribute::Bold)
-                .fg(Color::Red),
-            Cell::new("Finding").add_attribute(Attribute::Bold),
-            Cell::new("Evidence").add_attribute(Attribute::Bold),
-        ]);
-
-        for f in &active_findings {
-            let cis_note = f.cis_ref.unwrap_or("-");
-            t_breakdown.add_row(vec![
-                Cell::new(cis_note).fg(Color::DarkGrey),
-                Cell::new(format!("-{}", f.weight)).fg(Color::Red),
-                Cell::new(&f.title),
-                Cell::new(sanitize_terminal(&f.evidence)),
-            ]);
-        }
         println!("\nRisk Breakdown:");
-        println!("{t_breakdown}\n");
+
+        let categories = [
+            (
+                crate::scoring::Category::Security,
+                "\u{1F6E1} Security Findings",
+                Color::Cyan,
+            ),
+            (
+                crate::scoring::Category::Reliability,
+                "\u{2699} Reliability Findings",
+                Color::Yellow,
+            ),
+            (
+                crate::scoring::Category::Hygiene,
+                "\u{1F9F9} Hygiene Findings",
+                Color::Green,
+            ),
+        ];
+
+        for (cat, label, _color) in categories {
+            let cat_findings: Vec<_> = active_findings
+                .iter()
+                .filter(|f| f.category == cat)
+                .collect();
+
+            if !cat_findings.is_empty() {
+                println!("\n  {}", label);
+
+                let mut t_cat = create_dynamic_table();
+                t_cat.set_header(vec![
+                    Cell::new("CIS / Ref")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Cyan),
+                    Cell::new("Penalty")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Red),
+                    Cell::new("Finding").add_attribute(Attribute::Bold),
+                    Cell::new("Evidence").add_attribute(Attribute::Bold),
+                ]);
+
+                for f in cat_findings {
+                    let cis_note = f.cis_ref.unwrap_or("-");
+                    t_cat.add_row(vec![
+                        Cell::new(cis_note).fg(Color::DarkGrey),
+                        Cell::new(format!("-{}", f.weight)).fg(Color::Red),
+                        Cell::new(&f.title),
+                        Cell::new(sanitize_terminal(&f.evidence)),
+                    ]);
+                }
+                println!("{t_cat}");
+            }
+        }
+        println!();
     }
 
     if !report.is_root_execution {
