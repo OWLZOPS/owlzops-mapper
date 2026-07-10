@@ -5,7 +5,7 @@
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::models::ProcCapFinding;
+use crate::models::{ProcCapFinding, SuspiciousProcess};
 use crate::{coverage, safe_io};
 
 // ── Capability bit numbers (include/uapi/linux/capability.h) ────────────
@@ -210,23 +210,65 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
     })
 }
 
+// ── Malware sweep ────────────────────────────────────────────────────────
+
+/// Hard cap on stored suspicious processes — keeps JSONL flat under a fork-bomb
+/// of a matched implant name.
+const MAX_SUSPICIOUS: usize = 64;
+
+/// Check one comm against the blocklist; on a hit, record a SuspiciousProcess.
+/// Explicit names flag unconditionally; ambiguous names require ephemeral-path
+/// corroboration. `/proc/<pid>/exe` is read lazily — only on a name hit.
+/// Returns `true` iff an ambiguous match was dropped for an unresolvable exe
+/// (so the caller can surface an aggregate coverage warning).
+fn check_malware(comm: &str, pid: u32, proc_root: &Path, out: &mut Vec<SuspiciousProcess>) -> bool {
+    let explicit = crate::utils::is_known_malware(comm);
+    let ambiguous = crate::utils::is_ambiguous_malware(comm);
+    if !explicit && !ambiguous {
+        return false; // fast path: no allocation, no readlink for the 99.9%
+    }
+
+    let exe_path = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    // Ambiguous-only match must be corroborated by an ephemeral exe path.
+    if ambiguous && !explicit {
+        match exe_path.as_deref() {
+            Some(p) if crate::utils::is_ephemeral_exec_path(p) => {}
+            Some(_) => return false, // legit system path → not an implant
+            None => return true,     // exe unreadable → can't corroborate; signal
+        }
+    }
+
+    if out.len() < MAX_SUSPICIOUS {
+        out.push(SuspiciousProcess {
+            pid,
+            name: comm.trim().to_string(),
+            exe_path,
+        });
+    }
+    false
+}
+
 // ── Walker ───────────────────────────────────────────────────────────────
 
-/// Hard cap on stored findings — keeps JSONL memory flat on pathological hosts.
+/// Hard cap on stored capability findings.
 const MAX_FINDINGS: usize = 64;
 /// status is ~1–3 KiB; 16 KiB leaves headroom for long Groups:/Cpus_allowed:.
 const CAP_PROC_STATUS: usize = 16 * 1024;
 
 /// Walk `proc_root` (production: `/proc`; tests: tempdir) and flag non-root
 /// processes with critical CapEff|CapPrm bits or any ambient set.
-/// Root (euid 0) is skipped by design: full masks are the kernel default
-/// there — same contextual-suppression rationale as ip_forward on Docker hosts.
-/// CapBnd is recorded but never used for flagging: default bounding is the
-/// full mask for every process on the system.
-pub fn audit_host_processes(proc_root: &Path) -> Vec<ProcCapFinding> {
+/// Root (euid 0) is skipped for capability findings but is still inspected
+/// for malware names (to catch root-run implants).
+/// Returns a tuple of (capability findings, suspicious process names).
+pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<SuspiciousProcess>) {
     let mut findings = Vec::new();
+    let mut suspicious = Vec::new();
     let mut denied = 0usize;
     let mut over_cap = 0usize;
+    let mut ambiguous_dropped = 0usize;
 
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -235,7 +277,7 @@ pub fn audit_host_processes(proc_root: &Path) -> Vec<ProcCapFinding> {
                 "capability audit skipped: {} unreadable ({err})",
                 proc_root.display()
             ));
-            return findings;
+            return (findings, suspicious);
         }
     };
 
@@ -272,8 +314,13 @@ pub fn audit_host_processes(proc_root: &Path) -> Vec<ProcCapFinding> {
             continue;
         };
 
+        // ── Malware sweep ── runs for EVERY process (including root)
+        if check_malware(&st.name, pid, proc_root, &mut suspicious) {
+            ambiguous_dropped += 1;
+        }
+
         if st.euid == 0 {
-            continue; // root: full masks are the default — flagging is noise
+            continue; // root: full capability masks are the default — flagging is noise
         }
 
         // Possession, not acquisition potential: bounding excluded on purpose.
@@ -323,16 +370,27 @@ pub fn audit_host_processes(proc_root: &Path) -> Vec<ProcCapFinding> {
             "capability audit: finding cap ({MAX_FINDINGS}) reached; {over_cap} more processes matched but were not recorded"
         ));
     }
+    if ambiguous_dropped > 0 {
+        let hint = if crate::is_running_as_root() {
+            ""
+        } else {
+            " — run as root to resolve exe paths"
+        };
+        coverage::record(format!(
+            "malware sweep: {ambiguous_dropped} ambiguous name match(es) unresolved (exe unreadable){hint}"
+        ));
+    }
 
-    findings.sort_unstable_by_key(|f| f.pid); // deterministic report order
-    findings
+    findings.sort_unstable_by_key(|f| f.pid);
+    suspicious.sort_unstable_by_key(|s| s.pid);
+    (findings, suspicious)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
 
     const FULL_ROOT: &str = "Name:\tsystemd\nUmask:\t0022\nState:\tS (sleeping)\n\
@@ -428,7 +486,7 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
         fs::create_dir_all(tmp.path().join("sys")).unwrap(); // non-PID entry
         fs::write(tmp.path().join("uptime"), "1 1").unwrap();
 
-        let findings = audit_host_processes(tmp.path());
+        let (findings, _) = audit_host_processes(tmp.path());
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
         assert_eq!((f.pid, f.euid), (4242, 101));
@@ -452,7 +510,8 @@ CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\
 CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n\
 NoNewPrivs:\t0\nSeccomp:\t0\n",
         );
-        assert!(audit_host_processes(tmp.path()).is_empty());
+        let (findings, _) = audit_host_processes(tmp.path());
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -467,7 +526,7 @@ CapInh:\t0000000000000400\nCapPrm:\t0000000000000400\nCapEff:\t0000000000000400\
 CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000400\n\
 NoNewPrivs:\t1\nSeccomp:\t2\n",
         );
-        let findings = audit_host_processes(tmp.path());
+        let (findings, _) = audit_host_processes(tmp.path());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].ambient, 0x400);
         assert!(findings[0].critical_caps.is_empty());
@@ -488,6 +547,47 @@ NoNewPrivs:\t1\nSeccomp:\t2\n",
         )
         .unwrap();
         // Graceful degradation: no panic, empty result, denial aggregated.
-        assert!(audit_host_processes(tmp.path()).is_empty());
+        let (findings, _) = audit_host_processes(tmp.path());
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn malware_sweep_flags_explicit_and_corroborates_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = |name: &str, uid: &str| {
+            format!(
+                "Name:\t{name}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
+CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
+            )
+        };
+        let mk = |pid: u32, name: &str, uid: &str, exe: Option<&str>| {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("status"), status(name, uid)).unwrap();
+            if let Some(e) = exe {
+                symlink(e, d.join("exe")).unwrap();
+            }
+        };
+
+        mk(10, "xmrig", "0", Some("/usr/bin/xmrig")); // explicit + ROOT → caught
+        mk(
+            20,
+            "networkservice",
+            "1000",
+            Some("/usr/bin/networkservice"),
+        ); // legit path → NOT
+        mk(30, "networkservice", "1000", Some("/tmp/networkservice")); // ephemeral → caught
+
+        let (_caps, suspicious) = audit_host_processes(tmp.path());
+        let pids: Vec<u32> = suspicious.iter().map(|s| s.pid).collect();
+        assert!(pids.contains(&10), "root-run explicit miner must be caught");
+        assert!(
+            pids.contains(&30),
+            "ambiguous name from /tmp must be flagged"
+        );
+        assert!(
+            !pids.contains(&20),
+            "ambiguous name from /usr/bin must be suppressed"
+        );
     }
 }

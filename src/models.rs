@@ -248,6 +248,8 @@ pub struct SecurityInfo {
     pub secret_hygiene: Vec<SecretLeak>,
     #[serde(default)]
     pub capability_audit: Vec<ProcCapFinding>,
+    #[serde(default)]
+    pub suspicious_processes: Vec<SuspiciousProcess>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -404,6 +406,14 @@ pub struct SecretLeak {
     pub process: String,
     pub source: String,
     pub matched_key: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SuspiciousProcess {
+    pub pid: u32,
+    pub name: String,
+    #[serde(default)]
+    pub exe_path: Option<String>,
 }
 
 // Process Capability Audit Models

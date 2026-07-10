@@ -121,6 +121,34 @@ pub fn is_ephemeral_exec_path(path: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Known malware / miner process names
+// ---------------------------------------------------------------------------
+
+/// Explicit, high-confidence malware/miner comm names. Exact, case-insensitive
+/// match only (never substring) so legit binaries are never clobbered. Every
+/// entry MUST be ≤15 chars — the kernel truncates comm to TASK_COMM_LEN-1 (15);
+/// a longer signature could never match a truncated comm.
+pub const KNOWN_MALWARE: &[&str] = &["kdevtmpfsi", "kinsing", "xmrig", "sysupdate"];
+
+/// Ambiguous names resembling legitimate services. A name match here is NOT
+/// sufficient on its own — the caller must corroborate via an ephemeral
+/// exe_path before flagging (see [`is_ephemeral_exec_path`]).
+pub const AMBIGUOUS_MALWARE: &[&str] = &["networkservice"];
+
+/// Exact case-insensitive match against the high-confidence blocklist.
+/// Zero-copy: `eq_ignore_ascii_case` allocates nothing (unlike `to_lowercase`).
+pub fn is_known_malware(comm: &str) -> bool {
+    let c = comm.trim();
+    KNOWN_MALWARE.iter().any(|m| c.eq_ignore_ascii_case(m))
+}
+
+/// Exact case-insensitive match against the corroboration-required tier.
+pub fn is_ambiguous_malware(comm: &str) -> bool {
+    let c = comm.trim();
+    AMBIGUOUS_MALWARE.iter().any(|m| c.eq_ignore_ascii_case(m))
+}
+
+// ---------------------------------------------------------------------------
 // Child helpers (unchanged logic, now hardened and with stdin nulled)
 // ---------------------------------------------------------------------------
 
@@ -362,5 +390,23 @@ mod tests {
         assert!(!is_ephemeral_exec_path("/dev/null"));
         // /home alone is valid
         assert!(is_ephemeral_exec_path("/home/user/.local/share/something"));
+    }
+
+    #[test]
+    fn known_malware_exact_case_insensitive() {
+        assert!(is_known_malware("xmrig"));
+        assert!(is_known_malware("KDevTmpFSi"));
+        assert!(is_known_malware("  kinsing  "));
+        assert!(!is_known_malware("xmrigd")); // substring must NOT match
+        assert!(!is_known_malware("networkservice")); // ambiguous tier ≠ explicit
+        assert!(!is_known_malware("nginx"));
+        assert!(!is_known_malware(""));
+    }
+
+    #[test]
+    fn ambiguous_malware_is_separate_tier() {
+        assert!(is_ambiguous_malware("networkservice"));
+        assert!(!is_ambiguous_malware("NetworkManager")); // exact, not substring
+        assert!(!is_known_malware("networkservice")); // never in explicit tier
     }
 }
