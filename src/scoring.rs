@@ -400,7 +400,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = fileless
             .iter()
             .map(|p| match &p.exe_path {
-                Some(exe) => format!("{} (pid {}, deleted from {})", p.name, p.pid, exe),
+                Some(exe) => {
+                    if exe.starts_with("/memfd:") {
+                        format!("{} (pid {}, executing in-memory (memfd))", p.name, p.pid)
+                    } else {
+                        format!("{} (pid {}, deleted from {})", p.name, p.pid, exe)
+                    }
+                }
                 None => format!("{} (pid {}, deleted)", p.name, p.pid),
             })
             .collect::<Vec<_>>()
@@ -1169,6 +1175,35 @@ mod tests {
             !sec017.evidence.contains("xmrig"),
             "live miner must not be in SEC-017"
         );
+    }
+
+    #[test]
+    fn sec017_evidence_distinguishes_memfd_from_ondisk() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![
+            // обычный fileless: удалённый файл из /tmp
+            SuspiciousProcess {
+                pid: 10,
+                name: "malware".into(),
+                exe_path: Some("/tmp/malware".into()),
+                is_deleted: true,
+            },
+            // memfd-процесс
+            SuspiciousProcess {
+                pid: 20,
+                name: "stealth".into(),
+                exe_path: Some("/memfd:stealth".into()),
+                is_deleted: true,
+            },
+        ];
+        let sec017 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-017")
+            .unwrap();
+        assert!(sec017.evidence.contains("deleted from /tmp/malware"));
+        assert!(sec017.evidence.contains("executing in-memory (memfd)"));
+        assert!(!sec017.evidence.contains("deleted from /memfd:stealth"));
     }
 
     #[test]
