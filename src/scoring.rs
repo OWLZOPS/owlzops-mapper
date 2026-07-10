@@ -365,6 +365,51 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-016 — Known malware/miner detection by process name ──
+    // Compile-time list of known malware process names (exact match,
+    // case‑insensitive). Detection runs against two sources already
+    // collected by the agent (no additional /proc traversal):
+    //   1. top memory processes (host.top_memory_processes)
+    //   2. capability-audited processes (security.capability_audit)
+    // Each PID is reported only once.  Legitimate processes with
+    // similar but not identical names (e.g. “NetworkManager” vs
+    // “networkservice”) are not flagged — this is a deliberate guard
+    // against substring false positives.
+    const KNOWN_MALWARE: &[&str] = &["xmrig", "kdevtmpfsi", "kinsing", "networkservice"];
+    let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut malware_hits: Vec<String> = Vec::new();
+
+    for p in &report.host.top_memory_processes {
+        if KNOWN_MALWARE.iter().any(|m| p.name.eq_ignore_ascii_case(m)) {
+            if seen_pids.insert(p.pid) {
+                malware_hits.push(format!("pid {} ({})", p.pid, p.name));
+            }
+        }
+    }
+    for c in &report.security.capability_audit {
+        if KNOWN_MALWARE.iter().any(|m| c.comm.eq_ignore_ascii_case(m)) {
+            if seen_pids.insert(c.pid) {
+                malware_hits.push(format!("pid {} ({})", c.pid, c.comm));
+            }
+        }
+    }
+
+    if !malware_hits.is_empty() {
+        findings.push(Finding {
+            id: "SEC-016",
+            title: "Known malware/miner process detected".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!(
+                "Found {} known malware process(es): {}",
+                malware_hits.len(),
+                malware_hits.join(", ")
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── DLP & Secret Hygiene ───────────────────────────────
     if !report.security.secret_hygiene.is_empty() {
         let mut evidence_list = Vec::new();
@@ -524,8 +569,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             category: Category::Security,
             weight: 10,
             evidence:
-                "At least one container has elevated kernel capabilities (SYS_ADMIN/NET_ADMIN)"
-                    .to_string(),
+            "At least one container has elevated kernel capabilities (SYS_ADMIN/NET_ADMIN)"
+                .to_string(),
             suppressed: None,
             cis_ref: Some("CIS 5.2.5"),
         });
@@ -1019,5 +1064,64 @@ mod tests {
         // Mapped wildcard counts too (shares is_wildcard_bind contract).
         r.network.listening_ports = vec![port("::ffff:0.0.0.0", Some("/dev/shm/x"), Some(4242))];
         assert!(fires(&r));
+    }
+
+    #[test]
+    fn sec016_detects_known_malware_by_name() {
+        use crate::models::{ProcCapFinding, ProcessInfo};
+        let fires = |r: &AgentReport| evaluate(r).iter().any(|f| f.id == "SEC-016");
+        let cap = |pid, comm: &str| ProcCapFinding {
+            pid,
+            comm: comm.into(),
+            euid: 1000,
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+            bounding: 0,
+            ambient: 0,
+            no_new_privs: None,
+            seccomp: None,
+            critical_caps: vec![],
+        };
+
+        // Miner among top memory processes → detected, weight 60.
+        let mut r = minimal_report();
+        r.host.top_memory_processes = vec![ProcessInfo {
+            name: "xmrig".into(),
+            pid: 1337,
+            memory_mb: 2048,
+            instances: 1,
+        }];
+        assert!(fires(&r));
+        let f = evaluate(&r).into_iter().find(|f| f.id == "SEC-016").unwrap();
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("xmrig") && f.evidence.contains("1337"));
+
+        // Case-insensitive match via capability_audit source.
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![cap(4242, "KDevTmpFSi")];
+        assert!(fires(&r));
+
+        // Same pid in both sources → listed once.
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![cap(99, "kinsing")];
+        r.host.top_memory_processes = vec![ProcessInfo {
+            name: "kinsing".into(),
+            pid: 99,
+            memory_mb: 512,
+            instances: 1,
+        }];
+        let f = evaluate(&r).into_iter().find(|f| f.id == "SEC-016").unwrap();
+        assert_eq!(f.evidence.matches("pid 99").count(), 1);
+
+        // Exact match, not substring: legit process must stay clean.
+        let mut r = minimal_report();
+        r.host.top_memory_processes = vec![ProcessInfo {
+            name: "NetworkManager".into(),
+            pid: 500,
+            memory_mb: 100,
+            instances: 1,
+        }];
+        assert!(!fires(&r), "NetworkManager must not match 'networkservice'");
     }
 }
