@@ -103,6 +103,22 @@ pub struct ProcStatus {
     pub name: String,
     pub euid: u32,
     pub caps: CapabilitySets,
+    /// `NoNewPrivs:` line – present since Linux 4.10; None on older kernels.
+    pub no_new_privs: Option<bool>,
+    /// `Seccomp:` 0 = disabled, 1 = strict, 2 = filter.
+    /// Line present since Linux 3.8 and only with CONFIG_SECCOMP.
+    pub seccomp: Option<u8>,
+}
+
+/// Strict decimal u8 field (e.g. `Seccomp:\t2`).  Rejects signs and
+/// non‑digit bytes – bare `str::parse` would accept a leading `+`,
+/// same rationale as `parse_hex_mask`.  Zero‑copy: operates on the slice.
+fn parse_u8_field(value: &str) -> Option<u8> {
+    let v = value.trim_ascii();
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse().ok() // > 255 overflows → None
 }
 
 /// Strict hex parser: rejects empty, >16 chars, signs and radix prefixes.
@@ -125,6 +141,8 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
     let mut euid: Option<u32> = None;
     let mut caps = CapabilitySets::default();
     let mut seen = 0u8;
+    let mut no_new_privs: Option<bool> = None;
+    let mut seccomp: Option<u8> = None;
 
     for line in content.lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -168,6 +186,14 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
                     caps.ambient = m;
                 }
             }
+            "NoNewPrivs" => {
+                no_new_privs = match parse_u8_field(value) {
+                    Some(0) => Some(false),
+                    Some(1) => Some(true),
+                    _ => None,
+                };
+            }
+            "Seccomp" => seccomp = parse_u8_field(value),
             _ => {}
         }
     }
@@ -179,6 +205,8 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
         name: name?.to_string(),
         euid: euid?,
         caps,
+        no_new_privs,
+        seccomp,
     })
 }
 
@@ -274,6 +302,8 @@ pub fn audit_host_processes(proc_root: &Path) -> Vec<ProcCapFinding> {
             inheritable: st.caps.inheritable,
             bounding: st.caps.bounding,
             ambient: st.caps.ambient,
+            no_new_privs: st.no_new_privs,
+            seccomp: st.seccomp,
             critical_caps: critical,
         });
     }
@@ -308,12 +338,14 @@ mod tests {
     const FULL_ROOT: &str = "Name:\tsystemd\nUmask:\t0022\nState:\tS (sleeping)\n\
 Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n\
 CapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\n\
-CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
+CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n\
+NoNewPrivs:\t0\nSeccomp:\t0\n";
 
     // Docker default cap set held by a non-root container process.
     const DOCKER_DEFAULT_NONROOT: &str = "Name:\tnginx\nUid:\t101\t101\t101\t101\n\
 CapInh:\t0000000000000000\nCapPrm:\t00000000a80425fb\nCapEff:\t00000000a80425fb\n\
-CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
+CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n\
+NoNewPrivs:\t0\nSeccomp:\t2\n";
 
     fn write_proc(root: &Path, pid: u32, status: &str) {
         let dir = root.join(pid.to_string());
@@ -328,6 +360,8 @@ CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
         assert_eq!(st.euid, 0);
         assert_eq!(st.caps.effective, 0x0000_01ff_ffff_ffff);
         assert_eq!(st.caps.ambient, 0);
+        assert_eq!(st.no_new_privs, Some(false));
+        assert_eq!(st.seccomp, Some(0));
     }
 
     #[test]
@@ -343,6 +377,18 @@ CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
     }
 
     #[test]
+    fn u8_field_rejects_garbage() {
+        assert_eq!(parse_u8_field("\t2"), Some(2));
+        assert_eq!(parse_u8_field(" 0 "), Some(0));
+        assert_eq!(parse_u8_field("03"), Some(3));
+        assert_eq!(parse_u8_field(""), None);
+        assert_eq!(parse_u8_field("+1"), None); // bare str::parse would accept this
+        assert_eq!(parse_u8_field("-1"), None);
+        assert_eq!(parse_u8_field("x"), None);
+        assert_eq!(parse_u8_field("256"), None); // u8 overflow
+    }
+
+    #[test]
     fn truncated_status_returns_none() {
         let cut = &FULL_ROOT[..FULL_ROOT.find("CapBnd").unwrap()];
         assert!(parse_status(cut).is_none());
@@ -354,6 +400,17 @@ CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
         let legacy = FULL_ROOT.replace("CapAmb:\t0000000000000000\n", "");
         let st = parse_status(&legacy).expect("parse");
         assert_eq!(st.caps.ambient, 0);
+    }
+
+    #[test]
+    fn missing_nnp_and_seccomp_lines_are_none() {
+        // Kernels < 4.10 / no CONFIG_SECCOMP: lines absent, parse must succeed.
+        let legacy = FULL_ROOT
+            .replace("NoNewPrivs:\t0\n", "")
+            .replace("Seccomp:\t0\n", "");
+        let st = parse_status(&legacy).expect("parse must still succeed");
+        assert!(st.no_new_privs.is_none());
+        assert!(st.seccomp.is_none());
     }
 
     #[test]
@@ -379,6 +436,8 @@ CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
         assert!(f.critical_caps.iter().any(|c| c == "CAP_NET_RAW"));
         assert!(f.critical_caps.iter().any(|c| c == "CAP_DAC_OVERRIDE"));
         assert!(!f.critical_caps.iter().any(|c| c == "CAP_SYS_ADMIN"));
+        assert_eq!(f.no_new_privs, Some(false));
+        assert_eq!(f.seccomp, Some(2));
     }
 
     #[test]
@@ -390,7 +449,8 @@ CapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
             777,
             "Name:\tbash\nUid:\t1000\t1000\t1000\t1000\n\
 CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n\
-CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n",
+CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n\
+NoNewPrivs:\t0\nSeccomp:\t0\n",
         );
         assert!(audit_host_processes(tmp.path()).is_empty());
     }
@@ -404,12 +464,15 @@ CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n",
             900,
             "Name:\tnode\nUid:\t998\t998\t998\t998\n\
 CapInh:\t0000000000000400\nCapPrm:\t0000000000000400\nCapEff:\t0000000000000400\n\
-CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000400\n",
+CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000400\n\
+NoNewPrivs:\t1\nSeccomp:\t2\n",
         );
         let findings = audit_host_processes(tmp.path());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].ambient, 0x400);
         assert!(findings[0].critical_caps.is_empty());
+        assert_eq!(findings[0].no_new_privs, Some(true));
+        assert_eq!(findings[0].seccomp, Some(2));
     }
 
     #[test]

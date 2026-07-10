@@ -340,15 +340,29 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
     // ── Non-root processes with critical kernel capabilities ──
     if !report.security.capability_audit.is_empty() {
+        let n = report.security.capability_audit.len();
+        let nnp_open = report
+            .security
+            .capability_audit
+            .iter()
+            .filter(|f| f.no_new_privs == Some(false))
+            .count();
+
+        let mut evidence = format!(
+            "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets"
+        );
+        if nnp_open > 0 {
+            evidence.push_str(&format!(
+                "; {nnp_open} of them with NoNewPrivs=0 — setuid execve escalation path open"
+            ));
+        }
+
         findings.push(Finding {
             id: "CAP-001",
             title: "Non-root processes hold critical kernel capabilities".to_string(),
             category: Category::Security,
             weight: 8,
-            evidence: format!(
-                "{} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets",
-                report.security.capability_audit.len()
-            ),
+            evidence,
             suppressed: None,
             cis_ref: None,
         });

@@ -419,5 +419,11 @@ pub struct ProcCapFinding {
     pub bounding: u64,
     #[serde(default)]
     pub ambient: u64,
+    /// None = line absent (kernel < 4.10) or snapshot predates this field.
+    #[serde(default)]
+    pub no_new_privs: Option<bool>,
+    /// 0 disabled / 1 strict / 2 filter; None = no CONFIG_SECCOMP or old snapshot.
+    #[serde(default)]
+    pub seccomp: Option<u8>,
     pub critical_caps: Vec<String>,
 }
