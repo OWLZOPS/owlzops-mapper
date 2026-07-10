@@ -1,31 +1,39 @@
 
 ## Bug Fixes
 
-- **storage:** Use MiB for DiskInfo, add exact usage_pct (R10-01, R10-02)
-
-## CI/CD
-
-- **workflows:** Set `CC` environment variable to clang for test jobs (to fix undefined symbol __isoc23_sscanf )
-- **workflows:** Switch to GCC, update matrix cache prefix key for consistency
-- **workflows:** Force GCC over Clang for aws-lc-sys on Ubuntu 22.04, adjust child process handling
-- **workflows:** Enhance caching logic, refine GCC enforcement and organize steps for clarity
+- **compare, utils:** Prevent false escalation for wildcard binds already present with loopback
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.9
+- Update CHANGELOG for v0.5.10
+- **fields:** Update FIELDS.md with new properties and enhanced descriptions
 
 ## Features
 
-- **compare:** Detect port exposure escalation from local to wildcard (R10-03)
-- **network:** Detect and display DNS upstreams in UI and XLSX output
-- **ui, exporters, host:** Display reboot-required package details in UI and XLSX output
-- **ui, scoring:** Enhance cron job analysis and risk scoring output
-- **ui, exporters, host:** Improve zombie process reporting with parent details
-- **ui, scanners:** Add container RW size, aggregated process counts and reclaimable disk space
-- **ui, exporters, scanners:** Improve image size reporting and calculation logic
-- **scanners:** Add support for identifying container runtimes and orchestrators
+- **ui, exporters, scanners:** Add elevated capabilities audit for non-root processes
+- **scanners:** Enhance capability audit with NoNewPrivs and Seccomp support
+- **ui, exporters:** Extend capability audit with NoNewPrivs and Seccomp details
+- **scoring:** Adjust CAP-001 weighting for global exposure, bump SCORING_VERSION to 6
+- **scoring:** Add SEC-015 active compromise IoC detector
+- **scoring:** Add SEC-016 detector for known malware and miners by process name
+- **scoring, scanners:** Full /proc malware sweep, two-tier name detection
+- **scoring, scanners, ui:** Add SEC-017 detector for malicious cron jobs
+- **scoring, scanners:** Enhance process classification and introduce SEC-017 fileless malware detector
+- **utils, scoring:** Add /memfd: to ephemeral path predicate, bump scoring version
+- **scoring:** Enhance SEC-017 to distinguish in-memory (memfd) processes
 
 ## Miscellaneous
 
-- **release:** Bump version to 0.5.10, update changelog
+- **release:** Bump version to 0.5.11, refine utils for improved process handling
+
+## Refactoring
+
+- **network, utils:** Centralize bind address checks into reusable predicates
+- **ui:** Improve data presentation with dynamic tables and enhanced sanitization
+- **ui:** Add category-specific risk breakdown with improved headers and icons
+- **ui:** Simplify category formatting with conditional icon support for TTY
+
+## classify
+
+- **scanners:** Extend fileless detection to include /memfd: base paths
 
