@@ -234,8 +234,48 @@ async fn upload_via_channel(
     }
 }
 
+/// R10-01: best-effort removal of the uploaded binary over a fresh channel.
+/// Failures are logged but never fatal — the audit outcome is already final
+/// by the time this runs. `remote_path` has passed `validate_remote_path`
+/// (only `[A-Za-z0-9-_./]`, absolute), so shell interpolation is safe here.
+async fn cleanup_remote_binary(
+    session: &client::Handle<ClientHandler>,
+    remote_path: &str,
+    host: &str,
+) {
+    let fut = async {
+        let mut ch = session.channel_open_session().await?;
+        ch.exec(true, format!("rm -f -- {remote_path}")).await?;
+        ch.eof().await?;
+        let mut exit: Option<u32> = None;
+        while let Some(msg) = ch.wait().await {
+            match msg {
+                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        Ok::<Option<u32>, russh::Error>(exit)
+    };
+    match tokio::time::timeout(Duration::from_secs(10), fut).await {
+        Ok(Ok(Some(0))) => tracing::debug!(host = %host, "remote binary removed"),
+        Ok(Ok(code)) => tracing::warn!(
+            host = %host,
+            exit = ?code,
+            "cleanup did not confirm success — binary may be left on host"
+        ),
+        Ok(Err(e)) => {
+            tracing::warn!(host = %host, error = %e, "cleanup failed — binary left on host")
+        }
+        Err(_) => tracing::warn!(host = %host, "cleanup timed out — binary left on host"),
+    }
+}
+
 /// Connect to a remote host via russh, upload the binary if needed,
 /// execute the audit with `sudo -S`, and return the raw JSON output.
+/// Unless `keep_binary` is set, the binary at `remote_path` is removed
+/// afterwards (parity with the legacy SSH path) and the session is
+/// disconnected cleanly via SSH_MSG_DISCONNECT.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_remote_scan_russh(
     host: &str,
@@ -244,6 +284,7 @@ pub async fn run_remote_scan_russh(
     remote_path: &str,
     sudo_pass: &Zeroizing<String>,
     copy_binary: bool,
+    keep_binary: bool,
     local_bin: Option<&str>,
     remote_timeout_secs: u64,
 ) -> Result<Vec<u8>, RemoteError> {
@@ -397,30 +438,29 @@ pub async fn run_remote_scan_russh(
             }
         }
 
-        match exit_code {
+        // R10-01: no early returns — capture the outcome so the teardown
+        // below (cleanup + disconnect) runs on every completion path.
+        let outcome: Result<Vec<u8>, RemoteError> = match exit_code {
             Some(code) => {
                 let se = String::from_utf8_lossy(&stderr);
 
-                // 1. Check if sudo rejected the password
+                // 1. sudo rejected the password
                 if se.contains("incorrect password")
                     || se.contains("Sorry, try again")
                     || se.contains("a password is required")
                 {
-                    return Err(RemoteError::SudoAuth {
-                        host: hostname_for_timeout,
-                    });
-                }
-
-                // 2. If stdout looks like JSON, the audit succeeded regardless of exit code
-                if !stdout.is_empty() && stdout.starts_with(b"{") {
-                    return Ok(stdout);
-                }
-
-                // 3. Real failure (no binary, segfault, etc.)
-                if code != 0 {
+                    Err(RemoteError::SudoAuth {
+                        host: hostname_for_timeout.clone(),
+                    })
+                } else if !stdout.is_empty() && stdout.starts_with(b"{") {
+                    // 2. stdout looks like JSON — audit succeeded regardless
+                    //    of exit code
+                    Ok(stdout)
+                } else if code != 0 {
+                    // 3. Real failure (no binary, segfault, etc.)
                     let trimmed: String = se.trim().chars().take(300).collect();
                     Err(RemoteError::NonZeroExit {
-                        host: hostname_for_timeout,
+                        host: hostname_for_timeout.clone(),
                         code,
                         stderr: trimmed,
                     })
@@ -429,9 +469,21 @@ pub async fn run_remote_scan_russh(
                 }
             }
             None => Err(RemoteError::Timeout {
-                host: hostname_for_timeout,
+                host: hostname_for_timeout.clone(),
             }),
+        };
+
+        // R10-01: teardown parity with the legacy path (runner.rs removes
+        // the binary unless --keep-binary). Best-effort — never overrides
+        // `outcome`.
+        if !keep_binary {
+            cleanup_remote_binary(&session, remote_path, &hostname_for_timeout).await;
         }
+        let _ = session
+            .disconnect(russh::Disconnect::ByApplication, "audit complete", "en")
+            .await;
+
+        outcome
     })
     .await;
 
