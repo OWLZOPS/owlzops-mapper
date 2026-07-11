@@ -285,6 +285,8 @@ pub struct SecurityInfo {
     pub capability_audit: Vec<ProcCapFinding>,
     #[serde(default)]
     pub suspicious_processes: Vec<SuspiciousProcess>,
+    #[serde(default)]
+    pub mount_masking: Vec<MountMaskingFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -477,4 +479,24 @@ pub struct ProcCapFinding {
     #[serde(default)]
     pub seccomp: Option<u8>,
     pub critical_caps: Vec<String>,
+}
+
+// Bind‑mount / overlay masking (SEC‑021)
+
+/// A mount point that appears to hide something a defender would want to see:
+/// a `/proc/<pid>` overlay (process hiding) or a tmpfs/bind overlay on top of
+/// a log or container-log path (evidence hiding). Parsed from
+/// `/proc/self/mountinfo`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct MountMaskingFinding {
+    /// Mount point being masked (mountinfo field 5), e.g. `/proc/1234`.
+    pub target_path: String,
+    /// Mount source (mountinfo post-separator field 2), e.g. `tmpfs`, `/dev/sda1`.
+    pub mount_source: String,
+    /// Filesystem type (mountinfo post-separator field 1), e.g. `tmpfs`, `ext4`.
+    pub fstype: String,
+    /// Why this was flagged, for the evidence string (e.g. `hidden PID`,
+    /// `tmpfs over /var/log`, `bind overlay on /var/log`).
+    #[serde(default)]
+    pub reason: String,
 }

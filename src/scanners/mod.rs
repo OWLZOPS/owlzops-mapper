@@ -3,6 +3,7 @@ pub mod capabilities;
 mod dlp;
 pub mod docker;
 pub mod host;
+mod mounts;
 pub mod network;
 pub mod packages;
 mod proc_net;
