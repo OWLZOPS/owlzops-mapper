@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
@@ -17,25 +16,28 @@ fn tool_cache() -> &'static Mutex<HashMap<String, String>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// R10-04: poison‑tolerant lock helper
+fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    tool_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Resolve a system tool by searching fixed standard directories.
+/// This avoids a fork of `which` and is resilient against PATH manipulation.
 pub fn resolve_tool(tool: &str) -> Option<String> {
-    {
-        let cache = tool_cache().lock().unwrap();
-        if let Some(path) = cache.get(tool) {
-            return Some(path.clone());
-        }
+    // Fast path: hit the (poison‑tolerant) cache
+    if let Some(path) = lock_cache().get(tool) {
+        return Some(path.clone());
     }
-    let output = Command::new("which")
-        .arg(tool)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            let mut cache = tool_cache().lock().unwrap();
-            cache.insert(tool.to_string(), path.clone());
-            return Some(path);
+
+    use std::os::unix::fs::PermissionsExt;
+    for dir in ["/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+        let candidate = format!("{dir}/{tool}");
+        if let Ok(md) = std::fs::metadata(&candidate)
+            && md.is_file()
+            && md.permissions().mode() & 0o111 != 0
+        {
+            lock_cache().insert(tool.to_string(), candidate.clone());
+            return Some(candidate);
         }
     }
     None
@@ -106,10 +108,11 @@ pub fn is_ambiguous_malware(comm: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Child helpers (unchanged)
+// Child helpers
 // ---------------------------------------------------------------------------
 
 /// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
+/// R10-05: defensive reap in the `Err(_)` branch so no zombie escapes.
 fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
     loop {
@@ -122,7 +125,12 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
                 let _ = child.kill();
                 return child.wait().ok();
             }
-            Err(_) => return None,
+            Err(_) => {
+                // try_wait failed (realistically ECHILD) – reap defensively
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
     }
 }
@@ -198,6 +206,7 @@ pub fn run_with_timeout_any_exit(
     run_with_timeout_inner(program, args, timeout_secs, false)
 }
 
+// R10-05: capped stdout reader + defensive take() guard instead of `?`
 fn run_with_timeout_inner(
     program: &str,
     args: &[&str],
@@ -213,11 +222,26 @@ fn run_with_timeout_inner(
         .ok()?;
 
     let (tx, rx) = mpsc::channel();
-    let mut child_stdout = child.stdout.take()?;
+    // Defensive: if stdout was somehow not captured, reap the child immediately
+    let Some(child_stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let prog = program.to_string();
     thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = child_stdout.read_to_string(&mut buf);
-        let _ = tx.send(buf);
+        let (data, truncated) =
+            safe_io::read_reader_capped(child_stdout, safe_io::CAP_CHILD_STDOUT);
+        if truncated {
+            coverage::record(format!(
+                "Output of '{}' exceeded {} bytes and was truncated",
+                prog,
+                safe_io::CAP_CHILD_STDOUT
+            ));
+            tracing::warn!(tool = %prog, "child stdout truncated at cap");
+        }
+        // Lossy conversion preserves everything after the cap
+        let _ = tx.send(String::from_utf8_lossy(&data).into_owned());
     });
 
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
