@@ -18,7 +18,9 @@ fn tool_cache() -> &'static Mutex<HashMap<String, String>> {
 
 // R10-04: poison‑tolerant lock helper
 fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
-    tool_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    tool_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Resolve a system tool by searching fixed standard directories.
