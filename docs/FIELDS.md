@@ -207,6 +207,8 @@ An array of objects, one per detected database engine.
 | `suspicious_processes[].name` | string | Process comm name |
 | `suspicious_processes[].exe_path` | string \| null | Resolved executable path |
 | `suspicious_processes[].is_deleted` | boolean | Whether the executable was deleted from an ephemeral path or is a memfd‑based implant |
+| `suspicious_processes[].euid` | integer | Effective UID of the process |
+| `suspicious_processes[].is_mimic` | boolean | Kernel-thread name with userspace cmdline (masquerading) |
 
 ---
 

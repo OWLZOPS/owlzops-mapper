@@ -127,7 +127,7 @@ impl Formats {
             critical,
             ok,
             number,
-            integer,        // R10-08
+            integer, // R10-08
             even_row,
             odd_row,
             critical_even,
