@@ -25,6 +25,7 @@ pub struct Formats {
     critical: Format,
     ok: Format,
     number: Format,
+    integer: Format,
     even_row: Format,
     odd_row: Format,
     critical_even: Format,
@@ -65,6 +66,10 @@ impl Formats {
 
         let number = Format::new()
             .set_num_format("0.00")
+            .set_border(FormatBorder::Thin);
+
+        let integer = Format::new()
+            .set_num_format("0")
             .set_border(FormatBorder::Thin);
 
         let even_row = Format::new()
@@ -122,6 +127,7 @@ impl Formats {
             critical,
             ok,
             number,
+            integer,        // R10-08
             even_row,
             odd_row,
             critical_even,
@@ -838,7 +844,7 @@ fn sheet_host_combined(
     for p in &report.host.top_memory_processes {
         let band = fmts.row_band(w.current_row());
         w.write_string(0, &p.name, band)?;
-        w.write_number(1, p.pid as f64, &fmts.number)?;
+        w.write_number(1, p.pid as f64, &fmts.integer)?;
         w.write_number(2, p.memory_mb as f64, &fmts.number)?;
         w.next_row();
     }
@@ -1251,9 +1257,9 @@ fn write_capability_section(w: &mut SheetWriter, report: &AgentReport) -> Result
     ])?;
     for f in &report.security.capability_audit {
         let band = w.fmts.row_band(w.current_row());
-        w.write_number(0, f.pid as f64, &w.fmts.number)?;
+        w.write_number(0, f.pid as f64, &w.fmts.integer)?;
         w.write_string(1, &f.comm, band)?;
-        w.write_number(2, f.euid as f64, &w.fmts.number)?;
+        w.write_number(2, f.euid as f64, &w.fmts.integer)?;
         let cap_text = if f.critical_caps.is_empty() {
             format!("ambient set: 0x{:016x}", f.ambient)
         } else {
@@ -1543,7 +1549,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
     for p in &report.host.top_memory_processes {
         let band = fmts.row_band(w.current_row());
         w.write_string(0, &p.name, band)?;
-        w.write_number(1, p.pid as f64, &fmts.number)?;
+        w.write_number(1, p.pid as f64, &fmts.integer)?;
         w.write_number(2, p.memory_mb as f64, &fmts.number)?;
         w.next_row();
     }
