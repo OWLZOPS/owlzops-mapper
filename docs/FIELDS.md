@@ -207,6 +207,32 @@ An array of objects, one per detected database engine.
 | `suspicious_processes[].name` | string | Process comm name |
 | `suspicious_processes[].exe_path` | string \| null | Resolved executable path |
 | `suspicious_processes[].is_deleted` | boolean | Whether the executable was deleted from an ephemeral path or is a memfd‑based implant |
+| `suspicious_processes[].euid` | integer | Effective UID of the process |
+| `suspicious_processes[].is_mimic` | boolean | Kernel-thread name with userspace cmdline (masquerading) |
+| `mount_masking` | array of objects | Bind‑mount / overlay masking attempts (SEC‑021) |
+| `mount_masking[].target_path` | string | Mount point being masked (e.g. `/proc/<pid>`) |
+| `mount_masking[].mount_source` | string | Mount source (e.g. `tmpfs`, `/dev/sda1`) |
+| `mount_masking[].fstype` | string | Filesystem type (e.g. `tmpfs`, `ext4`) |
+| `mount_masking[].reason` | string | Why this was flagged (evidence hiding, process masking) |
+| `reverse_shells` | array of objects | Reverse shell / C2 connections detected (SEC‑022) |
+| `reverse_shells[].pid` | integer | PID of the interpreter process |
+| `reverse_shells[].process` | string | Process comm (interpreter name) |
+| `reverse_shells[].exe_path` | string \| null | Resolved executable path |
+| `reverse_shells[].remote_address` | string | Remote endpoint `ip:port` |
+| `reverse_shells[].stdio_fd` | integer \| null | Which stdio fd (0,1,2) carries the socket, or null if non‑stdio |
+| `library_injections` | array of objects | Userspace rootkit / library injection from ephemeral paths (SEC‑023) |
+| `library_injections[].pid` | integer | PID of the injected process |
+| `library_injections[].process` | string | Process comm |
+| `library_injections[].object_path` | string | The offending .so or LD_* value |
+| `library_injections[].source` | string | Where it was observed: `"LD_PRELOAD"`, `"LD_LIBRARY_PATH"`, or `"maps"` |
+| `library_injections[].is_deleted` | boolean | Whether the mapped object is marked `(deleted)` (stronger IoC) |
+| `ghost_pids` | array of objects | PIDs hidden from `/proc` listing by an LKM rootkit (SEC‑024/025) |
+| `ghost_pids[].pid` | integer | The hidden PID |
+| `ghost_pids[].state` | string \| null | Process state (`"R"`, `"S"`, `"D"`, `"Z"`, …) if readable |
+| `ghost_pids[].age_secs` | integer \| null | Age of the process in seconds, if computable |
+| `ghost_pids[].confirmed_via` | string | How existence was confirmed: `"stat-path"`, `"kill"`, or `"stat-path+kill"` |
+| `ghost_pids[].confirmed_ioc` | boolean | `true` if this is a hard IoC (meets all criteria); `false` if downgraded |
+| `ghost_pids[].holds_socket` | boolean | Whether the hidden PID also owns a network socket (corroboration) |
 
 ---
 

@@ -16,13 +16,25 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 // Sanitisation helper
 // ---------------------------------------------------------------------------
 
-/// Replace control characters with the Unicode replacement character.
+/// Replace control characters, bidi overrides, and zero-width characters
+/// with the Unicode replacement character (U+FFFD).
 /// Tabs (\t) are converted to 4 spaces to fix comfy_table border alignment calculations.
 pub fn sanitize_terminal(s: &str) -> String {
-    s.replace('\t', "    ")
-        .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => out.push('\u{FFFD}'),          // C0, C1, DEL
+            '\u{202A}'..='\u{202E}'   // bidi overrides (LRE, RLE, PDF, LRO, RLO)
+            | '\u{2066}'..='\u{2069}' // bidi isolates (LRI, RLI, FSI, PDI)
+            | '\u{200B}'..='\u{200D}' // zero-width space, non-joiner, joiner
+            | '\u{2060}'             // word joiner
+            | '\u{FEFF}'             // BOM / zero-width no-break space
+            => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +71,10 @@ pub fn render_dashboard(report: &AgentReport) {
     render_packages(report);
     render_docker(report);
     render_capability_audit(report);
+    render_mount_masking(report);
+    render_reverse_shells(report);
+    render_library_injections(report);
+    render_ghost_pids(report);
 
     if !report.coverage_warnings.is_empty() {
         println!("\n⚠ Coverage Warnings (incomplete data):");
@@ -1202,6 +1218,170 @@ fn render_capability_audit(report: &AgentReport) {
 
     println!("Non-root processes with elevated capabilities:");
     println!("{t_caps}\n");
+}
+
+// ── SEC-021: Bind‑Mount Masking ───────────────────────────────────────────
+
+fn render_mount_masking(report: &AgentReport) {
+    if report.security.mount_masking.is_empty() {
+        return;
+    }
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("Masked Path")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Source / FS").add_attribute(Attribute::Bold),
+        Cell::new("Reason").add_attribute(Attribute::Bold),
+    ]);
+    for m in &report.security.mount_masking {
+        t.add_row(vec![
+            Cell::new(sanitize_terminal(&m.target_path)),
+            Cell::new(format!(
+                "{} ({})",
+                sanitize_terminal(&m.mount_source),
+                sanitize_terminal(&m.fstype)
+            )),
+            Cell::new(sanitize_terminal(&m.reason)),
+        ]);
+    }
+    println!("⚠ Bind‑Mount Masking Detected (SEC‑021):");
+    println!("{t}\n");
+}
+
+// ── SEC-022: Reverse Shells / C2 ──────────────────────────────────────────
+
+fn render_reverse_shells(report: &AgentReport) {
+    if report.security.reverse_shells.is_empty() {
+        return;
+    }
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("PID")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Process").add_attribute(Attribute::Bold),
+        Cell::new("Remote C2").add_attribute(Attribute::Bold),
+        Cell::new("Stdio").add_attribute(Attribute::Bold),
+    ]);
+    for r in &report.security.reverse_shells {
+        let fd = match r.stdio_fd {
+            Some(0) => "stdin".to_string(),
+            Some(1) => "stdout".to_string(),
+            Some(2) => "stderr".to_string(),
+            Some(n) => format!("fd {n}"),
+            None => "—".to_string(),
+        };
+        t.add_row(vec![
+            Cell::new(r.pid.to_string()),
+            Cell::new(sanitize_terminal(&r.process)),
+            Cell::new(sanitize_terminal(&r.remote_address)),
+            Cell::new(fd),
+        ]);
+    }
+    println!("🚨 Reverse Shell / C2 Connections (SEC‑022):");
+    println!("{t}\n");
+}
+
+// ── SEC-023: Userspace Rootkit / Library Injection ─────────────────────────
+
+fn render_library_injections(report: &AgentReport) {
+    if report.security.library_injections.is_empty() {
+        return;
+    }
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("PID")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Process").add_attribute(Attribute::Bold),
+        Cell::new("Injected Object").add_attribute(Attribute::Bold),
+        Cell::new("Source").add_attribute(Attribute::Bold),
+        Cell::new("Deleted").add_attribute(Attribute::Bold),
+    ]);
+    for l in &report.security.library_injections {
+        t.add_row(vec![
+            Cell::new(l.pid.to_string()),
+            Cell::new(sanitize_terminal(&l.process)),
+            Cell::new(sanitize_terminal(&l.object_path)),
+            Cell::new(&l.source),
+            Cell::new(if l.is_deleted { "yes" } else { "no" }),
+        ]);
+    }
+    println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
+    println!("{t}\n");
+}
+
+// ── SEC-024/025: True Ghost PID / LKM Rootkit ─────────────────────────────
+
+fn render_ghost_pids(report: &AgentReport) {
+    if report.security.ghost_pids.is_empty() {
+        return;
+    }
+
+    let (hard, soft): (Vec<_>, Vec<_>) = report
+        .security
+        .ghost_pids
+        .iter()
+        .partition(|g| g.confirmed_ioc);
+
+    if !hard.is_empty() {
+        let mut t = create_dynamic_table();
+        t.set_header(vec![
+            Cell::new("PID")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("State").add_attribute(Attribute::Bold),
+            Cell::new("Age").add_attribute(Attribute::Bold),
+            Cell::new("Confirmed via").add_attribute(Attribute::Bold),
+            Cell::new("Socket").add_attribute(Attribute::Bold),
+        ]);
+        for g in hard {
+            let state = g.state.as_deref().unwrap_or("?");
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            t.add_row(vec![
+                Cell::new(g.pid.to_string()),
+                Cell::new(state),
+                Cell::new(age),
+                Cell::new(&g.confirmed_via),
+                Cell::new(if g.holds_socket { "yes" } else { "no" }),
+            ]);
+        }
+        println!("👻 Hidden Process Detected (LKM Rootkit) (SEC‑024):");
+        println!("{t}\n");
+    }
+
+    if !soft.is_empty() {
+        let mut t = create_dynamic_table();
+        t.set_header(vec![
+            Cell::new("PID")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("State").add_attribute(Attribute::Bold),
+            Cell::new("Age").add_attribute(Attribute::Bold),
+            Cell::new("Confirmed via").add_attribute(Attribute::Bold),
+            Cell::new("Socket").add_attribute(Attribute::Bold),
+        ]);
+        for g in soft {
+            let state = g.state.as_deref().unwrap_or("?");
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            t.add_row(vec![
+                Cell::new(g.pid.to_string()),
+                Cell::new(state),
+                Cell::new(age),
+                Cell::new(&g.confirmed_via),
+                Cell::new(if g.holds_socket { "yes" } else { "no" }),
+            ]);
+        }
+        println!("👻 Suspicious PID Visibility Mismatch (downgraded) (SEC‑025):");
+        println!("{t}\n");
+    }
 }
 
 fn render_footer() {

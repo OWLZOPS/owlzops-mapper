@@ -43,7 +43,7 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     // Exit ladder: 3 = compromised > 2 = incomplete/degraded > 1 = critical > 0 = clean.
     if flags.compromised_host {
         warn!(
-            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019 or DOCK-010; exiting 3"
+            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
         );
         return 3;
     }
@@ -182,22 +182,31 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 let writer_task = if let (Some(rx), Some(file)) = (rx_chan, jsonl_file.take()) {
                     Some(tokio::task::spawn_blocking(move || {
                         use std::io::Write;
-                        let mut file = file;
+                        // R10-02: buffered writes; I/O errors are counted and
+                        // logged instead of silently losing records.
+                        let mut file = std::io::BufWriter::new(file);
                         let mut rx = rx;
                         let mut written = 0usize;
+                        let mut io_errors = 0usize;
                         let mut worst = 0i32;
                         while let Some(report) = rx.blocking_recv() {
                             worst = worst.max(compute_exit_code(&report));
                             match serde_json::to_string(&report) {
-                                Ok(json) => {
-                                    if writeln!(file, "{json}").is_ok() {
-                                        written += 1;
+                                Ok(json) => match writeln!(file, "{json}") {
+                                    Ok(()) => written += 1,
+                                    Err(e) => {
+                                        io_errors += 1;
+                                        warn!(error = %e, "JSONL write failed — report lost");
                                     }
-                                }
+                                },
                                 Err(e) => warn!(error = %e, "skipping unserializable report"),
                             }
                         }
-                        (written, worst)
+                        if let Err(e) = file.flush() {
+                            io_errors += 1;
+                            warn!(error = %e, "JSONL flush failed — tail records may be lost");
+                        }
+                        (written, worst, io_errors)
                     }))
                 } else {
                     None
@@ -276,14 +285,33 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         &a.remote_path,
                                         pw,
                                         a.copy_binary,
+                                        a.keep_binary,   // R10-01: прокидываем keep_binary
                                         a.local_binary.as_deref(),
                                         a.remote_timeout_secs,
                                     )
-                                    .await
+                                        .await
                                     {
                                         Ok(stdout) => {
-                                            let stdout_str = String::from_utf8_lossy(&stdout);
-                                            serde_json::from_str::<AgentReport>(&stdout_str).ok()
+                                            // R10-03: parse from bytes (no full lossy
+                                            // copy) and surface failures instead of
+                                            // silently dropping the host.
+                                            match serde_json::from_slice::<AgentReport>(&stdout) {
+                                                Ok(report) => Some(report),
+                                                Err(e) => {
+                                                    let preview: String =
+                                                        String::from_utf8_lossy(&stdout)
+                                                            .chars()
+                                                            .take(200)
+                                                            .collect();
+                                                    warn!(
+                                                        host = %host,
+                                                        error = %e,
+                                                        preview = %preview,
+                                                        "remote output is not a valid AgentReport (truncated stdout?)"
+                                                    );
+                                                    None
+                                                }
+                                            }
                                         }
                                         Err(e) => {
                                             warn!(host = %host, error = %e, "russh scan failed");
@@ -294,7 +322,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     run_remote_scan_with_timeout(host, a).await.ok().flatten()
                                 }
                             })
-                            .await;
+                                .await;
 
                             match result {
                                 Ok(Some(report)) => Some(report),
@@ -356,7 +384,18 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         writer.await // channel is closed, completion is guaranteed
                     };
                     match joined {
-                        Ok((written, worst)) => return if written == 0 { 2 } else { worst },
+                        Ok((written, worst, io_errors)) => {
+                            // R10-02: degraded exit code when I/O errors were observed
+                            if io_errors > 0 {
+                                warn!(
+                                    written,
+                                    io_errors,
+                                    "JSONL output incomplete — returning degraded exit code"
+                                );
+                                return 2;
+                            }
+                            return if written == 0 { 2 } else { worst };
+                        }
                         Err(_) => {
                             warn!("JSONL writer task failed");
                             return 2;
@@ -666,6 +705,8 @@ async fn main() {
             eprintln!("Received interrupt signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
+            // R10-07: terminate any remaining legacy SSH children
+            crate::utils::terminate_registered_children();
             // Wait up to 5 seconds for tasks to finish, then force exit
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
@@ -680,6 +721,8 @@ async fn main() {
             eprintln!("Received termination signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
+            // R10-07: terminate any remaining legacy SSH children
+            crate::utils::terminate_registered_children();
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
                 _ => {

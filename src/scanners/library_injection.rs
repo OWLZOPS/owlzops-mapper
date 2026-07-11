@@ -1,0 +1,379 @@
+//! Userspace rootkit / library-injection detection (SEC-023).
+//!
+//! Flags processes with a shared object injected from a writable/ephemeral
+//! path. Two independent sources, correlated per-pid:
+//!   * `/proc/<pid>/environ` — LD_PRELOAD / LD_LIBRARY_PATH pointing at an
+//!     ephemeral path (userspace injection via environment: libprocesshider…);
+//!   * `/proc/<pid>/maps`    — a file-backed .so actually mapped from an
+//!     ephemeral path (catches ptrace/dlopen implants even after the env var
+//!     is scrubbed). A "(deleted)" mapped object is treated as a stronger IoC.
+//!
+//! FP control is by funnel, reusing the existing `is_ephemeral_exec_path`
+//! contract (the same /tmp,/var/tmp,/dev/shm,/home,/memfd: set that already
+//! drives SEC-013/015). Legit software does not preload .so from these paths.
+//!
+//! Kernel-rootkit caveat: like every readdir-based scanner this is blind to a
+//! PID hidden at the getdents layer — it targets the userspace class, where it
+//! is near-zero-FP.
+
+use std::fs;
+
+use crate::coverage;
+use crate::models::LibraryInjectionFinding;
+use crate::safe_io;
+
+/// maps can be large for JIT/DB processes; cap defensively.
+const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
+/// Hard cap on stored findings.
+const MAX_FINDINGS: usize = 64;
+/// LD_* keys whose ephemeral value indicates injection.
+const INJECT_ENV_KEYS: [&str; 2] = ["LD_PRELOAD", "LD_LIBRARY_PATH"];
+
+pub fn scan_library_injections() -> Vec<LibraryInjectionFinding> {
+    detect_from_proc("/proc")
+}
+
+fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
+    let mut findings = Vec::new();
+    let mut denied = 0usize;
+
+    let entries = match fs::read_dir(proc_root) {
+        Ok(e) => e,
+        Err(_) => {
+            coverage::record(format!(
+                "library-injection scan skipped: {proc_root} unreadable"
+            ));
+            return findings;
+        }
+    };
+
+    for entry in entries.flatten() {
+        if findings.len() >= MAX_FINDINGS {
+            break;
+        }
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+
+        let comm = match safe_io::read_file_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
+            Ok((c, _)) => c.trim().to_string(),
+            Err(_) => continue,
+        };
+
+        let mut pid_hits = 0usize;
+
+        // ── Source 1: environ (LD_PRELOAD / LD_LIBRARY_PATH) ──────────
+        match safe_io::read_file_bytes_capped(
+            &format!("{proc_root}/{pid}/environ"),
+            safe_io::CAP_PROC_ENVIRON,
+        ) {
+            Ok((data, truncated)) => {
+                if truncated {
+                    coverage::record(format!("/proc/{pid}/environ truncated"));
+                }
+                for chunk in data.split(|&b| b == 0) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let Ok(kv) = std::str::from_utf8(chunk) else {
+                        continue;
+                    };
+                    let Some((key, value)) = kv.split_once('=') else {
+                        continue;
+                    };
+                    let Some(&matched_key) =
+                        INJECT_ENV_KEYS.iter().find(|k| key.eq_ignore_ascii_case(k))
+                    else {
+                        continue;
+                    };
+                    for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
+                        if crate::utils::is_ephemeral_exec_path(path) {
+                            findings.push(LibraryInjectionFinding {
+                                pid,
+                                process: comm.clone(),
+                                object_path: path.to_string(),
+                                source: matched_key.to_string(),
+                                is_deleted: false,
+                            });
+                            pid_hits += 1;
+                            if findings.len() >= MAX_FINDINGS {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => denied += 1,
+        }
+
+        // ── Source 2: maps (file-backed .so from ephemeral path) ──────
+        if findings.len() < MAX_FINDINGS {
+            match safe_io::read_file_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS) {
+                Ok((content, truncated)) => {
+                    if truncated {
+                        coverage::record(format!("/proc/{pid}/maps truncated"));
+                    }
+                    scan_maps(&content, pid, &comm, &mut findings);
+                }
+                Err(_) => {
+                    if pid_hits == 0 {
+                        denied += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if denied > 0 {
+        let hint = if !crate::is_running_as_root() {
+            " — run as root for full visibility"
+        } else {
+            ""
+        };
+        coverage::record(format!(
+            "library-injection scan: {denied} process(es) with unreadable environ/maps{hint}"
+        ));
+    }
+
+    findings
+}
+
+fn scan_maps(content: &str, pid: u32, comm: &str, findings: &mut Vec<LibraryInjectionFinding>) {
+    let mut seen: Vec<&str> = Vec::new();
+    for line in content.lines() {
+        if findings.len() >= MAX_FINDINGS {
+            break;
+        }
+        let mut it = line.splitn(6, char::is_whitespace);
+        let (_addr, _perms, _off, _dev, _inode, path) = (
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+        );
+        let Some(path) = path else { continue };
+        let path = path.trim();
+        if path.is_empty() || path.starts_with('[') {
+            continue;
+        }
+
+        let (clean, is_deleted) = match path.strip_suffix(" (deleted)") {
+            Some(p) => (p, true),
+            None => (path, false),
+        };
+
+        let looks_like_so = clean.ends_with(".so") || clean.contains(".so.");
+        if !looks_like_so || !crate::utils::is_ephemeral_exec_path(clean) {
+            continue;
+        }
+        if seen.contains(&clean) {
+            continue;
+        }
+        seen.push(clean);
+
+        findings.push(LibraryInjectionFinding {
+            pid,
+            process: comm.to_string(),
+            object_path: clean.to_string(),
+            source: "maps".to_string(),
+            is_deleted,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    // ── maps parsing ─────────────────────────────────────────
+
+    fn find(content: &str) -> Vec<LibraryInjectionFinding> {
+        let mut f = Vec::new();
+        scan_maps(content, 1, "victim", &mut f);
+        f
+    }
+
+    #[test]
+    fn maps_flags_so_from_tmp() {
+        let m = "\
+7f00-7f10 r-xp 00000000 08:01 100 /usr/lib/x86_64-linux-gnu/libc.so.6
+7f20-7f30 r-xp 00000000 08:01 200 /tmp/evil.so
+7f40-7f50 rw-p 00000000 00:00 0 [heap]
+";
+        let out = find(m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/tmp/evil.so");
+        assert_eq!(out[0].source, "maps");
+        assert!(!out[0].is_deleted);
+    }
+
+    #[test]
+    fn maps_flags_deleted_so_from_dev_shm() {
+        let m = "7f20-7f30 r-xp 0 08:01 200 /dev/shm/impl.so (deleted)\n";
+        let out = find(m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/dev/shm/impl.so");
+        assert!(out[0].is_deleted, "deleted mapping must be flagged");
+    }
+
+    #[test]
+    fn maps_ignores_system_so_and_anon() {
+        let m = "\
+7f00-7f10 r-xp 0 08:01 100 /usr/lib/libssl.so.3
+7f40-7f50 rw-p 0 00:00 0 [stack]
+7f60-7f70 r--p 0 08:01 300 /lib/ld-linux.so.2
+";
+        assert!(find(m).is_empty(), "system libraries must not flag");
+    }
+
+    #[test]
+    fn maps_dedups_multi_segment_so() {
+        // Same .so mapped as 4 segments → one finding.
+        let m = "\
+7f20-7f21 r-xp 0 08:01 200 /tmp/x.so
+7f21-7f22 r--p 0 08:01 200 /tmp/x.so
+7f22-7f23 rw-p 0 08:01 200 /tmp/x.so
+7f23-7f24 ---p 0 08:01 200 /tmp/x.so
+";
+        assert_eq!(find(m).len(), 1);
+    }
+
+    #[test]
+    fn maps_versioned_so_matches() {
+        let m = "7f20-7f30 r-xp 0 08:01 200 /var/tmp/libfoo.so.1.2\n";
+        let out = find(m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/var/tmp/libfoo.so.1.2");
+    }
+
+    #[test]
+    fn maps_non_so_executable_from_tmp_is_ignored_here() {
+        let m = "7f20-7f30 r-xp 0 08:01 200 /tmp/dropper\n";
+        assert!(find(m).is_empty());
+    }
+
+    #[test]
+    fn maps_malformed_lines_do_not_panic() {
+        let m = "garbage\n\n7f20 r-xp\n7f20-7f30 r-xp 0 08:01 200 /tmp/ok.so\n";
+        let out = find(m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/tmp/ok.so");
+    }
+
+    // ── environ + end-to-end over a fake /proc ──────────────
+
+    /// Build a fake /proc/<pid> with comm, environ (NUL-separated), and maps.
+    fn fake_pid(pid: u32, comm: &str, environ: &[&str], maps: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(pid.to_string());
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("comm"), format!("{comm}\n")).unwrap();
+        let mut env_bytes = Vec::new();
+        for e in environ {
+            env_bytes.extend_from_slice(e.as_bytes());
+            env_bytes.push(0);
+        }
+        fs::write(base.join("environ"), env_bytes).unwrap();
+        fs::write(base.join("maps"), maps).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn environ_ld_preload_from_tmp_is_flagged() {
+        let proc = fake_pid(
+            1337,
+            "nginx",
+            &["PATH=/usr/bin", "LD_PRELOAD=/tmp/hide.so", "HOME=/root"],
+            "",
+        );
+        let out = detect_from_proc(proc.path().to_str().unwrap());
+        let hit = out
+            .iter()
+            .find(|f| f.source == "LD_PRELOAD")
+            .expect("LD_PRELOAD flagged");
+        assert_eq!(hit.pid, 1337);
+        assert_eq!(hit.object_path, "/tmp/hide.so");
+    }
+
+    #[test]
+    fn environ_ld_preload_from_system_path_is_not_flagged() {
+        let proc = fake_pid(
+            1338,
+            "redis-server",
+            &["LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"],
+            "",
+        );
+        let out = detect_from_proc(proc.path().to_str().unwrap());
+        assert!(out.is_empty(), "system-path preload is legitimate");
+    }
+
+    #[test]
+    fn environ_ld_library_path_list_flags_ephemeral_entry() {
+        let proc = fake_pid(
+            1339,
+            "app",
+            &["LD_LIBRARY_PATH=/usr/lib:/opt/app/lib:/dev/shm/x"],
+            "",
+        );
+        let out = detect_from_proc(proc.path().to_str().unwrap());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/dev/shm/x");
+        assert_eq!(out[0].source, "LD_LIBRARY_PATH");
+    }
+
+    #[test]
+    fn environ_and_maps_both_contribute() {
+        let proc = fake_pid(
+            1340,
+            "sshd",
+            &["LD_PRELOAD=/tmp/a.so"],
+            "7f20-7f30 r-xp 0 08:01 200 /dev/shm/b.so\n",
+        );
+        let out = detect_from_proc(proc.path().to_str().unwrap());
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter()
+                .any(|f| f.source == "LD_PRELOAD" && f.object_path == "/tmp/a.so")
+        );
+        assert!(
+            out.iter()
+                .any(|f| f.source == "maps" && f.object_path == "/dev/shm/b.so")
+        );
+    }
+
+    #[test]
+    fn clean_process_yields_nothing() {
+        let proc = fake_pid(
+            1341,
+            "bash",
+            &["PATH=/usr/bin", "HOME=/home/user"],
+            "7f00-7f10 r-xp 0 08:01 100 /usr/lib/libc.so.6\n7f40-7f50 rw-p 0 00:00 0 [heap]\n",
+        );
+        assert!(detect_from_proc(proc.path().to_str().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn unreadable_pid_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("9999")).unwrap();
+        let out = detect_from_proc(tmp.path().to_str().unwrap());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn non_numeric_proc_entries_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("net")).unwrap();
+        fs::write(tmp.path().join("net").join("tcp"), "junk").unwrap();
+        symlink("/x", tmp.path().join("self")).ok();
+        let out = detect_from_proc(tmp.path().to_str().unwrap());
+        assert!(out.is_empty());
+    }
+}

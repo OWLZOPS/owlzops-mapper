@@ -451,6 +451,18 @@ pub fn gather_security_info() -> SecurityInfo {
     let (capability_audit, suspicious_processes) =
         crate::scanners::capabilities::audit_host_processes(std::path::Path::new("/proc"));
 
+    // --- Bind-mount / overlay masking (SEC-021) ---------------------------
+    let mount_masking = crate::scanners::mounts::scan_mount_masking();
+
+    // --- Reverse-shell / C2 correlation (SEC-022) -------------------------
+    let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
+
+    // --- Userspace rootkit / library injection (SEC-023) ------------------
+    let library_injections = crate::scanners::library_injection::scan_library_injections();
+
+    // --- True Ghost PID / LKM rootkit hiding (SEC-024) --------------------
+    let ghost_pids = crate::scanners::ghost_pid::scan_ghost_pids();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -465,7 +477,11 @@ pub fn gather_security_info() -> SecurityInfo {
         access_alignment,
         secret_hygiene,
         capability_audit,
-        suspicious_processes, // NEW: filled by the full /proc sweep
+        suspicious_processes,
+        mount_masking,      // SEC-021
+        reverse_shells,     // SEC-022
+        library_injections, // SEC-023
+        ghost_pids,         // SEC-024 true ghost PID / LKM rootkit
     }
 }
 

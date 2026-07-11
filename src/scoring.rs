@@ -357,8 +357,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-016 — known malware/miner processes (name-recognized subset) ──
-    // Filter by name: the sweep vector now also holds name-independent fileless
-    // entries (SEC-017), which must NOT be mislabeled "known malicious" here.
     let name_hits: Vec<&crate::models::SuspiciousProcess> = report
         .security
         .suspicious_processes
@@ -388,8 +386,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-017 — fileless malware executing from an ephemeral path ──
-    // is_deleted is already FP-protected upstream (deleted AND ephemeral base),
-    // so a system-path deletion from apt upgrade never reaches here.
     let fileless: Vec<&crate::models::SuspiciousProcess> = report
         .security
         .suspicious_processes
@@ -423,13 +419,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-019 — fileless implant that also holds critical kernel caps ──
-    // ID 019 (SEC-018 is cron-persistence). Two branches over is_deleted procs:
-    //   A (root, euid==0): flag immediately — full kernel caps are the default,
-    //       and capability_audit suppresses root so a join would never match.
-    //   B (non-root): join capability_audit on pid; require non-empty
-    //       critical_caps (an ambient-only entry would make the title lie).
-    // Both vectors ≤64 entries; zero-copy — only evidence allocates. Score-neutral:
-    // every entry here is is_deleted ⇒ already in SEC-017 (60), Security caps at 60.
     let mut fileless_priv: Vec<String> = Vec::new();
     for p in report
         .security
@@ -438,13 +427,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         .filter(|p| p.is_deleted)
     {
         let where_ = match p.exe_path.as_deref() {
-            // memfd_create-backed: never touched disk — phrasing matches SEC-017.
             Some(exe) if exe.starts_with("/memfd:") => "executing in-memory (memfd)".to_string(),
             Some(exe) => format!("deleted from {exe}"),
             None => "deleted".to_string(),
         };
         if p.euid == 0 {
-            // Branch A — root: no join, caps are full by default.
             fileless_priv.push(format!(
                 "{} (pid {}, {}) (root-run fileless implant, full kernel capabilities by default)",
                 p.name, p.pid, where_
@@ -455,7 +442,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .iter()
             .find(|c| c.pid == p.pid && !c.critical_caps.is_empty())
         {
-            // Branch B — non-root: must actually hold critical caps.
             fileless_priv.push(format!(
                 "{} (pid {}, {}) holds [{}]",
                 p.name,
@@ -484,8 +470,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-020 — process masquerading as a kernel thread ──
-    // is_mimic is set upstream only for a kthread-looking comm with a non-empty
-    // cmdline (real kthreads have empty cmdline) — a userspace impostor.
     let mimics: Vec<&crate::models::SuspiciousProcess> = report
         .security
         .suspicious_processes
@@ -515,8 +499,159 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-021 – Bind-mount / overlay masking detected ──────
+    if !report.security.mount_masking.is_empty() {
+        let list = report
+            .security
+            .mount_masking
+            .iter()
+            .map(|m| format!("{} [{}] — {}", m.target_path, m.fstype, m.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-021",
+            title: "ACTIVE COMPROMISE: Bind-mount masking detected".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!(
+                "{} masking mount(s): {}",
+                report.security.mount_masking.len(),
+                list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-022 – Reverse shell / C2 connection detected ─────
+    if !report.security.reverse_shells.is_empty() {
+        let list = report
+            .security
+            .reverse_shells
+            .iter()
+            .map(|r| {
+                let fd = match r.stdio_fd {
+                    Some(0) => " (stdin)",
+                    Some(1) => " (stdout)",
+                    Some(2) => " (stderr)",
+                    _ => "",
+                };
+                format!("{} (pid {}) → {}{}", r.process, r.pid, r.remote_address, fd)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-022",
+            title: "ACTIVE COMPROMISE: Reverse shell / C2 connection detected".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!(
+                "{} interpreter(s) with outbound socket to a public host: {}",
+                report.security.reverse_shells.len(),
+                list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-023 – Userspace rootkit / library injection ──────
+    if !report.security.library_injections.is_empty() {
+        let list = report
+            .security
+            .library_injections
+            .iter()
+            .map(|l| {
+                let del = if l.is_deleted { " (deleted)" } else { "" };
+                format!(
+                    "{} (pid {}): {} via {}{}",
+                    l.process, l.pid, l.object_path, l.source, del
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-023",
+            title: "ACTIVE COMPROMISE: Userspace rootkit / library injection detected".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!(
+                "{} injected object(s) from ephemeral paths: {}",
+                report.security.library_injections.len(),
+                list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-024 – True Ghost PID (LKM rootkit process hiding) ─
+    // Split by confidence: confirmed IoCs escalate to exit(3); downgraded
+    // candidates (young/racy/unconfirmable) are a separate non-IoC warning.
+    if !report.security.ghost_pids.is_empty() {
+        let describe = |g: &crate::models::GhostPidFinding| {
+            let st = g.state.as_deref().unwrap_or("?");
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            let sock = if g.holds_socket { ", holds socket" } else { "" };
+            format!(
+                "pid {} (state {st}, {age}, via {}{sock})",
+                g.pid, g.confirmed_via
+            )
+        };
+
+        let (hard, soft): (Vec<_>, Vec<_>) = report
+            .security
+            .ghost_pids
+            .iter()
+            .partition(|g| g.confirmed_ioc);
+
+        if !hard.is_empty() {
+            let list = hard
+                .iter()
+                .map(|g| describe(g))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-024",
+                title: "ACTIVE COMPROMISE: Hidden process (LKM rootkit) detected".to_string(),
+                category: Category::Security,
+                weight: 60,
+                evidence: format!(
+                    "{} PID(s) live but hidden from /proc listing: {}",
+                    hard.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        if !soft.is_empty() {
+            let list = soft
+                .iter()
+                .map(|g| describe(g))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-025",
+                title: "Suspicious transient PID visibility mismatch".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} PID(s) with a readdir/stat mismatch, downgraded (young or unconfirmable): {}",
+                    soft.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     // ── SEC-018 – Malicious cron job detected ────────────────
-    // (formerly SEC-017; renumbered to avoid conflict with fileless detection)
     if let Some(_critical) = report
         .host
         .cron_jobs
@@ -710,11 +845,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── DOCK-010 — runtime capability ground truth (container escape) ──
-    // Each running container's LIVE bounding set (kernel truth from its init's
-    // host pid) vs Moby default + declared cap_add. Undeclared escape-grade caps
-    // ⇒ tampered daemon / malicious runtime shim / plugin. Privileged containers
-    // are suppressed (full caps expected — DOCK-003 covers them). None
-    // runtime_bounding_caps (not running / non-root scan) is skipped, not flagged.
     let mut tampered: Vec<String> = Vec::new();
     for c in &report.topology.containers {
         if c.privileged {
@@ -976,8 +1106,11 @@ impl CriticalFlags {
         };
         // Active-compromise (IoC) finding IDs. SEC-018 is deliberately excluded:
         // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
-        const IOC_IDS: [&str; 6] = [
-            "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "DOCK-010",
+        // SEC-025 is likewise excluded: it is a downgraded ghost-PID suspicion
+        // (young/racy/unconfirmable), not a confirmed hidden process.
+        const IOC_IDS: [&str; 10] = [
+            "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
+            "SEC-024", "DOCK-010",
         ];
         let count_sysctl = findings
             .iter()
@@ -1294,7 +1427,7 @@ mod tests {
                 name: "obfuscated".into(),
                 exe_path: Some("/dev/shm/loader".into()),
                 is_deleted: true,
-                euid: 1000, // non-root, original semantics preserved
+                euid: 1000,
                 is_mimic: false,
             },
             // known miner, live → SEC-016 only
@@ -1338,7 +1471,6 @@ mod tests {
         use crate::models::SuspiciousProcess;
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![
-            // fileless on-disk /tmp
             SuspiciousProcess {
                 pid: 10,
                 name: "malware".into(),
@@ -1347,7 +1479,6 @@ mod tests {
                 euid: 1000,
                 is_mimic: false,
             },
-            // memfd process
             SuspiciousProcess {
                 pid: 20,
                 name: "stealth".into(),
@@ -1469,7 +1600,6 @@ mod tests {
         // Branch A — ROOT fileless, capability_audit EMPTY → SEC-019 still fires.
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![fileless(1, 0, Some("/dev/shm/loader"))];
-        // deliberately no capability_audit entry (root is suppressed there anyway)
         let f = evaluate(&r)
             .into_iter()
             .find(|f| f.id == "SEC-019")
@@ -1591,6 +1721,128 @@ mod tests {
         assert!(
             CriticalFlags::from_report(&r).compromised_host,
             "mimic must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec021_mount_masking_sets_compromised_host() {
+        use crate::models::MountMaskingFinding;
+        let mut r = minimal_report();
+        r.security.mount_masking = vec![MountMaskingFinding {
+            target_path: "/proc/1337".into(),
+            mount_source: "tmpfs".into(),
+            fstype: "tmpfs".into(),
+            reason: "overlay hides a PID from /proc (process masking)".into(),
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-021")
+            .expect("SEC-021 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("/proc/1337"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "mount masking must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec022_reverse_shell_sets_compromised_host() {
+        use crate::models::ReverseShellFinding;
+        let mut r = minimal_report();
+        r.security.reverse_shells = vec![ReverseShellFinding {
+            pid: 4444,
+            process: "bash".into(),
+            exe_path: Some("/usr/bin/bash".into()),
+            remote_address: "203.0.113.5:443".into(),
+            stdio_fd: Some(1),
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-022")
+            .expect("SEC-022 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("203.0.113.5:443"));
+        assert!(f.evidence.contains("stdout"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "reverse shell must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec023_library_injection_sets_compromised_host() {
+        use crate::models::LibraryInjectionFinding;
+        let mut r = minimal_report();
+        r.security.library_injections = vec![LibraryInjectionFinding {
+            pid: 2222,
+            process: "sshd".into(),
+            object_path: "/tmp/hide.so".into(),
+            source: "LD_PRELOAD".into(),
+            is_deleted: false,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-023")
+            .expect("SEC-023 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("/tmp/hide.so"));
+        assert!(f.evidence.contains("LD_PRELOAD"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "library injection must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec024_confirmed_ghost_sets_compromised_host() {
+        use crate::models::GhostPidFinding;
+        let mut r = minimal_report();
+        r.security.ghost_pids = vec![GhostPidFinding {
+            pid: 31337,
+            state: Some("R".into()),
+            age_secs: Some(3600),
+            confirmed_via: "stat-path+kill".into(),
+            confirmed_ioc: true,
+            holds_socket: true,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-024")
+            .expect("SEC-024 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("31337"));
+        assert!(f.evidence.contains("holds socket"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "confirmed ghost PID must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec025_downgraded_ghost_does_not_set_compromise() {
+        use crate::models::GhostPidFinding;
+        let mut r = minimal_report();
+        // Young candidate (age < 2s) → downgraded, must NOT escalate to exit-3.
+        r.security.ghost_pids = vec![GhostPidFinding {
+            pid: 4242,
+            state: Some("R".into()),
+            age_secs: Some(1),
+            confirmed_via: "stat-path".into(),
+            confirmed_ioc: false,
+            holds_socket: false,
+        }];
+        assert!(
+            evaluate(&r).iter().any(|f| f.id == "SEC-025"),
+            "SEC-025 downgraded finding fires"
+        );
+        assert!(
+            !evaluate(&r).iter().any(|f| f.id == "SEC-024"),
+            "no hard SEC-024 for a young candidate"
+        );
+        assert!(
+            !CriticalFlags::from_report(&r).compromised_host,
+            "downgraded ghost must not set compromise"
         );
     }
 }
