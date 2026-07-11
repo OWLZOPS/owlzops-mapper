@@ -43,7 +43,7 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     // Exit ladder: 3 = compromised > 2 = incomplete/degraded > 1 = critical > 0 = clean.
     if flags.compromised_host {
         warn!(
-            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021 or DOCK-010; exiting 3"
+            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022 or DOCK-010; exiting 3"
         );
         return 3;
     }

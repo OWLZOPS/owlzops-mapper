@@ -71,6 +71,8 @@ pub fn render_dashboard(report: &AgentReport) {
     render_packages(report);
     render_docker(report);
     render_capability_audit(report);
+    render_mount_masking(report);
+    render_reverse_shells(report);
 
     if !report.coverage_warnings.is_empty() {
         println!("\n⚠ Coverage Warnings (incomplete data):");
@@ -1214,6 +1216,69 @@ fn render_capability_audit(report: &AgentReport) {
 
     println!("Non-root processes with elevated capabilities:");
     println!("{t_caps}\n");
+}
+
+// ── SEC-021: Bind‑Mount Masking ───────────────────────────────────────────
+
+fn render_mount_masking(report: &AgentReport) {
+    if report.security.mount_masking.is_empty() {
+        return;
+    }
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("Masked Path")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Source / FS").add_attribute(Attribute::Bold),
+        Cell::new("Reason").add_attribute(Attribute::Bold),
+    ]);
+    for m in &report.security.mount_masking {
+        t.add_row(vec![
+            Cell::new(sanitize_terminal(&m.target_path)),
+            Cell::new(format!(
+                "{} ({})",
+                sanitize_terminal(&m.mount_source),
+                sanitize_terminal(&m.fstype)
+            )),
+            Cell::new(sanitize_terminal(&m.reason)),
+        ]);
+    }
+    println!("⚠ Bind‑Mount Masking Detected (SEC‑021):");
+    println!("{t}\n");
+}
+
+// ── SEC-022: Reverse Shells / C2 ──────────────────────────────────────────
+
+fn render_reverse_shells(report: &AgentReport) {
+    if report.security.reverse_shells.is_empty() {
+        return;
+    }
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("PID")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Process").add_attribute(Attribute::Bold),
+        Cell::new("Remote C2").add_attribute(Attribute::Bold),
+        Cell::new("Stdio").add_attribute(Attribute::Bold),
+    ]);
+    for r in &report.security.reverse_shells {
+        let fd = match r.stdio_fd {
+            Some(0) => "stdin".to_string(),
+            Some(1) => "stdout".to_string(),
+            Some(2) => "stderr".to_string(),
+            Some(n) => format!("fd {n}"),
+            None => "—".to_string(),
+        };
+        t.add_row(vec![
+            Cell::new(r.pid.to_string()),
+            Cell::new(sanitize_terminal(&r.process)),
+            Cell::new(sanitize_terminal(&r.remote_address)),
+            Cell::new(fd),
+        ]);
+    }
+    println!("🚨 Reverse Shell / C2 Connections (SEC‑022):");
+    println!("{t}\n");
 }
 
 fn render_footer() {

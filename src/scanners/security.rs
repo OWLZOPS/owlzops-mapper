@@ -454,6 +454,9 @@ pub fn gather_security_info() -> SecurityInfo {
     // --- Bind-mount / overlay masking (SEC-021) ---------------------------
     let mount_masking = crate::scanners::mounts::scan_mount_masking();
 
+    // --- Reverse-shell / C2 correlation (SEC-022) -------------------------
+    let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -469,7 +472,8 @@ pub fn gather_security_info() -> SecurityInfo {
         secret_hygiene,
         capability_audit,
         suspicious_processes,
-        mount_masking, // NEW: SEC-021 bind-mount masking
+        mount_masking,  // SEC-021
+        reverse_shells, // SEC-022
     }
 }
 

