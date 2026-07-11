@@ -74,6 +74,7 @@ pub fn render_dashboard(report: &AgentReport) {
     render_mount_masking(report);
     render_reverse_shells(report);
     render_library_injections(report);
+    render_ghost_pids(report);
 
     if !report.coverage_warnings.is_empty() {
         println!("\n⚠ Coverage Warnings (incomplete data):");
@@ -1309,6 +1310,78 @@ fn render_library_injections(report: &AgentReport) {
     }
     println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
     println!("{t}\n");
+}
+
+// ── SEC-024/025: True Ghost PID / LKM Rootkit ─────────────────────────────
+
+fn render_ghost_pids(report: &AgentReport) {
+    if report.security.ghost_pids.is_empty() {
+        return;
+    }
+
+    let (hard, soft): (Vec<_>, Vec<_>) = report
+        .security
+        .ghost_pids
+        .iter()
+        .partition(|g| g.confirmed_ioc);
+
+    if !hard.is_empty() {
+        let mut t = create_dynamic_table();
+        t.set_header(vec![
+            Cell::new("PID")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("State").add_attribute(Attribute::Bold),
+            Cell::new("Age").add_attribute(Attribute::Bold),
+            Cell::new("Confirmed via").add_attribute(Attribute::Bold),
+            Cell::new("Socket").add_attribute(Attribute::Bold),
+        ]);
+        for g in hard {
+            let state = g.state.as_deref().unwrap_or("?");
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            t.add_row(vec![
+                Cell::new(g.pid.to_string()),
+                Cell::new(state),
+                Cell::new(age),
+                Cell::new(&g.confirmed_via),
+                Cell::new(if g.holds_socket { "yes" } else { "no" }),
+            ]);
+        }
+        println!("👻 Hidden Process Detected (LKM Rootkit) (SEC‑024):");
+        println!("{t}\n");
+    }
+
+    if !soft.is_empty() {
+        let mut t = create_dynamic_table();
+        t.set_header(vec![
+            Cell::new("PID")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("State").add_attribute(Attribute::Bold),
+            Cell::new("Age").add_attribute(Attribute::Bold),
+            Cell::new("Confirmed via").add_attribute(Attribute::Bold),
+            Cell::new("Socket").add_attribute(Attribute::Bold),
+        ]);
+        for g in soft {
+            let state = g.state.as_deref().unwrap_or("?");
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            t.add_row(vec![
+                Cell::new(g.pid.to_string()),
+                Cell::new(state),
+                Cell::new(age),
+                Cell::new(&g.confirmed_via),
+                Cell::new(if g.holds_socket { "yes" } else { "no" }),
+            ]);
+        }
+        println!("👻 Suspicious PID Visibility Mismatch (downgraded) (SEC‑025):");
+        println!("{t}\n");
+    }
 }
 
 fn render_footer() {

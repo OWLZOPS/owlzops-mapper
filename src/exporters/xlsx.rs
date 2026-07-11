@@ -864,6 +864,7 @@ fn sheet_host_combined(
     write_mount_masking_section(&mut w, report)?;
     write_reverse_shells_section(&mut w, report)?;
     write_library_injection_section(&mut w, report)?;
+    write_ghost_pids_section(&mut w, report)?;
     write_packages_section(&mut w, report, false)?;
 
     w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
@@ -1359,6 +1360,58 @@ fn write_library_injection_section(
     Ok(())
 }
 
+// ── SEC-024/025: True Ghost PID / LKM Rootkit ─────────────────────────────
+
+fn write_ghost_pids_section(w: &mut SheetWriter, report: &AgentReport) -> Result<(), XlsxError> {
+    if report.security.ghost_pids.is_empty() {
+        return Ok(());
+    }
+
+    let (hard, soft): (Vec<_>, Vec<_>) = report
+        .security
+        .ghost_pids
+        .iter()
+        .partition(|g| g.confirmed_ioc);
+
+    if !hard.is_empty() {
+        w.write_section_title("Hidden Process (LKM Rootkit) (SEC-024)")?;
+        w.write_header(&["PID", "State", "Age", "Confirmed via", "Socket"])?;
+        for g in hard {
+            let band = w.fmts.row_band(w.current_row());
+            w.write_number(0, g.pid as f64, &w.fmts.integer)?;
+            w.write_string(1, g.state.as_deref().unwrap_or("?"), band)?;
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            w.write_string(2, &age, band)?;
+            w.write_string(3, &g.confirmed_via, band)?;
+            w.write_string(4, if g.holds_socket { "yes" } else { "no" }, band)?;
+            w.next_row();
+        }
+    }
+
+    if !soft.is_empty() {
+        w.write_section_title("Suspicious PID Visibility Mismatch (downgraded) (SEC-025)")?;
+        w.write_header(&["PID", "State", "Age", "Confirmed via", "Socket"])?;
+        for g in soft {
+            let band = w.fmts.row_band(w.current_row());
+            w.write_number(0, g.pid as f64, &w.fmts.integer)?;
+            w.write_string(1, g.state.as_deref().unwrap_or("?"), band)?;
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            w.write_string(2, &age, band)?;
+            w.write_string(3, &g.confirmed_via, band)?;
+            w.write_string(4, if g.holds_socket { "yes" } else { "no" }, band)?;
+            w.next_row();
+        }
+    }
+
+    Ok(())
+}
+
 fn write_packages_section(
     w: &mut SheetWriter,
     report: &AgentReport,
@@ -1602,6 +1655,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
     write_mount_masking_section(&mut w, report)?;
     write_reverse_shells_section(&mut w, report)?;
     write_library_injection_section(&mut w, report)?;
+    write_ghost_pids_section(&mut w, report)?;
 
     w.next_row();
 
