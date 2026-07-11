@@ -1,39 +1,38 @@
 
 ## Bug Fixes
 
-- **compare, utils:** Prevent false escalation for wildcard binds already present with loopback
+- **russh:** Enforce binary cleanup and JSONL error handling (R10-01, R10-02, R10-03)
+- **utils:** Improve poison lock handling, tool resolution, and child process safety (R10-04, R10-05)
+- **utils:** Improve poison lock handling, tool resolution, and child process safety (R10-04, R10-05)
+- **ui:** Sanitize bidi and zero-width characters (R10-06)
+- **utils:** SIGTERM legacy SSH children on shutdown (R10-07)
+- **exporters:** Add integer format for PID and EUID in XLSX reports (R10-08)
+- **russh:** Optimize TCP_NODELAY settings and reduce chunk size for file streams
+- **workflows:** Remove stderr redirection for audit JSON output
+- **workflows:** Update exit code validation and capture stderr logs in e2e tests
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.10
-- **fields:** Update FIELDS.md with new properties and enhanced descriptions
+- Update CHANGELOG for v0.5.11
+- **exporters:** Add `euid` and `is_mimic` fields, adjust XLSX formatting (R10-08)
 
 ## Features
 
-- **ui, exporters, scanners:** Add elevated capabilities audit for non-root processes
-- **scanners:** Enhance capability audit with NoNewPrivs and Seccomp support
-- **ui, exporters:** Extend capability audit with NoNewPrivs and Seccomp details
-- **scoring:** Adjust CAP-001 weighting for global exposure, bump SCORING_VERSION to 6
-- **scoring:** Add SEC-015 active compromise IoC detector
-- **scoring:** Add SEC-016 detector for known malware and miners by process name
-- **scoring, scanners:** Full /proc malware sweep, two-tier name detection
-- **scoring, scanners, ui:** Add SEC-017 detector for malicious cron jobs
-- **scoring, scanners:** Enhance process classification and introduce SEC-017 fileless malware detector
-- **utils, scoring:** Add /memfd: to ephemeral path predicate, bump scoring version
-- **scoring:** Enhance SEC-017 to distinguish in-memory (memfd) processes
+- **scoring, scanners:** Add DOCK-010 to detect runtime capability tampering
+- **scoring:** Introduce SEC-019 to detect fileless processes with critical kernel capabilities
+- **scoring, main:** Track active compromises with `compromised_host` flag, update exit codes
+- **scoring:** Add SEC-020 for detection of kernel thread mimicry
+- **scoring:** Add SEC-021 for detecting bind-mount and overlay masking
+- **scoring, exporters, ui:** Add SEC-022 for reverse shell/C2 detection
+- **scoring, exporters, ui:** Add SEC-023 for userspace rootkit/library injection detection
+- **scoring, detectors, tests:** Add SEC-024 for detecting LKM rootkit-hidden "ghost" PIDs
+- **exporters, ui, docs:** Add SEC-024/025 ghost PID detection
 
 ## Miscellaneous
 
-- **release:** Bump version to 0.5.11, refine utils for improved process handling
+- Bump version to 0.5.12, update README with refocused messaging and feature highlights
 
 ## Refactoring
 
-- **network, utils:** Centralize bind address checks into reusable predicates
-- **ui:** Improve data presentation with dynamic tables and enhanced sanitization
-- **ui:** Add category-specific risk breakdown with improved headers and icons
-- **ui:** Simplify category formatting with conditional icon support for TTY
-
-## classify
-
-- **scanners:** Extend fileless detection to include /memfd: base paths
+- **scoring:** Streamline SEC-019 logic for fileless malware detection
 
