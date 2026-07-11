@@ -110,6 +110,57 @@ pub fn is_ambiguous_malware(comm: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Child process registry (R10-07) — graceful shutdown of legacy SSH children
+// ---------------------------------------------------------------------------
+
+static CHILD_REGISTRY: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+fn with_registry<F, R>(f: F) -> R
+where
+    F: FnOnce(&Mutex<Vec<u32>>) -> R,
+{
+    let registry = CHILD_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
+    f(registry)
+}
+
+pub fn register_child(pid: u32) {
+    with_registry(|reg| {
+        reg.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pid);
+    });
+}
+
+pub fn unregister_child(pid: u32) {
+    with_registry(|reg| {
+        reg.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&p| p != pid);
+    });
+}
+
+/// Send SIGTERM to all currently tracked child processes and clear the list.
+/// Used during graceful shutdown to terminate any remaining `ssh`/`scp`
+/// processes started by the legacy engine.
+pub fn terminate_registered_children() {
+    with_registry(|reg| {
+        let pids: Vec<u32> = {
+            let mut guard = reg
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pids = guard.clone();
+            guard.clear();
+            pids
+        };
+        for pid in pids {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Child helpers
 // ---------------------------------------------------------------------------
 
@@ -150,6 +201,9 @@ pub fn run_child_with_timeout(
         .spawn()
         .ok()?;
 
+    let child_pid = child.id();
+    register_child(child_pid);
+
     let out_pipe = child.stdout.take()?;
     let err_pipe = child.stderr.take()?;
     let prog = program.to_string();
@@ -184,11 +238,13 @@ pub fn run_child_with_timeout(
                 let _ = child.wait();
                 drop(out_handle);
                 drop(err_handle);
+                unregister_child(child_pid);
                 return None;
             }
         }
     };
 
+    unregister_child(child_pid);
     Some(std::process::Output {
         status,
         stdout: out_handle.join().unwrap_or_default(),
@@ -223,11 +279,15 @@ fn run_with_timeout_inner(
         .spawn()
         .ok()?;
 
+    let child_pid = child.id();
+    register_child(child_pid);
+
     let (tx, rx) = mpsc::channel();
     // Defensive: if stdout was somehow not captured, reap the child immediately
     let Some(child_stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
+        unregister_child(child_pid);
         return None;
     };
     let prog = program.to_string();
@@ -249,18 +309,21 @@ fn run_with_timeout_inner(
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(stdout) => {
             let status = poll_wait(&mut child, Duration::from_secs(2));
-            if require_success {
+            let result = if require_success {
                 match status {
                     Some(s) if s.success() => Some(stdout),
                     _ => None,
                 }
             } else {
                 Some(stdout)
-            }
+            };
+            unregister_child(child_pid);
+            result
         }
         Err(_timeout) => {
             let _ = child.kill();
             let _ = child.wait();
+            unregister_child(child_pid);
             None
         }
     }
@@ -361,16 +424,12 @@ mod tests {
 
     #[test]
     fn ephemeral_path_matches_memfd() {
-        // Base path after ` (deleted)` is stripped (classify_suspicious order).
         assert!(is_ephemeral_exec_path("/memfd:kdevtmpfsi"));
-        // Raw readlink form, suffix still attached — prefix match is robust to it.
         assert!(is_ephemeral_exec_path("/memfd:kdevtmpfsi (deleted)"));
         assert!(is_ephemeral_exec_path("/memfd:x"));
-        // Regression guard: a legit file literally named "memfd:" without the
-        // leading slash, or a system path mentioning memfd, must NOT match.
         assert!(!is_ephemeral_exec_path("/usr/bin/memfd:tool"));
-        assert!(!is_ephemeral_exec_path("memfd:foo")); // no leading slash
-        assert!(!is_ephemeral_exec_path("/opt/memfd:app")); // memfd not at root
+        assert!(!is_ephemeral_exec_path("memfd:foo"));
+        assert!(!is_ephemeral_exec_path("/opt/memfd:app"));
     }
 
     #[test]
