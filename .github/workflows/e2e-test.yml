@@ -28,7 +28,7 @@ jobs:
       - name: Run Local Audit & Validate JSON
         run: |
           set +e
-          sudo ./target/debug/owlzops-mapper audit --format json > audit_result.json 2>/dev/null
+          sudo ./target/debug/owlzops-mapper audit --format json > audit_result.json
           MAPPER_EXIT=$?
           set -e
 
