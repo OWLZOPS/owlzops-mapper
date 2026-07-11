@@ -184,12 +184,16 @@ async fn upload_via_channel(
         .await
         .map_err(|e| RemoteError::from_russh(e, host))?;
 
-    // Stream file content in chunks
+    // Stream file content in chunks.
+    // 32 KiB chunks — one full CHANNEL_DATA per write at the RFC 4253
+    // baseline max payload (32768). NB: russh re-chunks to the negotiated
+    // max packet regardless; this buys progress-bar granularity and halves
+    // the stack buffer, it is NOT a wire-format change.
     let mut file = std::fs::File::open(local_bin).map_err(|e| RemoteError::Io {
         host: host.to_string(),
         source: e,
     })?;
-    let mut buf = [0u8; 64 * 1024]; // 64 KiB chunks
+    let mut buf = [0u8; 32 * 1024];
     loop {
         let n = file.read(&mut buf).map_err(|e| RemoteError::Io {
             host: host.to_string(),
@@ -302,6 +306,18 @@ pub async fn run_remote_scan_russh(
         host: hostname.clone(),
         source: e,
     })?;
+
+    // Disable Nagle: SSH multiplexes small control messages (exec, eof,
+    // sudo password line, keepalives, window adjusts) with bulk data;
+    // Nagle + delayed ACK adds avoidable latency to each small write.
+    // OpenSSH sets this unconditionally. Best-effort — never fatal.
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!(
+            host = %hostname,
+            error = %e,
+            "failed to set TCP_NODELAY — continuing with default socket options"
+        );
+    }
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(30)),
