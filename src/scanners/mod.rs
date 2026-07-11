@@ -2,6 +2,7 @@ mod access;
 pub mod capabilities;
 mod dlp;
 pub mod docker;
+mod ghost_pid;
 pub mod host;
 mod library_injection;
 mod mounts;

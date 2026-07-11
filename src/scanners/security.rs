@@ -460,6 +460,9 @@ pub fn gather_security_info() -> SecurityInfo {
     // --- Userspace rootkit / library injection (SEC-023) ------------------
     let library_injections = crate::scanners::library_injection::scan_library_injections();
 
+    // --- True Ghost PID / LKM rootkit hiding (SEC-024) --------------------
+    let ghost_pids = crate::scanners::ghost_pid::scan_ghost_pids();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -477,7 +480,8 @@ pub fn gather_security_info() -> SecurityInfo {
         suspicious_processes,
         mount_masking,      // SEC-021
         reverse_shells,     // SEC-022
-        library_injections, // SEC-023 userspace rootkit / LD_PRELOAD
+        library_injections, // SEC-023
+        ghost_pids,         // SEC-024 true ghost PID / LKM rootkit
     }
 }
 

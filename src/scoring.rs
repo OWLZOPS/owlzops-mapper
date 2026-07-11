@@ -585,6 +585,72 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-024 – True Ghost PID (LKM rootkit process hiding) ─
+    // Split by confidence: confirmed IoCs escalate to exit(3); downgraded
+    // candidates (young/racy/unconfirmable) are a separate non-IoC warning.
+    if !report.security.ghost_pids.is_empty() {
+        let describe = |g: &crate::models::GhostPidFinding| {
+            let st = g.state.as_deref().unwrap_or("?");
+            let age = g
+                .age_secs
+                .map(|a| format!("{a}s"))
+                .unwrap_or_else(|| "age?".to_string());
+            let sock = if g.holds_socket { ", holds socket" } else { "" };
+            format!(
+                "pid {} (state {st}, {age}, via {}{sock})",
+                g.pid, g.confirmed_via
+            )
+        };
+
+        let (hard, soft): (Vec<_>, Vec<_>) = report
+            .security
+            .ghost_pids
+            .iter()
+            .partition(|g| g.confirmed_ioc);
+
+        if !hard.is_empty() {
+            let list = hard
+                .iter()
+                .map(|g| describe(g))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-024",
+                title: "ACTIVE COMPROMISE: Hidden process (LKM rootkit) detected".to_string(),
+                category: Category::Security,
+                weight: 60,
+                evidence: format!(
+                    "{} PID(s) live but hidden from /proc listing: {}",
+                    hard.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        if !soft.is_empty() {
+            let list = soft
+                .iter()
+                .map(|g| describe(g))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-025",
+                title: "Suspicious transient PID visibility mismatch".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} PID(s) with a readdir/stat mismatch, downgraded (young or unconfirmable): {}",
+                    soft.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     // ── SEC-018 – Malicious cron job detected ────────────────
     if let Some(_critical) = report
         .host
@@ -1040,9 +1106,11 @@ impl CriticalFlags {
         };
         // Active-compromise (IoC) finding IDs. SEC-018 is deliberately excluded:
         // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
-        const IOC_IDS: [&str; 9] = [
+        // SEC-025 is likewise excluded: it is a downgraded ghost-PID suspicion
+        // (young/racy/unconfirmable), not a confirmed hidden process.
+        const IOC_IDS: [&str; 10] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "DOCK-010",
+            "SEC-024", "DOCK-010",
         ];
         let count_sysctl = findings
             .iter()
@@ -1723,6 +1791,58 @@ mod tests {
         assert!(
             CriticalFlags::from_report(&r).compromised_host,
             "library injection must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec024_confirmed_ghost_sets_compromised_host() {
+        use crate::models::GhostPidFinding;
+        let mut r = minimal_report();
+        r.security.ghost_pids = vec![GhostPidFinding {
+            pid: 31337,
+            state: Some("R".into()),
+            age_secs: Some(3600),
+            confirmed_via: "stat-path+kill".into(),
+            confirmed_ioc: true,
+            holds_socket: true,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-024")
+            .expect("SEC-024 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("31337"));
+        assert!(f.evidence.contains("holds socket"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "confirmed ghost PID must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec025_downgraded_ghost_does_not_set_compromise() {
+        use crate::models::GhostPidFinding;
+        let mut r = minimal_report();
+        // Young candidate (age < 2s) → downgraded, must NOT escalate to exit-3.
+        r.security.ghost_pids = vec![GhostPidFinding {
+            pid: 4242,
+            state: Some("R".into()),
+            age_secs: Some(1),
+            confirmed_via: "stat-path".into(),
+            confirmed_ioc: false,
+            holds_socket: false,
+        }];
+        assert!(
+            evaluate(&r).iter().any(|f| f.id == "SEC-025"),
+            "SEC-025 downgraded finding fires"
+        );
+        assert!(
+            !evaluate(&r).iter().any(|f| f.id == "SEC-024"),
+            "no hard SEC-024 for a young candidate"
+        );
+        assert!(
+            !CriticalFlags::from_report(&r).compromised_host,
+            "downgraded ghost must not set compromise"
         );
     }
 }

@@ -291,6 +291,8 @@ pub struct SecurityInfo {
     pub reverse_shells: Vec<ReverseShellFinding>,
     #[serde(default)]
     pub library_injections: Vec<LibraryInjectionFinding>,
+    #[serde(default)]
+    pub ghost_pids: Vec<GhostPidFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -548,4 +550,32 @@ pub struct LibraryInjectionFinding {
     /// (implant unlinked to hide from disk inspection).
     #[serde(default)]
     pub is_deleted: bool,
+}
+
+// True Ghost PID — LKM rootkit process hiding (SEC-024)
+
+/// A PID that is live via direct `/proc/<pid>` stat AND/OR `kill(pid,0)` but is
+/// absent from the `readdir("/proc")` listing across multiple probe cycles —
+/// the signature of a getdents64-hooking LKM rootkit (Diamorphine class).
+/// `confirmed_ioc` distinguishes a hard IoC (survived all cycles, age ≥ 2s,
+/// live state) from a downgraded suspicion (young/racy/unconfirmable).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct GhostPidFinding {
+    pub pid: u32,
+    /// Process state from /proc/<pid>/stat (R/S/D/Z/…), if readable.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Age in seconds derived from starttime, if computable.
+    #[serde(default)]
+    pub age_secs: Option<u64>,
+    /// How existence was confirmed: "stat-path", "kill", or "stat-path+kill".
+    /// A "kill"-only confirmation with stat-path ENOENT indicates a rootkit
+    /// hiding the direct /proc path too (advanced variant).
+    pub confirmed_via: String,
+    /// True = hard IoC (exit-3 eligible); false = downgraded suspicion.
+    #[serde(default)]
+    pub confirmed_ioc: bool,
+    /// Corroboration: this hidden PID also owns a network socket.
+    #[serde(default)]
+    pub holds_socket: bool,
 }
