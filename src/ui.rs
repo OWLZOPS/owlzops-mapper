@@ -16,13 +16,25 @@ use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 // Sanitisation helper
 // ---------------------------------------------------------------------------
 
-/// Replace control characters with the Unicode replacement character.
+/// Replace control characters, bidi overrides, and zero-width characters
+/// with the Unicode replacement character (U+FFFD).
 /// Tabs (\t) are converted to 4 spaces to fix comfy_table border alignment calculations.
 pub fn sanitize_terminal(s: &str) -> String {
-    s.replace('\t', "    ")
-        .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => out.push('\u{FFFD}'),          // C0, C1, DEL
+            '\u{202A}'..='\u{202E}'   // bidi overrides (LRE, RLE, PDF, LRO, RLO)
+            | '\u{2066}'..='\u{2069}' // bidi isolates (LRI, RLI, FSI, PDI)
+            | '\u{200B}'..='\u{200D}' // zero-width space, non-joiner, joiner
+            | '\u{2060}'             // word joiner
+            | '\u{FEFF}'             // BOM / zero-width no-break space
+            => out.push('\u{FFFD}'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
