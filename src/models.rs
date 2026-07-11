@@ -289,6 +289,8 @@ pub struct SecurityInfo {
     pub mount_masking: Vec<MountMaskingFinding>,
     #[serde(default)]
     pub reverse_shells: Vec<ReverseShellFinding>,
+    #[serde(default)]
+    pub library_injections: Vec<LibraryInjectionFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -524,4 +526,26 @@ pub struct ReverseShellFinding {
     /// None = socket held on a non-stdio fd (weaker, still reported).
     #[serde(default)]
     pub stdio_fd: Option<u8>,
+}
+
+// Userspace rootkit / library injection (SEC-023)
+
+/// Evidence that a process has a shared object injected from a writable or
+/// ephemeral location — the signature of a userspace rootkit / LD_PRELOAD
+/// implant (libprocesshider, Azazel, Jynx). Sourced from `/proc/<pid>/environ`
+/// (LD_PRELOAD / LD_LIBRARY_PATH pointing at an ephemeral path) and
+/// `/proc/<pid>/maps` (a file-backed .so actually mapped from such a path).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct LibraryInjectionFinding {
+    pub pid: u32,
+    /// Process comm, for the evidence string.
+    pub process: String,
+    /// The offending path (the .so or the LD_* value).
+    pub object_path: String,
+    /// Where it was observed: "LD_PRELOAD", "LD_LIBRARY_PATH", or "maps".
+    pub source: String,
+    /// True when the mapped object is marked "(deleted)" — a stronger IoC
+    /// (implant unlinked to hide from disk inspection).
+    #[serde(default)]
+    pub is_deleted: bool,
 }

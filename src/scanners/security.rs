@@ -457,6 +457,9 @@ pub fn gather_security_info() -> SecurityInfo {
     // --- Reverse-shell / C2 correlation (SEC-022) -------------------------
     let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
 
+    // --- Userspace rootkit / library injection (SEC-023) ------------------
+    let library_injections = crate::scanners::library_injection::scan_library_injections();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -472,8 +475,9 @@ pub fn gather_security_info() -> SecurityInfo {
         secret_hygiene,
         capability_audit,
         suspicious_processes,
-        mount_masking,  // SEC-021
-        reverse_shells, // SEC-022
+        mount_masking,      // SEC-021
+        reverse_shells,     // SEC-022
+        library_injections, // SEC-023 userspace rootkit / LD_PRELOAD
     }
 }
 

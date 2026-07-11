@@ -555,6 +555,36 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-023 – Userspace rootkit / library injection ──────
+    if !report.security.library_injections.is_empty() {
+        let list = report
+            .security
+            .library_injections
+            .iter()
+            .map(|l| {
+                let del = if l.is_deleted { " (deleted)" } else { "" };
+                format!(
+                    "{} (pid {}): {} via {}{}",
+                    l.process, l.pid, l.object_path, l.source, del
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-023",
+            title: "ACTIVE COMPROMISE: Userspace rootkit / library injection detected".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!(
+                "{} injected object(s) from ephemeral paths: {}",
+                report.security.library_injections.len(),
+                list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── SEC-018 – Malicious cron job detected ────────────────
     if let Some(_critical) = report
         .host
@@ -1010,8 +1040,9 @@ impl CriticalFlags {
         };
         // Active-compromise (IoC) finding IDs. SEC-018 is deliberately excluded:
         // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
-        const IOC_IDS: [&str; 8] = [
-            "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "DOCK-010",
+        const IOC_IDS: [&str; 9] = [
+            "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
+            "DOCK-010",
         ];
         let count_sysctl = findings
             .iter()
@@ -1668,6 +1699,30 @@ mod tests {
         assert!(
             CriticalFlags::from_report(&r).compromised_host,
             "reverse shell must set compromise"
+        );
+    }
+
+    #[test]
+    fn sec023_library_injection_sets_compromised_host() {
+        use crate::models::LibraryInjectionFinding;
+        let mut r = minimal_report();
+        r.security.library_injections = vec![LibraryInjectionFinding {
+            pid: 2222,
+            process: "sshd".into(),
+            object_path: "/tmp/hide.so".into(),
+            source: "LD_PRELOAD".into(),
+            is_deleted: false,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-023")
+            .expect("SEC-023 fires");
+        assert_eq!(f.weight, 60);
+        assert!(f.evidence.contains("/tmp/hide.so"));
+        assert!(f.evidence.contains("LD_PRELOAD"));
+        assert!(
+            CriticalFlags::from_report(&r).compromised_host,
+            "library injection must set compromise"
         );
     }
 }

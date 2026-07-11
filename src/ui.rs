@@ -73,6 +73,7 @@ pub fn render_dashboard(report: &AgentReport) {
     render_capability_audit(report);
     render_mount_masking(report);
     render_reverse_shells(report);
+    render_library_injections(report);
 
     if !report.coverage_warnings.is_empty() {
         println!("\n⚠ Coverage Warnings (incomplete data):");
@@ -1278,6 +1279,35 @@ fn render_reverse_shells(report: &AgentReport) {
         ]);
     }
     println!("🚨 Reverse Shell / C2 Connections (SEC‑022):");
+    println!("{t}\n");
+}
+
+// ── SEC-023: Userspace Rootkit / Library Injection ─────────────────────────
+
+fn render_library_injections(report: &AgentReport) {
+    if report.security.library_injections.is_empty() {
+        return;
+    }
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("PID")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Process").add_attribute(Attribute::Bold),
+        Cell::new("Injected Object").add_attribute(Attribute::Bold),
+        Cell::new("Source").add_attribute(Attribute::Bold),
+        Cell::new("Deleted").add_attribute(Attribute::Bold),
+    ]);
+    for l in &report.security.library_injections {
+        t.add_row(vec![
+            Cell::new(l.pid.to_string()),
+            Cell::new(sanitize_terminal(&l.process)),
+            Cell::new(sanitize_terminal(&l.object_path)),
+            Cell::new(&l.source),
+            Cell::new(if l.is_deleted { "yes" } else { "no" }),
+        ]);
+    }
+    println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
     println!("{t}\n");
 }
 

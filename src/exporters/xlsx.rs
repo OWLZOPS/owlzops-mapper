@@ -863,6 +863,7 @@ fn sheet_host_combined(
     write_capability_section(&mut w, report)?;
     write_mount_masking_section(&mut w, report)?;
     write_reverse_shells_section(&mut w, report)?;
+    write_library_injection_section(&mut w, report)?;
     write_packages_section(&mut w, report, false)?;
 
     w.apply_col_widths_with_min(&[12.0, 12.0, 8.0, 12.0, 10.0, 10.0, 20.0, 12.0])?;
@@ -1335,6 +1336,29 @@ fn write_reverse_shells_section(
     Ok(())
 }
 
+// ── SEC-023: Userspace Rootkit / Library Injection ─────────────────────────
+
+fn write_library_injection_section(
+    w: &mut SheetWriter,
+    report: &AgentReport,
+) -> Result<(), XlsxError> {
+    if report.security.library_injections.is_empty() {
+        return Ok(());
+    }
+    w.write_section_title("Userspace Rootkit / Library Injection (SEC-023)")?;
+    w.write_header(&["PID", "Process", "Injected Object", "Source", "Deleted"])?;
+    for l in &report.security.library_injections {
+        let band = w.fmts.row_band(w.current_row());
+        w.write_number(0, l.pid as f64, &w.fmts.integer)?;
+        w.write_string(1, &l.process, band)?;
+        w.write_string(2, &l.object_path, band)?;
+        w.write_string(3, &l.source, band)?;
+        w.write_string(4, if l.is_deleted { "yes" } else { "no" }, band)?;
+        w.next_row();
+    }
+    Ok(())
+}
+
 fn write_packages_section(
     w: &mut SheetWriter,
     report: &AgentReport,
@@ -1577,6 +1601,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
     write_capability_section(&mut w, report)?;
     write_mount_masking_section(&mut w, report)?;
     write_reverse_shells_section(&mut w, report)?;
+    write_library_injection_section(&mut w, report)?;
 
     w.next_row();
 

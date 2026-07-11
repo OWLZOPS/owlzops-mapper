@@ -3,6 +3,7 @@ pub mod capabilities;
 mod dlp;
 pub mod docker;
 pub mod host;
+mod library_injection;
 mod mounts;
 pub mod network;
 pub mod packages;
