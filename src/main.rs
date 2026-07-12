@@ -238,14 +238,21 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     let multi = MultiProgress::new();
 
                     // 1. Upload progress bar (will be passed to ssh_engine)
-                    let upload_bar = multi.add(ProgressBar::new(0));
-                    upload_bar.set_style(
-                        ProgressStyle::default_bar()
-                            .template("{bytes:>9}/{total_bytes:9} [{wide_bar:.cyan/blue}] {msg}")
-                            .unwrap()
-                            .progress_chars("##-"),
-                    );
-                    upload_bar.set_message("uploading binary");
+                    let upload_bar = if sudo_pass.is_some() && args.copy_binary {
+                        let pb = multi.add(ProgressBar::new(0));
+                        pb.set_style(
+                            ProgressStyle::default_bar()
+                                .template(
+                                    "{bytes:>9}/{total_bytes:9} [{wide_bar:.cyan/blue}] {msg}",
+                                )
+                                .unwrap()
+                                .progress_chars("##-"),
+                        );
+                        pb.set_message("uploading binary");
+                        Some(pb)
+                    } else {
+                        None
+                    };
 
                     // 2. Scan spinner
                     let scan_bar = multi.add(ProgressBar::new_spinner());
@@ -318,7 +325,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         a.local_binary.as_deref(),
                                         a.deep,
                                         a.remote_timeout_secs,
-                                        Some(upload_pb), // <- new parameter
+                                        upload_pb, // <- new parameter
                                     )
                                     .await
                                     {
@@ -370,7 +377,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             _ = shutdown_notify.notified() => {
                                 join_set.abort_all();
                                 scan_bar.finish_and_clear();
-                                upload_bar.finish_and_clear();
+                                if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
                                 break;
                             }
                             res = join_set.join_next() => {
@@ -393,7 +400,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         // All tasks finished
                                         let _elapsed = start_time.elapsed();
                                         scan_bar.finish_and_clear();
-                                        upload_bar.finish_and_clear();
+                                        if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
                                         break;
                                     }
                                 }
