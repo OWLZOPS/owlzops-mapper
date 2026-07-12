@@ -180,8 +180,22 @@ pub fn run_child_with_timeout(
     let child_pid = child.id();
     register_child(child_pid);
 
-    let out_pipe = child.stdout.take()?;
-    let err_pipe = child.stderr.take()?;
+    // stdout safety block
+    let Some(out_pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        unregister_child(child_pid);
+        return None;
+    };
+
+    // stderr safety block
+    let Some(err_pipe) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        unregister_child(child_pid);
+        return None;
+    };
+
     let prog = program.to_string();
 
     let out_handle = thread::spawn(move || {
