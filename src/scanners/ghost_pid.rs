@@ -306,11 +306,6 @@ fn candidate_diff(
 
 // ── live-set probe (Tier-B io_uring, Tier-C sync fallback) ────────────────
 
-/// Live-set probe. Tier-B (io_uring, full 1..=pid_max) is taken only for the
-/// real /proc mount — exhaustiveness is affordable when batched, so there is
-/// no allocator-wrap blind spot. For injected roots (tests) or when io_uring
-/// is unavailable/disabled, the bounded Tier-C sync loop runs instead, keeping
-/// those paths fast and deterministic.
 fn probe_live_set(proc_root: &Path) -> BTreeSet<u32> {
     if proc_root == Path::new("/proc")
         && let Some(set) = probe_live_set_iouring(proc_root)
@@ -320,10 +315,7 @@ fn probe_live_set(proc_root: &Path) -> BTreeSet<u32> {
     probe_live_set_sync(proc_root)
 }
 
-/// Tier-B. Returns `None` if io_uring is unavailable or disabled (ENOSYS,
-/// EPERM, kernel.io_uring_disabled) so the caller falls back to Tier-C.
-/// Scans the full 1..=pid_max range (pid_max is the hard ceiling; no live PID
-/// can exceed it), so there is no wrap gap and no coverage tail to record.
+#[cfg(not(target_env = "musl"))]
 fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     use io_uring::{IoUring, opcode, types};
     const RING_DEPTH: u32 = 4096;
@@ -396,9 +388,11 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     Some(set)
 }
 
-/// Tier-C fallback: synchronous stat loop, bounded by ns_last_pid (+ wrap
-/// tail) for acceptable latency without io_uring. `pid_scan_bounds` records
-/// any unscanned (upper, pid_max] range so the bound is never a silent gap.
+#[cfg(target_env = "musl")]
+fn probe_live_set_iouring(_proc_root: &Path) -> Option<BTreeSet<u32>> {
+    None
+}
+
 fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
     let mut set = BTreeSet::new();
     let (upper, wrap_tail) = pid_scan_bounds();
