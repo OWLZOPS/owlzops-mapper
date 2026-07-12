@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 
-> One binary. Zero dependencies. Sub-second host scanning. Identify active compromises, container escapes, and compliance gaps without deploying heavy agents.
+> One binary. Zero dependencies. Sub-second host scanning. Identify active compromises, container escapes, and compliance gaps without deploying heavy agents. 
 
 `owlzops-mapper` is a surgical, self-contained Rust binary designed for rapid forensics, infrastructure hardening and drift monitoring. It performs a deep-state Linux and Docker audit in seconds, securely extracting IoCs (Indicators of Compromise), capability abuses, and misconfigurations — exporting directly to JSONL, Excel, or terminal for SIEM integration. No internet required. No data leaves the server.
 
@@ -49,7 +49,7 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.5.12
+## Highlights v0.5.13
 
 **New Active Compromise Detectors (SEC‑021 – SEC‑025)**
 
@@ -431,6 +431,21 @@ See [LICENSE](LICENSE) for details.
 
 <details>
 <summary>Click to expand changelog</summary>
+
+### v0.5.13 (2026-07-12)
+
+* **Unified russh remote path** – legacy `ssh`/`scp` fallback removed; all remote scans now use the pure‑Rust `russh` engine.
+* **Optional sudo** – `sudo_pass` is now `Option`, allowing direct execution without `sudo` when the SSH user already has root privileges.
+* **False zombie fix** – mapper‑spawned transient zombies are excluded from the zombie count.
+* **Clean progress UI** – `MultiProgress` coordinates upload bar and scan spinner; all bars are cleared with `finish_and_clear()` for a clean terminal.
+* **Spinner message respects `--deep` flag** – “Deep forensic scan in progress” vs. “Auditing systems…”.
+
+### v0.5.12 (2026-07-11)
+
+* **SEC‑021 – SEC‑025** – new active compromise detectors for bind‑mount masking, reverse shells, library injection, and hidden PIDs.
+* **R10 reliability hardening** – upload/cleanup parity, JSONL error tracking, poison‑tolerant tool resolution, child process reaping, terminal sanitisation.
+* **Performance** – Ghost PID scanner bounds to `ns_last_pid`; micro‑yield throttling.
+* **UI completeness** – dedicated sections for new IoC findings in terminal and Excel.
 
 ### v0.5.11 (2026-07-10)
 
