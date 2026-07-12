@@ -294,7 +294,8 @@ async fn cleanup_remote_binary(
 }
 
 /// Connect to a remote host via russh, upload the binary if needed,
-/// execute the audit with `sudo -S`, and return the raw JSON output.
+/// execute the audit (with or without sudo depending on whether `sudo_pass`
+/// is provided), and return the raw JSON output.
 /// Unless `keep_binary` is set, the binary at `remote_path` is removed
 /// afterwards (parity with the legacy SSH path) and the session is
 /// disconnected cleanly via SSH_MSG_DISCONNECT.
@@ -304,7 +305,7 @@ pub async fn run_remote_scan_russh(
     ssh_user: &str,
     ssh_key_path: &str,
     remote_path: &str,
-    sudo_pass: &Zeroizing<String>,
+    sudo_pass: Option<&Zeroizing<String>>, // now optional
     copy_binary: bool,
     keep_binary: bool,
     local_bin: Option<&str>,
@@ -407,30 +408,38 @@ pub async fn run_remote_scan_russh(
                 .await?;
             }
 
-            // Execute audit with sudo -S (force C locale for predictable error messages)
+            // Execute audit, with sudo only if a password was provided
             let mut exec_channel = session
                 .channel_open_session()
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
 
             let deep_arg = if deep { " --deep" } else { "" };
-            exec_channel
-                .exec(
-                    true,
-                    format!(
-                        "LC_ALL=C sudo -k -S -p '' -- {} audit --format json --offline{}",
-                        remote_path, deep_arg
-                    ),
+            let cmd = if sudo_pass.is_some() {
+                format!(
+                    "LC_ALL=C sudo -k -S -p '' -- {} audit --format json --offline{}",
+                    remote_path, deep_arg
                 )
+            } else {
+                format!(
+                    "LC_ALL=C {} audit --format json --offline{}",
+                    remote_path, deep_arg
+                )
+            };
+            exec_channel
+                .exec(true, cmd)
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
 
-            let mut line = Zeroizing::new(sudo_pass.to_string());
-            line.push('\n');
-            exec_channel
-                .data(line.as_bytes())
-                .await
-                .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+            // Send password only if we have one
+            if let Some(pass) = sudo_pass {
+                let mut line = Zeroizing::new(pass.to_string());
+                line.push('\n');
+                exec_channel
+                    .data(line.as_bytes())
+                    .await
+                    .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+            }
             exec_channel
                 .eof()
                 .await
@@ -484,9 +493,11 @@ pub async fn run_remote_scan_russh(
                 Some(code) => {
                     let se = String::from_utf8_lossy(&stderr);
 
-                    if se.contains("incorrect password")
-                        || se.contains("Sorry, try again")
-                        || se.contains("a password is required")
+                    // sudo password rejection is only relevant when we sent one
+                    if sudo_pass.is_some()
+                        && (se.contains("incorrect password")
+                            || se.contains("Sorry, try again")
+                            || se.contains("a password is required"))
                     {
                         Err(RemoteError::SudoAuth {
                             host: hostname_for_timeout.clone(),

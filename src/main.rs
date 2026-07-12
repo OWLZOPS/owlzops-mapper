@@ -18,7 +18,7 @@ use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use models::{AgentReport, HostDiffStatus};
-use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
+use runner::{is_local_host, run_local_scan_async, snapshot_run};
 use scoring::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -64,26 +64,6 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     }
 
     if flags.has_critical() { 1 } else { 0 }
-}
-
-async fn run_remote_scan_with_timeout(
-    host: String,
-    args: AuditArgs,
-) -> Result<Option<AgentReport>, tokio::task::JoinError> {
-    let host_for_log = host.clone();
-    let cap = host_budget_secs(args.remote_timeout_secs);
-    match tokio::time::timeout(
-        Duration::from_secs(cap),
-        tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
-    )
-    .await
-    {
-        Ok(inner) => inner,
-        Err(_elapsed) => {
-            warn!(host = %host_for_log, "remote scan timed out after {}s", cap);
-            Ok(None)
-        }
-    }
 }
 
 fn raise_nofile_limit() {
@@ -142,6 +122,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     }
                 }
 
+                // Resolve sudo password once (before any progress bars)
                 let sudo_pass: Option<Arc<Zeroizing<String>>> = if args.ask_sudo_pass {
                     match ssh_engine::resolve_sudo_password() {
                         Ok(p) => Some(Arc::new(p)),
@@ -237,7 +218,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     // ========== MULTIPROGRESS SETUP ==========
                     let multi = MultiProgress::new();
 
-                    // 1. Upload progress bar (will be passed to ssh_engine)
+                    // 1. Upload progress bar (only when we copy a binary)
                     let upload_bar = if sudo_pass.is_some() && args.copy_binary {
                         let pb = multi.add(ProgressBar::new(0));
                         pb.set_style(
@@ -310,51 +291,47 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
-                                if let Some(pw) = &pass {
-                                    let ssh_key_expanded =
-                                        shellexpand::tilde(&a.ssh_key).to_string();
-                                    // Pass upload_bar into ssh_engine
-                                    match ssh_engine::run_remote_scan_russh(
-                                        &host,
-                                        &a.ssh_user,
-                                        &ssh_key_expanded,
-                                        &a.remote_path,
-                                        pw,
-                                        a.copy_binary,
-                                        a.keep_binary,
-                                        a.local_binary.as_deref(),
-                                        a.deep,
-                                        a.remote_timeout_secs,
-                                        upload_pb, // <- new parameter
-                                    )
-                                    .await
-                                    {
-                                        Ok(stdout) => {
-                                            match serde_json::from_slice::<AgentReport>(&stdout) {
-                                                Ok(report) => Some(report),
-                                                Err(e) => {
-                                                    let preview: String =
-                                                        String::from_utf8_lossy(&stdout)
-                                                            .chars()
-                                                            .take(200)
-                                                            .collect();
-                                                    warn!(
-                                                        host = %host,
-                                                        error = %e,
-                                                        preview = %preview,
-                                                        "remote output is not a valid AgentReport"
-                                                    );
-                                                    None
-                                                }
+                                let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+
+                                // Single russh call – sudo_pass is optional
+                                match ssh_engine::run_remote_scan_russh(
+                                    &host,
+                                    &a.ssh_user,
+                                    &ssh_key_expanded,
+                                    &a.remote_path,
+                                    pass.as_deref(), // Option<&Zeroizing<String>>
+                                    a.copy_binary,
+                                    a.keep_binary,
+                                    a.local_binary.as_deref(),
+                                    a.deep,
+                                    a.remote_timeout_secs,
+                                    upload_pb,
+                                )
+                                .await
+                                {
+                                    Ok(stdout) => {
+                                        match serde_json::from_slice::<AgentReport>(&stdout) {
+                                            Ok(report) => Some(report),
+                                            Err(e) => {
+                                                let preview: String =
+                                                    String::from_utf8_lossy(&stdout)
+                                                        .chars()
+                                                        .take(200)
+                                                        .collect();
+                                                warn!(
+                                                    host = %host,
+                                                    error = %e,
+                                                    preview = %preview,
+                                                    "remote output is not a valid AgentReport"
+                                                );
+                                                None
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!(host = %host, error = %e, "russh scan failed");
-                                            None
-                                        }
                                     }
-                                } else {
-                                    run_remote_scan_with_timeout(host, a).await.ok().flatten()
+                                    Err(e) => {
+                                        warn!(host = %host, error = %e, "russh scan failed");
+                                        None
+                                    }
                                 }
                             })
                             .await;
