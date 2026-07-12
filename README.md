@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 
-> One binary. Zero dependencies. Sub-second host scanning. Identify active compromises, container escapes, and compliance gaps without deploying heavy agents. 
+> One binary. Zero dependencies. Sub-second host scanning. Identify active compromises, container escapes, and compliance gaps without deploying heavy agents.
 
 `owlzops-mapper` is a surgical, self-contained Rust binary designed for rapid forensics, infrastructure hardening and drift monitoring. It performs a deep-state Linux and Docker audit in seconds, securely extracting IoCs (Indicators of Compromise), capability abuses, and misconfigurations — exporting directly to JSONL, Excel, or terminal for SIEM integration. No internet required. No data leaves the server.
 
@@ -70,6 +70,13 @@ sudo ./owlzops-mapper audit
 * Legacy SSH children are registered and sent `SIGTERM` on graceful shutdown.
 * PID and EUID columns in Excel reports render as integers.
 * TCP_NODELAY is enabled on russh sockets for lower upload latency.
+
+**Infrastructure & UX Improvements**
+
+* **Unified russh remote path** – the system `ssh`/`scp` fallback has been removed; all remote scans now use the pure‑Rust `russh` engine, eliminating terminal capture issues and dependency on external binaries.
+* **Optional sudo** – `sudo_pass` is now optional in `run_remote_scan_russh`. When no password is supplied (e.g., passwordless sudo or root‑key setups), the remote command executes directly without `sudo`, keeping the UX clean.
+* **False zombie fix** – transient zombies created by the mapper's own child processes are now filtered out, ensuring accurate zombie counts in reports.
+* **Clean progress UI** – `MultiProgress` coordinates the upload progress bar and the scan spinner. Bars are automatically cleared from the terminal (`finish_and_clear()`) once they finish, leaving the final report uncluttered. The spinner only appears after any sudo password prompt, preventing TTY interference.
 
 **Performance & Infrastructure**
 
@@ -175,6 +182,8 @@ uploads itself to `/tmp/owlzops-mapper`, executes the audit, collects
 the JSON results, removes the binary from each host, and produces a
 single multi‑sheet Excel report.  No agent installation, no open ports
 beyond SSH.
+
+*Note: the mapper now uses the `russh` library exclusively for all SSH operations – no external `ssh` or `scp` binaries are required, ensuring consistent behaviour regardless of the local `~/.ssh/config`.*
 
 ### Snapshotting & drift monitoring
 
