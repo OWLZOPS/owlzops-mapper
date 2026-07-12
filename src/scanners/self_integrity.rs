@@ -29,6 +29,7 @@
 //! Out‑of‑band attestation (TPM, remote observer) is the only true anchor.
 
 use std::fs;
+use std::io::Read;
 
 // ---------------------------------------------------------------------------
 // public interface
@@ -43,7 +44,6 @@ pub struct IntegrityReport {
 }
 
 /// Execute all self‑integrity checks and return a report.
-#[allow(dead_code)]
 pub fn run_self_integrity_check() -> IntegrityReport {
     let mut report = IntegrityReport::default();
 
@@ -78,10 +78,11 @@ fn check_proc_self_status(report: &mut IntegrityReport) {
         if let Some(rest) = line.strip_prefix("Seccomp:") {
             let val = rest.trim();
             if val == "2" {
-                report.compromised = true;
+                // Seccomp filter is active – common in containers and hardened units.
+                // Do NOT mark as compromised; only add a note.
                 report.warnings.push(
-                    "self-integrity WARNING: Seccomp filter is active on the mapper process. \
-                     Possible rootkit tampering via parent lifecycle injection."
+                    "self-integrity NOTE: Seccomp filter is active on the mapper process. \
+                     Expected under container/hardened unit; tamper only if unexpected on bare metal."
                         .to_string(),
                 );
             }
@@ -91,9 +92,10 @@ fn check_proc_self_status(report: &mut IntegrityReport) {
         if let Some(rest) = line.strip_prefix("NoNewPrivs:")
             && rest.trim() == "1"
         {
-            report.compromised = true;
+            // NoNewPrivs is set – normal in containers. Do NOT mark as compromised.
             report.warnings.push(
-                "self-integrity WARNING: NoNewPrivs is unexpectedly set on the mapper process."
+                "self-integrity NOTE: NoNewPrivs is set on the mapper process. \
+                 Expected in containers/hardened units."
                     .to_string(),
             );
         }
@@ -117,19 +119,28 @@ fn check_proc_self_status(report: &mut IntegrityReport) {
 }
 
 fn check_proc_self_maps(report: &mut IntegrityReport) {
-    match fs::metadata("/proc/self/maps") {
-        Ok(meta) if meta.len() > 0 => { /* ok */ }
-        Ok(_) => {
-            report.compromised = true;
-            report.warnings.push(
-                "self-integrity CRITICAL: /proc/self/maps is empty – kernel/rootkit is hiding memory mappings"
-                    .to_string(),
-            );
+    // Attempt to read at least 1 byte to confirm the file is present and non-empty.
+    match fs::File::open("/proc/self/maps") {
+        Ok(mut f) => {
+            let mut buf = [0u8; 1];
+            match f.read(&mut buf) {
+                Ok(1) => { /* ok */ }
+                Ok(0) => {
+                    report.compromised = true;
+                    report.warnings.push(
+                        "self-integrity CRITICAL: /proc/self/maps is empty – kernel/rootkit is hiding memory mappings"
+                            .to_string(),
+                    );
+                }
+                _ => {
+                    // couldn't read – soft fail, other checks may catch
+                }
+            }
         }
         Err(e) => {
             report.compromised = true;
             report.warnings.push(format!(
-                "self-integrity CRITICAL: cannot stat /proc/self/maps ({e})"
+                "self-integrity CRITICAL: cannot open /proc/self/maps ({e})"
             ));
         }
     }

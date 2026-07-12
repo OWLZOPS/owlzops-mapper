@@ -555,11 +555,16 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023 – Userspace rootkit / library injection ──────
-    if !report.security.library_injections.is_empty() {
-        let list = report
-            .security
-            .library_injections
+    // ── SEC-023 & SEC-026 – Library injection & Anomalous executable memory ──
+    let (hard_injections, anon_execs): (Vec<_>, Vec<_>) = report
+        .security
+        .library_injections
+        .iter()
+        .partition(|l| l.source != "maps-anon-exec");
+
+    // Hard IoC: real injections (LD_PRELOAD, ephemeral .so, etc.)
+    if !hard_injections.is_empty() {
+        let list = hard_injections
             .iter()
             .map(|l| {
                 let del = if l.is_deleted { " (deleted)" } else { "" };
@@ -577,7 +582,29 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 60,
             evidence: format!(
                 "{} injected object(s) from ephemeral paths: {}",
-                report.security.library_injections.len(),
+                hard_injections.len(),
+                list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // Suspicious executable memory (anon/rwx), not an active compromise
+    if !anon_execs.is_empty() {
+        let list = anon_execs
+            .iter()
+            .map(|l| format!("{} (pid {}): {}", l.process, l.pid, l.object_path))
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-026",
+            title: "Suspicious executable memory mapping (anon/rwx)".to_string(),
+            category: Category::Security,
+            weight: 20,
+            evidence: format!(
+                "{} process(es) with anomalous memory mappings: {}",
+                anon_execs.len(),
                 list
             ),
             suppressed: None,
@@ -586,8 +613,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-024 – True Ghost PID (LKM rootkit process hiding) ─
-    // Split by confidence: confirmed IoCs escalate to exit(3); downgraded
-    // candidates (young/racy/unconfirmable) are a separate non-IoC warning.
     if !report.security.ghost_pids.is_empty() {
         let describe = |g: &crate::models::GhostPidFinding| {
             let st = g.state.as_deref().unwrap_or("?");
@@ -1108,6 +1133,8 @@ impl CriticalFlags {
         // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
         // SEC-025 is likewise excluded: it is a downgraded ghost-PID suspicion
         // (young/racy/unconfirmable), not a confirmed hidden process.
+        // SEC-026 is excluded: suspicious memory mappings (anon/rwx) are not
+        // confirmed active compromise, but may indicate JIT or driver activity.
         const IOC_IDS: [&str; 10] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
             "SEC-024", "DOCK-010",
@@ -1170,6 +1197,8 @@ mod tests {
             is_root_execution: true,
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
+            scoring_version: 1,
+            self_integrity: None,
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),
@@ -1177,8 +1206,6 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
-            scoring_version: 1,
-            self_integrity: None,
         }
     }
 
