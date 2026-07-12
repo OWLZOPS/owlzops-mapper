@@ -203,7 +203,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
-                        local_spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
+                        local_spinner
+                            .set_message("Deep forensic scan in progress (may take 10–30s)");
                     } else {
                         local_spinner.set_message("Auditing local system...");
                     }

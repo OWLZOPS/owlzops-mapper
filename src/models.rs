@@ -485,6 +485,11 @@ pub struct ProcCapFinding {
     #[serde(default)]
     pub seccomp: Option<u8>,
     pub critical_caps: Vec<String>,
+    /// Set to "ambient_caps_no_new_privs" when a non-root process holds
+    /// ambient capabilities with NoNewPrivs disabled – a strong signal of
+    /// misconfiguration or preparation for privilege escalation.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // Bind‑mount / overlay masking (SEC‑021)

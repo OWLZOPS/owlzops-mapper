@@ -8,6 +8,11 @@
 //!     ephemeral path (catches ptrace/dlopen implants even after the env var
 //!     is scrubbed). A "(deleted)" mapped object is treated as a stronger IoC.
 //!
+//! Additionally, the scan now flags `LD_AUDIT` and `LD_PROFILE`, two less
+//! known but equally powerful dynamic linker variables that can force the
+//! loading of a shared object into every process started by the affected
+//! binary (MITRE T1574.006).
+//!
 //! FP control is by funnel, reusing the existing `is_ephemeral_exec_path`
 //! contract (the same /tmp,/var/tmp,/dev/shm,/home,/memfd: set that already
 //! drives SEC-013/015). Legit software does not preload .so from these paths.
@@ -27,7 +32,7 @@ const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
 /// Hard cap on stored findings.
 const MAX_FINDINGS: usize = 64;
 /// LD_* keys whose ephemeral value indicates injection.
-const INJECT_ENV_KEYS: [&str; 2] = ["LD_PRELOAD", "LD_LIBRARY_PATH"];
+const INJECT_ENV_KEYS: [&str; 4] = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE"];
 
 pub fn scan_library_injections() -> Vec<LibraryInjectionFinding> {
     detect_from_proc("/proc")
@@ -66,7 +71,7 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
 
         let mut pid_hits = 0usize;
 
-        // ── Source 1: environ (LD_PRELOAD / LD_LIBRARY_PATH) ──────────
+        // ── Source 1: environ (LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT / LD_PROFILE) ──
         match safe_io::read_file_bytes_capped(
             &format!("{proc_root}/{pid}/environ"),
             safe_io::CAP_PROC_ENVIRON,
@@ -90,6 +95,10 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
                     else {
                         continue;
                     };
+                    // For LD_AUDIT and LD_PROFILE the value is a single path,
+                    // but we reuse the same loop: split on colon/space for
+                    // compatibility with colon-separated lists (common in
+                    // LD_LIBRARY_PATH). This is harmless for single-path vars.
                     for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
                         if crate::utils::is_ephemeral_exec_path(path) {
                             findings.push(LibraryInjectionFinding {
@@ -326,6 +335,24 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].object_path, "/dev/shm/x");
         assert_eq!(out[0].source, "LD_LIBRARY_PATH");
+    }
+
+    #[test]
+    fn environ_ld_audit_from_tmp_is_flagged() {
+        let proc = fake_pid(1342, "sshd", &["LD_AUDIT=/dev/shm/audit.so"], "");
+        let out = detect_from_proc(proc.path().to_str().unwrap());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/dev/shm/audit.so");
+        assert_eq!(out[0].source, "LD_AUDIT");
+    }
+
+    #[test]
+    fn environ_ld_profile_from_tmp_is_flagged() {
+        let proc = fake_pid(1343, "java", &["LD_PROFILE=/tmp/prof.so"], "");
+        let out = detect_from_proc(proc.path().to_str().unwrap());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/tmp/prof.so");
+        assert_eq!(out[0].source, "LD_PROFILE");
     }
 
     #[test]
