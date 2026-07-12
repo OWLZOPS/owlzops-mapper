@@ -203,8 +203,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
-                        local_spinner
-                            .set_message("Deep forensic scan in progress (may take 10–30s)");
+                        local_spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
                     } else {
                         local_spinner.set_message("Auditing local system...");
                     }
@@ -470,7 +469,23 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             }
 
             // Single local scan
+            let local_spinner = ProgressBar::new_spinner();
+            local_spinner.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
+            );
+            if args.deep {
+                local_spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
+            } else {
+                local_spinner.set_message("Auditing local system...");
+            }
+            local_spinner.enable_steady_tick(Duration::from_millis(100));
+
             let report = run_local_scan_async(&args).await;
+
+            local_spinner.finish_and_clear();
+
             let exit_code = compute_exit_code(&report);
             if let Err(e) = output::output_single(
                 &report,
