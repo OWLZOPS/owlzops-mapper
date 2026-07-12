@@ -164,30 +164,6 @@ pub fn terminate_registered_children() {
 // Child helpers
 // ---------------------------------------------------------------------------
 
-/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
-/// R10-05: defensive reap in the `Err(_)` branch so no zombie escapes.
-fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if start.elapsed() < deadline => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                return child.wait().ok();
-            }
-            Err(_) => {
-                // try_wait failed (realistically ECHILD) – reap defensively
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-}
-
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
@@ -250,6 +226,30 @@ pub fn run_child_with_timeout(
         stdout: out_handle.join().unwrap_or_default(),
         stderr: err_handle.join().unwrap_or_default(),
     })
+}
+
+/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
+/// R10-05: defensive reap in the `Err(_)` branch so no zombie escapes.
+fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if start.elapsed() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return child.wait().ok();
+            }
+            Err(_) => {
+                // try_wait failed (realistically ECHILD) – reap defensively
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 pub fn run_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
