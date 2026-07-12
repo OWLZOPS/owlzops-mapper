@@ -148,6 +148,8 @@ fn decode_v6(hex: &str) -> Option<String> {
 
 /// True only for globally-routable addresses. RFC1918, loopback, link-local,
 /// CGNAT (100.64/10), and IPv6 ULA/loopback are treated as internal (not C2).
+/// IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are converted back to IPv4
+/// and classified with the IPv4 rules.
 fn is_public_addr(ip: &str) -> bool {
     if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
         let o = v4.octets();
@@ -161,6 +163,10 @@ fn is_public_addr(ip: &str) -> bool {
         return !internal;
     }
     if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
+        // Unwrap IPv4-mapped addresses (::ffff:a.b.c.d) and classify as IPv4.
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return is_public_addr(&v4.to_string());
+        }
         let internal = v6.is_loopback()
             || v6.is_unspecified()
             || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
@@ -200,6 +206,8 @@ fn correlate_with_processes(
         }
     };
 
+    const MAX_FD_PER_PID: usize = 4096;
+
     for entry in entries.flatten() {
         if findings.len() >= MAX_FINDINGS {
             break;
@@ -231,10 +239,18 @@ fn correlate_with_processes(
         };
 
         let mut exe_cache: Option<Option<String>> = None;
-        // Track the best hit for this pid: a stdio-fd match wins over non-stdio.
         let mut best: Option<ReverseShellFinding> = None;
+        let mut fd_seen = 0usize;
 
         for fd in fds.flatten() {
+            fd_seen += 1;
+            if fd_seen > MAX_FD_PER_PID {
+                coverage::record(format!(
+                    "/proc/{pid}/fd exceeded {MAX_FD_PER_PID} entries – reverse-shell correlation for this pid is partial"
+                ));
+                break;
+            }
+
             // fd number is the file name (0,1,2,…).
             let fd_num: Option<u8> = fd.file_name().to_str().and_then(|s| s.parse().ok());
             let Ok(target) = fs::read_link(fd.path()) else {
@@ -333,6 +349,19 @@ mod tests {
         assert!(!is_public_addr("fc00::1"));
         assert!(!is_public_addr("fe80::1"));
         assert!(is_public_addr("2606:4700:4700::1111"));
+    }
+
+    #[test]
+    fn v4_mapped_ipv6_classification() {
+        // public IPv4 mapped into IPv6
+        assert!(is_public_addr("::ffff:8.8.8.8"));
+        // internal IPv4 mapped into IPv6 (10.0.0.1, 192.168.1.1) → not public
+        assert!(!is_public_addr("::ffff:10.0.0.1"));
+        assert!(!is_public_addr("::ffff:192.168.1.1"));
+        // pure IPv6 remains unchanged (public)
+        assert!(is_public_addr("2001:4860:4860::8888"));
+        // link-local always false
+        assert!(!is_public_addr("fe80::1"));
     }
 
     // ── comm allowlist ──────────────────────────────────────

@@ -1300,6 +1300,7 @@ mod tests {
             no_new_privs: Some(false),
             seccomp: Some(2),
             critical_caps: vec!["CAP_NET_RAW".into()],
+            reason: None,
         }];
         r.network.listening_ports = vec![PortInfo {
             protocol: "tcp".into(),
@@ -1350,6 +1351,7 @@ mod tests {
             no_new_privs: Some(false),
             seccomp: Some(0),
             critical_caps: vec!["CAP_SYS_ADMIN".into()],
+            reason: None,
         };
         let port = |bind: &str, exe: Option<&str>, pid| PortInfo {
             protocol: "tcp".into(),
@@ -1587,6 +1589,7 @@ mod tests {
             no_new_privs: Some(false),
             seccomp: Some(0),
             critical_caps: caps,
+            reason: None,
         };
         let fileless = |pid: u32, euid: u32, exe: Option<&str>| SuspiciousProcess {
             pid,

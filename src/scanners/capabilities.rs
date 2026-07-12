@@ -503,6 +503,14 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
             continue;
         }
 
+        // CAP-002: ambient caps without NoNewPrivs on a non-root process.
+        // A strong signal of misconfiguration or preparation for privilege escalation.
+        let reason = if st.caps.ambient != 0 && st.no_new_privs != Some(true) {
+            Some("ambient_caps_no_new_privs".to_string())
+        } else {
+            None
+        };
+
         findings.push(ProcCapFinding {
             pid,
             comm: st.name,
@@ -515,6 +523,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
             no_new_privs: st.no_new_privs,
             seccomp: st.seccomp,
             critical_caps: critical,
+            reason,
         });
     }
 
@@ -657,6 +666,8 @@ NoNewPrivs:\t0\nSeccomp:\t2\n";
         assert!(!f.critical_caps.iter().any(|c| c == "CAP_SYS_ADMIN"));
         assert_eq!(f.no_new_privs, Some(false));
         assert_eq!(f.seccomp, Some(2));
+        // No ambient caps in this Docker default set, so reason should be None.
+        assert!(f.reason.is_none());
     }
 
     #[test]
@@ -691,6 +702,48 @@ NoNewPrivs:\t1\nSeccomp:\t2\n",
         assert!(findings[0].critical_caps.is_empty());
         assert_eq!(findings[0].no_new_privs, Some(true));
         assert_eq!(findings[0].seccomp, Some(2));
+        // NoNewPrivs is enabled (1), so reason must be None.
+        assert!(findings[0].reason.is_none());
+    }
+
+    #[test]
+    fn ambient_no_new_privs_off_triggers_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_proc(
+            tmp.path(),
+            1001,
+            "Name:\thax\nUid:\t1000\t1000\t1000\t1000\n\
+CapInh:\t0000000000000400\nCapPrm:\t0000000000000400\nCapEff:\t0000000000000400\n\
+CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000400\n\
+NoNewPrivs:\t0\nSeccomp:\t0\n",
+        );
+        let (findings, _) = audit_host_processes(tmp.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].reason.as_deref(),
+            Some("ambient_caps_no_new_privs")
+        );
+    }
+
+    #[test]
+    fn ambient_no_new_privs_missing_is_treated_as_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No "NoNewPrivs:" line at all (older kernel)
+        write_proc(
+            tmp.path(),
+            1002,
+            "Name:\tlegacy\nUid:\t1000\t1000\t1000\t1000\n\
+CapInh:\t0000000000000400\nCapPrm:\t0000000000000400\nCapEff:\t0000000000000400\n\
+CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000400\n\
+Seccomp:\t0\n",
+        );
+        let (findings, _) = audit_host_processes(tmp.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].reason.as_deref(),
+            Some("ambient_caps_no_new_privs"),
+            "missing NoNewPrivs line implies no protection"
+        );
     }
 
     #[test]

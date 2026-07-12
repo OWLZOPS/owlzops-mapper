@@ -525,6 +525,8 @@ fn socket_owning_pids() -> BTreeSet<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return set;
     };
+    const MAX_FD_PER_PID: usize = 4096;
+
     for e in entries.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
@@ -533,7 +535,15 @@ fn socket_owning_pids() -> BTreeSet<u32> {
         let Ok(fds) = fs::read_dir(&fd_dir) else {
             continue;
         };
+        let mut fd_seen = 0usize;
         for fd in fds.flatten() {
+            fd_seen += 1;
+            if fd_seen > MAX_FD_PER_PID {
+                coverage::record(format!(
+                    "/proc/{pid}/fd exceeded {MAX_FD_PER_PID} entries – ghost pid socket scan for this pid is partial"
+                ));
+                break;
+            }
             if let Ok(t) = fs::read_link(fd.path())
                 && t.to_str().is_some_and(|s| s.starts_with("socket:["))
             {
