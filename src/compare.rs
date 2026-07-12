@@ -4,6 +4,8 @@ use crate::models::{
 };
 use std::collections::{HashMap, HashSet};
 
+use crate::ui::sanitize_terminal as st; // R11‑02: sanitize terminal output
+
 fn sev_rank(s: &Severity) -> u8 {
     match s {
         Severity::Degraded => 0,
@@ -652,19 +654,19 @@ fn human_span(before: &str, after: &str) -> Option<(String, bool)> {
 
 /// Terminal output with colored table (using comfy_table)
 pub fn print_diff_terminal(report: &DiffReport) {
-    // Metadata header
+    // Metadata header – all strings from reports are sanitized before printing
     if let (Some(b), Some(a)) = (&report.before, &report.after) {
-        println!("  host:    {}", b.hostname);
+        println!("  host:    {}", st(&b.hostname));
         println!(
             "  before: {}  (v{}, risk {})",
-            fmt_ts(&b.timestamp),
-            b.version,
+            st(&fmt_ts(&b.timestamp)),
+            st(&b.version),
             b.risk_score
         );
         println!(
             "  after:  {}  (v{}, risk {})",
-            fmt_ts(&a.timestamp),
-            a.version,
+            st(&fmt_ts(&a.timestamp)),
+            st(&a.version),
             a.risk_score
         );
         match human_span(&b.timestamp, &a.timestamp) {
@@ -677,7 +679,8 @@ pub fn print_diff_terminal(report: &DiffReport) {
         if b.hostname != a.hostname {
             println!(
                 "  \x1b[1;33m[!] comparing different hosts: {} vs {}\x1b[0m",
-                b.hostname, a.hostname
+                st(&b.hostname),
+                st(&a.hostname)
             );
         }
     }
@@ -712,9 +715,9 @@ pub fn print_diff_terminal(report: &DiffReport) {
         };
 
         table.add_row(vec![
-            Cell::new(&change.field),
-            Cell::new(before),
-            Cell::new(after),
+            Cell::new(st(&change.field)), // R11‑02
+            Cell::new(st(before)),
+            Cell::new(st(after)),
             severity_cell,
         ]);
     }

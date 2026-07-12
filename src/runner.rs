@@ -89,8 +89,13 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             tokio::task::spawn_blocking(crate::scanners::network::gather_network_info);
         let storage_task =
             tokio::task::spawn_blocking(crate::scanners::storage::gather_storage_info);
-        let security_task =
-            tokio::task::spawn_blocking(crate::scanners::security::gather_security_info);
+
+        // SecurityInfo теперь зависит от --deep
+        let deep = args.deep;
+        let security_task = tokio::task::spawn_blocking(move || {
+            crate::scanners::security::gather_security_info(deep)
+        });
+
         let packages_task = tokio::task::spawn_blocking(move || {
             crate::scanners::packages::gather_packages_info(want_refresh_packages)
         });

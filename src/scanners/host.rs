@@ -253,6 +253,9 @@ fn gather_process_and_tech(
     let mut pid_info: HashMap<u32, (String, u32)> = HashMap::new();
     let mut zombie_details: Vec<ZombieInfo> = Vec::new();
 
+    // Get PID of this mapper process to skip its own zombies
+    let my_pid = std::process::id() as u32;
+
     for (pid, proc) in sys.processes() {
         let pid_u32 = pid.as_u32();
         let name = proc.name().to_string();
@@ -260,6 +263,11 @@ fn gather_process_and_tech(
         pid_info.insert(pid_u32, (name.clone(), ppid));
 
         if proc.status() == ProcessStatus::Zombie {
+            // Skip zombies that are children of the mapper itself
+            if ppid == my_pid {
+                continue;
+            }
+
             zombie_processes += 1;
             if zombie_details.len() < 10 {
                 zombie_details.push(ZombieInfo {

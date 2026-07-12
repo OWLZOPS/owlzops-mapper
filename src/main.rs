@@ -16,18 +16,22 @@ mod utils;
 use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use models::{AgentReport, HostDiffStatus};
-use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
+use runner::{is_local_host, run_local_scan_async, snapshot_run};
 use scoring::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
 use zeroize::Zeroizing;
+
+// R11-02: sanitize hostname when printing to terminal in compare paths
+use crate::ui::sanitize_terminal as st;
 
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -36,11 +40,6 @@ fn is_running_as_root() -> bool {
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let flags = CriticalFlags::from_report(report);
 
-    // Active compromise takes precedence over incompleteness and hygiene: a
-    // detected IoC is the single most actionable signal. Distinct code 3 — NOT 2,
-    // which already means "incomplete/not-root" — so pipelines can trigger paging
-    // separately from a normal build failure.
-    // Exit ladder: 3 = compromised > 2 = incomplete/degraded > 1 = critical > 0 = clean.
     if flags.compromised_host {
         warn!(
             "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
@@ -65,26 +64,6 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
     }
 
     if flags.has_critical() { 1 } else { 0 }
-}
-
-async fn run_remote_scan_with_timeout(
-    host: String,
-    args: AuditArgs,
-) -> Result<Option<AgentReport>, tokio::task::JoinError> {
-    let host_for_log = host.clone();
-    let cap = host_budget_secs(args.remote_timeout_secs);
-    match tokio::time::timeout(
-        Duration::from_secs(cap),
-        tokio::task::spawn_blocking(move || run_remote_scan(&host, &args)),
-    )
-    .await
-    {
-        Ok(inner) => inner,
-        Err(_elapsed) => {
-            warn!(host = %host_for_log, "remote scan timed out after {}s", cap);
-            Ok(None)
-        }
-    }
 }
 
 fn raise_nofile_limit() {
@@ -143,6 +122,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     }
                 }
 
+                // Resolve sudo password once (before any progress bars)
                 let sudo_pass: Option<Arc<Zeroizing<String>>> = if args.ask_sudo_pass {
                     match ssh_engine::resolve_sudo_password() {
                         Ok(p) => Some(Arc::new(p)),
@@ -182,8 +162,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 let writer_task = if let (Some(rx), Some(file)) = (rx_chan, jsonl_file.take()) {
                     Some(tokio::task::spawn_blocking(move || {
                         use std::io::Write;
-                        // R10-02: buffered writes; I/O errors are counted and
-                        // logged instead of silently losing records.
                         let mut file = std::io::BufWriter::new(file);
                         let mut rx = rx;
                         let mut written = 0usize;
@@ -237,6 +215,42 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                 // Process remote hosts with JoinSet + Semaphore + global timeout
                 if !remote.is_empty() {
+                    // ========== MULTIPROGRESS SETUP ==========
+                    let multi = MultiProgress::new();
+
+                    // 1. Upload progress bar (only when we copy a binary)
+                    let upload_bar = if sudo_pass.is_some() && args.copy_binary {
+                        let pb = multi.add(ProgressBar::new(0));
+                        pb.set_style(
+                            ProgressStyle::default_bar()
+                                .template(
+                                    "{bytes:>9}/{total_bytes:9} [{wide_bar:.cyan/blue}] {msg}",
+                                )
+                                .unwrap()
+                                .progress_chars("##-"),
+                        );
+                        pb.set_message("uploading binary");
+                        Some(pb)
+                    } else {
+                        None
+                    };
+
+                    // 2. Scan spinner
+                    let scan_bar = multi.add(ProgressBar::new_spinner());
+                    scan_bar.set_style(
+                        ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
+                            .unwrap()
+                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
+                    );
+                    if args.deep {
+                        scan_bar.set_message("Deep forensic scan in progress (may take 10–30s)");
+                    } else {
+                        scan_bar.set_message("Auditing systems...");
+                    }
+                    scan_bar.enable_steady_tick(Duration::from_millis(100));
+                    let start_time = Instant::now();
+                    // ==========================================
+
                     let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
                     let mut join_set = tokio::task::JoinSet::new();
 
@@ -252,6 +266,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         };
                         let pass = sudo_pass.clone();
                         let host_for_log = host.clone();
+                        let upload_pb = upload_bar.clone(); // clone to pass into ssh_engine
+
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
 
@@ -275,54 +291,50 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
 
                             let result = tokio::time::timeout(overall, async {
-                                if let Some(pw) = &pass {
-                                    let ssh_key_expanded =
-                                        shellexpand::tilde(&a.ssh_key).to_string();
-                                    match ssh_engine::run_remote_scan_russh(
-                                        &host,
-                                        &a.ssh_user,
-                                        &ssh_key_expanded,
-                                        &a.remote_path,
-                                        pw,
-                                        a.copy_binary,
-                                        a.keep_binary,   // R10-01: прокидываем keep_binary
-                                        a.local_binary.as_deref(),
-                                        a.remote_timeout_secs,
-                                    )
-                                        .await
-                                    {
-                                        Ok(stdout) => {
-                                            // R10-03: parse from bytes (no full lossy
-                                            // copy) and surface failures instead of
-                                            // silently dropping the host.
-                                            match serde_json::from_slice::<AgentReport>(&stdout) {
-                                                Ok(report) => Some(report),
-                                                Err(e) => {
-                                                    let preview: String =
-                                                        String::from_utf8_lossy(&stdout)
-                                                            .chars()
-                                                            .take(200)
-                                                            .collect();
-                                                    warn!(
-                                                        host = %host,
-                                                        error = %e,
-                                                        preview = %preview,
-                                                        "remote output is not a valid AgentReport (truncated stdout?)"
-                                                    );
-                                                    None
-                                                }
+                                let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+
+                                // Single russh call – sudo_pass is optional
+                                match ssh_engine::run_remote_scan_russh(
+                                    &host,
+                                    &a.ssh_user,
+                                    &ssh_key_expanded,
+                                    &a.remote_path,
+                                    pass.as_deref(), // Option<&Zeroizing<String>>
+                                    a.copy_binary,
+                                    a.keep_binary,
+                                    a.local_binary.as_deref(),
+                                    a.deep,
+                                    a.remote_timeout_secs,
+                                    upload_pb,
+                                )
+                                .await
+                                {
+                                    Ok(stdout) => {
+                                        match serde_json::from_slice::<AgentReport>(&stdout) {
+                                            Ok(report) => Some(report),
+                                            Err(e) => {
+                                                let preview: String =
+                                                    String::from_utf8_lossy(&stdout)
+                                                        .chars()
+                                                        .take(200)
+                                                        .collect();
+                                                warn!(
+                                                    host = %host,
+                                                    error = %e,
+                                                    preview = %preview,
+                                                    "remote output is not a valid AgentReport"
+                                                );
+                                                None
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!(host = %host, error = %e, "russh scan failed");
-                                            None
-                                        }
                                     }
-                                } else {
-                                    run_remote_scan_with_timeout(host, a).await.ok().flatten()
+                                    Err(e) => {
+                                        warn!(host = %host, error = %e, "russh scan failed");
+                                        None
+                                    }
                                 }
                             })
-                                .await;
+                            .await;
 
                             match result {
                                 Ok(Some(report)) => Some(report),
@@ -341,6 +353,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             biased;
                             _ = shutdown_notify.notified() => {
                                 join_set.abort_all();
+                                scan_bar.finish_and_clear();
+                                if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
                                 break;
                             }
                             res = join_set.join_next() => {
@@ -359,11 +373,19 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                             Err(e) => warn!("scan task failed: {e}"),
                                         }
                                     }
-                                    None => break,
+                                    None => {
+                                        // All tasks finished
+                                        let _elapsed = start_time.elapsed();
+                                        scan_bar.finish_and_clear();
+                                        if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
+                                        break;
+                                    }
                                 }
+                                crate::coverage::drain_and_log("fleet-orchestrator");
                             }
                         }
                     }
+                    // MultiProgress will automatically restore terminal when dropped
                 }
 
                 if let Some(tx) = tx {
@@ -381,11 +403,10 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             }
                         }
                     } else {
-                        writer.await // channel is closed, completion is guaranteed
+                        writer.await
                     };
                     match joined {
                         Ok((written, worst, io_errors)) => {
-                            // R10-02: degraded exit code when I/O errors were observed
                             if io_errors > 0 {
                                 warn!(
                                     written,
@@ -566,7 +587,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 HostDiffStatus::Removed => " [− removed]",
                                 HostDiffStatus::Compared => "",
                             };
-                            println!("\nHost: {}{}", mh.hostname, tag);
+                            println!("\nHost: {}{}", st(&mh.hostname), tag);
                             compare::print_diff_terminal(&mh.diff);
                         }
                     }
@@ -686,7 +707,6 @@ async fn main() {
         .expect("failed to install SIGTERM handler");
 
     let exit_code = tokio::select! {
-        // Command finished normally
         res = &mut cmd_handle => {
             match res {
                 Ok(code) => code,
@@ -700,14 +720,11 @@ async fn main() {
                 }
             }
         }
-        // First interrupt signal – initiate graceful shutdown
         _ = sig_int.recv() => {
             eprintln!("Received interrupt signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
-            // R10-07: terminate any remaining legacy SSH children
             crate::utils::terminate_registered_children();
-            // Wait up to 5 seconds for tasks to finish, then force exit
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
                 _ => {
@@ -716,12 +733,10 @@ async fn main() {
                 }
             }
         }
-        // First termination signal – initiate graceful shutdown
         _ = sig_term.recv() => {
             eprintln!("Received termination signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
-            // R10-07: terminate any remaining legacy SSH children
             crate::utils::terminate_registered_children();
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,

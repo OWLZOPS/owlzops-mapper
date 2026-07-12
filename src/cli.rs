@@ -77,6 +77,10 @@ pub struct AuditArgs {
     /// Keep the binary on the remote host after the scan (skip cleanup).
     #[arg(long, default_value_t = false)]
     pub keep_binary: bool,
+
+    /// Enable heavy deep scans (Ghost PID, full capability walk, etc.)
+    #[arg(long, default_value_t = false)]
+    pub deep: bool,
 }
 
 #[derive(Args, Debug, Clone)]
