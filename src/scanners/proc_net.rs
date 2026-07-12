@@ -183,6 +183,7 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
     pids.sort_unstable();
 
     let mut denied = 0usize;
+    const MAX_FD_PER_PID: usize = 4096;
 
     for pid in pids {
         if attributed.len() == wanted.len() {
@@ -196,8 +197,17 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
         };
 
         let mut exe_cache: Option<Option<String>> = None;
+        let mut fd_seen = 0usize;
 
         for fd in fds.flatten() {
+            fd_seen += 1;
+            if fd_seen > MAX_FD_PER_PID {
+                coverage::record(format!(
+                    "/proc/{pid}/fd exceeded {MAX_FD_PER_PID} entries – socket attribution for this pid is partial"
+                ));
+                break;
+            }
+
             let Ok(target) = fs::read_link(fd.path()) else {
                 continue;
             };
