@@ -369,7 +369,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             biased;
                             _ = shutdown_notify.notified() => {
                                 join_set.abort_all();
-                                scan_bar.finish_with_message("Scan aborted by signal");
+                                scan_bar.finish_and_clear();
                                 upload_bar.finish_and_clear();
                                 break;
                             }
@@ -391,11 +391,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     }
                                     None => {
                                         // All tasks finished
-                                        let elapsed = start_time.elapsed();
-                                        scan_bar.finish_with_message(format!(
-                                            "Scans completed in {:.1}s",
-                                            elapsed.as_secs_f64()
-                                        ));
+                                        let _elapsed = start_time.elapsed();
+                                        scan_bar.finish_and_clear();
                                         upload_bar.finish_and_clear();
                                         break;
                                     }

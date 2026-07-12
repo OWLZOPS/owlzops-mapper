@@ -242,9 +242,12 @@ async fn upload_via_channel(
     }
     .await;
 
-    match &res {
-        Ok(()) => pb.finish_with_message("Uploaded"),
-        Err(_) => pb.abandon_with_message("Upload failed"),
+    // Always clear the progress bar from the terminal to prevent artifacts.
+    pb.finish_and_clear();
+
+    // Log any failure to tracing (stderr), not to the terminal.
+    if let Err(ref e) = res {
+        tracing::warn!(host = %host, error = %e, "Binary upload failed");
     }
 
     res
