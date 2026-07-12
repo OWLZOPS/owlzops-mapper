@@ -183,6 +183,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             security: security_info,
             packages: packages_info,
             scoring_version: crate::scoring::SCORING_VERSION,
+            self_integrity: None,
         };
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 

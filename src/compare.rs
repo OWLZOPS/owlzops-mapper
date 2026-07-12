@@ -758,6 +758,7 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            self_integrity: None,
         }
     }
 

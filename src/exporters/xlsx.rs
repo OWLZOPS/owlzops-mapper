@@ -1880,6 +1880,7 @@ mod tests {
                 installed_count: 100,
                 ..Default::default()
             },
+            self_integrity: None,
         }
     }
 

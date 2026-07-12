@@ -7,6 +7,14 @@ fn one() -> u32 {
     1
 }
 
+/// Result of the mapper's self‑integrity preflight (R11 audit – Fable).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SelfIntegrityReport {
+    pub compromised: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentReport {
     pub scan_id: String,
@@ -20,6 +28,9 @@ pub struct AgentReport {
     pub coverage_warnings: Vec<String>,
     #[serde(default = "default_scoring_version")]
     pub scoring_version: u8,
+    /// Self‑integrity preflight result. None = check not performed or legacy snapshot.
+    #[serde(default)]
+    pub self_integrity: Option<SelfIntegrityReport>,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,
     pub network: NetworkInfo,
@@ -41,6 +52,7 @@ impl Default for AgentReport {
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
             scoring_version: 1,
+            self_integrity: None,
             host: HostInfo::default(),
             databases: Vec::new(),
             network: NetworkInfo::default(),

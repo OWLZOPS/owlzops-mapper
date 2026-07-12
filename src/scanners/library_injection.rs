@@ -2,11 +2,14 @@
 //!
 //! Flags processes with a shared object injected from a writable/ephemeral
 //! path. Two independent sources, correlated per-pid:
-//!   * `/proc/<pid>/environ` — LD_PRELOAD / LD_LIBRARY_PATH pointing at an
-//!     ephemeral path (userspace injection via environment: libprocesshider…);
+//!   * `/proc/<pid>/environ` — LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT /
+//!     LD_PROFILE pointing at an ephemeral path;
 //!   * `/proc/<pid>/maps`    — a file-backed .so actually mapped from an
 //!     ephemeral path (catches ptrace/dlopen implants even after the env var
 //!     is scrubbed). A "(deleted)" mapped object is treated as a stronger IoC.
+//!     Anonymous executable mappings (r‑xp without a file) and
+//!     writable+executable file‑backed mappings (rwxp) are now also flagged
+//!     as potential code injection / shellcode.
 //!
 //! Additionally, the scan now flags `LD_AUDIT` and `LD_PROFILE`, two less
 //! known but equally powerful dynamic linker variables that can force the
@@ -95,10 +98,6 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
                     else {
                         continue;
                     };
-                    // For LD_AUDIT and LD_PROFILE the value is a single path,
-                    // but we reuse the same loop: split on colon/space for
-                    // compatibility with colon-separated lists (common in
-                    // LD_LIBRARY_PATH). This is harmless for single-path vars.
                     for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
                         if crate::utils::is_ephemeral_exec_path(path) {
                             findings.push(LibraryInjectionFinding {
@@ -119,7 +118,7 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
             Err(_) => denied += 1,
         }
 
-        // ── Source 2: maps (file-backed .so from ephemeral path) ──────
+        // ── Source 2: maps (file-backed .so from ephemeral path + anon exec) ──
         if findings.len() < MAX_FINDINGS {
             match safe_io::read_file_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS) {
                 Ok((content, truncated)) => {
@@ -151,14 +150,34 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
     findings
 }
 
+/// Returns true if the maps line describes an anonymous executable region
+/// (potential code injection) or a writable+executable file-backed region
+/// (weaker, but still suspicious).
+fn is_anon_exec(perms: &str, backing: Option<&str>) -> bool {
+    let x = perms.as_bytes().get(2) == Some(&b'x');
+    if !x {
+        return false;
+    }
+    match backing {
+        Some(path) if path.starts_with('/') => {
+            // file-backed and executable – only flag if also writable
+            perms.as_bytes().get(1) == Some(&b'w')
+        }
+        Some(_) => false, // [heap], [stack], etc.
+        None => true,     // anonymous executable (no path)
+    }
+}
+
 fn scan_maps(content: &str, pid: u32, comm: &str, findings: &mut Vec<LibraryInjectionFinding>) {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for line in content.lines() {
         if findings.len() >= MAX_FINDINGS {
             break;
         }
+
+        // Original /proc/<pid>/maps parsing (six columns)
         let mut it = line.splitn(6, char::is_whitespace);
-        let (_addr, _perms, _off, _dev, _inode, path) = (
+        let (addr, perms, _off, _dev, _inode, path) = (
             it.next(),
             it.next(),
             it.next(),
@@ -166,33 +185,63 @@ fn scan_maps(content: &str, pid: u32, comm: &str, findings: &mut Vec<LibraryInje
             it.next(),
             it.next(),
         );
-        let Some(path) = path else { continue };
-        let path = path.trim();
-        if path.is_empty() || path.starts_with('[') {
+        // Skip malformed lines that don't have a proper address range
+        let Some(addr) = addr else { continue };
+        if !addr.contains('-') {
+            continue;
+        }
+        let Some(perms) = perms else { continue };
+        let path = path.map(str::trim).filter(|p| !p.is_empty());
+
+        // --- File-backed ephemeral .so check ---
+        let mut found_ephemeral = false;
+        if let Some(p) = path
+            && !p.starts_with('[')
+        {
+            let (clean, is_deleted) = match p.strip_suffix(" (deleted)") {
+                Some(base) => (base, true),
+                None => (p, false),
+            };
+            let looks_like_so = clean.ends_with(".so") || clean.contains(".so.");
+            if looks_like_so && crate::utils::is_ephemeral_exec_path(clean) {
+                let clean_str = clean.to_string();
+                if !seen.contains(&clean_str) {
+                    seen.push(clean_str);
+                    findings.push(LibraryInjectionFinding {
+                        pid,
+                        process: comm.to_string(),
+                        object_path: clean.to_string(),
+                        source: "maps".to_string(),
+                        is_deleted,
+                    });
+                    found_ephemeral = true;
+                }
+            }
+        }
+
+        // If we already flagged this line, skip the anon check
+        if found_ephemeral {
             continue;
         }
 
-        let (clean, is_deleted) = match path.strip_suffix(" (deleted)") {
-            Some(p) => (p, true),
-            None => (path, false),
-        };
-
-        let looks_like_so = clean.ends_with(".so") || clean.contains(".so.");
-        if !looks_like_so || !crate::utils::is_ephemeral_exec_path(clean) {
-            continue;
+        // --- Anonymous executable detection ---
+        if is_anon_exec(perms, path) {
+            let description = match path {
+                Some(p) if p.starts_with('[') => format!("{p} (anon rwx)"),
+                Some(p) => format!("{p} (rwx file-backed)"),
+                None => "anonymous executable (r-xp)".to_string(),
+            };
+            if !seen.contains(&description) {
+                seen.push(description.clone());
+                findings.push(LibraryInjectionFinding {
+                    pid,
+                    process: comm.to_string(),
+                    object_path: description,
+                    source: "maps-anon-exec".to_string(),
+                    is_deleted: false,
+                });
+            }
         }
-        if seen.contains(&clean) {
-            continue;
-        }
-        seen.push(clean);
-
-        findings.push(LibraryInjectionFinding {
-            pid,
-            process: comm.to_string(),
-            object_path: clean.to_string(),
-            source: "maps".to_string(),
-            is_deleted,
-        });
     }
 }
 
@@ -265,6 +314,7 @@ mod tests {
     #[test]
     fn maps_non_so_executable_from_tmp_is_ignored_here() {
         let m = "7f20-7f30 r-xp 0 08:01 200 /tmp/dropper\n";
+        // Not a .so, and not writable, so neither ephemeral nor anon exec fires.
         assert!(find(m).is_empty());
     }
 
@@ -274,6 +324,33 @@ mod tests {
         let out = find(m);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].object_path, "/tmp/ok.so");
+    }
+
+    // ── NEW: anon exec tests ──────────────────────────────────
+
+    #[test]
+    fn maps_flags_anon_exec() {
+        let m = "7f20-7f30 r-xp 00000000 00:00 0\n";
+        let out = find(m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "anonymous executable (r-xp)");
+        assert_eq!(out[0].source, "maps-anon-exec");
+    }
+
+    #[test]
+    fn maps_flags_rwx_file_backed() {
+        let m = "7f20-7f30 rwxp 0 08:01 200 /tmp/suspicious\n";
+        let out = find(m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].object_path, "/tmp/suspicious (rwx file-backed)");
+        assert_eq!(out[0].source, "maps-anon-exec");
+    }
+
+    #[test]
+    fn maps_anon_rw_ignored() {
+        // writable but not executable → not flagged
+        let m = "7f20-7f30 rw-p 00000000 00:00 0\n";
+        assert!(find(m).is_empty());
     }
 
     // ── environ + end-to-end over a fake /proc ──────────────

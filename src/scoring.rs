@@ -1178,6 +1178,7 @@ mod tests {
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
             scoring_version: 1,
+            self_integrity: None,
         }
     }
 
