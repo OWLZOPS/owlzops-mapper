@@ -29,6 +29,9 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
 use zeroize::Zeroizing;
 
+// R11-02: sanitize hostname when printing to terminal in compare paths
+use crate::ui::sanitize_terminal as st;
+
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
@@ -285,7 +288,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         &a.remote_path,
                                         pw,
                                         a.copy_binary,
-                                        a.keep_binary,   // R10-01: прокидываем keep_binary
+                                        a.keep_binary,   // R10-01
                                         a.local_binary.as_deref(),
                                         a.remote_timeout_secs,
                                     )
@@ -361,6 +364,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     }
                                     None => break,
                                 }
+                                // R11-03: drain fleet‑orchestrator coverage events per host
+                                crate::coverage::drain_and_log("fleet-orchestrator");
                             }
                         }
                     }
@@ -385,7 +390,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     };
                     match joined {
                         Ok((written, worst, io_errors)) => {
-                            // R10-02: degraded exit code when I/O errors were observed
                             if io_errors > 0 {
                                 warn!(
                                     written,
@@ -566,7 +570,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 HostDiffStatus::Removed => " [− removed]",
                                 HostDiffStatus::Compared => "",
                             };
-                            println!("\nHost: {}{}", mh.hostname, tag);
+                            // R11-02: sanitize hostname before printing
+                            println!("\nHost: {}{}", st(&mh.hostname), tag);
                             compare::print_diff_terminal(&mh.diff);
                         }
                     }
