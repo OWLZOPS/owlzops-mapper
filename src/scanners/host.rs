@@ -253,6 +253,9 @@ fn gather_process_and_tech(
     let mut pid_info: HashMap<u32, (String, u32)> = HashMap::new();
     let mut zombie_details: Vec<ZombieInfo> = Vec::new();
 
+    // Получаем PID текущего процесса, чтобы не считать собственных зомби
+    let my_pid = std::process::id() as u32;
+
     for (pid, proc) in sys.processes() {
         let pid_u32 = pid.as_u32();
         let name = proc.name().to_string();
@@ -260,6 +263,11 @@ fn gather_process_and_tech(
         pid_info.insert(pid_u32, (name.clone(), ppid));
 
         if proc.status() == ProcessStatus::Zombie {
+            // Пропускаем зомби, порождённые самим маппером
+            if ppid == my_pid {
+                continue;
+            }
+
             zombie_processes += 1;
             if zombie_details.len() < 10 {
                 zombie_details.push(ZombieInfo {
@@ -416,19 +424,19 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
         ],
         10,
     )
-    .map(|s| {
-        s.lines()
-            .filter_map(|l| {
-                l.split_whitespace()
-                    .next()
-                    .map(|n| n.replace(".service", ""))
-            })
-            .filter(|n| {
-                !n.starts_with("systemd-") && !n.starts_with("dbus") && !n.starts_with("polkit")
-            })
-            .collect()
-    })
-    .unwrap_or_default();
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    l.split_whitespace()
+                        .next()
+                        .map(|n| n.replace(".service", ""))
+                })
+                .filter(|n| {
+                    !n.starts_with("systemd-") && !n.starts_with("dbus") && !n.starts_with("polkit")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // failed services
     let failed_services = crate::utils::run_with_timeout(
@@ -436,18 +444,18 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
         &["--failed", "--no-pager", "--no-legend", "--plain"],
         10,
     )
-    .map(|s| {
-        s.lines()
-            .filter_map(|l| {
-                let trimmed = l.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                trimmed.split_whitespace().next().map(|s| s.to_string())
-            })
-            .collect()
-    })
-    .unwrap_or_default();
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let trimmed = l.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    trimmed.split_whitespace().next().map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // cron jobs (all sources) – now classified
     let mut raw_lines = Vec::new();
@@ -540,17 +548,17 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
         &["list-timers", "--all", "--no-pager", "--no-legend"],
         10,
     )
-    .map(|s| {
-        let mut timers: Vec<String> = s
-            .lines()
-            .flat_map(|l| l.split_whitespace().map(|w| w.to_string()))
-            .filter(|w| w.ends_with(".timer"))
-            .collect();
-        timers.sort();
-        timers.dedup();
-        timers
-    })
-    .unwrap_or_default();
+        .map(|s| {
+            let mut timers: Vec<String> = s
+                .lines()
+                .flat_map(|l| l.split_whitespace().map(|w| w.to_string()))
+                .filter(|w| w.ends_with(".timer"))
+                .collect();
+            timers.sort();
+            timers.dedup();
+            timers
+        })
+        .unwrap_or_default();
 
     (native_services, failed_services, cron_jobs, systemd_timers)
 }
@@ -637,7 +645,7 @@ fn gather_backup_info(
             } else {
                 "cron (rsync/backup)"
             }
-            .to_string(),
+                .to_string(),
         );
     }
 
@@ -736,7 +744,7 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
     let mut reboot_required_pkgs = Vec::new();
     if reboot_required
         && let Ok((content, _truncated)) =
-            crate::safe_io::read_file_capped("/var/run/reboot-required.pkgs", 16 * 1024)
+        crate::safe_io::read_file_capped("/var/run/reboot-required.pkgs", 16 * 1024)
     {
         let mut seen = std::collections::HashSet::new();
         for line in content.lines() {
