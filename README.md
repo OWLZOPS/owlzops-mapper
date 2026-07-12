@@ -229,7 +229,8 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `snapshot` | Run an audit and save the JSON snapshot to disk |
 | `compare <before> <after>` | Compare two JSON snapshots and show drift |
 | `dir-compare <dir>` | Compare the two most recent snapshots in a directory |
-
+| `--host <HOST>` | Single hostname/IP (or comma‑separated list) for remote scanning |
+| `--deep` | Enable deep forensic scan: ghost PID (LKM rootkit) detection, extended /proc probing. Root only. |
 ---
 
 ## Exit Codes
