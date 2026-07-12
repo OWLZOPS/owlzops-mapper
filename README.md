@@ -49,44 +49,15 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.5.13
+## Highlights v0.5.14
 
-**New Active Compromise Detectors (SEC‑021 – SEC‑025)**
+**R11 Audit Fixes & Hardening**
 
-* **SEC‑021 – Bind‑mount / overlay masking** – detects `/proc/<pid>` overlays (process hiding) and tmpfs/bind overlays over log paths (`/var/log`, `/var/lib/docker/containers`). Parses `mountinfo` correctly across shared‑subtree hosts. Weight: 60, exit code 3.
-* **SEC‑022 – Reverse shell / C2 connection** – correlates `ESTABLISHED` TCP sockets from `/proc/net/tcp` with `/proc/<pid>/fd` and flags interpreters (bash, python, nc, socat...) connected to a public remote address on a stdio fd. Internal targets are intentionally excluded to keep near‑zero false positives. Weight: 60, exit code 3.
-* **SEC‑023 – Userspace rootkit / library injection** – scans `/proc/<pid>/environ` (`LD_PRELOAD` / `LD_LIBRARY_PATH`) and `/proc/<pid>/maps` for shared objects loaded from ephemeral paths (`/tmp`, `/dev/shm`, …). Treats `(deleted)` mapped objects as stronger IoC. Weight: 60, exit code 3.
-* **SEC‑024 – True Ghost PID (LKM rootkit – Diamorphine class)** – detects PIDs hidden from `readdir("/proc")` by a getdents64‑hooking rootkit. Brute‑force `stat("/proc/<pid>")` bypasses the hook; `kill(pid, 0)` acts as an independent arbiter. Candidates must survive 3 stability cycles, have a live state, and be older than 2 s. Weight: 60, exit code 3. Young/racy candidates are downgraded to **SEC‑025** (weight 20, no exit code).
-* **SEC‑025 – Downgraded ghost PID suspicion** – reports transient visibility mismatches that did not meet the full IoC criteria, for manual triage.
+* **CPU‑DoS protection** – added `MAX_FD_PER_PID = 4096` cap in `attribute_sockets`, `correlate_with_processes`, and `socket_owning_pids`. A single process with hundreds of thousands of file descriptors can no longer stall the scan; coverage warns when the cap is hit.
+* **IPv4‑mapped IPv6 false‑positive fix** – `is_public_addr()` now unwraps `::ffff:x.x.x.x` and classifies them by IPv4 rules, eliminating spurious `SEC-022` (reverse shell) alerts for internal addresses on dual‑stack sockets.
+* **CAP‑002 heuristic** – `ProcCapFinding` gains an optional `reason` field. Non‑root processes with ambient capabilities and `NoNewPrivs` disabled (or absent) are marked `"ambient_caps_no_new_privs"`, highlighting a potential privilege‑escalation path without extra I/O.
+* **Broader library‑injection detection** – `LD_AUDIT` and `LD_PROFILE` are now scanned alongside `LD_PRELOAD` and `LD_LIBRARY_PATH`. Catches injection via the rtld‑audit interface (MITRE T1574.006).
 
-**R10 Reliability & Hardening (all verified)**
-
-* `russh` path now removes the uploaded binary and performs a clean SSH disconnect (parity with legacy SSH).
-* JSONL streaming writer tracks I/O errors and flushes explicitly; degraded output returns exit code 2 instead of silent success.
-* Malformed JSON from remote hosts is no longer silently dropped – a preview is logged for diagnostics.
-* Tool resolution (`resolve_tool`) is poison‑tolerant and no longer shells out to `which`.
-* `run_with_timeout_inner` uses capped reads and guarantees child process reaping in every exit path.
-* Terminal output sanitises bidi‑override and zero‑width characters.
-* Legacy SSH children are registered and sent `SIGTERM` on graceful shutdown.
-* PID and EUID columns in Excel reports render as integers.
-* TCP_NODELAY is enabled on russh sockets for lower upload latency.
-
-**Infrastructure & UX Improvements**
-
-* **Unified russh remote path** – the system `ssh`/`scp` fallback has been removed; all remote scans now use the pure‑Rust `russh` engine, eliminating terminal capture issues and dependency on external binaries.
-* **Optional sudo** – `sudo_pass` is now optional in `run_remote_scan_russh`. When no password is supplied (e.g., passwordless sudo or root‑key setups), the remote command executes directly without `sudo`, keeping the UX clean.
-* **False zombie fix** – transient zombies created by the mapper's own child processes are now filtered out, ensuring accurate zombie counts in reports.
-* **Clean progress UI** – `MultiProgress` coordinates the upload progress bar and the scan spinner. Bars are automatically cleared from the terminal (`finish_and_clear()`) once they finish, leaving the final report uncluttered. The spinner only appears after any sudo password prompt, preventing TTY interference.
-
-**Performance & Infrastructure**
-
-* Ghost PID scanner bounds its search to `ns_last_pid` with an optional wrap‑tail heuristic, avoiding brute‑force over 4 M PIDs. Single‑threaded, with micro‑yield throttling.
-* All new scanners respect `MAX_FINDINGS` caps and defensive I/O budgets.
-
-**UI, Excel & JSON Completeness**
-
-* Terminal dashboard and Excel exports include dedicated sections for every new finding (SEC‑021–025).
-* `docs/FIELDS.md` fully documents `mount_masking`, `reverse_shells`, `library_injections`, and `ghost_pids`.
 
 ---
 
@@ -430,7 +401,7 @@ See [LICENSE](LICENSE) for details.
 ## Previous Releases
 
 <details>
-<summary>Click to expand changelog</summary>
+<summary>Click to expand changelog (last 5 versions)</summary>
 
 ### v0.5.13 (2026-07-12)
 
@@ -525,114 +496,4 @@ See [LICENSE](LICENSE) for details.
 * Removed ineffective `debug = "limited"` from the release profile.
 * Unified timeout budget calculation (`host_budget_secs`) shared between fleet orchestrator and russh engine.
 
-### v0.5.8 (2026-07-08)
-
-**Observability & Correctness**
-
-* R9-01: Coverage warnings (truncated files, inaccessible /proc entries) are now reported in the audit output (`coverage_warnings` field).
-* R9-02: Binary upload via the russh channel now waits for the remote command to finish and checks its exit status. Failures (disk full, permissions) are surfaced as `UploadFailed` errors.
-* R9-05: Sudoers file filtering now follows `sudoers(5)` rules exactly (files containing `.` or ending with `~` are ignored). Read errors are logged as coverage warnings.
-
-**Fleet Orchestration**
-
-* R9-03: The JSONL writer is no longer subject to a hard 2‑second timeout on success; it drains completely. The timeout is only applied during graceful shutdown.
-* R9-04: `SIGINT` / `SIGTERM` now immediately aborts in‑flight SSH sessions via `tokio::sync::Notify` and `JoinSet::abort_all()`, instead of waiting for a task to complete.
-
-**Security & Platform Support**
-
-* R9-06: The legacy SSH path (`run_remote_scan`) now uses `split_host_port` and passes ports explicitly to `ssh`/`scp`. IPv6 addresses are correctly bracketed for SCP.
-* R9-07: The TOFU trust store no longer falls back to `/tmp` when `$HOME` is unset. The mapper fails with a clear error instead of using a world‑writable directory.
-* DLP scanner now reuses a single `String` buffer for path construction, reducing per‑process allocations.
-
-### v0.5.7 (2026-07-08)
-
-**Security**
-
-* R8-01: Cap remote stdout/stderr in russh path to prevent OOM from untrusted hosts.
-* R8-02: Fix false `HostKeyChanged` when multiple key types exist in known_hosts.
-* R8-05: Include exact known_hosts file path in host key error messages.
-* R8-07: Set `stdin(Stdio::null())` on child processes to prevent terminal hijacking.
-* R8-08: Handle SIGTERM and improve SIGINT with graceful shutdown, abort active SSH sessions immediately.
-
-**Stability & Compatibility**
-
-* R8-03: Cap child stderr at 1 MiB in legacy SSH path.
-* R8-04: Support IPv6 addresses (bare and `[::1]:port`) in `split_host_port`.
-* R8-06: Add `#[serde(default)]` to `HostInfo` for forward compatibility with older snapshots.
-
-**Performance & Hygiene**
-
-* Replace external SCP/SSH upload with internal russh channel – real-time progress bar, no dependency on system `scp`.
-* N8-1: Avoid extra UTF-8 allocation in `read_file_capped`.
-* N8-2: Replace `Vec<&str>` collection in `/proc/net` parser with an iterator.
-* N8-3: Deduplicate listening ports using a `HashSet`.
-* N8-5: Include accurate hostname in `RemoteError::Ssh` errors.
-* N8-6: Use `safe_io` for `/proc/<pid>/comm` reads in DLP scanner.
-* N8-7: Progress bar for file upload replaced with animated spinner (legacy) or real-time progress (russh).
-
-### v0.5.6 (2026-07-08)
-
-*(identical to 0.5.7 except for the SCP replacement and abort_all improvements)*
-
-### v0.5.5 (2026-07-07)
-
-### Security
-
-* R7-05: Implement TOFU + HMAC-SHA1 verification for russh host keys. Store newly accepted keys in `~/.owlzops/known_hosts`. Detect changed keys (`HostKeyChanged`).
-* R7-09: Enable keepalive in russh client config to prevent long scans from timing out.
-* PIVOT-1: Sanitize terminal output to prevent escape sequence injection.
-* PIVOT-2: Prevent XLSX formula injection by prefixing `'` to strings starting with `=`, `+`, `-`, `@`.
-* Hardened child process environment: clear environment (`env_clear`), fixed `PATH`, resolve tools to absolute paths to block `LD_PRELOAD`/`PATH` hijacking.
-
-### Stability
-
-* Capped reads for `/proc`, `/proc/*/environ`, and child stdout/stderr to prevent OOM on untrusted inputs. Truncation events are reported as scan warnings.
-* Docker scanner: moved synchronous `fs::metadata` out of async runtime into `spawn_blocking` to avoid blocking Tokio executor.
-
-### v0.5.4 (production reliability)
-
-* **Scanner isolation restored** – `panic = "abort"` removed; individual scanner panics now degrade gracefully instead of aborting the whole scan.
-* **UDP listeners detected** – `/proc/net` parser fixed; UDP ports now appear in `listening_ports`.
-* **Clean machine‑readable output** – tracing logs now go to stderr; stdout always contains valid JSON.
-* **Fleet‑drift with streaming** – `compare --multi-host` now reads JSONL files produced by fleet scans.
-* **Input validation for russh** – host, user, and remote path are now validated before use.
-* **Miscellaneous hardening** – timeout budgets unified, keepalive added to russh, panic‑free path handling, deterministic process attribution.
-
-### v0.5.3 (IAM, Process Attribution, DLP)
-
-* **IAM & Access Alignment** – audit SSH keys for algorithm, bit length, and policy compliance; detect `NOPASSWD: ALL` in sudoers. Both findings include CIS references.
-* **Process Attribution (Zero‑Setup)** – replaced the `ss` utility with direct `/proc/net` parsing; every listening port now shows the exact binary path and PID. Suspicious listeners (Shadow IT) are flagged as critical.
-* **DLP / Secret Hygiene** – scans process memory (`/proc/*/environ`, `cmdline`) for exposed credentials (AWS keys, GitHub tokens, database URLs). Detected leaks are reported without saving secret values.
-* **Fleet Orchestration** – `--max-concurrent` controls parallelism; global per‑host timeouts prevent stuck tasks from blocking the queue; optional JSONL streaming output for massive fleets without memory bloat.
-* **Local hosts in fleet mode** – localhost is now included in multi‑host terminal, XLSX, and JSONL reports.
-
-### v0.5.2 (async SSH + Docker audit)
-
-* **Async SSH engine (`russh`)** – fleet scans now support `--ask-sudo-pass` to authenticate via password without pre‑configuring `NOPASSWD` on every host. Known‑hosts TOFU verification with warnings.
-* **Progress bar for `--copy-binary**` – binary uploads show a real‑time progress bar with file size and ETA, in both legacy and async SSH paths.
-* **Docker reliability findings** – OOM‑killed containers, restart loops, and unhealthy healthchecks are now detected and scored under the Reliability category (`DOCK‑007…DOCK‑009`).
-* **Sensitive mount detection** – containers mounting the Docker socket, host root, or writable sensitive directories are flagged as high‑risk (`DOCK‑005`, `DOCK‑006`) with CIS references.
-* **Scoring version guard** – `risk_score` differences caused by formula updates are now marked as `Changed` instead of false improvements/degradations, preserving drift accuracy in `compare`.
-* **Compare v2** – metadata header with hostname, timestamps, binary version and time span; deterministic diff order; multi‑host summary with Added/Removed/Compared statuses.
-* **UX polish** – `--keep-binary` flag to skip cleanup after remote scan; emojis and ANSI colours are automatically disabled when stdout is piped; `--max-concurrent` controls fleet parallelism; file descriptor limit raised automatically.
-
-### v0.5.1 (compare v2)
-
-* **Rich diff metadata** – terminal and Excel diffs now show hostname, timestamps, binary version, and time span between snapshots.
-* **Scoring version guard** – `risk_score` changes across different scoring engine versions are marked as `Changed`, preventing false drift.
-* **Deterministic diff order** – byte‑identical reports for the same snapshots, safe for version control.
-* **Multi‑host summary** – fleet diffs show summary line and status tags (`[+ added]`, `[− removed]`).
-* **Extended SSL tracking** – warning‑level expiry and newly added certificates are detected.
-* **Port diff optimization** – zero‑copy O(n) comparison.
-
-### v0.5.0
-
-* **Context‑aware scoring** – `ip_forward` and `suid_dumpable` are no longer flagged on Docker/kubelet hosts or when systemd‑coredump is active.
-* **Graduated weights** – SSH `PermitRootLogin` differentiates `prohibit‑password`; security updates are tiered; sudo `NOPASSWD` distinguishes `ALL` from restricted commands.
-* **Docker security findings** – containers missing memory/CPU limits, privileged mode, and dangerous capabilities now directly affect Risk Score.
-* **CIS Benchmark references** – every finding includes a CIS reference (e.g., `CIS 5.2.10`) for immediate audit compliance mapping.
-* **Sub‑scores** – Security, Reliability, and Hygiene now have individual caps (60/30/10), preventing score saturation and enabling drift visibility.
-* **Transparent Breakdown** – the terminal dashboard now shows the exact active findings with weights and CIS tags.
-
 </details>
-```
