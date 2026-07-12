@@ -302,6 +302,7 @@ pub async fn run_remote_scan_russh(
     copy_binary: bool,
     keep_binary: bool,
     local_bin: Option<&str>,
+    deep: bool, // NEW: --deep flag forwarded to remote command
     remote_timeout_secs: u64,
 ) -> Result<Vec<u8>, RemoteError> {
     let (hostname, port) = split_host_port(host);
@@ -407,12 +408,15 @@ pub async fn run_remote_scan_russh(
                 .channel_open_session()
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+
+            // Add --deep flag when requested
+            let deep_arg = if deep { " --deep" } else { "" };
             exec_channel
                 .exec(
                     true,
                     format!(
-                        "LC_ALL=C sudo -k -S -p '' -- {} audit --format json --offline",
-                        remote_path
+                        "LC_ALL=C sudo -k -S -p '' -- {} audit --format json --offline{}",
+                        remote_path, deep_arg
                     ),
                 )
                 .await

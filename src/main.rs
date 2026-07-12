@@ -290,6 +290,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         a.copy_binary,
                                         a.keep_binary,   // R10-01
                                         a.local_binary.as_deref(),
+                                        a.deep,           // NEW: pass --deep to remote
                                         a.remote_timeout_secs,
                                     )
                                         .await

@@ -287,7 +287,7 @@ fn gather_sysctl_issues() -> Vec<String> {
 
 // ── Main gather function ─────────────────────────────────────────────────
 
-pub fn gather_security_info() -> SecurityInfo {
+pub fn gather_security_info(deep: bool) -> SecurityInfo {
     // --- SSH config parsing ------------------------------------------------
     let (
         ssh_password_auth_enabled,
@@ -461,7 +461,12 @@ pub fn gather_security_info() -> SecurityInfo {
     let library_injections = crate::scanners::library_injection::scan_library_injections();
 
     // --- True Ghost PID / LKM rootkit hiding (SEC-024) --------------------
-    let ghost_pids = crate::scanners::ghost_pid::scan_ghost_pids();
+    // Only run the expensive ghost-pid scan when explicitly requested via --deep.
+    let ghost_pids = if deep {
+        crate::scanners::ghost_pid::scan_ghost_pids(deep)
+    } else {
+        Vec::new()
+    };
 
     SecurityInfo {
         ssh_password_auth_enabled,
