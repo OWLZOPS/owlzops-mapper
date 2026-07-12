@@ -1,38 +1,31 @@
 
 ## Bug Fixes
 
-- **russh:** Enforce binary cleanup and JSONL error handling (R10-01, R10-02, R10-03)
-- **utils:** Improve poison lock handling, tool resolution, and child process safety (R10-04, R10-05)
-- **utils:** Improve poison lock handling, tool resolution, and child process safety (R10-04, R10-05)
-- **ui:** Sanitize bidi and zero-width characters (R10-06)
-- **utils:** SIGTERM legacy SSH children on shutdown (R10-07)
-- **exporters:** Add integer format for PID and EUID in XLSX reports (R10-08)
-- **russh:** Optimize TCP_NODELAY settings and reduce chunk size for file streams
-- **workflows:** Remove stderr redirection for audit JSON output
-- **workflows:** Update exit code validation and capture stderr logs in e2e tests
+- R11 audit fixes (cleanup guarantee, terminal sanitization, coverage cap)
+- **utils:** Handle stdout/stderr take safety in child process
+- **scanners:** Disable io_uring statx on musl to fix Alpine build
+- **ui:** Ensure progress bars are always cleared and improve error logging
+- **progress:** Make upload progress bar optional based on conditions
+- **scanners:** Skip self-zombies in zombie detection logic and apply minor formatting adjustments
+- **scanners:** Update comments in zombie detection to improve clarity and consistency
+- **ssh_engine:** Make `sudo_pass` optional and adjust remote scan logic
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.11
-- **exporters:** Add `euid` and `is_mimic` fields, adjust XLSX formatting (R10-08)
+- Update CHANGELOG for v0.5.12
 
 ## Features
 
-- **scoring, scanners:** Add DOCK-010 to detect runtime capability tampering
-- **scoring:** Introduce SEC-019 to detect fileless processes with critical kernel capabilities
-- **scoring, main:** Track active compromises with `compromised_host` flag, update exit codes
-- **scoring:** Add SEC-020 for detection of kernel thread mimicry
-- **scoring:** Add SEC-021 for detecting bind-mount and overlay masking
-- **scoring, exporters, ui:** Add SEC-022 for reverse shell/C2 detection
-- **scoring, exporters, ui:** Add SEC-023 for userspace rootkit/library injection detection
-- **scoring, detectors, tests:** Add SEC-024 for detecting LKM rootkit-hidden "ghost" PIDs
-- **exporters, ui, docs:** Add SEC-024/025 ghost PID detection
+- **scanners:** Enhance ghost PID detection with thread filtering and hidepid safeguard
+- Add `--deep` flag for enhanced scan depth and ghost PID detection
+- **audit:** Add spinner for progress visualization and improve shutdown handling
+- **ssh_engine:** Add upload progress bar integration and improve user feedback
 
 ## Miscellaneous
 
-- Bump version to 0.5.12, update README with refocused messaging and feature highlights
+- **release:** Bump version to 0.5.13 and update documentation
 
 ## Refactoring
 
-- **scoring:** Streamline SEC-019 logic for fileless malware detection
+- **utils:** Reorder `poll_wait` for better readability
 
