@@ -16,7 +16,7 @@ mod utils;
 use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
-use indicatif::{ProgressBar, ProgressStyle}; // ← добавлен
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use models::{AgentReport, HostDiffStatus};
 use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
 use scoring::*;
@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant}; // ← Instant добавлен
+use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
@@ -234,21 +234,34 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                 // Process remote hosts with JoinSet + Semaphore + global timeout
                 if !remote.is_empty() {
-                    // ========== SPINNER START ==========
-                    let spinner = ProgressBar::new_spinner();
-                    spinner.set_style(
+                    // ========== MULTIPROGRESS SETUP ==========
+                    let multi = MultiProgress::new();
+
+                    // 1. Upload progress bar (will be passed to ssh_engine)
+                    let upload_bar = multi.add(ProgressBar::new(0));
+                    upload_bar.set_style(
+                        ProgressStyle::default_bar()
+                            .template("{bytes:>9}/{total_bytes:9} [{wide_bar:.cyan/blue}] {msg}")
+                            .unwrap()
+                            .progress_chars("##-"),
+                    );
+                    upload_bar.set_message("uploading binary");
+
+                    // 2. Scan spinner
+                    let scan_bar = multi.add(ProgressBar::new_spinner());
+                    scan_bar.set_style(
                         ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
                             .unwrap()
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
-                        spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
+                        scan_bar.set_message("Deep forensic scan in progress (may take 10–30s)");
                     } else {
-                        spinner.set_message("Auditing systems...");
+                        scan_bar.set_message("Auditing systems...");
                     }
-                    spinner.enable_steady_tick(Duration::from_millis(100));
+                    scan_bar.enable_steady_tick(Duration::from_millis(100));
                     let start_time = Instant::now();
-                    // ========== SPINNER SETUP DONE ==========
+                    // ==========================================
 
                     let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
                     let mut join_set = tokio::task::JoinSet::new();
@@ -265,6 +278,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         };
                         let pass = sudo_pass.clone();
                         let host_for_log = host.clone();
+                        let upload_pb = upload_bar.clone(); // clone to pass into ssh_engine
+
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
 
@@ -291,6 +306,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 if let Some(pw) = &pass {
                                     let ssh_key_expanded =
                                         shellexpand::tilde(&a.ssh_key).to_string();
+                                    // Pass upload_bar into ssh_engine
                                     match ssh_engine::run_remote_scan_russh(
                                         &host,
                                         &a.ssh_user,
@@ -302,8 +318,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         a.local_binary.as_deref(),
                                         a.deep,
                                         a.remote_timeout_secs,
+                                        Some(upload_pb), // <- new parameter
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(stdout) => {
                                             match serde_json::from_slice::<AgentReport>(&stdout) {
@@ -318,7 +335,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                         host = %host,
                                                         error = %e,
                                                         preview = %preview,
-                                                        "remote output is not a valid AgentReport (truncated stdout?)"
+                                                        "remote output is not a valid AgentReport"
                                                     );
                                                     None
                                                 }
@@ -333,7 +350,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     run_remote_scan_with_timeout(host, a).await.ok().flatten()
                                 }
                             })
-                                .await;
+                            .await;
 
                             match result {
                                 Ok(Some(report)) => Some(report),
@@ -352,7 +369,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             biased;
                             _ = shutdown_notify.notified() => {
                                 join_set.abort_all();
-                                spinner.finish_with_message("Scan aborted by signal");
+                                scan_bar.finish_with_message("Scan aborted by signal");
+                                upload_bar.finish_and_clear();
                                 break;
                             }
                             res = join_set.join_next() => {
@@ -374,10 +392,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     None => {
                                         // All tasks finished
                                         let elapsed = start_time.elapsed();
-                                        spinner.finish_with_message(format!(
+                                        scan_bar.finish_with_message(format!(
                                             "Scans completed in {:.1}s",
                                             elapsed.as_secs_f64()
                                         ));
+                                        upload_bar.finish_and_clear();
                                         break;
                                     }
                                 }
@@ -385,6 +404,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             }
                         }
                     }
+                    // MultiProgress will automatically restore terminal when dropped
                 }
 
                 if let Some(tx) = tx {

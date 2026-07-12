@@ -148,15 +148,16 @@ pub(crate) fn split_host_port(host: &str) -> (String, u16) {
 }
 
 /// Upload a binary file over an existing russh channel by piping `cat > path`
-/// and feeding the file in chunks. Progress bar is updated incrementally.
-/// After EOF we wait for the remote command to finish and check its exit status.
-/// On error the progress bar is properly abandoned so it does not leave a
-/// dangling line in the terminal.
+/// and feeding the file in chunks. If `upload_pb` is provided it is used to
+/// show progress; otherwise a hidden bar is substituted so call sites do not
+/// need special-case handling. The caller is responsible for cleaning up the
+/// bar afterwards (e.g. via `finish_and_clear` on the MultiProgress).
 async fn upload_via_channel(
     channel: &mut Channel<client::Msg>,
     local_bin: &str,
     remote_path: &str,
     host: &str,
+    upload_pb: Option<ProgressBar>, // new parameter
 ) -> Result<(), RemoteError> {
     let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
         host: host.to_string(),
@@ -164,14 +165,20 @@ async fn upload_via_channel(
     })?;
     let file_size = metadata.len();
 
-    // Setup progress bar
-    let pb = ProgressBar::new(file_size);
-    let style = ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("#>-");
-    pb.set_style(style);
-    pb.set_message(format!("Uploading to {host}"));
+    // Use provided bar or a hidden one so the progress API stays the same.
+    let pb = if let Some(pb) = upload_pb {
+        pb.set_length(file_size);
+        pb.set_message(format!("Uploading to {host}"));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
 
     // Wrap the actual upload so we can react to errors without external crates.
     let res = async {
@@ -188,10 +195,6 @@ async fn upload_via_channel(
             .map_err(|e| RemoteError::from_russh(e, host))?;
 
         // Stream file content in chunks.
-        // 32 KiB chunks — one full CHANNEL_DATA per write at the RFC 4253
-        // baseline max payload (32768). NB: russh re-chunks to the negotiated
-        // max packet regardless; this buys progress-bar granularity and halves
-        // the stack buffer, it is NOT a wire-format change.
         let mut file = std::fs::File::open(local_bin).map_err(|e| RemoteError::Io {
             host: host.to_string(),
             source: e,
@@ -302,8 +305,9 @@ pub async fn run_remote_scan_russh(
     copy_binary: bool,
     keep_binary: bool,
     local_bin: Option<&str>,
-    deep: bool, // NEW: --deep flag forwarded to remote command
+    deep: bool,
     remote_timeout_secs: u64,
+    upload_pb: Option<ProgressBar>, // new parameter
 ) -> Result<Vec<u8>, RemoteError> {
     let (hostname, port) = split_host_port(host);
 
@@ -373,15 +377,12 @@ pub async fn run_remote_scan_russh(
     }
 
     // Apply overall timeout for the rest of the operation.
-    // Clone hostname so the outer scope can still use it for the timeout error.
     let hostname_for_timeout = hostname.clone();
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
 
     let result = tokio::time::timeout(overall, async {
         let mut uploaded = false;
 
-        // Inner async block – any errors inside propagate via `?`,
-        // but teardown below ALWAYS runs.
         let outcome = async {
             if copy_binary {
                 let default_exe = std::path::PathBuf::from("./owlzops-mapper");
@@ -392,13 +393,13 @@ pub async fn run_remote_scan_russh(
                     .channel_open_session()
                     .await
                     .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
-                // Once we've sent the `cat > ...` command, artifacts may exist on disk.
                 uploaded = true;
                 upload_via_channel(
                     &mut upload_channel,
                     local,
                     remote_path,
                     &hostname_for_timeout,
+                    upload_pb, // forward the progress bar
                 )
                 .await?;
             }
@@ -409,7 +410,6 @@ pub async fn run_remote_scan_russh(
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
 
-            // Add --deep flag when requested
             let deep_arg = if deep { " --deep" } else { "" };
             exec_channel
                 .exec(
@@ -481,7 +481,6 @@ pub async fn run_remote_scan_russh(
                 Some(code) => {
                     let se = String::from_utf8_lossy(&stderr);
 
-                    // 1. sudo rejected the password
                     if se.contains("incorrect password")
                         || se.contains("Sorry, try again")
                         || se.contains("a password is required")
@@ -490,11 +489,8 @@ pub async fn run_remote_scan_russh(
                             host: hostname_for_timeout.clone(),
                         })
                     } else if !stdout.is_empty() && stdout.starts_with(b"{") {
-                        // 2. stdout looks like JSON — audit succeeded regardless
-                        //    of exit code
                         Ok(stdout)
                     } else if code != 0 {
-                        // 3. Real failure (no binary, segfault, etc.)
                         let trimmed: String = se.trim().chars().take(300).collect();
                         Err(RemoteError::NonZeroExit {
                             host: hostname_for_timeout.clone(),
