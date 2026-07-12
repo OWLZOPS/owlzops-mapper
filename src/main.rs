@@ -16,6 +16,7 @@ mod utils;
 use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
+use indicatif::{ProgressBar, ProgressStyle}; // ← добавлен
 use models::{AgentReport, HostDiffStatus};
 use runner::{is_local_host, run_local_scan_async, run_remote_scan, snapshot_run};
 use scoring::*;
@@ -23,7 +24,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant}; // ← Instant добавлен
 use tokio::signal;
 use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
@@ -39,11 +40,6 @@ fn is_running_as_root() -> bool {
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let flags = CriticalFlags::from_report(report);
 
-    // Active compromise takes precedence over incompleteness and hygiene: a
-    // detected IoC is the single most actionable signal. Distinct code 3 — NOT 2,
-    // which already means "incomplete/not-root" — so pipelines can trigger paging
-    // separately from a normal build failure.
-    // Exit ladder: 3 = compromised > 2 = incomplete/degraded > 1 = critical > 0 = clean.
     if flags.compromised_host {
         warn!(
             "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
@@ -185,8 +181,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 let writer_task = if let (Some(rx), Some(file)) = (rx_chan, jsonl_file.take()) {
                     Some(tokio::task::spawn_blocking(move || {
                         use std::io::Write;
-                        // R10-02: buffered writes; I/O errors are counted and
-                        // logged instead of silently losing records.
                         let mut file = std::io::BufWriter::new(file);
                         let mut rx = rx;
                         let mut written = 0usize;
@@ -240,6 +234,22 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                 // Process remote hosts with JoinSet + Semaphore + global timeout
                 if !remote.is_empty() {
+                    // ========== SPINNER START ==========
+                    let spinner = ProgressBar::new_spinner();
+                    spinner.set_style(
+                        ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
+                            .unwrap()
+                            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
+                    );
+                    if args.deep {
+                        spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
+                    } else {
+                        spinner.set_message("Auditing systems...");
+                    }
+                    spinner.enable_steady_tick(Duration::from_millis(100));
+                    let start_time = Instant::now();
+                    // ========== SPINNER SETUP DONE ==========
+
                     let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
                     let mut join_set = tokio::task::JoinSet::new();
 
@@ -288,17 +298,14 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         &a.remote_path,
                                         pw,
                                         a.copy_binary,
-                                        a.keep_binary,   // R10-01
+                                        a.keep_binary,
                                         a.local_binary.as_deref(),
-                                        a.deep,           // NEW: pass --deep to remote
+                                        a.deep,
                                         a.remote_timeout_secs,
                                     )
                                         .await
                                     {
                                         Ok(stdout) => {
-                                            // R10-03: parse from bytes (no full lossy
-                                            // copy) and surface failures instead of
-                                            // silently dropping the host.
                                             match serde_json::from_slice::<AgentReport>(&stdout) {
                                                 Ok(report) => Some(report),
                                                 Err(e) => {
@@ -345,6 +352,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             biased;
                             _ = shutdown_notify.notified() => {
                                 join_set.abort_all();
+                                spinner.finish_with_message("Scan aborted by signal");
                                 break;
                             }
                             res = join_set.join_next() => {
@@ -363,9 +371,16 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                             Err(e) => warn!("scan task failed: {e}"),
                                         }
                                     }
-                                    None => break,
+                                    None => {
+                                        // All tasks finished
+                                        let elapsed = start_time.elapsed();
+                                        spinner.finish_with_message(format!(
+                                            "Scans completed in {:.1}s",
+                                            elapsed.as_secs_f64()
+                                        ));
+                                        break;
+                                    }
                                 }
-                                // R11-03: drain fleet‑orchestrator coverage events per host
                                 crate::coverage::drain_and_log("fleet-orchestrator");
                             }
                         }
@@ -387,7 +402,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             }
                         }
                     } else {
-                        writer.await // channel is closed, completion is guaranteed
+                        writer.await
                     };
                     match joined {
                         Ok((written, worst, io_errors)) => {
@@ -571,7 +586,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 HostDiffStatus::Removed => " [− removed]",
                                 HostDiffStatus::Compared => "",
                             };
-                            // R11-02: sanitize hostname before printing
                             println!("\nHost: {}{}", st(&mh.hostname), tag);
                             compare::print_diff_terminal(&mh.diff);
                         }
@@ -692,7 +706,6 @@ async fn main() {
         .expect("failed to install SIGTERM handler");
 
     let exit_code = tokio::select! {
-        // Command finished normally
         res = &mut cmd_handle => {
             match res {
                 Ok(code) => code,
@@ -706,14 +719,11 @@ async fn main() {
                 }
             }
         }
-        // First interrupt signal – initiate graceful shutdown
         _ = sig_int.recv() => {
             eprintln!("Received interrupt signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
-            // R10-07: terminate any remaining legacy SSH children
             crate::utils::terminate_registered_children();
-            // Wait up to 5 seconds for tasks to finish, then force exit
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
                 _ => {
@@ -722,12 +732,10 @@ async fn main() {
                 }
             }
         }
-        // First termination signal – initiate graceful shutdown
         _ = sig_term.recv() => {
             eprintln!("Received termination signal, shutting down gracefully...");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
-            // R10-07: terminate any remaining legacy SSH children
             crate::utils::terminate_registered_children();
             match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
                 Ok(Ok(code)) => code,
