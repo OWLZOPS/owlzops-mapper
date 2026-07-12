@@ -1,31 +1,20 @@
 
 ## Bug Fixes
 
-- R11 audit fixes (cleanup guarantee, terminal sanitization, coverage cap)
-- **utils:** Handle stdout/stderr take safety in child process
-- **scanners:** Disable io_uring statx on musl to fix Alpine build
-- **ui:** Ensure progress bars are always cleared and improve error logging
-- **progress:** Make upload progress bar optional based on conditions
-- **scanners:** Skip self-zombies in zombie detection logic and apply minor formatting adjustments
-- **scanners:** Update comments in zombie detection to improve clarity and consistency
-- **ssh_engine:** Make `sudo_pass` optional and adjust remote scan logic
+- **ui:** Reuse spinner for local scan and ensure proper cleanup
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.12
+- Update CHANGELOG for v0.5.13
+- **README:** Document `--host` and `--deep` scan options
 
 ## Features
 
-- **scanners:** Enhance ghost PID detection with thread filtering and hidepid safeguard
-- Add `--deep` flag for enhanced scan depth and ghost PID detection
-- **audit:** Add spinner for progress visualization and improve shutdown handling
-- **ssh_engine:** Add upload progress bar integration and improve user feedback
+- **scanners:** Enforce fd limits per PID and improve logging for partial socket scans
+- **scanners:** Add "reason" field for ambient capabilities and support LD_AUDIT/LD_PROFILE detection
 
 ## Miscellaneous
 
-- **release:** Bump version to 0.5.13 and update documentation
-
-## Refactoring
-
-- **utils:** Reorder `poll_wait` for better readability
+- **docs:** Update README for v0.5.13 release
+- **release:** Bump version to 0.5.14, update README and changelog
 
