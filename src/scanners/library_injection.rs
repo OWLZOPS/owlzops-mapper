@@ -309,6 +309,7 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
                             source: matched_key.to_string(),
                             is_deleted: false,
                             region_addr: None, // no address available from environ
+                            deep_forensics: None,
                         });
                         pid_hits += 1;
                     }
@@ -412,6 +413,7 @@ fn scan_maps(
                         source: source.to_string(),
                         is_deleted,
                         region_addr: Some(addr.to_string()),
+                        deep_forensics: None,
                     });
                     found_ephemeral = true;
                 }
@@ -460,6 +462,7 @@ fn scan_maps(
                     source: src.to_string(),
                     is_deleted: false,
                     region_addr: Some(addr.to_string()),
+                    deep_forensics: None,
                 });
             }
             continue;
@@ -490,6 +493,7 @@ fn scan_maps(
                 source: source.to_string(),
                 is_deleted: false,
                 region_addr: Some(addr.to_string()),
+                deep_forensics: None,
             });
         }
     }
@@ -529,6 +533,7 @@ mod tests {
             source: src.to_string(),
             is_deleted: false,
             region_addr: None,
+            deep_forensics: None,
         };
 
         // Advisory sources must map to JitAdvisory

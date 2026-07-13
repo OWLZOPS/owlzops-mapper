@@ -1873,6 +1873,7 @@ mod tests {
             source: "LD_PRELOAD".into(),
             is_deleted: false,
             region_addr: None,
+            deep_forensics: None,
         }];
         let f = evaluate(&r)
             .into_iter()

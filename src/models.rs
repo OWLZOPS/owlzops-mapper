@@ -570,6 +570,10 @@ pub struct LibraryInjectionFinding {
     /// VMA start-end address ("7f3c0000-7f3d0000") — forensic anchor for investigation.
     #[serde(default)]
     pub region_addr: Option<String>,
+    /// Deep memory forensics payload (only present with `--deep`).
+    /// `None` in fast‑path; silently omitted from JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_forensics: Option<DeepMemoryAnalysis>,
 }
 
 // ---------------------------------------------------------------------------
@@ -631,4 +635,63 @@ pub struct GhostPidFinding {
     /// Corroboration: this hidden PID also owns a network socket.
     #[serde(default)]
     pub holds_socket: bool,
+}
+
+// ── Deep Forensics (Pointer Resolution & Memory Analysis) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepMemoryAnalysis {
+    pub origin: Origin,
+    pub confidence: u8,             // 0..100
+    pub entropy: f32,               // Shannon entropy
+    pub prologue: Option<Prologue>, // ENDBR64 / PushRbp / None
+    pub resolved_pointers: Vec<ResolvedPointer>,
+    pub bytes_examined: usize,
+}
+
+impl DeepMemoryAnalysis {
+    pub fn inconclusive() -> Self {
+        Self {
+            origin: Origin::Inconclusive,
+            confidence: 0,
+            entropy: 0.0,
+            prologue: None,
+            resolved_pointers: Vec::new(),
+            bytes_examined: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    FfiClosure,
+    GObjectCallback,
+    JitCode,
+    RuntimeTrampoline,
+    UnknownPayload,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Prologue {
+    Endbr64,
+    PushRbp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedPointer {
+    pub value: String,
+    pub target: String,
+    pub kind: PointerKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerKind {
+    LibText,
+    JitCluster,
+    LibData,
+    Unmapped,
 }
