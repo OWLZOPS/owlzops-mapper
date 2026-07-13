@@ -647,6 +647,8 @@ pub struct DeepMemoryAnalysis {
     pub prologue: Option<Prologue>, // ENDBR64 / PushRbp / None
     pub resolved_pointers: Vec<ResolvedPointer>,
     pub bytes_examined: usize,
+    #[serde(default)]
+    pub image_header: bool, // MZ / ELF / PE in the first bytes of RWX region
 }
 
 impl DeepMemoryAnalysis {
@@ -658,6 +660,7 @@ impl DeepMemoryAnalysis {
             prologue: None,
             resolved_pointers: Vec::new(),
             bytes_examined: 0,
+            image_header: false,
         }
     }
 }

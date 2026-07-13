@@ -555,35 +555,70 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026, SEC-027 & SEC-028 – Memory Forensics ──
-    const DEEP_ESCALATE_MIN: u8 = 60; // UnknownPayload → Critical
-    const DEEP_DEMOTE_MIN: u8 = 70; // Benign origin → Advisory
+    // ── SEC-023, SEC-026, SEC-027, SEC-028 & SEC-029 – Memory Forensics ──
+    const DEEP_ESCALATE_MIN: u8 = 60;
+    const DEEP_DEMOTE_MIN: u8 = 70;
+
+    fn is_trumping_malice(d: &crate::models::DeepMemoryAnalysis) -> bool {
+        d.entropy >= 7.0 || d.image_header
+    }
+
+    fn is_benign_shape(d: &crate::models::DeepMemoryAnalysis) -> bool {
+        d.prologue.is_some()
+            && d.entropy < 6.5
+            && d.resolved_pointers.iter().any(|p| {
+                matches!(
+                    p.kind,
+                    crate::models::PointerKind::LibText | crate::models::PointerKind::JitCluster
+                )
+            })
+    }
 
     enum MemBucket {
         Classic,
         DeepCritical,
         Anomaly,
         Advisory,
+        TrustedUnverified,
     }
 
     fn mem_bucket(f: &crate::models::LibraryInjectionFinding) -> MemBucket {
-        if let Some(d) = &f.deep_forensics {
+        let deep = f.deep_forensics.as_ref();
+
+        // Layer 1 — trumping malice overrides everything.
+        if let Some(d) = deep
+            && is_trumping_malice(d)
+        {
+            return MemBucket::DeepCritical;
+        }
+
+        // Layer 2 — confident Origin attribution.
+        if let Some(d) = deep {
             match d.origin {
-                // Escalate confidently: unattributed executable payload = live IoC.
                 Origin::UnknownPayload if d.confidence >= DEEP_ESCALATE_MIN => {
                     return MemBucket::DeepCritical;
                 }
-                // Demote cautiously: ONLY high-confidence benign attribution.
-                Origin::FfiClosure | Origin::GObjectCallback | Origin::RuntimeTrampoline
+                Origin::FfiClosure
+                | Origin::GObjectCallback
+                | Origin::HotSpot
+                | Origin::RuntimeTrampoline
                     if d.confidence >= DEEP_DEMOTE_MIN =>
                 {
                     return MemBucket::Advisory;
                 }
-                // JitCode / Inconclusive / low confidence → structure decides.
                 _ => {}
             }
         }
 
+        // Layer 3 — trusted path (allowlist) requires benign shape.
+        if f.source == "maps-rwx-runtime-allowlist" {
+            return match deep {
+                Some(d) if is_benign_shape(d) => MemBucket::Advisory,
+                _ => MemBucket::TrustedUnverified,
+            };
+        }
+
+        // Layer 4 — structural class.
         match f.classify() {
             InjectionClass::ClassicInjection => MemBucket::Classic,
             InjectionClass::MemoryAnomaly => MemBucket::Anomaly,
@@ -595,6 +630,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut deep_critical = Vec::new();
     let mut memory_anomalies = Vec::new();
     let mut jit_advisories = Vec::new();
+    let mut trusted_unverified = Vec::new();
 
     for finding in &report.security.library_injections {
         match mem_bucket(finding) {
@@ -602,10 +638,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             MemBucket::DeepCritical => deep_critical.push(finding),
             MemBucket::Anomaly => memory_anomalies.push(finding),
             MemBucket::Advisory => jit_advisories.push(finding),
+            MemBucket::TrustedUnverified => trusted_unverified.push(finding),
         }
     }
 
-    // Hard IoC: real injections (LD_*, ephemeral .so, etc.) -> SEC-023
+    // SEC-023 – Classic injections
     if !classic_injections.is_empty() {
         let list = classic_injections
             .iter()
@@ -630,7 +667,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Deep: unattributed executable payload -> SEC-028 (confirmed IoC)
+    // SEC-028 – Deep Critical
     if !deep_critical.is_empty() {
         let list = deep_critical
             .iter()
@@ -662,10 +699,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Suspicious executable memory (isolated anon/rwx/stack/heap) -> SEC-026
+    // SEC-026 – Memory anomalies
     if !memory_anomalies.is_empty() {
-        // Aggregation: Group by process to reduce visual noise
-        // Also capture the first region address for forensic anchoring
         let mut by_process: std::collections::HashMap<String, (usize, Option<String>)> =
             std::collections::HashMap::new();
         for anomaly in &memory_anomalies {
@@ -710,7 +745,41 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // JIT Advisory (W^X hardening gap / legit JIT cache) -> SEC-027 (Suppressed/Info)
+    // SEC-029 – Trusted but unverified
+    if !trusted_unverified.is_empty() {
+        let mut by_proc = std::collections::HashMap::new();
+        for f in &trusted_unverified {
+            *by_proc
+                .entry(format!("{} (pid {})", f.process, f.pid))
+                .or_insert(0usize) += 1;
+        }
+        let list = by_proc
+            .into_iter()
+            .map(|(p, n)| format!("{p}: {n} region(s)"))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        findings.push(Finding {
+            id: "SEC-029",
+            title: "Trusted-path executable memory — UNVERIFIED (no JIT signature)".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} region(s) in allowlisted binaries; no malice indicators (entropy < 7.0, no image \
+                 header) but JIT shape not yet attributed — provisional trust, add a runtime signature: {}",
+                trusted_unverified.len(),
+                list
+            ),
+            suppressed: Some(
+                "Trusted binary path; deep forensics found no malicious indicators but could not \
+                 positively attribute the JIT origin. Trust is PROVISIONAL, not verified."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
+    // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
         for adv in &jit_advisories {
@@ -728,7 +797,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             id: "SEC-027",
             title: "Writable JIT code cache — hardening opportunity".to_string(),
             category: Category::Security,
-            weight: 0, // Advisory only, no penalty
+            weight: 0,
             evidence: format!(
                 "{} process(es) using writable JIT arenas: {}",
                 jit_advisories.len(),

@@ -279,6 +279,11 @@ fn analyze(buf: &[u8], ctx: &ProcMemContext) -> DeepMemoryAnalysis {
     let ptrs = scan_pointers(buf, &ctx.resolver);
     let has = |needle: &str| ptrs.iter().any(|p| p.target.contains(needle));
 
+    // Detect binary headers (MZ, ELF, PE) indicative of reflective loading
+    let image_header = buf.starts_with(b"MZ")
+        || buf.starts_with(&[0x7F, b'E', b'L', b'F'])
+        || buf.windows(4).take(64).any(|w| w == b"PE\0\0");
+
     let (origin, confidence) = ConfidenceEngine::new()
         .vote(has("libffi"), Origin::FfiClosure, 70)
         .vote(has("_gi") || has("gobject"), Origin::GObjectCallback, 70)
@@ -288,7 +293,11 @@ fn analyze(buf: &[u8], ctx: &ProcMemContext) -> DeepMemoryAnalysis {
             Origin::JitCode,
             55,
         )
-        .vote(entropy > 7.0 && ptrs.is_empty(), Origin::UnknownPayload, 60)
+        .vote(
+            (entropy > 7.0 && ptrs.is_empty()) || image_header,
+            Origin::UnknownPayload,
+            60,
+        )
         .conclude(prologue.is_some());
 
     DeepMemoryAnalysis {
@@ -298,6 +307,7 @@ fn analyze(buf: &[u8], ctx: &ProcMemContext) -> DeepMemoryAnalysis {
         prologue,
         resolved_pointers: ptrs,
         bytes_examined: buf.len(),
+        image_header,
     }
 }
 

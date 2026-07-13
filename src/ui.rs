@@ -1298,7 +1298,7 @@ fn origin_label(o: &Origin) -> &'static str {
     }
 }
 
-// ── SEC-023 / SEC-026 / SEC-027 / SEC-028: Library Injection & Memory Anomalies ─────
+// ── SEC-023 / SEC-026 / SEC-027 / SEC-028 / SEC-029: Library Injection & Memory Anomalies ─────
 
 fn render_library_injections(report: &AgentReport, verbose: bool) {
     let inj = &report.security.library_injections;
@@ -1574,6 +1574,18 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         println!(
             "🛡  JIT writable-code advisory (SEC‑027): {} suppressed finding(s) with verified runtime topology.\n",
             jit_advisories.len()
+        );
+    }
+
+    // Provisional Trust (SEC-029)
+    let prov_trust: Vec<_> = inj
+        .iter()
+        .filter(|l| l.source == "maps-rwx-runtime-allowlist")
+        .collect();
+    if !prov_trust.is_empty() {
+        println!(
+            "🛡  Provisional Trust (SEC‑029): {} region(s) in allowlisted binaries (JIT shape unverified).\n",
+            prov_trust.len()
         );
     }
 }
