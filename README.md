@@ -3,7 +3,7 @@
 [![Release](https://img.shields.io/github/v/release/OWLZOPS/owlzops-mapper?include_prereleases&style=flat)](https://github.com/OWLZOPS/owlzops-mapper/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0%20with%20Commons%20Clause-blue.svg)](LICENSE)
 
-> One binary. Zero dependencies. Sub-second host scanning. Identify active compromises, container escapes, and compliance gaps without deploying heavy agents. 
+> One binary. Zero dependencies. Sub-second host scanning. Identify active compromises, container escapes, and compliance gaps without deploying heavy agents.
 
 `owlzops-mapper` is a surgical, self-contained Rust binary designed for rapid forensics, infrastructure hardening and drift monitoring. It performs a deep-state Linux and Docker audit in seconds, securely extracting IoCs (Indicators of Compromise), capability abuses, and misconfigurations — exporting directly to JSONL, Excel, or terminal for SIEM integration. No internet required. No data leaves the server.
 
@@ -40,6 +40,8 @@ sudo ./owlzops-mapper audit
 ## Core Features (Agentless EDR-lite)
 
 * **Active Compromise & Threat Hunting (IoC)** – Sweeps memory (`/memfd`), deleted executables, ephemeral paths (`/dev/shm`, `/tmp`), and network state to detect hidden rootkits, reverse shells, library injection, and fileless malware in milliseconds.
+* **Deep Memory Forensics** – When invoked with `--deep`, the mapper reads process memory via `process_vm_readv`, resolves pointers, calculates Shannon entropy, detects binary prologues and image headers. Untrusted executable payloads escalate directly to **SEC‑028** (Critical).
+* **Trust‑but‑Verify Policy** – Trusted binary paths (allowlist) no longer grant a free pass. Memory that cannot be positively attributed as legitimate JIT code is flagged as **SEC‑029** (Provisional Trust), visible to the operator and auditable.
 * **Deep Container Forensics & Escape Detection** – Analyzes Docker/containerd runtimes for privileged container abuses, sensitive host mounts (`/var/run/docker.sock`), capability leakage, and missing resource limits. All mapped to CIS benchmarks.
 * **Agentless Fleet Orchestration** – Drop the binary via SSH, scan dozens of servers in parallel, and clean up automatically. Supports both passwordless sudo and **password‑based sudo** (`--ask-sudo-pass`). Zero permanent footprint.
 * **Snapshot Diffing & Drift Monitoring** – Capture server state as JSON snapshots, compare any two, and get color‑coded Excel/terminal diffs of exactly what changed (new open ports, changed capabilities, added cronjobs).
@@ -51,13 +53,16 @@ sudo ./owlzops-mapper audit
 
 ## Highlights v0.5.14
 
-**R11 Audit Fixes & Hardening**
+**Deep Memory Forensics & Intelligent Alerting**
 
-* **CPU‑DoS protection** – added `MAX_FD_PER_PID = 4096` cap in `attribute_sockets`, `correlate_with_processes`, and `socket_owning_pids`. A single process with hundreds of thousands of file descriptors can no longer stall the scan; coverage warns when the cap is hit.
-* **IPv4‑mapped IPv6 false‑positive fix** – `is_public_addr()` now unwraps `::ffff:x.x.x.x` and classifies them by IPv4 rules, eliminating spurious `SEC-022` (reverse shell) alerts for internal addresses on dual‑stack sockets.
-* **CAP‑002 heuristic** – `ProcCapFinding` gains an optional `reason` field. Non‑root processes with ambient capabilities and `NoNewPrivs` disabled (or absent) are marked `"ambient_caps_no_new_privs"`, highlighting a potential privilege‑escalation path without extra I/O.
-* **Broader library‑injection detection** – `LD_AUDIT` and `LD_PROFILE` are now scanned alongside `LD_PRELOAD` and `LD_LIBRARY_PATH`. Catches injection via the rtld‑audit interface (MITRE T1574.006).
+* **Deep Forensics (`--deep`)** – Reads process memory, resolves pointers, calculates entropy, and detects binary headers (MZ/ELF/PE). Unattributed executable payloads raise **SEC‑028** (Critical), while benign JIT shapes are verified and suppressed.
+* **Single Source of Truth for Injection Classification** – `InjectionClass` enum centralises policy; UI and scoring now use the same logic, eliminating false escalation mismatches.
+* **JetBrains False Positives Eliminated** – `/home` is no longer treated as a volatile path for `.so` libraries; 15 CRITICAL findings on JetBrains IDEs are removed.
+* **Smart UI Aggregation** – Memory anomaly tables show forensic anchors (VMA addresses, type breakdown, origin labels) and can be expanded with `-v`/`--verbose` for full per‑region detail.
+* **Trust‑but‑Verify** – Allowlisted binaries (Chrome, Zen, GNOME Shell, etc.) no longer receive blind trust. Their memory regions are labelled `maps‑rwx‑runtime‑allowlist` and enter the new **SEC‑029** provisional trust bucket until deep analysis confirms benign JIT shape or detects anomalies.
+* **Security** – `process_vm_readv` is used instead of `ptrace`, avoiding anti‑debugging conflicts; memory reads are capped and budgeted.
 
+(Previous R11 fixes — CPU‑DoS protection, IPv4‑mapped IPv6 fix, CAP‑002 heuristic, broader LD‑injection detection — are retained.)
 
 ---
 
@@ -66,11 +71,17 @@ sudo ./owlzops-mapper audit
 ### Local audit & Forensics
 
 ```bash
-# Terminal dashboard (default, fully offline)
+# Standard fast‑path audit
 sudo ./owlzops-mapper audit
 
-# Export to Excel (with Executive Summary as first sheet)
-sudo ./owlzops-mapper audit --format excel --output report.xlsx
+# Deep forensic scan (memory pointers, entropy, image headers)
+sudo ./owlzops-mapper audit --deep
+
+# Verbose terminal output (full VMA detail)
+sudo ./owlzops-mapper audit --deep -v
+
+# Export to Excel
+sudo ./owlzops-mapper audit --deep --format excel --output report.xlsx
 ```
 
 ```bash
@@ -218,6 +229,8 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `--ask-sudo-pass` | Prompt for a sudo password and forward it securely over the SSH channel (removes the NOPASSWD requirement) |
 | `--keep-binary` | Skip cleanup — leave the binary on the remote host after the scan |
 | `--max-concurrent <N>` | Maximum number of simultaneous SSH sessions (default: 50) |
+| `--deep` | Enable deep forensic scan: memory pointer resolution, entropy, binary header detection, and ghost PID (LKM rootkit) scanning |
+| `-v, --verbose` | Show full per‑VMA detail in memory anomaly tables (useful with `--deep`) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
@@ -230,7 +243,9 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `compare <before> <after>` | Compare two JSON snapshots and show drift |
 | `dir-compare <dir>` | Compare the two most recent snapshots in a directory |
 | `--host <HOST>` | Single hostname/IP (or comma‑separated list) for remote scanning |
-| `--deep` | Enable deep forensic scan: ghost PID (LKM rootkit) detection, extended /proc probing. Root only. |
+| `--deep` | Enable deep forensic scan: ghost PID (LKM rootkit) detection, extended /proc probing, and memory forensics. Root only. |
+| `-v, --verbose` | Show full per‑region detail in memory tables (only effective with text output) |
+
 ---
 
 ## Exit Codes
@@ -240,7 +255,7 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `0` | No critical issues found | All hosts clean |
 | `1` | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) | Any host has critical issues |
 | `2` | Not running as root, scan warnings present, **or fleet scan produced zero reports** | Any host not running as root, **or all remote hosts failed** |
-| `3` | **Active compromise detected** (IoC findings SEC‑015…SEC‑024, DOCK‑010) | **Any host shows active compromise** |
+| `3` | **Active compromise detected** (IoC findings SEC‑015…SEC‑024, SEC‑028, DOCK‑010) | **Any host shows active compromise** |
 
 > **Scoring version guard:** when comparing snapshots taken with different scoring engine versions, `risk_score` changes are marked as `~ Changed` rather than `↑ Improved` or `↓ Degraded`.
 
@@ -302,6 +317,8 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | **SEC‑023 – Userspace rootkit / library injection** | **+60** |
 | **SEC‑024 – True Ghost PID (LKM rootkit)** | **+60** |
 | **SEC‑025 – Downgraded PID visibility mismatch** | **+20** (no exit code escalation) |
+| **SEC‑028 – Unattributed executable payload in memory (deep forensics)** | **+60** |
+| **SEC‑029 – Provisional trust (allowlisted binary, memory unverified)** | **0** (auditable, no penalty) |
 | **DOCK‑010 – Container runtime capability tampering** | **+60** |
 | **CAP‑001 (dynamic) – Non‑root with critical capabilities** | **+8 (loopback) / +20 (wildcard exposure)** |
 
@@ -321,6 +338,7 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Internals | Cron jobs (with severity classification), systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
 | Backups | Detection of restic, borg, duplicati, rsync/backup in cron |
 | NTP | Time synchronization status and offset |
+| **Memory Forensics (‑‑deep)** | **Process memory reading, pointer resolution (O(log N)), Shannon entropy, binary headers, prologue detection, origin attribution (FFI, GObject, JVM, trampoline)** |
 | **Malware & Intrusion** | **Full /proc sweep for known malicious processes, fileless executables, memfd implants, bind‑mount masking, reverse shells, library injection, hidden PIDs (LKM rootkit), container runtime capability tampering** |
 
 ---
@@ -331,7 +349,7 @@ Owlzops provides high-tier engineering and security consulting to remediate the 
 
 | Finding Category | Business Impact | Our Service |
 | --- | --- | --- |
-| **Active compromise detected (SEC‑015…024)** | Evidence of a rootkit, backdoor, or fileless malware. Immediate incident response is required to isolate and expel the threat. | **Compromise Assessment:** Deep forensic analysis to answer "Who is in our servers right now?" and secure the perimeter. |
+| **Active compromise detected (SEC‑015…024, SEC‑028)** | Evidence of a rootkit, backdoor, or fileless malware. Immediate incident response is required to isolate and expel the threat. | **Compromise Assessment:** Deep forensic analysis to answer "Who is in our servers right now?" and secure the perimeter. |
 | **Risk Score ≥ 70 / Firewall disabled / Socket Mounts** | The infrastructure has systemic architectural flaws exposing you to automated exploitation or container escapes. | **Infrastructure Hardening:** We rebuild your VPCs, implement strict firewall policies, and deploy secure rootless container environments. |
 | **Pending updates / CIS Benchmark gaps** | You are accumulating technical debt and will fail compliance audits. | **Compliance Readiness:** Engineering consultation to align your infrastructure with strict SOC 2 and ISO 27001 requirements before the official auditor arrives. |
 
