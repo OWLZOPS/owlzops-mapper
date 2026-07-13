@@ -1,20 +1,24 @@
 
-## Bug Fixes
-
-- **ui:** Reuse spinner for local scan and ensure proper cleanup
-
 ## Documentation
 
-- Update CHANGELOG for v0.5.13
-- **README:** Document `--host` and `--deep` scan options
+- Update CHANGELOG for v0.5.14
 
 ## Features
 
-- **scanners:** Enforce fd limits per PID and improve logging for partial socket scans
-- **scanners:** Add "reason" field for ambient capabilities and support LD_AUDIT/LD_PROFILE detection
+- **scanners:** Add self-integrity preflight checks for tamper detection
+- **scanners:** Refine self-integrity and library injection logic
+- **scanners/ui:** Enhance library injection scanner and improve memory anomaly reporting
+- **scanners:** Expand allow list with additional binaries for injection scanner
+- **ui:** Add verbose mode for detailed dashboard rendering
+- **scanners:** Implement deep memory forensics and pointer resolution analysis
+- **scanners/ui:** Introduce SEC-028 for deep memory forensics and enhance anomaly reporting
+- **scanners/ui:** Add HotSpot origin classification for Java JIT detection
+- **scanners/ui:** Introduce SEC-029 for trusted-path executable memory verification
+- **scanners/ui:** Enhance anomaly filtering and expand runtime allowlist
+- **scanners/ui:** Add PCRE2 JIT origin classification and update deep scanner logic
+- **ui:** Add PCRE2 JIT to benign anomaly filter
 
 ## Miscellaneous
 
-- **docs:** Update README for v0.5.13 release
-- **release:** Bump version to 0.5.14, update README and changelog
+- Bump version to 0.5.15 and document deep memory forensics features
 
