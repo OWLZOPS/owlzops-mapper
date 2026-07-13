@@ -38,6 +38,11 @@ const RUNTIME_EXE_ALLOWLIST: &[&str] = &[
     "/usr/bin/php",
     "/usr/sbin/php-fpm",
     "/usr/bin/node",
+    "/usr/local/bin/node",
+    "/usr/bin/python",
+    "/usr/bin/python3",
+    "/usr/bin/unattended-upgrade",
+    "/usr/local/hestia/nginx/sbin/hestia-nginx",
 ];
 
 /// Volatile paths where a loaded .so is genuinely suspicious.
