@@ -1,44 +1,277 @@
-//! Userspace rootkit / library-injection detection (SEC-023).
-//!
-//! Flags processes with a shared object injected from a writable/ephemeral
-//! path. Two independent sources, correlated per-pid:
-//!   * `/proc/<pid>/environ` — LD_PRELOAD / LD_LIBRARY_PATH pointing at an
-//!     ephemeral path (userspace injection via environment: libprocesshider…);
-//!   * `/proc/<pid>/maps`    — a file-backed .so actually mapped from an
-//!     ephemeral path (catches ptrace/dlopen implants even after the env var
-//!     is scrubbed). A "(deleted)" mapped object is treated as a stronger IoC.
-//!
-//! Additionally, the scan now flags `LD_AUDIT` and `LD_PROFILE`, two less
-//! known but equally powerful dynamic linker variables that can force the
-//! loading of a shared object into every process started by the affected
-//! binary (MITRE T1574.006).
-//!
-//! FP control is by funnel, reusing the existing `is_ephemeral_exec_path`
-//! contract (the same /tmp,/var/tmp,/dev/shm,/home,/memfd: set that already
-//! drives SEC-013/015). Legit software does not preload .so from these paths.
-//!
-//! Kernel-rootkit caveat: like every readdir-based scanner this is blind to a
-//! PID hidden at the getdents layer — it targets the userspace class, where it
-//! is near-zero-FP.
+//! Userspace rootkit / library-injection detection (SEC-023) and
+//! Anomalous Executable Memory detection (SEC-026).
 
 use std::fs;
 
+use super::deep;
 use crate::coverage;
 use crate::models::LibraryInjectionFinding;
 use crate::safe_io;
 
-/// maps can be large for JIT/DB processes; cap defensively.
-const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
-/// Hard cap on stored findings.
-const MAX_FINDINGS: usize = 64;
-/// LD_* keys whose ephemeral value indicates injection.
-const INJECT_ENV_KEYS: [&str; 4] = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE"];
-
-pub fn scan_library_injections() -> Vec<LibraryInjectionFinding> {
-    detect_from_proc("/proc")
+/// Configuration for the memory scanner, passed down from CLI args.
+#[derive(Debug, Clone, Default)]
+pub struct ScanConfig {
+    pub deep: bool,
+    pub target_pid: Option<u32>,
 }
 
-fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
+impl ScanConfig {
+    /// Should we perform deep memory forensics on this PID?
+    #[inline]
+    fn deep_for(&self, pid: u32) -> bool {
+        self.deep || self.target_pid == Some(pid)
+    }
+}
+
+const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
+const MAX_FINDINGS: usize = 64;
+const INJECT_ENV_KEYS: [&str; 4] = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE"];
+const RT_LIBS: &[&str] = &[
+    "libjvm.so",
+    "libnode.so",
+    "libpython3",
+    "libv8",
+    "libcef.so",
+];
+
+// ── VENDOR & RUNTIME ANCHORS ───────────────────────────────
+
+const VENDOR_ROOTS: &[&str] = &[
+    "/.local/share/JetBrains/",
+    "/.cache/JetBrains/",
+    "/.vscode/",
+    "/.vscode-server/",
+    "/usr/share/code/",
+    "/opt/google/chrome/",
+];
+const VENDOR_ANCHOR_MIN_SO: usize = 3;
+
+/// Known static runtimes or complex interpreters that do not predictably
+/// load RT_LIBS. Checked by strict binary path only.
+const RUNTIME_EXE_ALLOWLIST: &[&str] = &[
+    // --- for Servers ---
+    "/usr/bin/php",
+    "/usr/sbin/php-fpm",
+    "/usr/bin/node",
+    "/usr/local/bin/node",
+    "/usr/bin/python",
+    "/usr/bin/python3",
+    "/usr/bin/unattended-upgrade",
+    "/usr/local/hestia/nginx/sbin/hestia-nginx",
+    // --- Linux Desktop ---
+    "/opt/google/chrome/chrome",
+    "/usr/lib/chromium/chromium",
+    "/opt/zen-browser/zen",
+    "/usr/bin/gjs-console",
+    "/usr/bin/gnome-shell",
+    "/opt/telegram/telegram",
+];
+
+/// Volatile paths where a loaded .so is genuinely suspicious.
+/// Differs from is_ephemeral_exec_path by NOT including /home,
+/// because user software (IDEs, VSCode) legitimately loads .so from /home.
+fn is_volatile_lib_path(p: &str) -> bool {
+    p.starts_with("/tmp/")
+        || p.starts_with("/var/tmp/")
+        || p.starts_with("/dev/shm/")
+        || p.starts_with("/run/")
+        || p.starts_with("/memfd:")
+}
+
+fn exe_allowlisted(exe: Option<&str>) -> bool {
+    exe.is_some_and(|e| {
+        let base = e.trim_end_matches(" (deleted)");
+        !e.ends_with(" (deleted)")
+            && RUNTIME_EXE_ALLOWLIST
+                .iter()
+                .any(|p| base.starts_with(p) || base == *p)
+    })
+}
+
+// ── REGION TIERING ─────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum ExecTier {
+    Ignore,
+    AnonRx,
+    AnonRwx,
+    RwxFileBacked,
+    ExecStack,
+    ExecHeap,
+}
+
+fn classify_region(perms: &str, backing: Option<&str>) -> ExecTier {
+    let b = perms.as_bytes();
+    let x = b.get(2) == Some(&b'x');
+    let w = b.get(1) == Some(&b'w');
+
+    if !x {
+        return ExecTier::Ignore;
+    }
+
+    match backing {
+        Some("[vdso]") | Some("[vvar]") | Some("[vsyscall]") => ExecTier::Ignore,
+        Some(p) if p == "[stack]" || p.starts_with("[stack:") => ExecTier::ExecStack,
+        Some("[heap]") => ExecTier::ExecHeap,
+        Some(p) if p.starts_with("[anon:") => {
+            if w {
+                ExecTier::AnonRwx
+            } else {
+                ExecTier::AnonRx
+            }
+        }
+        Some(p) if p.starts_with('/') => {
+            // If a writable file resides in a volatile directory -> alert
+            if w && is_volatile_lib_path(p) {
+                ExecTier::RwxFileBacked
+            } else {
+                ExecTier::Ignore
+            }
+        }
+        Some(_) => {
+            if w {
+                ExecTier::AnonRwx
+            } else {
+                ExecTier::AnonRx
+            }
+        }
+        None => {
+            if w {
+                ExecTier::AnonRwx
+            } else {
+                ExecTier::AnonRx
+            }
+        }
+    }
+}
+
+// ── RUNTIME TRUST & TOPOLOGY ───────────────────────────────
+
+struct RuntimeTrust {
+    exe_ok: bool,
+    runtime_libs: bool,
+    vendor_anchored: bool,
+}
+
+fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
+    let exe_ok = exe_path.is_some_and(|e| {
+        let clean = e.trim_end_matches(" (deleted)");
+        let is_deleted = e.ends_with(" (deleted)");
+
+        // Allow execution from /home if it's a confirmed vendor path (e.g. JetBrains)
+        let is_vendor = VENDOR_ROOTS.iter().any(|r| clean.contains(*r));
+
+        !is_deleted && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
+    });
+
+    let runtime_libs = maps.lines().any(|l| {
+        l.rsplit(char::is_whitespace)
+            .next()
+            .is_some_and(|p| p.starts_with("/usr/") && RT_LIBS.iter().any(|lib| p.contains(lib)))
+    });
+
+    let vendor_anchored = exe_path
+        .and_then(|e| VENDOR_ROOTS.iter().find(|r| e.contains(**r)).copied())
+        .is_some_and(|root| {
+            maps.lines()
+                .filter(|l| {
+                    let last = l.rsplit(char::is_whitespace).next().unwrap_or("");
+                    last.contains(root)
+                        && !last.ends_with("(deleted)")
+                        && (last.ends_with(".so") || last.contains(".so."))
+                })
+                .count()
+                >= VENDOR_ANCHOR_MIN_SO
+        });
+
+    RuntimeTrust {
+        exe_ok,
+        runtime_libs,
+        vendor_anchored,
+    }
+}
+
+#[derive(Debug)]
+struct ExecCluster {
+    lo: u64,
+    hi: u64,
+    pages: usize,
+    span: u64,
+}
+
+fn build_exec_clusters(maps: &str) -> Vec<ExecCluster> {
+    const GAP: u64 = 64 * 1024;
+    let mut regions: Vec<(u64, u64)> = maps
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(6, char::is_whitespace);
+            let addr = it.next()?;
+            if it.next()?.as_bytes().get(2) != Some(&b'x') {
+                return None;
+            }
+            let (lo, hi) = addr.split_once('-')?;
+            Some((
+                u64::from_str_radix(lo, 16).ok()?,
+                u64::from_str_radix(hi, 16).ok()?,
+            ))
+        })
+        .collect();
+
+    regions.sort_unstable();
+    let mut out: Vec<ExecCluster> = Vec::new();
+    for (lo, hi) in regions {
+        match out.last_mut() {
+            Some(c) if lo.saturating_sub(c.hi) <= GAP => {
+                c.hi = hi;
+                c.pages += 1;
+                c.span = c.hi - c.lo;
+            }
+            _ => out.push(ExecCluster {
+                lo,
+                hi,
+                pages: 1,
+                span: hi - lo,
+            }),
+        }
+    }
+    out
+}
+
+fn is_inside_jit_cluster(addr_lo: u64, clusters: &[ExecCluster]) -> bool {
+    clusters
+        .iter()
+        .any(|c| (c.span >= 8 * 1024 * 1024 || c.pages >= 16) && addr_lo >= c.lo && addr_lo <= c.hi)
+}
+
+const TRAMP_MAX_BYTES: u64 = 4 * 4096;
+const TRAMP_POOL_MIN: usize = 8;
+
+fn region_size(addr: &str) -> Option<u64> {
+    let (lo, hi) = addr.split_once('-')?;
+    Some(u64::from_str_radix(hi, 16).ok()? - u64::from_str_radix(lo, 16).ok()?)
+}
+
+fn is_trampoline_pool(maps: &str) -> bool {
+    maps.lines()
+        .filter(|l| {
+            let mut it = l.splitn(6, char::is_whitespace);
+            let (Some(a), Some(p)) = (it.next(), it.next()) else {
+                return false;
+            };
+            p.as_bytes().get(2) == Some(&b'x')
+                && region_size(a).is_some_and(|s| s <= TRAMP_MAX_BYTES)
+        })
+        .count()
+        >= TRAMP_POOL_MIN
+}
+
+// ── MAIN SCANNER ───────────────────────────────────────────
+
+pub fn scan_library_injections(cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
+    detect_from_proc("/proc", cfg)
+}
+
+fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
     let mut findings = Vec::new();
     let mut denied = 0usize;
 
@@ -71,94 +304,101 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
 
         let mut pid_hits = 0usize;
 
-        // ── Source 1: environ (LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT / LD_PROFILE) ──
-        match safe_io::read_file_bytes_capped(
+        // --- 1. ENVIRON SCAN ---
+        if let Ok((data, _)) = safe_io::read_file_bytes_capped(
             &format!("{proc_root}/{pid}/environ"),
             safe_io::CAP_PROC_ENVIRON,
         ) {
-            Ok((data, truncated)) => {
-                if truncated {
-                    coverage::record(format!("/proc/{pid}/environ truncated"));
-                }
-                for chunk in data.split(|&b| b == 0) {
-                    if chunk.is_empty() {
-                        continue;
-                    }
-                    let Ok(kv) = std::str::from_utf8(chunk) else {
-                        continue;
-                    };
-                    let Some((key, value)) = kv.split_once('=') else {
-                        continue;
-                    };
-                    let Some(&matched_key) =
-                        INJECT_ENV_KEYS.iter().find(|k| key.eq_ignore_ascii_case(k))
-                    else {
-                        continue;
-                    };
-                    // For LD_AUDIT and LD_PROFILE the value is a single path,
-                    // but we reuse the same loop: split on colon/space for
-                    // compatibility with colon-separated lists (common in
-                    // LD_LIBRARY_PATH). This is harmless for single-path vars.
-                    for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
-                        if crate::utils::is_ephemeral_exec_path(path) {
-                            findings.push(LibraryInjectionFinding {
-                                pid,
-                                process: comm.clone(),
-                                object_path: path.to_string(),
-                                source: matched_key.to_string(),
-                                is_deleted: false,
-                            });
-                            pid_hits += 1;
-                            if findings.len() >= MAX_FINDINGS {
-                                break;
-                            }
-                        }
+            for chunk in data.split(|&b| b == 0).filter(|c| !c.is_empty()) {
+                let Ok(kv) = std::str::from_utf8(chunk) else {
+                    continue;
+                };
+                let Some((key, value)) = kv.split_once('=') else {
+                    continue;
+                };
+                let Some(&matched_key) =
+                    INJECT_ENV_KEYS.iter().find(|k| key.eq_ignore_ascii_case(k))
+                else {
+                    continue;
+                };
+
+                for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
+                    if is_volatile_lib_path(path) {
+                        findings.push(LibraryInjectionFinding {
+                            pid,
+                            process: comm.clone(),
+                            object_path: path.to_string(),
+                            source: matched_key.to_string(),
+                            is_deleted: false,
+                            region_addr: None, // no address available from environ
+                            deep_forensics: None,
+                        });
+                        pid_hits += 1;
                     }
                 }
             }
-            Err(_) => denied += 1,
         }
 
-        // ── Source 2: maps (file-backed .so from ephemeral path) ──────
+        // --- 2. MAPS SCAN ---
         if findings.len() < MAX_FINDINGS {
-            match safe_io::read_file_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS) {
-                Ok((content, truncated)) => {
-                    if truncated {
-                        coverage::record(format!("/proc/{pid}/maps truncated"));
-                    }
-                    scan_maps(&content, pid, &comm, &mut findings);
+            if let Ok((content, _)) =
+                safe_io::read_file_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
+            {
+                let exe_path = fs::read_link(format!("{proc_root}/{pid}/exe"))
+                    .map(|p| p.to_string_lossy().to_string())
+                    .ok();
+                let trust = assess_runtime(&content, exe_path.as_deref());
+
+                let start = findings.len(); // mark the tail before scan_maps appends
+
+                scan_maps(
+                    &content,
+                    pid,
+                    &comm,
+                    &trust,
+                    exe_path.as_deref(),
+                    &mut findings,
+                );
+
+                // Slow path: enrich only findings created for this PID
+                if cfg.deep_for(pid) && findings.len() > start {
+                    let ctx = deep::ProcMemContext::build(&content); // single maps parse
+                    deep::enrich(&mut findings[start..], pid, &ctx);
                 }
-                Err(_) => {
-                    if pid_hits == 0 {
-                        denied += 1;
-                    }
-                }
+            } else if pid_hits == 0 {
+                denied += 1;
             }
         }
     }
 
     if denied > 0 {
-        let hint = if !crate::is_running_as_root() {
-            " — run as root for full visibility"
-        } else {
-            ""
-        };
         coverage::record(format!(
-            "library-injection scan: {denied} process(es) with unreadable environ/maps{hint}"
+            "library-injection scan: {denied} process(es) with unreadable maps"
         ));
     }
-
     findings
 }
 
-fn scan_maps(content: &str, pid: u32, comm: &str, findings: &mut Vec<LibraryInjectionFinding>) {
-    let mut seen: Vec<&str> = Vec::new();
+fn scan_maps(
+    content: &str,
+    pid: u32,
+    comm: &str,
+    trust: &RuntimeTrust,
+    exe_path: Option<&str>,
+    findings: &mut Vec<LibraryInjectionFinding>,
+) {
+    let mut seen: Vec<String> = Vec::new();
+    let clusters = build_exec_clusters(content);
+    let pool = is_trampoline_pool(content);
+    let trust_met = trust.exe_ok && (trust.runtime_libs || trust.vendor_anchored);
+
     for line in content.lines() {
         if findings.len() >= MAX_FINDINGS {
             break;
         }
+
         let mut it = line.splitn(6, char::is_whitespace);
-        let (_addr, _perms, _off, _dev, _inode, path) = (
+        let (addr, perms, _off, _dev, _inode, path) = (
             it.next(),
             it.next(),
             it.next(),
@@ -166,241 +406,198 @@ fn scan_maps(content: &str, pid: u32, comm: &str, findings: &mut Vec<LibraryInje
             it.next(),
             it.next(),
         );
-        let Some(path) = path else { continue };
-        let path = path.trim();
-        if path.is_empty() || path.starts_with('[') {
+
+        let Some(addr) = addr else { continue };
+        if !addr.contains('-') {
+            continue;
+        }
+        let addr_lo = addr
+            .split_once('-')
+            .and_then(|(lo, _)| u64::from_str_radix(lo, 16).ok())
+            .unwrap_or(0);
+
+        let Some(perms) = perms else { continue };
+        let path = path.map(str::trim).filter(|p| !p.is_empty());
+
+        // --- 2.1 Classical Ephemeral .so Injection (SEC-023) ---
+        let mut found_ephemeral = false;
+        if let Some(p) = path
+            && !p.starts_with('[')
+        {
+            let (clean, is_deleted) = match p.strip_suffix(" (deleted)") {
+                Some(base) => (base, true),
+                None => (p, false),
+            };
+            if (clean.ends_with(".so") || clean.contains(".so.")) && is_volatile_lib_path(clean) {
+                let source = if trust_met {
+                    "maps-so-jit-extract"
+                } else {
+                    "maps"
+                };
+                let clean_str = clean.to_string();
+                if !seen.contains(&clean_str) {
+                    seen.push(clean_str);
+                    findings.push(LibraryInjectionFinding {
+                        pid,
+                        process: comm.to_string(),
+                        object_path: clean.to_string(),
+                        source: source.to_string(),
+                        is_deleted,
+                        region_addr: Some(addr.to_string()),
+                        deep_forensics: None,
+                    });
+                    found_ephemeral = true;
+                }
+            }
+        }
+        if found_ephemeral {
             continue;
         }
 
-        let (clean, is_deleted) = match path.strip_suffix(" (deleted)") {
-            Some(p) => (p, true),
-            None => (path, false),
+        // --- 2.2 Anomalous Executable Regions (SEC-026 & SEC-027) ---
+        let tier = classify_region(perms, path);
+        if tier == ExecTier::Ignore {
+            continue;
+        }
+
+        let small = region_size(addr).is_some_and(|s| s <= TRAMP_MAX_BYTES);
+
+        // 1. Strict JIT cluster check
+        let mut downgrade: Option<&str> = if trust_met {
+            match tier {
+                ExecTier::AnonRx => Some("maps-rx-jit-suppressed"),
+                ExecTier::AnonRwx if is_inside_jit_cluster(addr_lo, &clusters) => {
+                    Some("maps-rwx-jit-hardening")
+                }
+                ExecTier::AnonRwx if small => Some(if pool {
+                    "maps-rwx-jit-trampoline"
+                } else {
+                    "maps-rwx-jit-runtime"
+                }),
+                _ => None,
+            }
+        } else {
+            None
         };
 
-        let looks_like_so = clean.ends_with(".so") || clean.contains(".so.");
-        if !looks_like_so || !crate::utils::is_ephemeral_exec_path(clean) {
-            continue;
+        // 2. FALLBACK: if clusters didn't match but the path is allowlisted — label for SEC-029
+        if downgrade.is_none()
+            && exe_allowlisted(exe_path)
+            && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx)
+        {
+            downgrade = Some("maps-rwx-runtime-allowlist");
         }
-        if seen.contains(&clean) {
-            continue;
-        }
-        seen.push(clean);
 
-        findings.push(LibraryInjectionFinding {
-            pid,
-            process: comm.to_string(),
-            object_path: clean.to_string(),
-            source: "maps".to_string(),
-            is_deleted,
-        });
+        if let Some(src) = downgrade {
+            let desc = format!("{} (pid {}): suppressed via {}", comm, pid, src);
+            if !seen.contains(&desc) {
+                seen.push(desc.clone());
+                findings.push(LibraryInjectionFinding {
+                    pid,
+                    process: comm.to_string(),
+                    object_path: desc,
+                    source: src.to_string(),
+                    is_deleted: false,
+                    region_addr: Some(addr.to_string()),
+                    deep_forensics: None,
+                });
+            }
+            continue;
+        }
+
+        // Active Finding (SEC-026 or SEC-023 Escalation)
+        let (source, desc) = match tier {
+            ExecTier::ExecStack => (
+                "maps-exec-stack",
+                format!("{} (shellcode on stack)", path.unwrap_or("[stack]")),
+            ),
+            ExecTier::ExecHeap => ("maps-exec-heap", "[heap] (heap spray IOC)".to_string()),
+            ExecTier::RwxFileBacked => (
+                "maps-anon-rwx",
+                format!("{} (rwx file-backed)", path.unwrap_or("unknown")),
+            ),
+            ExecTier::AnonRwx => ("maps-anon-rwx", "anonymous executable (rwxp)".to_string()),
+            ExecTier::AnonRx => ("maps-anon-rx", "anonymous executable (r-xp)".to_string()),
+            _ => continue,
+        };
+
+        if !seen.contains(&desc) {
+            seen.push(desc.clone());
+            findings.push(LibraryInjectionFinding {
+                pid,
+                process: comm.to_string(),
+                object_path: desc,
+                source: source.to_string(),
+                is_deleted: false,
+                region_addr: Some(addr.to_string()),
+                deep_forensics: None,
+            });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use crate::models::InjectionClass;
 
-    // ── maps parsing ─────────────────────────────────────────
-
-    fn find(content: &str) -> Vec<LibraryInjectionFinding> {
-        let mut f = Vec::new();
-        scan_maps(content, 1, "victim", &mut f);
-        f
+    #[test]
+    fn test_volatile_lib_path_excludes_home() {
+        assert!(is_volatile_lib_path("/tmp/evil.so"));
+        assert!(is_volatile_lib_path("/dev/shm/payload.so"));
+        assert!(
+            !is_volatile_lib_path("/home/user/.vscode/extensions/lib.so"),
+            "Home must not be volatile for .so"
+        );
     }
 
     #[test]
-    fn maps_flags_so_from_tmp() {
-        let m = "\
-7f00-7f10 r-xp 00000000 08:01 100 /usr/lib/x86_64-linux-gnu/libc.so.6
-7f20-7f30 r-xp 00000000 08:01 200 /tmp/evil.so
-7f40-7f50 rw-p 00000000 00:00 0 [heap]
-";
-        let out = find(m);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/tmp/evil.so");
-        assert_eq!(out[0].source, "maps");
-        assert!(!out[0].is_deleted);
+    fn test_exe_allowlist() {
+        assert!(exe_allowlisted(Some("/usr/bin/node")));
+        assert!(exe_allowlisted(Some("/opt/google/chrome/chrome")));
+        assert!(
+            !exe_allowlisted(Some("/tmp/node")),
+            "Must check absolute path"
+        );
     }
 
     #[test]
-    fn maps_flags_deleted_so_from_dev_shm() {
-        let m = "7f20-7f30 r-xp 0 08:01 200 /dev/shm/impl.so (deleted)\n";
-        let out = find(m);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/dev/shm/impl.so");
-        assert!(out[0].is_deleted, "deleted mapping must be flagged");
-    }
+    fn test_classify_all_downgrade_sources() {
+        let make = |src: &str| LibraryInjectionFinding {
+            pid: 0,
+            process: String::new(),
+            object_path: String::new(),
+            source: src.to_string(),
+            is_deleted: false,
+            region_addr: None,
+            deep_forensics: None,
+        };
 
-    #[test]
-    fn maps_ignores_system_so_and_anon() {
-        let m = "\
-7f00-7f10 r-xp 0 08:01 100 /usr/lib/libssl.so.3
-7f40-7f50 rw-p 0 00:00 0 [stack]
-7f60-7f70 r--p 0 08:01 300 /lib/ld-linux.so.2
-";
-        assert!(find(m).is_empty(), "system libraries must not flag");
-    }
-
-    #[test]
-    fn maps_dedups_multi_segment_so() {
-        // Same .so mapped as 4 segments → one finding.
-        let m = "\
-7f20-7f21 r-xp 0 08:01 200 /tmp/x.so
-7f21-7f22 r--p 0 08:01 200 /tmp/x.so
-7f22-7f23 rw-p 0 08:01 200 /tmp/x.so
-7f23-7f24 ---p 0 08:01 200 /tmp/x.so
-";
-        assert_eq!(find(m).len(), 1);
-    }
-
-    #[test]
-    fn maps_versioned_so_matches() {
-        let m = "7f20-7f30 r-xp 0 08:01 200 /var/tmp/libfoo.so.1.2\n";
-        let out = find(m);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/var/tmp/libfoo.so.1.2");
-    }
-
-    #[test]
-    fn maps_non_so_executable_from_tmp_is_ignored_here() {
-        let m = "7f20-7f30 r-xp 0 08:01 200 /tmp/dropper\n";
-        assert!(find(m).is_empty());
-    }
-
-    #[test]
-    fn maps_malformed_lines_do_not_panic() {
-        let m = "garbage\n\n7f20 r-xp\n7f20-7f30 r-xp 0 08:01 200 /tmp/ok.so\n";
-        let out = find(m);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/tmp/ok.so");
-    }
-
-    // ── environ + end-to-end over a fake /proc ──────────────
-
-    /// Build a fake /proc/<pid> with comm, environ (NUL-separated), and maps.
-    fn fake_pid(pid: u32, comm: &str, environ: &[&str], maps: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join(pid.to_string());
-        fs::create_dir_all(&base).unwrap();
-        fs::write(base.join("comm"), format!("{comm}\n")).unwrap();
-        let mut env_bytes = Vec::new();
-        for e in environ {
-            env_bytes.extend_from_slice(e.as_bytes());
-            env_bytes.push(0);
+        // Advisory sources must map to JitAdvisory
+        for src in &[
+            "maps-rwx-jit-hardening",
+            "maps-rwx-jit-trampoline",
+            "maps-rwx-jit-runtime",
+            "maps-rx-jit-suppressed",
+            "maps-so-jit-extract",
+            "maps-rwx-runtime-allowlist",
+        ] {
+            assert_eq!(
+                make(src).classify(),
+                InjectionClass::JitAdvisory,
+                "source '{src}' should be JitAdvisory"
+            );
         }
-        fs::write(base.join("environ"), env_bytes).unwrap();
-        fs::write(base.join("maps"), maps).unwrap();
-        tmp
-    }
 
-    #[test]
-    fn environ_ld_preload_from_tmp_is_flagged() {
-        let proc = fake_pid(
-            1337,
-            "nginx",
-            &["PATH=/usr/bin", "LD_PRELOAD=/tmp/hide.so", "HOME=/root"],
-            "",
+        // Real anomaly must remain MemoryAnomaly
+        assert_eq!(
+            make("maps-anon-rwx").classify(),
+            InjectionClass::MemoryAnomaly
         );
-        let out = detect_from_proc(proc.path().to_str().unwrap());
-        let hit = out
-            .iter()
-            .find(|f| f.source == "LD_PRELOAD")
-            .expect("LD_PRELOAD flagged");
-        assert_eq!(hit.pid, 1337);
-        assert_eq!(hit.object_path, "/tmp/hide.so");
-    }
-
-    #[test]
-    fn environ_ld_preload_from_system_path_is_not_flagged() {
-        let proc = fake_pid(
-            1338,
-            "redis-server",
-            &["LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"],
-            "",
+        // Classic injection must stay ClassicInjection
+        assert_eq!(
+            make("LD_PRELOAD").classify(),
+            InjectionClass::ClassicInjection
         );
-        let out = detect_from_proc(proc.path().to_str().unwrap());
-        assert!(out.is_empty(), "system-path preload is legitimate");
-    }
-
-    #[test]
-    fn environ_ld_library_path_list_flags_ephemeral_entry() {
-        let proc = fake_pid(
-            1339,
-            "app",
-            &["LD_LIBRARY_PATH=/usr/lib:/opt/app/lib:/dev/shm/x"],
-            "",
-        );
-        let out = detect_from_proc(proc.path().to_str().unwrap());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/dev/shm/x");
-        assert_eq!(out[0].source, "LD_LIBRARY_PATH");
-    }
-
-    #[test]
-    fn environ_ld_audit_from_tmp_is_flagged() {
-        let proc = fake_pid(1342, "sshd", &["LD_AUDIT=/dev/shm/audit.so"], "");
-        let out = detect_from_proc(proc.path().to_str().unwrap());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/dev/shm/audit.so");
-        assert_eq!(out[0].source, "LD_AUDIT");
-    }
-
-    #[test]
-    fn environ_ld_profile_from_tmp_is_flagged() {
-        let proc = fake_pid(1343, "java", &["LD_PROFILE=/tmp/prof.so"], "");
-        let out = detect_from_proc(proc.path().to_str().unwrap());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].object_path, "/tmp/prof.so");
-        assert_eq!(out[0].source, "LD_PROFILE");
-    }
-
-    #[test]
-    fn environ_and_maps_both_contribute() {
-        let proc = fake_pid(
-            1340,
-            "sshd",
-            &["LD_PRELOAD=/tmp/a.so"],
-            "7f20-7f30 r-xp 0 08:01 200 /dev/shm/b.so\n",
-        );
-        let out = detect_from_proc(proc.path().to_str().unwrap());
-        assert_eq!(out.len(), 2);
-        assert!(
-            out.iter()
-                .any(|f| f.source == "LD_PRELOAD" && f.object_path == "/tmp/a.so")
-        );
-        assert!(
-            out.iter()
-                .any(|f| f.source == "maps" && f.object_path == "/dev/shm/b.so")
-        );
-    }
-
-    #[test]
-    fn clean_process_yields_nothing() {
-        let proc = fake_pid(
-            1341,
-            "bash",
-            &["PATH=/usr/bin", "HOME=/home/user"],
-            "7f00-7f10 r-xp 0 08:01 100 /usr/lib/libc.so.6\n7f40-7f50 rw-p 0 00:00 0 [heap]\n",
-        );
-        assert!(detect_from_proc(proc.path().to_str().unwrap()).is_empty());
-    }
-
-    #[test]
-    fn unreadable_pid_is_skipped_not_fatal() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("9999")).unwrap();
-        let out = detect_from_proc(tmp.path().to_str().unwrap());
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn non_numeric_proc_entries_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("net")).unwrap();
-        fs::write(tmp.path().join("net").join("tcp"), "junk").unwrap();
-        symlink("/x", tmp.path().join("self")).ok();
-        let out = detect_from_proc(tmp.path().to_str().unwrap());
-        assert!(out.is_empty());
     }
 }

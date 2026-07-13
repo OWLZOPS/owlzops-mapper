@@ -10,6 +10,10 @@ use std::path::PathBuf;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+
+    /// Verbose output (show full VMA details in memory anomaly tables)
+    #[arg(short = 'v', long = "verbose", global = true, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand, Debug)]

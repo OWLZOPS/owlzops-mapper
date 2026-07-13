@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, CronSeverity};
+use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin};
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -555,11 +555,97 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023 – Userspace rootkit / library injection ──────
-    if !report.security.library_injections.is_empty() {
-        let list = report
-            .security
-            .library_injections
+    // ── SEC-023, SEC-026, SEC-027, SEC-028 & SEC-029 – Memory Forensics ──
+    const DEEP_ESCALATE_MIN: u8 = 60;
+    const DEEP_DEMOTE_MIN: u8 = 70;
+
+    fn is_trumping_malice(d: &crate::models::DeepMemoryAnalysis) -> bool {
+        d.entropy >= 7.0 || d.image_header
+    }
+
+    fn is_benign_shape(d: &crate::models::DeepMemoryAnalysis) -> bool {
+        d.prologue.is_some()
+            && d.entropy < 6.5
+            && d.resolved_pointers.iter().any(|p| {
+                matches!(
+                    p.kind,
+                    crate::models::PointerKind::LibText | crate::models::PointerKind::JitCluster
+                )
+            })
+    }
+
+    enum MemBucket {
+        Classic,
+        DeepCritical,
+        Anomaly,
+        Advisory,
+        TrustedUnverified,
+    }
+
+    fn mem_bucket(f: &crate::models::LibraryInjectionFinding) -> MemBucket {
+        let deep = f.deep_forensics.as_ref();
+
+        // Layer 1 — trumping malice overrides everything.
+        if let Some(d) = deep
+            && is_trumping_malice(d)
+        {
+            return MemBucket::DeepCritical;
+        }
+
+        // Layer 2 — confident Origin attribution.
+        if let Some(d) = deep {
+            match d.origin {
+                Origin::UnknownPayload if d.confidence >= DEEP_ESCALATE_MIN => {
+                    return MemBucket::DeepCritical;
+                }
+                Origin::FfiClosure
+                | Origin::GObjectCallback
+                | Origin::HotSpot
+                | Origin::RuntimeTrampoline
+                | Origin::Pcre2Jit
+                    if d.confidence >= DEEP_DEMOTE_MIN =>
+                {
+                    return MemBucket::Advisory;
+                }
+                _ => {}
+            }
+        }
+
+        // Layer 3 — trusted path (allowlist) requires benign shape.
+        if f.source == "maps-rwx-runtime-allowlist" {
+            return match deep {
+                Some(d) if is_benign_shape(d) => MemBucket::Advisory,
+                _ => MemBucket::TrustedUnverified,
+            };
+        }
+
+        // Layer 4 — structural class.
+        match f.classify() {
+            InjectionClass::ClassicInjection => MemBucket::Classic,
+            InjectionClass::MemoryAnomaly => MemBucket::Anomaly,
+            InjectionClass::JitAdvisory => MemBucket::Advisory,
+        }
+    }
+
+    let mut classic_injections = Vec::new();
+    let mut deep_critical = Vec::new();
+    let mut memory_anomalies = Vec::new();
+    let mut jit_advisories = Vec::new();
+    let mut trusted_unverified = Vec::new();
+
+    for finding in &report.security.library_injections {
+        match mem_bucket(finding) {
+            MemBucket::Classic => classic_injections.push(finding),
+            MemBucket::DeepCritical => deep_critical.push(finding),
+            MemBucket::Anomaly => memory_anomalies.push(finding),
+            MemBucket::Advisory => jit_advisories.push(finding),
+            MemBucket::TrustedUnverified => trusted_unverified.push(finding),
+        }
+    }
+
+    // SEC-023 – Classic injections
+    if !classic_injections.is_empty() {
+        let list = classic_injections
             .iter()
             .map(|l| {
                 let del = if l.is_deleted { " (deleted)" } else { "" };
@@ -570,14 +656,89 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             })
             .collect::<Vec<_>>()
             .join("; ");
+
         findings.push(Finding {
             id: "SEC-023",
-            title: "ACTIVE COMPROMISE: Userspace rootkit / library injection detected".to_string(),
+            title: "ACTIVE COMPROMISE: Userspace rootkit or code injection detected".to_string(),
             category: Category::Security,
             weight: 60,
+            evidence: format!("{} injected object(s): {}", classic_injections.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // SEC-028 – Deep Critical
+    if !deep_critical.is_empty() {
+        let list = deep_critical
+            .iter()
+            .map(|l| {
+                let (ent, conf) = l
+                    .deep_forensics
+                    .as_ref()
+                    .map_or((0.0, 0), |d| (d.entropy, d.confidence));
+                format!(
+                    "{} (pid {}) @ {}: unattributed RWX payload (entropy {:.1}, {}% conf)",
+                    l.process,
+                    l.pid,
+                    l.region_addr.as_deref().unwrap_or("?"),
+                    ent,
+                    conf
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        findings.push(Finding {
+            id: "SEC-028",
+            title: "ACTIVE COMPROMISE: unattributed executable payload in memory".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!("{} region(s): {}", deep_critical.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // SEC-026 – Memory anomalies
+    if !memory_anomalies.is_empty() {
+        let mut by_process: std::collections::HashMap<String, (usize, Option<String>)> =
+            std::collections::HashMap::new();
+        for anomaly in &memory_anomalies {
+            let key = format!("{} (pid {})", anomaly.process, anomaly.pid);
+            let entry = by_process.entry(key).or_insert((0, None));
+            entry.0 += 1;
+            if entry.1.is_none() {
+                entry.1 = anomaly.region_addr.clone();
+            }
+        }
+
+        let list = by_process
+            .into_iter()
+            .map(|(proc, (count, addr))| {
+                let addr_str = addr.as_deref().unwrap_or("?");
+                format!("{proc} (first @ {addr_str}): {count} anomalous region(s)")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let weight = if memory_anomalies
+            .iter()
+            .any(|l| l.source.contains("exec") || l.source.contains("rwx"))
+        {
+            20
+        } else {
+            10
+        };
+
+        findings.push(Finding {
+            id: "SEC-026",
+            title: "Suspicious executable memory mapping (anon/rwx/stack/heap)".to_string(),
+            category: Category::Security,
+            weight,
             evidence: format!(
-                "{} injected object(s) from ephemeral paths: {}",
-                report.security.library_injections.len(),
+                "{} process(es) with anomalous memory mappings: {}",
+                memory_anomalies.len(),
                 list
             ),
             suppressed: None,
@@ -585,9 +746,73 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // SEC-029 – Trusted but unverified
+    if !trusted_unverified.is_empty() {
+        let mut by_proc = std::collections::HashMap::new();
+        for f in &trusted_unverified {
+            *by_proc
+                .entry(format!("{} (pid {})", f.process, f.pid))
+                .or_insert(0usize) += 1;
+        }
+        let list = by_proc
+            .into_iter()
+            .map(|(p, n)| format!("{p}: {n} region(s)"))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        findings.push(Finding {
+            id: "SEC-029",
+            title: "Trusted-path executable memory — UNVERIFIED (no JIT signature)".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} region(s) in allowlisted binaries; no malice indicators (entropy < 7.0, no image \
+                 header) but JIT shape not yet attributed — provisional trust, add a runtime signature: {}",
+                trusted_unverified.len(),
+                list
+            ),
+            suppressed: Some(
+                "Trusted binary path; deep forensics found no malicious indicators but could not \
+                 positively attribute the JIT origin. Trust is PROVISIONAL, not verified."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
+    // SEC-027 – JIT Advisory
+    if !jit_advisories.is_empty() {
+        let mut by_process = std::collections::HashMap::new();
+        for adv in &jit_advisories {
+            let key = format!("{} (pid {})", adv.process, adv.pid);
+            *by_process.entry(key).or_insert(0usize) += 1;
+        }
+
+        let list = by_process
+            .into_iter()
+            .map(|(proc, count)| format!("{}: {} JIT regions", proc, count))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        findings.push(Finding {
+            id: "SEC-027",
+            title: "Writable JIT code cache — hardening opportunity".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} process(es) using writable JIT arenas: {}",
+                jit_advisories.len(),
+                list
+            ),
+            suppressed: Some(
+                "JIT topology verified; structural pattern matches expected runtime behavior."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
     // ── SEC-024 – True Ghost PID (LKM rootkit process hiding) ─
-    // Split by confidence: confirmed IoCs escalate to exit(3); downgraded
-    // candidates (young/racy/unconfirmable) are a separate non-IoC warning.
     if !report.security.ghost_pids.is_empty() {
         let describe = |g: &crate::models::GhostPidFinding| {
             let st = g.state.as_deref().unwrap_or("?");
@@ -1108,9 +1333,12 @@ impl CriticalFlags {
         // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
         // SEC-025 is likewise excluded: it is a downgraded ghost-PID suspicion
         // (young/racy/unconfirmable), not a confirmed hidden process.
-        const IOC_IDS: [&str; 10] = [
+        // SEC-026 is excluded: suspicious memory mappings (anon/rwx) are not
+        // confirmed active compromise, but may indicate JIT or driver activity.
+        // SEC-028 is included: deep-confirmed unattributed payload = live IoC.
+        const IOC_IDS: [&str; 11] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "DOCK-010",
+            "SEC-024", "SEC-028", "DOCK-010",
         ];
         let count_sysctl = findings
             .iter()
@@ -1170,6 +1398,8 @@ mod tests {
             is_root_execution: true,
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
+            scoring_version: 1,
+            self_integrity: None,
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),
@@ -1177,7 +1407,6 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
-            scoring_version: 1,
         }
     }
 
@@ -1783,6 +2012,8 @@ mod tests {
             object_path: "/tmp/hide.so".into(),
             source: "LD_PRELOAD".into(),
             is_deleted: false,
+            region_addr: None,
+            deep_forensics: None,
         }];
         let f = evaluate(&r)
             .into_iter()

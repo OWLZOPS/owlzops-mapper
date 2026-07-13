@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 
-use crate::models::{AgentReport, CronSeverity, PackageManager};
+use crate::models::{
+    AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
+};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -57,7 +59,7 @@ fn create_dynamic_table() -> Table {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn render_dashboard(report: &AgentReport) {
+pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_header(report);
     render_system_overview(report);
     render_top_memory(report);
@@ -73,7 +75,7 @@ pub fn render_dashboard(report: &AgentReport) {
     render_capability_audit(report);
     render_mount_masking(report);
     render_reverse_shells(report);
-    render_library_injections(report);
+    render_library_injections(report, verbose);
     render_ghost_pids(report);
 
     if !report.coverage_warnings.is_empty() {
@@ -1283,33 +1285,342 @@ fn render_reverse_shells(report: &AgentReport) {
     println!("{t}\n");
 }
 
-// ── SEC-023: Userspace Rootkit / Library Injection ─────────────────────────
+/// Short label for a forensic origin.
+fn origin_label(o: &Origin) -> &'static str {
+    match o {
+        Origin::FfiClosure => "libffi",
+        Origin::GObjectCallback => "GObject",
+        Origin::JitCode => "JIT",
+        Origin::RuntimeTrampoline => "trampoline",
+        Origin::HotSpot => "Java JIT",
+        Origin::Pcre2Jit => "PCRE2 JIT",
+        Origin::UnknownPayload => "Unknown",
+        Origin::Inconclusive => "n/a",
+    }
+}
 
-fn render_library_injections(report: &AgentReport) {
-    if report.security.library_injections.is_empty() {
+// ── SEC-023 / SEC-026 / SEC-027 / SEC-028 / SEC-029: Library Injection & Memory Anomalies ─────
+
+fn render_library_injections(report: &AgentReport, verbose: bool) {
+    let inj = &report.security.library_injections;
+    if inj.is_empty() {
         return;
     }
-    let mut t = create_dynamic_table();
-    t.set_header(vec![
-        Cell::new("PID")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Process").add_attribute(Attribute::Bold),
-        Cell::new("Injected Object").add_attribute(Attribute::Bold),
-        Cell::new("Source").add_attribute(Attribute::Bold),
-        Cell::new("Deleted").add_attribute(Attribute::Bold),
-    ]);
-    for l in &report.security.library_injections {
-        t.add_row(vec![
-            Cell::new(l.pid.to_string()),
-            Cell::new(sanitize_terminal(&l.process)),
-            Cell::new(sanitize_terminal(&l.object_path)),
-            Cell::new(&l.source),
-            Cell::new(if l.is_deleted { "yes" } else { "no" }),
+
+    // Classic injections (SEC-023)
+    let classic: Vec<_> = inj
+        .iter()
+        .filter(|l| l.classify() == InjectionClass::ClassicInjection)
+        .collect();
+    if !classic.is_empty() {
+        let mut t = create_dynamic_table();
+        t.set_header(vec![
+            Cell::new("PID")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("Process").add_attribute(Attribute::Bold),
+            Cell::new("Injected Object").add_attribute(Attribute::Bold),
+            Cell::new("Source").add_attribute(Attribute::Bold),
+            Cell::new("Deleted").add_attribute(Attribute::Bold),
         ]);
+        for l in classic {
+            t.add_row(vec![
+                Cell::new(l.pid.to_string()),
+                Cell::new(sanitize_terminal(&l.process)),
+                Cell::new(sanitize_terminal(&l.object_path)),
+                Cell::new(&l.source).fg(Color::Red),
+                Cell::new(if l.is_deleted { "yes" } else { "no" }),
+            ]);
+        }
+        println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
+        println!("{t}\n");
     }
-    println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
-    println!("{t}\n");
+
+    // Memory anomalies (SEC-026 & SEC-028)
+    // Exclude findings that Deep Forensics has exonerated (benign origin with high confidence)
+    let memory_anomalies: Vec<_> = inj
+        .iter()
+        .filter(|l| {
+            // 1. Base structural filter
+            if l.classify() != InjectionClass::MemoryAnomaly {
+                return false;
+            }
+            // 2. Exoneration by Deep Forensics: benign origin with confidence >= 70
+            if let Some(d) = &l.deep_forensics {
+                let is_benign = matches!(
+                    d.origin,
+                    Origin::FfiClosure
+                        | Origin::GObjectCallback
+                        | Origin::HotSpot
+                        | Origin::RuntimeTrampoline
+                        | Origin::Pcre2Jit
+                );
+                if is_benign && d.confidence >= 70 {
+                    return false; // Remove from the warning table
+                }
+            }
+            true
+        })
+        .collect();
+
+    if !memory_anomalies.is_empty() {
+        let has_deep = memory_anomalies.iter().any(|l| l.deep_forensics.is_some());
+
+        if verbose {
+            // -v: one row per VMA, full Raw Truth
+            let mut t = create_dynamic_table();
+            t.set_header(vec![
+                Cell::new("PID")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Cyan),
+                Cell::new("Process").add_attribute(Attribute::Bold),
+                Cell::new("Type").add_attribute(Attribute::Bold),
+                Cell::new("Address").add_attribute(Attribute::Bold),
+                Cell::new("Detail").add_attribute(Attribute::Bold),
+            ]);
+            let mut all: Vec<_> = memory_anomalies.iter().collect();
+            all.sort_by_key(|l| std::cmp::Reverse(region_kind(&l.source).1));
+            for l in all {
+                let (kind, rank) = region_kind(&l.source);
+                let c = if rank >= 3 { Color::Red } else { Color::Yellow };
+                t.add_row(vec![
+                    Cell::new(l.pid.to_string()),
+                    Cell::new(sanitize_terminal(&l.process)),
+                    Cell::new(kind).fg(c),
+                    Cell::new(l.region_addr.as_deref().unwrap_or("?")),
+                    Cell::new(sanitize_terminal(&l.object_path)),
+                ]);
+            }
+            println!("⚠️  Anomalous Executable Memory (SEC‑026) — verbose:");
+            println!("{t}\n");
+        } else {
+            // Compact default: group by (process, pid) with shape-aware merging
+            struct Row {
+                process: String,
+                pids: Vec<u32>,
+                kinds: String,
+                anchor: String,
+                rank: u8,
+                origin: Option<String>,
+            }
+
+            let mut groups: std::collections::BTreeMap<
+                (&str, u32),
+                Vec<&&LibraryInjectionFinding>,
+            > = std::collections::BTreeMap::new();
+            for l in &memory_anomalies {
+                groups
+                    .entry((l.process.as_str(), l.pid))
+                    .or_default()
+                    .push(l);
+            }
+
+            let mut per_pid: Vec<Row> = groups
+                .into_iter()
+                .map(|((proc_name, pid), regs)| {
+                    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+                    let mut rank = 0u8;
+                    for r in &regs {
+                        let (k, rk) = region_kind(&r.source);
+                        *counts.entry(k).or_default() += 1;
+                        rank = rank.max(rk);
+                    }
+                    let kinds = counts
+                        .iter()
+                        .map(|(k, n)| format!("{n}× {k}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let extra = if regs.len() > 1 {
+                        format!(" (+{})", regs.len() - 1)
+                    } else {
+                        String::new()
+                    };
+                    let anchor = regs[0].region_addr.clone().unwrap_or_else(|| "?".into()) + &extra;
+
+                    let origin = regs
+                        .iter()
+                        .filter_map(|r| r.deep_forensics.as_ref())
+                        .min_by_key(|d| match d.origin {
+                            Origin::UnknownPayload => 0,
+                            Origin::Inconclusive => 9,
+                            _ => 1,
+                        })
+                        .map(|d| format!("{} ({}%)", origin_label(&d.origin), d.confidence));
+
+                    Row {
+                        process: proc_name.to_string(),
+                        pids: vec![pid],
+                        kinds,
+                        anchor,
+                        rank,
+                        origin,
+                    }
+                })
+                .collect();
+
+            let mut merged: std::collections::BTreeMap<(String, String, Option<String>), Row> =
+                Default::default();
+            for r in per_pid.drain(..) {
+                merged
+                    .entry((r.process.clone(), r.kinds.clone(), r.origin.clone()))
+                    .and_modify(|m| m.pids.extend(&r.pids))
+                    .or_insert(r);
+            }
+
+            let mut rows: Vec<Row> = merged.into_values().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.rank));
+
+            let mut t = create_dynamic_table();
+            let mut header = vec![
+                Cell::new("Process")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Yellow),
+                Cell::new("PID(s)").add_attribute(Attribute::Bold),
+                Cell::new("Regions").add_attribute(Attribute::Bold),
+                Cell::new("Address").add_attribute(Attribute::Bold),
+            ];
+            if has_deep {
+                header.push(
+                    Cell::new("Origin")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Cyan),
+                );
+            }
+            t.set_header(header);
+
+            const CAP: usize = 15;
+            for r in rows.iter().take(CAP) {
+                let pids = if r.pids.len() <= 4 {
+                    r.pids
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    format!(
+                        "{},…(+{})",
+                        r.pids
+                            .iter()
+                            .take(3)
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        r.pids.len() - 3
+                    )
+                };
+                let c = if r.rank >= 3 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+
+                let mut cells = vec![
+                    Cell::new(sanitize_terminal(&r.process)),
+                    Cell::new(pids),
+                    Cell::new(&r.kinds).fg(c),
+                    Cell::new(&r.anchor),
+                ];
+
+                if has_deep {
+                    let (lbl, col) = match r.origin.as_deref() {
+                        Some(o) if o.starts_with("Unknown") => (o.to_string(), Color::Red),
+                        Some(o) => (o.to_string(), Color::Green),
+                        None => ("—".to_string(), Color::DarkGrey),
+                    };
+                    cells.push(Cell::new(lbl).fg(col));
+                }
+                t.add_row(cells);
+            }
+            println!("⚠️  Anomalous Executable Memory (SEC‑026 / SEC-028):");
+            println!("{t}");
+            if rows.len() > CAP {
+                println!(
+                    "    …and {} more (process,pid) group(s) — run with -v or see JSON export\n",
+                    rows.len() - CAP
+                );
+            } else {
+                println!();
+            }
+        }
+
+        // Pointer resolution trace (only when deep analysis has resolved pointers)
+        let traced: Vec<_> = memory_anomalies
+            .iter()
+            .filter(|l| {
+                l.deep_forensics
+                    .as_ref()
+                    .is_some_and(|d| !d.resolved_pointers.is_empty())
+            })
+            .collect();
+
+        if !traced.is_empty() {
+            println!("  🔍 Pointer resolution trace (deep forensics):");
+            for l in traced.iter().take(5) {
+                let d = l.deep_forensics.as_ref().unwrap();
+                println!(
+                    "    pid {} @ {}  origin={} ({}%)  entropy={:.1}",
+                    l.pid,
+                    l.region_addr.as_deref().unwrap_or("?"),
+                    origin_label(&d.origin),
+                    d.confidence,
+                    d.entropy
+                );
+                for p in d.resolved_pointers.iter().take(4) {
+                    println!("        → {:<16} {}", p.value, sanitize_terminal(&p.target));
+                }
+                if d.resolved_pointers.len() > 4 {
+                    println!(
+                        "        … (+{} more pointers, see JSON)",
+                        d.resolved_pointers.len() - 4
+                    );
+                }
+            }
+            if traced.len() > 5 {
+                println!(
+                    "    …and {} more regions analyzed (see JSON)\n",
+                    traced.len() - 5
+                );
+            } else {
+                println!();
+            }
+        }
+    }
+
+    // JIT Advisories (SEC-027) – suppressed, single line
+    let jit_advisories: Vec<_> = inj
+        .iter()
+        .filter(|l| l.classify() == InjectionClass::JitAdvisory)
+        .collect();
+    if !jit_advisories.is_empty() {
+        println!(
+            "🛡  JIT writable-code advisory (SEC‑027): {} suppressed finding(s) with verified runtime topology.\n",
+            jit_advisories.len()
+        );
+    }
+
+    // Provisional Trust (SEC-029)
+    let prov_trust: Vec<_> = inj
+        .iter()
+        .filter(|l| l.source == "maps-rwx-runtime-allowlist")
+        .collect();
+    if !prov_trust.is_empty() {
+        println!(
+            "🛡  Provisional Trust (SEC‑029): {} region(s) in allowlisted binaries (JIT shape unverified).\n",
+            prov_trust.len()
+        );
+    }
+}
+
+/// Short label + severity rank from the source string.
+fn region_kind(source: &str) -> (&'static str, u8) {
+    match source {
+        s if s.contains("exec-stack") => ("rwx-stack", 4),
+        s if s.contains("exec-heap") => ("rwx-heap", 4),
+        s if s.contains("file-backed") => ("rwx-file", 3),
+        s if s.contains("rwx") => ("rwxp", 2),
+        _ => ("r-xp", 1),
+    }
 }
 
 // ── SEC-024/025: True Ghost PID / LKM Rootkit ─────────────────────────────

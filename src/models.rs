@@ -7,6 +7,14 @@ fn one() -> u32 {
     1
 }
 
+/// Result of the mapper's self‑integrity preflight (R11 audit – Fable).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SelfIntegrityReport {
+    pub compromised: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentReport {
     pub scan_id: String,
@@ -20,6 +28,9 @@ pub struct AgentReport {
     pub coverage_warnings: Vec<String>,
     #[serde(default = "default_scoring_version")]
     pub scoring_version: u8,
+    /// Self‑integrity preflight result. None = check not performed or legacy snapshot.
+    #[serde(default)]
+    pub self_integrity: Option<SelfIntegrityReport>,
     pub host: HostInfo,
     pub databases: Vec<DatabaseInfo>,
     pub network: NetworkInfo,
@@ -41,6 +52,7 @@ impl Default for AgentReport {
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
             scoring_version: 1,
+            self_integrity: None,
             host: HostInfo::default(),
             databases: Vec::new(),
             network: NetworkInfo::default(),
@@ -555,6 +567,46 @@ pub struct LibraryInjectionFinding {
     /// (implant unlinked to hide from disk inspection).
     #[serde(default)]
     pub is_deleted: bool,
+    /// VMA start-end address ("7f3c0000-7f3d0000") — forensic anchor for investigation.
+    #[serde(default)]
+    pub region_addr: Option<String>,
+    /// Deep memory forensics payload (only present with `--deep`).
+    /// `None` in fast‑path; silently omitted from JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_forensics: Option<DeepMemoryAnalysis>,
+}
+
+// ---------------------------------------------------------------------------
+// Injection classification (single source of truth for policy)
+// ---------------------------------------------------------------------------
+
+/// Classification of a library injection finding used for scoring and display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionClass {
+    /// Classic injections: LD_*, ephemeral .so (SEC-023 Critical)
+    ClassicInjection,
+    /// Suspicious executable memory: isolated rwx, exec-stack, exec-heap (SEC-026 Warning)
+    MemoryAnomaly,
+    /// Expected JIT/interpreter behavior: JIT code cache, W^X hardening gaps (SEC-027 Info)
+    JitAdvisory,
+}
+
+impl LibraryInjectionFinding {
+    /// Single source of truth for classifying a memory finding by its `source` field.
+    pub fn classify(&self) -> InjectionClass {
+        if self.source == "maps" || self.source.starts_with("LD_") {
+            InjectionClass::ClassicInjection
+        } else if self.source.starts_with("maps-rwx-jit")
+            || self.source.starts_with("maps-rx-jit")
+            || self.source == "maps-so-jit-extract"
+            || self.source == "maps-rwx-runtime-allowlist"
+            || self.source.ends_with("-jit")
+        {
+            InjectionClass::JitAdvisory
+        } else {
+            InjectionClass::MemoryAnomaly
+        }
+    }
 }
 
 // True Ghost PID — LKM rootkit process hiding (SEC-024)
@@ -583,4 +635,68 @@ pub struct GhostPidFinding {
     /// Corroboration: this hidden PID also owns a network socket.
     #[serde(default)]
     pub holds_socket: bool,
+}
+
+// ── Deep Forensics (Pointer Resolution & Memory Analysis) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepMemoryAnalysis {
+    pub origin: Origin,
+    pub confidence: u8,             // 0..100
+    pub entropy: f32,               // Shannon entropy
+    pub prologue: Option<Prologue>, // ENDBR64 / PushRbp / None
+    pub resolved_pointers: Vec<ResolvedPointer>,
+    pub bytes_examined: usize,
+    #[serde(default)]
+    pub image_header: bool, // MZ / ELF / PE in the first bytes of RWX region
+}
+
+impl DeepMemoryAnalysis {
+    pub fn inconclusive() -> Self {
+        Self {
+            origin: Origin::Inconclusive,
+            confidence: 0,
+            entropy: 0.0,
+            prologue: None,
+            resolved_pointers: Vec::new(),
+            bytes_examined: 0,
+            image_header: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    FfiClosure,
+    GObjectCallback,
+    JitCode,
+    RuntimeTrampoline,
+    HotSpot,
+    Pcre2Jit,
+    UnknownPayload,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Prologue {
+    Endbr64,
+    PushRbp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedPointer {
+    pub value: String,
+    pub target: String,
+    pub kind: PointerKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerKind {
+    LibText,
+    JitCluster,
+    LibData,
+    Unmapped,
 }

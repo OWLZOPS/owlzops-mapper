@@ -1,5 +1,6 @@
 mod access;
 pub mod capabilities;
+mod deep;
 mod dlp;
 pub mod docker;
 mod ghost_pid;
@@ -11,4 +12,5 @@ pub mod packages;
 mod proc_net;
 mod reverse_shell;
 pub mod security;
+pub mod self_integrity;
 pub mod storage;

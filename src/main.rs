@@ -17,7 +17,7 @@ use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use models::{AgentReport, HostDiffStatus};
+use models::{AgentReport, HostDiffStatus, SelfIntegrityReport};
 use runner::{is_local_host, run_local_scan_async, snapshot_run};
 use scoring::*;
 use std::collections::HashSet;
@@ -87,6 +87,7 @@ fn raise_nofile_limit() {
 }
 
 async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> i32 {
+    let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
         Commands::Audit(args) => {
             let mut hosts: Vec<String> = Vec::new();
@@ -221,7 +222,13 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         ..args.clone()
                     };
 
-                    let local_report = run_local_scan_async(&a).await;
+                    // Self‑integrity preflight
+                    let integrity = scanners::self_integrity::run_self_integrity_check();
+                    let mut local_report = run_local_scan_async(&a).await;
+                    local_report.self_integrity = Some(SelfIntegrityReport {
+                        compromised: integrity.compromised,
+                        warnings: integrity.warnings,
+                    });
 
                     local_spinner.finish_and_clear();
 
@@ -285,12 +292,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         };
                         let pass = sudo_pass.clone();
                         let host_for_log = host.clone();
-                        let upload_pb = upload_bar.clone(); // clone to pass into ssh_engine
+                        let upload_pb = upload_bar.clone();
 
                         join_set.spawn(async move {
                             let _permit = sem.acquire_owned().await;
 
-                            // R7-08: Validate inputs before using them in russh path
                             if pass.is_some() {
                                 if let Err(e) = runner::validate_host(&host) {
                                     warn!("{e}");
@@ -312,13 +318,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             let result = tokio::time::timeout(overall, async {
                                 let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
 
-                                // Single russh call – sudo_pass is optional
                                 match ssh_engine::run_remote_scan_russh(
                                     &host,
                                     &a.ssh_user,
                                     &ssh_key_expanded,
                                     &a.remote_path,
-                                    pass.as_deref(), // Option<&Zeroizing<String>>
+                                    pass.as_deref(),
                                     a.copy_binary,
                                     a.keep_binary,
                                     a.local_binary.as_deref(),
@@ -393,7 +398,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         }
                                     }
                                     None => {
-                                        // All tasks finished
                                         let _elapsed = start_time.elapsed();
                                         scan_bar.finish_and_clear();
                                         if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
@@ -404,7 +408,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             }
                         }
                     }
-                    // MultiProgress will automatically restore terminal when dropped
                 }
 
                 if let Some(tx) = tx {
@@ -450,6 +453,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         &reports,
                         &args.format,
                         args.output.as_deref().map(std::path::Path::new),
+                        verbose,
                     ) {
                         warn!("output error: {e}");
                     }
@@ -460,6 +464,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     &reports,
                     &args.format,
                     args.output.as_deref().map(std::path::Path::new),
+                    verbose,
                 ) {
                     warn!("output error: {e}");
                     return 2;
@@ -469,7 +474,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 return worst;
             }
 
-            // Single local scan
+            // Single local scan (no hosts file or empty hosts)
             let local_spinner = ProgressBar::new_spinner();
             local_spinner.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
@@ -483,7 +488,13 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             }
             local_spinner.enable_steady_tick(Duration::from_millis(100));
 
-            let report = run_local_scan_async(&args).await;
+            // Self‑integrity preflight
+            let integrity = scanners::self_integrity::run_self_integrity_check();
+            let mut report = run_local_scan_async(&args).await;
+            report.self_integrity = Some(SelfIntegrityReport {
+                compromised: integrity.compromised,
+                warnings: integrity.warnings,
+            });
 
             local_spinner.finish_and_clear();
 
@@ -492,6 +503,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 &report,
                 &args.format,
                 args.output.as_deref().map(std::path::Path::new),
+                verbose,
             ) {
                 warn!("output error: {e}");
                 return 2;
@@ -801,6 +813,8 @@ mod tests {
             is_root_execution: true,
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
+            scoring_version: 1,
+            self_integrity: None,
             host: HostInfo::default(),
             databases: vec![],
             network: NetworkInfo::default(),
@@ -808,7 +822,6 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
-            scoring_version: 1,
         }
     }
 

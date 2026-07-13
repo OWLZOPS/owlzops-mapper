@@ -8,6 +8,7 @@ pub fn output_single(
     report: &AgentReport,
     format: &OutputFormat,
     output_file: Option<&Path>,
+    verbose: bool,
 ) -> Result<(), String> {
     match format {
         OutputFormat::Json => {
@@ -21,7 +22,7 @@ pub fn output_single(
             Ok(())
         }
         OutputFormat::Text => {
-            ui::render_dashboard(report);
+            ui::render_dashboard(report, verbose);
             Ok(())
         }
         OutputFormat::Xlsx => {
@@ -48,13 +49,16 @@ pub fn output_multi(
     reports: &[AgentReport],
     format: &OutputFormat,
     output_file: Option<&Path>,
+    verbose: bool,
 ) -> Result<(), String> {
     match format {
         OutputFormat::Text => {
             if reports.len() == 1 {
-                ui::render_dashboard(&reports[0]);
+                ui::render_dashboard(&reports[0], verbose);
             } else {
                 ui::render_multi_host_summary(reports);
+                println!("\n--- Detail for first host ---\n");
+                ui::render_dashboard(&reports[0], verbose);
             }
             Ok(())
         }
