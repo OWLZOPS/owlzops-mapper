@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, CronSeverity};
+use crate::models::{AgentReport, CronSeverity, InjectionClass};
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -555,16 +555,22 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023 & SEC-026 – Library injection & Anomalous executable memory ──
-    let (hard_injections, anon_execs): (Vec<_>, Vec<_>) = report
-        .security
-        .library_injections
-        .iter()
-        .partition(|l| l.source != "maps-anon-exec");
+    // ── SEC-023, SEC-026 & SEC-027 – Memory Forensics ──
+    let mut classic_injections = Vec::new();
+    let mut memory_anomalies = Vec::new();
+    let mut jit_advisories = Vec::new();
 
-    // Hard IoC: real injections (LD_PRELOAD, ephemeral .so, etc.)
-    if !hard_injections.is_empty() {
-        let list = hard_injections
+    for finding in &report.security.library_injections {
+        match finding.classify() {
+            InjectionClass::ClassicInjection => classic_injections.push(finding),
+            InjectionClass::MemoryAnomaly => memory_anomalies.push(finding),
+            InjectionClass::JitAdvisory => jit_advisories.push(finding),
+        }
+    }
+
+    // Hard IoC: real injections (LD_*, ephemeral .so, etc.) -> SEC-023
+    if !classic_injections.is_empty() {
+        let list = classic_injections
             .iter()
             .map(|l| {
                 let del = if l.is_deleted { " (deleted)" } else { "" };
@@ -575,14 +581,59 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             })
             .collect::<Vec<_>>()
             .join("; ");
+
         findings.push(Finding {
             id: "SEC-023",
-            title: "ACTIVE COMPROMISE: Userspace rootkit / library injection detected".to_string(),
+            title: "ACTIVE COMPROMISE: Userspace rootkit or code injection detected".to_string(),
             category: Category::Security,
             weight: 60,
+            evidence: format!("{} injected object(s): {}", classic_injections.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // Suspicious executable memory (isolated anon/rwx/stack/heap) -> SEC-026
+    if !memory_anomalies.is_empty() {
+        // Aggregation: Group by process to reduce visual noise
+        // Also capture the first region address for forensic anchoring
+        let mut by_process: std::collections::HashMap<String, (usize, Option<String>)> =
+            std::collections::HashMap::new();
+        for anomaly in &memory_anomalies {
+            let key = format!("{} (pid {})", anomaly.process, anomaly.pid);
+            let entry = by_process.entry(key).or_insert((0, None));
+            entry.0 += 1;
+            if entry.1.is_none() {
+                entry.1 = anomaly.region_addr.clone();
+            }
+        }
+
+        let list = by_process
+            .into_iter()
+            .map(|(proc, (count, addr))| {
+                let addr_str = addr.as_deref().unwrap_or("?");
+                format!("{proc} (first @ {addr_str}): {count} anomalous region(s)")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let weight = if memory_anomalies
+            .iter()
+            .any(|l| l.source.contains("exec") || l.source.contains("rwx"))
+        {
+            20
+        } else {
+            10
+        };
+
+        findings.push(Finding {
+            id: "SEC-026",
+            title: "Suspicious executable memory mapping (anon/rwx/stack/heap)".to_string(),
+            category: Category::Security,
+            weight,
             evidence: format!(
-                "{} injected object(s) from ephemeral paths: {}",
-                hard_injections.len(),
+                "{} process(es) with anomalous memory mappings: {}",
+                memory_anomalies.len(),
                 list
             ),
             suppressed: None,
@@ -590,24 +641,34 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Suspicious executable memory (anon/rwx), not an active compromise
-    if !anon_execs.is_empty() {
-        let list = anon_execs
-            .iter()
-            .map(|l| format!("{} (pid {}): {}", l.process, l.pid, l.object_path))
+    // JIT Advisory (W^X hardening gap / legit JIT cache) -> SEC-027 (Suppressed/Info)
+    if !jit_advisories.is_empty() {
+        let mut by_process = std::collections::HashMap::new();
+        for adv in &jit_advisories {
+            let key = format!("{} (pid {})", adv.process, adv.pid);
+            *by_process.entry(key).or_insert(0usize) += 1;
+        }
+
+        let list = by_process
+            .into_iter()
+            .map(|(proc, count)| format!("{}: {} JIT regions", proc, count))
             .collect::<Vec<_>>()
             .join("; ");
+
         findings.push(Finding {
-            id: "SEC-026",
-            title: "Suspicious executable memory mapping (anon/rwx)".to_string(),
+            id: "SEC-027",
+            title: "Writable JIT code cache — hardening opportunity".to_string(),
             category: Category::Security,
-            weight: 20,
+            weight: 0, // Advisory only, no penalty
             evidence: format!(
-                "{} process(es) with anomalous memory mappings: {}",
-                anon_execs.len(),
+                "{} process(es) using writable JIT arenas: {}",
+                jit_advisories.len(),
                 list
             ),
-            suppressed: None,
+            suppressed: Some(
+                "JIT topology verified; structural pattern matches expected runtime behavior."
+                    .to_string(),
+            ),
             cis_ref: None,
         });
     }
@@ -1811,6 +1872,7 @@ mod tests {
             object_path: "/tmp/hide.so".into(),
             source: "LD_PRELOAD".into(),
             is_deleted: false,
+            region_addr: None,
         }];
         let f = evaluate(&r)
             .into_iter()

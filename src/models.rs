@@ -567,6 +567,42 @@ pub struct LibraryInjectionFinding {
     /// (implant unlinked to hide from disk inspection).
     #[serde(default)]
     pub is_deleted: bool,
+    /// VMA start-end address ("7f3c0000-7f3d0000") — forensic anchor for investigation.
+    #[serde(default)]
+    pub region_addr: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Injection classification (single source of truth for policy)
+// ---------------------------------------------------------------------------
+
+/// Classification of a library injection finding used for scoring and display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionClass {
+    /// Classic injections: LD_*, ephemeral .so (SEC-023 Critical)
+    ClassicInjection,
+    /// Suspicious executable memory: isolated rwx, exec-stack, exec-heap (SEC-026 Warning)
+    MemoryAnomaly,
+    /// Expected JIT/interpreter behavior: JIT code cache, W^X hardening gaps (SEC-027 Info)
+    JitAdvisory,
+}
+
+impl LibraryInjectionFinding {
+    /// Single source of truth for classifying a memory finding by its `source` field.
+    pub fn classify(&self) -> InjectionClass {
+        if self.source == "maps" || self.source.starts_with("LD_") {
+            InjectionClass::ClassicInjection
+        } else if self.source.starts_with("maps-rwx-jit")
+            || self.source.starts_with("maps-rx-jit")
+            || self.source == "maps-so-jit-extract"
+            || self.source == "maps-rwx-runtime-allowlist"
+            || self.source.ends_with("-jit")
+        {
+            InjectionClass::JitAdvisory
+        } else {
+            InjectionClass::MemoryAnomaly
+        }
+    }
 }
 
 // True Ghost PID — LKM rootkit process hiding (SEC-024)

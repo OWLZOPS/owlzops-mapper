@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 
-use crate::models::{AgentReport, CronSeverity, PackageManager};
+use crate::models::{
+    AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, PackageManager,
+};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -57,7 +59,7 @@ fn create_dynamic_table() -> Table {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn render_dashboard(report: &AgentReport) {
+pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_header(report);
     render_system_overview(report);
     render_top_memory(report);
@@ -73,7 +75,7 @@ pub fn render_dashboard(report: &AgentReport) {
     render_capability_audit(report);
     render_mount_masking(report);
     render_reverse_shells(report);
-    render_library_injections(report);
+    render_library_injections(report, verbose);
     render_ghost_pids(report);
 
     if !report.coverage_warnings.is_empty() {
@@ -1283,33 +1285,215 @@ fn render_reverse_shells(report: &AgentReport) {
     println!("{t}\n");
 }
 
-// ── SEC-023: Userspace Rootkit / Library Injection ─────────────────────────
+// ── SEC-023 / SEC-026 / SEC-027: Library Injection & Memory Anomalies ─────
 
-fn render_library_injections(report: &AgentReport) {
-    if report.security.library_injections.is_empty() {
+fn render_library_injections(report: &AgentReport, verbose: bool) {
+    let inj = &report.security.library_injections;
+    if inj.is_empty() {
         return;
     }
-    let mut t = create_dynamic_table();
-    t.set_header(vec![
-        Cell::new("PID")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Process").add_attribute(Attribute::Bold),
-        Cell::new("Injected Object").add_attribute(Attribute::Bold),
-        Cell::new("Source").add_attribute(Attribute::Bold),
-        Cell::new("Deleted").add_attribute(Attribute::Bold),
-    ]);
-    for l in &report.security.library_injections {
-        t.add_row(vec![
-            Cell::new(l.pid.to_string()),
-            Cell::new(sanitize_terminal(&l.process)),
-            Cell::new(sanitize_terminal(&l.object_path)),
-            Cell::new(&l.source),
-            Cell::new(if l.is_deleted { "yes" } else { "no" }),
+
+    // Classic injections (SEC-023)
+    let classic: Vec<_> = inj
+        .iter()
+        .filter(|l| l.classify() == InjectionClass::ClassicInjection)
+        .collect();
+    if !classic.is_empty() {
+        let mut t = create_dynamic_table();
+        t.set_header(vec![
+            Cell::new("PID")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("Process").add_attribute(Attribute::Bold),
+            Cell::new("Injected Object").add_attribute(Attribute::Bold),
+            Cell::new("Source").add_attribute(Attribute::Bold),
+            Cell::new("Deleted").add_attribute(Attribute::Bold),
         ]);
+        for l in classic {
+            t.add_row(vec![
+                Cell::new(l.pid.to_string()),
+                Cell::new(sanitize_terminal(&l.process)),
+                Cell::new(sanitize_terminal(&l.object_path)),
+                Cell::new(&l.source).fg(Color::Red),
+                Cell::new(if l.is_deleted { "yes" } else { "no" }),
+            ]);
+        }
+        println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
+        println!("{t}\n");
     }
-    println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
-    println!("{t}\n");
+
+    // Memory anomalies (SEC-026) with multi-level aggregation and verbose mode
+    let memory_anomalies: Vec<_> = inj
+        .iter()
+        .filter(|l| l.classify() == InjectionClass::MemoryAnomaly)
+        .collect();
+    if !memory_anomalies.is_empty() {
+        if verbose {
+            // -v: one row per VMA, full Raw Truth
+            let mut t = create_dynamic_table();
+            t.set_header(vec![
+                Cell::new("PID")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Cyan),
+                Cell::new("Process").add_attribute(Attribute::Bold),
+                Cell::new("Type").add_attribute(Attribute::Bold),
+                Cell::new("Address").add_attribute(Attribute::Bold),
+                Cell::new("Detail").add_attribute(Attribute::Bold),
+            ]);
+            let mut all: Vec<_> = memory_anomalies.iter().collect();
+            all.sort_by_key(|l| std::cmp::Reverse(region_kind(&l.source).1));
+            for l in all {
+                let (kind, rank) = region_kind(&l.source);
+                let c = if rank >= 3 { Color::Red } else { Color::Yellow };
+                t.add_row(vec![
+                    Cell::new(l.pid.to_string()),
+                    Cell::new(sanitize_terminal(&l.process)),
+                    Cell::new(kind).fg(c),
+                    Cell::new(l.region_addr.as_deref().unwrap_or("?")),
+                    Cell::new(sanitize_terminal(&l.object_path)),
+                ]);
+            }
+            println!("⚠️  Anomalous Executable Memory (SEC‑026) — verbose:");
+            println!("{t}\n");
+        } else {
+            // Compact default: group by (process, pid) with shape-aware merging
+            struct Row {
+                process: String,
+                pids: Vec<u32>,
+                kinds: String,
+                anchor: String,
+                rank: u8,
+            }
+
+            // 1. Group by (process, pid) — the unit of investigation
+            let mut groups: std::collections::BTreeMap<(&str, u32), Vec<&LibraryInjectionFinding>> =
+                std::collections::BTreeMap::new();
+            for l in &memory_anomalies {
+                groups
+                    .entry((l.process.as_str(), l.pid))
+                    .or_default()
+                    .push(l);
+            }
+
+            // 2. Collapse each PID into a type summary + anchor
+            let mut per_pid: Vec<Row> = groups
+                .iter()
+                .map(|((proc, pid), regs)| {
+                    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+                    let mut rank = 0u8;
+                    for r in regs {
+                        let (k, rk) = region_kind(&r.source);
+                        *counts.entry(k).or_default() += 1;
+                        rank = rank.max(rk);
+                    }
+                    let kinds = counts
+                        .iter()
+                        .map(|(k, n)| format!("{n}× {k}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let extra = if regs.len() > 1 {
+                        format!(" (+{})", regs.len() - 1)
+                    } else {
+                        String::new()
+                    };
+                    let anchor = regs[0].region_addr.clone().unwrap_or_else(|| "?".into()) + &extra;
+                    Row {
+                        process: (*proc).to_string(),
+                        pids: vec![*pid],
+                        kinds,
+                        anchor,
+                        rank,
+                    }
+                })
+                .collect();
+
+            // 3. Merge peers with identical shape (same process + kinds)
+            let mut merged: std::collections::BTreeMap<(String, String), Row> = Default::default();
+            for r in per_pid.drain(..) {
+                merged
+                    .entry((r.process.clone(), r.kinds.clone()))
+                    .and_modify(|m| m.pids.extend(&r.pids))
+                    .or_insert(r);
+            }
+            let mut rows: Vec<Row> = merged.into_values().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.rank)); // most severe first
+
+            let mut t = create_dynamic_table();
+            t.set_header(vec![
+                Cell::new("Process")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Yellow),
+                Cell::new("PID(s)").add_attribute(Attribute::Bold),
+                Cell::new("Regions").add_attribute(Attribute::Bold),
+                Cell::new("Address").add_attribute(Attribute::Bold),
+            ]);
+            const CAP: usize = 15;
+            for r in rows.iter().take(CAP) {
+                let pids = if r.pids.len() <= 4 {
+                    r.pids
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    format!(
+                        "{},…(+{})",
+                        r.pids
+                            .iter()
+                            .take(3)
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        r.pids.len() - 3
+                    )
+                };
+                let c = if r.rank >= 3 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+                t.add_row(vec![
+                    Cell::new(sanitize_terminal(&r.process)),
+                    Cell::new(pids),
+                    Cell::new(&r.kinds).fg(c),
+                    Cell::new(&r.anchor),
+                ]);
+            }
+            println!("⚠️  Anomalous Executable Memory (SEC‑026):");
+            println!("{t}");
+            if rows.len() > CAP {
+                println!(
+                    "    …and {} more (process,pid) group(s) — run with -v or see JSON export\n",
+                    rows.len() - CAP
+                );
+            } else {
+                println!();
+            }
+        }
+    }
+
+    // JIT Advisories (SEC-027) – suppressed, single line
+    let jit_advisories: Vec<_> = inj
+        .iter()
+        .filter(|l| l.classify() == InjectionClass::JitAdvisory)
+        .collect();
+    if !jit_advisories.is_empty() {
+        println!(
+            "🛡  JIT writable-code advisory (SEC‑027): {} suppressed finding(s) with verified runtime topology.\n",
+            jit_advisories.len()
+        );
+    }
+}
+
+/// Short label + severity rank from the source string.
+fn region_kind(source: &str) -> (&'static str, u8) {
+    match source {
+        s if s.contains("exec-stack") => ("rwx-stack", 4),
+        s if s.contains("exec-heap") => ("rwx-heap", 4),
+        s if s.contains("file-backed") => ("rwx-file", 3),
+        s if s.contains("rwx") => ("rwxp", 2),
+        _ => ("r-xp", 1),
+    }
 }
 
 // ── SEC-024/025: True Ghost PID / LKM Rootkit ─────────────────────────────
