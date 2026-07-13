@@ -1353,6 +1353,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                         | Origin::GObjectCallback
                         | Origin::HotSpot
                         | Origin::RuntimeTrampoline
+                        | Origin::Pcre2Jit
                 );
                 if is_benign && d.confidence >= 70 {
                     return false; // Remove from the warning table
