@@ -288,6 +288,7 @@ fn analyze(buf: &[u8], ctx: &ProcMemContext) -> DeepMemoryAnalysis {
         .vote(has("libffi"), Origin::FfiClosure, 70)
         .vote(has("_gi") || has("gobject"), Origin::GObjectCallback, 70)
         .vote(has("libjvm"), Origin::HotSpot, 75)
+        .vote(has("libpcre2"), Origin::Pcre2Jit, 75)
         .vote(
             ptrs.iter().any(|p| p.kind == PointerKind::JitCluster),
             Origin::JitCode,

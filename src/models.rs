@@ -673,6 +673,7 @@ pub enum Origin {
     JitCode,
     RuntimeTrampoline,
     HotSpot,
+    Pcre2Jit,
     UnknownPayload,
     Inconclusive,
 }

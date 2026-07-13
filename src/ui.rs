@@ -1293,6 +1293,7 @@ fn origin_label(o: &Origin) -> &'static str {
         Origin::JitCode => "JIT",
         Origin::RuntimeTrampoline => "trampoline",
         Origin::HotSpot => "Java JIT",
+        Origin::Pcre2Jit => "PCRE2 JIT",
         Origin::UnknownPayload => "Unknown",
         Origin::Inconclusive => "n/a",
     }

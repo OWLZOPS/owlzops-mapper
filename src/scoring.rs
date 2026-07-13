@@ -602,6 +602,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 | Origin::GObjectCallback
                 | Origin::HotSpot
                 | Origin::RuntimeTrampoline
+                | Origin::Pcre2Jit
                     if d.confidence >= DEEP_DEMOTE_MIN =>
                 {
                     return MemBucket::Advisory;
