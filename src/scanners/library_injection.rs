@@ -49,8 +49,7 @@ const VENDOR_ANCHOR_MIN_SO: usize = 3;
 /// Known static runtimes or complex interpreters that do not predictably
 /// load RT_LIBS. Checked by strict binary path only.
 const RUNTIME_EXE_ALLOWLIST: &[&str] = &[
-    "/opt/google/chrome/chrome",
-    "/usr/lib/chromium/chromium",
+    // --- for Servers ---
     "/usr/bin/php",
     "/usr/sbin/php-fpm",
     "/usr/bin/node",
@@ -59,6 +58,13 @@ const RUNTIME_EXE_ALLOWLIST: &[&str] = &[
     "/usr/bin/python3",
     "/usr/bin/unattended-upgrade",
     "/usr/local/hestia/nginx/sbin/hestia-nginx",
+    // --- Linux Desktop ---
+    "/opt/google/chrome/chrome",
+    "/usr/lib/chromium/chromium",
+    "/opt/zen-browser/zen",
+    "/usr/bin/gjs-console",
+    "/usr/bin/gnome-shell",
+    "/opt/telegram/telegram",
 ];
 
 /// Volatile paths where a loaded .so is genuinely suspicious.
@@ -456,7 +462,8 @@ fn scan_maps(
 
         let small = region_size(addr).is_some_and(|s| s <= TRAMP_MAX_BYTES);
 
-        let downgrade: Option<&str> = if trust_met {
+        // 1. Strict JIT cluster check
+        let mut downgrade: Option<&str> = if trust_met {
             match tier {
                 ExecTier::AnonRx => Some("maps-rx-jit-suppressed"),
                 ExecTier::AnonRwx if is_inside_jit_cluster(addr_lo, &clusters) => {
@@ -469,12 +476,17 @@ fn scan_maps(
                 }),
                 _ => None,
             }
-        } else if exe_allowlisted(exe_path) && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx)
-        {
-            Some("maps-rwx-runtime-allowlist")
         } else {
             None
         };
+
+        // 2. FALLBACK: if clusters didn't match but the path is allowlisted — label for SEC-029
+        if downgrade.is_none()
+            && exe_allowlisted(exe_path)
+            && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx)
+        {
+            downgrade = Some("maps-rwx-runtime-allowlist");
+        }
 
         if let Some(src) = downgrade {
             let desc = format!("{} (pid {}): suppressed via {}", comm, pid, src);

@@ -1336,9 +1336,29 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     }
 
     // Memory anomalies (SEC-026 & SEC-028)
+    // Exclude findings that Deep Forensics has exonerated (benign origin with high confidence)
     let memory_anomalies: Vec<_> = inj
         .iter()
-        .filter(|l| matches!(l.classify(), InjectionClass::MemoryAnomaly))
+        .filter(|l| {
+            // 1. Base structural filter
+            if l.classify() != InjectionClass::MemoryAnomaly {
+                return false;
+            }
+            // 2. Exoneration by Deep Forensics: benign origin with confidence >= 70
+            if let Some(d) = &l.deep_forensics {
+                let is_benign = matches!(
+                    d.origin,
+                    Origin::FfiClosure
+                        | Origin::GObjectCallback
+                        | Origin::HotSpot
+                        | Origin::RuntimeTrampoline
+                );
+                if is_benign && d.confidence >= 70 {
+                    return false; // Remove from the warning table
+                }
+            }
+            true
+        })
         .collect();
 
     if !memory_anomalies.is_empty() {
