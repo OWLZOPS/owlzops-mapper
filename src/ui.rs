@@ -1292,6 +1292,7 @@ fn origin_label(o: &Origin) -> &'static str {
         Origin::GObjectCallback => "GObject",
         Origin::JitCode => "JIT",
         Origin::RuntimeTrampoline => "trampoline",
+        Origin::HotSpot => "Java JIT",
         Origin::UnknownPayload => "Unknown",
         Origin::Inconclusive => "n/a",
     }

@@ -282,6 +282,7 @@ fn analyze(buf: &[u8], ctx: &ProcMemContext) -> DeepMemoryAnalysis {
     let (origin, confidence) = ConfidenceEngine::new()
         .vote(has("libffi"), Origin::FfiClosure, 70)
         .vote(has("_gi") || has("gobject"), Origin::GObjectCallback, 70)
+        .vote(has("libjvm"), Origin::HotSpot, 75)
         .vote(
             ptrs.iter().any(|p| p.kind == PointerKind::JitCluster),
             Origin::JitCode,

@@ -669,6 +669,7 @@ pub enum Origin {
     GObjectCallback,
     JitCode,
     RuntimeTrampoline,
+    HotSpot,
     UnknownPayload,
     Inconclusive,
 }
