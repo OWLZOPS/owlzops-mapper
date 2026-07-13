@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::models::{
-    AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, PackageManager,
+    AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
@@ -1285,7 +1285,19 @@ fn render_reverse_shells(report: &AgentReport) {
     println!("{t}\n");
 }
 
-// ── SEC-023 / SEC-026 / SEC-027: Library Injection & Memory Anomalies ─────
+/// Short label for a forensic origin.
+fn origin_label(o: &Origin) -> &'static str {
+    match o {
+        Origin::FfiClosure => "libffi",
+        Origin::GObjectCallback => "GObject",
+        Origin::JitCode => "JIT",
+        Origin::RuntimeTrampoline => "trampoline",
+        Origin::UnknownPayload => "Unknown",
+        Origin::Inconclusive => "n/a",
+    }
+}
+
+// ── SEC-023 / SEC-026 / SEC-027 / SEC-028: Library Injection & Memory Anomalies ─────
 
 fn render_library_injections(report: &AgentReport, verbose: bool) {
     let inj = &report.security.library_injections;
@@ -1322,12 +1334,15 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         println!("{t}\n");
     }
 
-    // Memory anomalies (SEC-026) with multi-level aggregation and verbose mode
+    // Memory anomalies (SEC-026 & SEC-028)
     let memory_anomalies: Vec<_> = inj
         .iter()
-        .filter(|l| l.classify() == InjectionClass::MemoryAnomaly)
+        .filter(|l| matches!(l.classify(), InjectionClass::MemoryAnomaly))
         .collect();
+
     if !memory_anomalies.is_empty() {
+        let has_deep = memory_anomalies.iter().any(|l| l.deep_forensics.is_some());
+
         if verbose {
             // -v: one row per VMA, full Raw Truth
             let mut t = create_dynamic_table();
@@ -1363,11 +1378,13 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                 kinds: String,
                 anchor: String,
                 rank: u8,
+                origin: Option<String>,
             }
 
-            // 1. Group by (process, pid) — the unit of investigation
-            let mut groups: std::collections::BTreeMap<(&str, u32), Vec<&LibraryInjectionFinding>> =
-                std::collections::BTreeMap::new();
+            let mut groups: std::collections::BTreeMap<
+                (&str, u32),
+                Vec<&&LibraryInjectionFinding>,
+            > = std::collections::BTreeMap::new();
             for l in &memory_anomalies {
                 groups
                     .entry((l.process.as_str(), l.pid))
@@ -1375,13 +1392,12 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                     .push(l);
             }
 
-            // 2. Collapse each PID into a type summary + anchor
             let mut per_pid: Vec<Row> = groups
-                .iter()
-                .map(|((proc, pid), regs)| {
+                .into_iter()
+                .map(|((proc_name, pid), regs)| {
                     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
                     let mut rank = 0u8;
-                    for r in regs {
+                    for r in &regs {
                         let (k, rk) = region_kind(&r.source);
                         *counts.entry(k).or_default() += 1;
                         rank = rank.max(rk);
@@ -1391,42 +1407,65 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                         .map(|(k, n)| format!("{n}× {k}"))
                         .collect::<Vec<_>>()
                         .join(", ");
+
                     let extra = if regs.len() > 1 {
                         format!(" (+{})", regs.len() - 1)
                     } else {
                         String::new()
                     };
                     let anchor = regs[0].region_addr.clone().unwrap_or_else(|| "?".into()) + &extra;
+
+                    let origin = regs
+                        .iter()
+                        .filter_map(|r| r.deep_forensics.as_ref())
+                        .min_by_key(|d| match d.origin {
+                            Origin::UnknownPayload => 0,
+                            Origin::Inconclusive => 9,
+                            _ => 1,
+                        })
+                        .map(|d| format!("{} ({}%)", origin_label(&d.origin), d.confidence));
+
                     Row {
-                        process: (*proc).to_string(),
-                        pids: vec![*pid],
+                        process: proc_name.to_string(),
+                        pids: vec![pid],
                         kinds,
                         anchor,
                         rank,
+                        origin,
                     }
                 })
                 .collect();
 
-            // 3. Merge peers with identical shape (same process + kinds)
-            let mut merged: std::collections::BTreeMap<(String, String), Row> = Default::default();
+            let mut merged: std::collections::BTreeMap<(String, String, Option<String>), Row> =
+                Default::default();
             for r in per_pid.drain(..) {
                 merged
-                    .entry((r.process.clone(), r.kinds.clone()))
+                    .entry((r.process.clone(), r.kinds.clone(), r.origin.clone()))
                     .and_modify(|m| m.pids.extend(&r.pids))
                     .or_insert(r);
             }
+
             let mut rows: Vec<Row> = merged.into_values().collect();
-            rows.sort_by_key(|r| std::cmp::Reverse(r.rank)); // most severe first
+            rows.sort_by_key(|r| std::cmp::Reverse(r.rank));
 
             let mut t = create_dynamic_table();
-            t.set_header(vec![
+            let mut header = vec![
                 Cell::new("Process")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Yellow),
                 Cell::new("PID(s)").add_attribute(Attribute::Bold),
                 Cell::new("Regions").add_attribute(Attribute::Bold),
                 Cell::new("Address").add_attribute(Attribute::Bold),
-            ]);
+            ];
+            if has_deep {
+                header.push(
+                    Cell::new("Origin")
+                        .add_attribute(Attribute::Bold)
+                        .fg(Color::Cyan),
+                );
+            }
+            t.set_header(header);
+
             const CAP: usize = 15;
             for r in rows.iter().take(CAP) {
                 let pids = if r.pids.len() <= 4 {
@@ -1452,19 +1491,72 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                 } else {
                     Color::Yellow
                 };
-                t.add_row(vec![
+
+                let mut cells = vec![
                     Cell::new(sanitize_terminal(&r.process)),
                     Cell::new(pids),
                     Cell::new(&r.kinds).fg(c),
                     Cell::new(&r.anchor),
-                ]);
+                ];
+
+                if has_deep {
+                    let (lbl, col) = match r.origin.as_deref() {
+                        Some(o) if o.starts_with("Unknown") => (o.to_string(), Color::Red),
+                        Some(o) => (o.to_string(), Color::Green),
+                        None => ("—".to_string(), Color::DarkGrey),
+                    };
+                    cells.push(Cell::new(lbl).fg(col));
+                }
+                t.add_row(cells);
             }
-            println!("⚠️  Anomalous Executable Memory (SEC‑026):");
+            println!("⚠️  Anomalous Executable Memory (SEC‑026 / SEC-028):");
             println!("{t}");
             if rows.len() > CAP {
                 println!(
                     "    …and {} more (process,pid) group(s) — run with -v or see JSON export\n",
                     rows.len() - CAP
+                );
+            } else {
+                println!();
+            }
+        }
+
+        // Pointer resolution trace (only when deep analysis has resolved pointers)
+        let traced: Vec<_> = memory_anomalies
+            .iter()
+            .filter(|l| {
+                l.deep_forensics
+                    .as_ref()
+                    .is_some_and(|d| !d.resolved_pointers.is_empty())
+            })
+            .collect();
+
+        if !traced.is_empty() {
+            println!("  🔍 Pointer resolution trace (deep forensics):");
+            for l in traced.iter().take(5) {
+                let d = l.deep_forensics.as_ref().unwrap();
+                println!(
+                    "    pid {} @ {}  origin={} ({}%)  entropy={:.1}",
+                    l.pid,
+                    l.region_addr.as_deref().unwrap_or("?"),
+                    origin_label(&d.origin),
+                    d.confidence,
+                    d.entropy
+                );
+                for p in d.resolved_pointers.iter().take(4) {
+                    println!("        → {:<16} {}", p.value, sanitize_terminal(&p.target));
+                }
+                if d.resolved_pointers.len() > 4 {
+                    println!(
+                        "        … (+{} more pointers, see JSON)",
+                        d.resolved_pointers.len() - 4
+                    );
+                }
+            }
+            if traced.len() > 5 {
+                println!(
+                    "    …and {} more regions analyzed (see JSON)\n",
+                    traced.len() - 5
                 );
             } else {
                 println!();

@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, CronSeverity, InjectionClass};
+use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin};
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -555,16 +555,53 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026 & SEC-027 – Memory Forensics ──
+    // ── SEC-023, SEC-026, SEC-027 & SEC-028 – Memory Forensics ──
+    const DEEP_ESCALATE_MIN: u8 = 60; // UnknownPayload → Critical
+    const DEEP_DEMOTE_MIN: u8 = 70; // Benign origin → Advisory
+
+    enum MemBucket {
+        Classic,
+        DeepCritical,
+        Anomaly,
+        Advisory,
+    }
+
+    fn mem_bucket(f: &crate::models::LibraryInjectionFinding) -> MemBucket {
+        if let Some(d) = &f.deep_forensics {
+            match d.origin {
+                // Escalate confidently: unattributed executable payload = live IoC.
+                Origin::UnknownPayload if d.confidence >= DEEP_ESCALATE_MIN => {
+                    return MemBucket::DeepCritical;
+                }
+                // Demote cautiously: ONLY high-confidence benign attribution.
+                Origin::FfiClosure | Origin::GObjectCallback | Origin::RuntimeTrampoline
+                    if d.confidence >= DEEP_DEMOTE_MIN =>
+                {
+                    return MemBucket::Advisory;
+                }
+                // JitCode / Inconclusive / low confidence → structure decides.
+                _ => {}
+            }
+        }
+
+        match f.classify() {
+            InjectionClass::ClassicInjection => MemBucket::Classic,
+            InjectionClass::MemoryAnomaly => MemBucket::Anomaly,
+            InjectionClass::JitAdvisory => MemBucket::Advisory,
+        }
+    }
+
     let mut classic_injections = Vec::new();
+    let mut deep_critical = Vec::new();
     let mut memory_anomalies = Vec::new();
     let mut jit_advisories = Vec::new();
 
     for finding in &report.security.library_injections {
-        match finding.classify() {
-            InjectionClass::ClassicInjection => classic_injections.push(finding),
-            InjectionClass::MemoryAnomaly => memory_anomalies.push(finding),
-            InjectionClass::JitAdvisory => jit_advisories.push(finding),
+        match mem_bucket(finding) {
+            MemBucket::Classic => classic_injections.push(finding),
+            MemBucket::DeepCritical => deep_critical.push(finding),
+            MemBucket::Anomaly => memory_anomalies.push(finding),
+            MemBucket::Advisory => jit_advisories.push(finding),
         }
     }
 
@@ -588,6 +625,38 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             category: Category::Security,
             weight: 60,
             evidence: format!("{} injected object(s): {}", classic_injections.len(), list),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // Deep: unattributed executable payload -> SEC-028 (confirmed IoC)
+    if !deep_critical.is_empty() {
+        let list = deep_critical
+            .iter()
+            .map(|l| {
+                let (ent, conf) = l
+                    .deep_forensics
+                    .as_ref()
+                    .map_or((0.0, 0), |d| (d.entropy, d.confidence));
+                format!(
+                    "{} (pid {}) @ {}: unattributed RWX payload (entropy {:.1}, {}% conf)",
+                    l.process,
+                    l.pid,
+                    l.region_addr.as_deref().unwrap_or("?"),
+                    ent,
+                    conf
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        findings.push(Finding {
+            id: "SEC-028",
+            title: "ACTIVE COMPROMISE: unattributed executable payload in memory".to_string(),
+            category: Category::Security,
+            weight: 60,
+            evidence: format!("{} region(s): {}", deep_critical.len(), list),
             suppressed: None,
             cis_ref: None,
         });
@@ -1196,9 +1265,10 @@ impl CriticalFlags {
         // (young/racy/unconfirmable), not a confirmed hidden process.
         // SEC-026 is excluded: suspicious memory mappings (anon/rwx) are not
         // confirmed active compromise, but may indicate JIT or driver activity.
-        const IOC_IDS: [&str; 10] = [
+        // SEC-028 is included: deep-confirmed unattributed payload = live IoC.
+        const IOC_IDS: [&str; 11] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "DOCK-010",
+            "SEC-024", "SEC-028", "DOCK-010",
         ];
         let count_sysctl = findings
             .iter()

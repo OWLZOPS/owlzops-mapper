@@ -3,9 +3,25 @@
 
 use std::fs;
 
+use super::deep;
 use crate::coverage;
 use crate::models::LibraryInjectionFinding;
 use crate::safe_io;
+
+/// Configuration for the memory scanner, passed down from CLI args.
+#[derive(Debug, Clone, Default)]
+pub struct ScanConfig {
+    pub deep: bool,
+    pub target_pid: Option<u32>,
+}
+
+impl ScanConfig {
+    /// Should we perform deep memory forensics on this PID?
+    #[inline]
+    fn deep_for(&self, pid: u32) -> bool {
+        self.deep || self.target_pid == Some(pid)
+    }
+}
 
 const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
 const MAX_FINDINGS: usize = 64;
@@ -245,11 +261,11 @@ fn is_trampoline_pool(maps: &str) -> bool {
 
 // ── MAIN SCANNER ───────────────────────────────────────────
 
-pub fn scan_library_injections() -> Vec<LibraryInjectionFinding> {
-    detect_from_proc("/proc")
+pub fn scan_library_injections(cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
+    detect_from_proc("/proc", cfg)
 }
 
-fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
+fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
     let mut findings = Vec::new();
     let mut denied = 0usize;
 
@@ -326,6 +342,9 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
                     .map(|p| p.to_string_lossy().to_string())
                     .ok();
                 let trust = assess_runtime(&content, exe_path.as_deref());
+
+                let start = findings.len(); // mark the tail before scan_maps appends
+
                 scan_maps(
                     &content,
                     pid,
@@ -334,6 +353,12 @@ fn detect_from_proc(proc_root: &str) -> Vec<LibraryInjectionFinding> {
                     exe_path.as_deref(),
                     &mut findings,
                 );
+
+                // Slow path: enrich only findings created for this PID
+                if cfg.deep_for(pid) && findings.len() > start {
+                    let ctx = deep::ProcMemContext::build(&content); // single maps parse
+                    deep::enrich(&mut findings[start..], pid, &ctx);
+                }
             } else if pid_hits == 0 {
                 denied += 1;
             }

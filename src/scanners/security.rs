@@ -458,7 +458,11 @@ pub fn gather_security_info(deep: bool) -> SecurityInfo {
     let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
 
     // --- Userspace rootkit / library injection (SEC-023) ------------------
-    let library_injections = crate::scanners::library_injection::scan_library_injections();
+    let scan_cfg = crate::scanners::library_injection::ScanConfig {
+        deep,             // --deep flag from CLI
+        target_pid: None, // future: --pid flag
+    };
+    let library_injections = crate::scanners::library_injection::scan_library_injections(&scan_cfg);
 
     // --- True Ghost PID / LKM rootkit hiding (SEC-024) --------------------
     // Only run the expensive ghost-pid scan when explicitly requested via --deep.
