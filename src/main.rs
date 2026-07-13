@@ -87,6 +87,7 @@ fn raise_nofile_limit() {
 }
 
 async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> i32 {
+    let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
         Commands::Audit(args) => {
             let mut hosts: Vec<String> = Vec::new();
@@ -452,6 +453,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         &reports,
                         &args.format,
                         args.output.as_deref().map(std::path::Path::new),
+                        verbose,
                     ) {
                         warn!("output error: {e}");
                     }
@@ -462,6 +464,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     &reports,
                     &args.format,
                     args.output.as_deref().map(std::path::Path::new),
+                    verbose,
                 ) {
                     warn!("output error: {e}");
                     return 2;
@@ -500,6 +503,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 &report,
                 &args.format,
                 args.output.as_deref().map(std::path::Path::new),
+                verbose,
             ) {
                 warn!("output error: {e}");
                 return 2;
