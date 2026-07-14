@@ -665,6 +665,43 @@ fn render_security_health(report: &AgentReport) {
         ]);
     }
 
+    // ── Shadow IT & Suspicious Listeners ───────────────────────────────
+    let mut shadow_it_ports = Vec::new();
+    let mut devtool_ports = Vec::new();
+
+    for port in &report.network.listening_ports {
+        if let Some(exe) = &port.exe_path
+            && crate::utils::is_ephemeral_exec_path(exe)
+        {
+            let loopback = crate::utils::is_loopback_bind(&port.bind_address);
+            let label = format!(
+                "{}/{} on {} ({})",
+                port.port, port.protocol, port.bind_address, exe
+            );
+
+            match (loopback, crate::utils::exe_provenance(exe)) {
+                (true, crate::utils::ExeProvenance::InstalledApp) => devtool_ports.push(label),
+                _ => shadow_it_ports.push(label),
+            }
+        }
+    }
+
+    if !shadow_it_ports.is_empty() {
+        let shadow_cell = Cell::new(format!("{} listener(s)", shadow_it_ports.len()))
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold);
+        t_risk.add_row(vec![
+            Cell::new("Shadow IT / Suspicious Listener"),
+            shadow_cell,
+        ]);
+    }
+
+    if !devtool_ports.is_empty() {
+        let dev_cell =
+            Cell::new(format!("{} loopback IPC port(s)", devtool_ports.len())).fg(Color::Yellow);
+        t_risk.add_row(vec![Cell::new("Developer Tools (IPC)"), dev_cell]);
+    }
+
     println!("{t_risk}\n");
     if !report.host.dmesg_errors.is_empty() {
         println!("\x1b[1;31m[!] Critical Kernel Logs (dmesg):\x1b[0m");
@@ -1337,15 +1374,12 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     }
 
     // Memory anomalies (SEC-026 & SEC-028)
-    // Exclude findings that Deep Forensics has exonerated (benign origin with high confidence)
     let memory_anomalies: Vec<_> = inj
         .iter()
         .filter(|l| {
-            // 1. Base structural filter
             if l.classify() != InjectionClass::MemoryAnomaly {
                 return false;
             }
-            // 2. Exoneration by Deep Forensics: benign origin with confidence >= 70
             if let Some(d) = &l.deep_forensics {
                 let is_benign = matches!(
                     d.origin,
@@ -1356,7 +1390,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                         | Origin::Pcre2Jit
                 );
                 if is_benign && d.confidence >= 70 {
-                    return false; // Remove from the warning table
+                    return false;
                 }
             }
             true
@@ -1367,7 +1401,6 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         let has_deep = memory_anomalies.iter().any(|l| l.deep_forensics.is_some());
 
         if verbose {
-            // -v: one row per VMA, full Raw Truth
             let mut t = create_dynamic_table();
             t.set_header(vec![
                 Cell::new("PID")
@@ -1394,7 +1427,6 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             println!("⚠️  Anomalous Executable Memory (SEC‑026) — verbose:");
             println!("{t}\n");
         } else {
-            // Compact default: group by (process, pid) with shape-aware merging
             struct Row {
                 process: String,
                 pids: Vec<u32>,
@@ -1544,7 +1576,6 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             }
         }
 
-        // Pointer resolution trace (only when deep analysis has resolved pointers)
         let traced: Vec<_> = memory_anomalies
             .iter()
             .filter(|l| {

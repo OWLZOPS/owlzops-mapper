@@ -277,28 +277,66 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Shadow IT & Suspicious Listeners ───────────────────────────────
-    let mut shadow_it_ports = Vec::new();
+    // ── Shadow IT & Suspicious Listeners — tiered by exposure × provenance ──
+    let mut suspicious_listeners = Vec::new(); // SEC-013 Warning
+    let mut devtool_listeners = Vec::new(); // SEC-030 Advisory (loopback IPC, installed app)
+
     for port in &report.network.listening_ports {
-        if let Some(exe) = &port.exe_path
-            && crate::utils::is_ephemeral_exec_path(exe)
-        {
-            shadow_it_ports.push(format!("{}/{} ({})", port.port, port.protocol, exe));
+        let Some(exe) = port.exe_path.as_deref() else {
+            continue;
+        };
+
+        if !crate::utils::is_ephemeral_exec_path(exe) {
+            continue; // packaged/system path → normal service
+        }
+
+        let loopback = crate::utils::is_loopback_bind(&port.bind_address);
+        let label = format!(
+            "{}/{} on {} ({})",
+            port.port, port.protocol, port.bind_address, exe
+        );
+
+        match (loopback, crate::utils::exe_provenance(exe)) {
+            // Installed application on loopback → dev-IPC. Advisory, no penalty.
+            (true, crate::utils::ExeProvenance::InstalledApp) => devtool_listeners.push(label),
+            // Lone/deleted binary OR exposed to the world → keep alert.
+            _ => suspicious_listeners.push(label),
         }
     }
 
-    if !shadow_it_ports.is_empty() {
+    if !suspicious_listeners.is_empty() {
         findings.push(Finding {
             id: "SEC-013",
             title: "Suspicious process listening on network port (Shadow IT)".to_string(),
             category: Category::Security,
             weight: 20,
             evidence: format!(
-                "Found {} suspicious listeners: {}",
-                shadow_it_ports.len(),
-                shadow_it_ports.join(", ")
+                "{} suspicious listener(s): {}",
+                suspicious_listeners.len(),
+                suspicious_listeners.join(", ")
             ),
             suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // Loopback IPC of installed applications — honest informational state (not suppression).
+    if !devtool_listeners.is_empty() {
+        findings.push(Finding {
+            id: "SEC-030",
+            title: "Developer tool listening on loopback (IPC) — informational".to_string(),
+            category: Category::Security,
+            weight: 0, // visible and countable, but no penalty
+            evidence: format!(
+                "{} loopback-only listener(s) from installed applications (not network-reachable): {}",
+                devtool_listeners.len(),
+                devtool_listeners.join(", ")
+            ),
+            suppressed: Some(
+                "Loopback-only bind (not reachable off-host) from a populated on-disk install tree \
+                 under a known install-convention path. Provenance is STRUCTURAL, not name-based."
+                    .to_string(),
+            ),
             cis_ref: None,
         });
     }

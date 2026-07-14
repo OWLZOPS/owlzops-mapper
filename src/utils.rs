@@ -343,6 +343,59 @@ fn run_with_timeout_inner(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structural provenance (exe install shape vs lone dropper)
+// ---------------------------------------------------------------------------
+
+/// Provenance of an executable on disk — distinguishes an INSTALLED application
+/// (populated tree under a known install convention) from a lone dropper or
+/// self-deleted implant. Name-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExeProvenance {
+    Deleted,      // "(deleted)" / memfd — image removed after launch
+    LoneDropped,  // ephemeral path, sparse directory — trojan shape
+    InstalledApp, // populated tree under a recognised install convention
+}
+
+/// Locations where applications are LEGITIMATELY installed (paths, NOT app names).
+const INSTALL_ROOTS: &[&str] = &[
+    "/.local/share/",
+    "/.local/lib/",
+    "/.vscode/",
+    "/.vscode-server/",
+    "/.config/",
+    "/.var/app/", // flatpak per-user
+    "/.cache/JetBrains/",
+    "/opt/",
+    "/snap/",
+    "/usr/lib/",
+    "/usr/share/",
+    "/var/lib/flatpak/",
+];
+const INSTALL_TREE_MIN_SIBLINGS: usize = 8;
+
+pub fn exe_provenance(exe: &str) -> ExeProvenance {
+    if exe.ends_with(" (deleted)") || exe.starts_with("/memfd:") {
+        return ExeProvenance::Deleted;
+    }
+    if !INSTALL_ROOTS.iter().any(|r| exe.contains(*r)) {
+        return ExeProvenance::LoneDropped; // ephemeral path outside any install convention
+    }
+    // Structural fact: installed trees are POPULATED, droppers sit ~alone.
+    // Fail-closed → LoneDropped on any FS error (never blind the scanner).
+    let siblings = std::path::Path::new(exe)
+        .parent()
+        .and_then(|p| std::fs::read_dir(p).ok())
+        .map(|rd| rd.take(INSTALL_TREE_MIN_SIBLINGS + 1).count())
+        .unwrap_or(0);
+
+    if siblings >= INSTALL_TREE_MIN_SIBLINGS {
+        ExeProvenance::InstalledApp
+    } else {
+        ExeProvenance::LoneDropped
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
