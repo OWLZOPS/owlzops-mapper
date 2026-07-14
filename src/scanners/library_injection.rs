@@ -497,7 +497,7 @@ fn scan_maps(
             downgrade = match exe_path.and_then(|e| cache.lookup(e)) {
                 Some(Verdict::Benign) => Some("maps-rwx-cached-clean"),
                 Some(Verdict::Malicious) => None,
-                None => match exe_path.map(crate::utils::exe_provenance) {
+                None => match exe_path.map(|p| crate::utils::exe_provenance(p, pid)) {
                     Some(crate::utils::ExeProvenance::InstalledApp)
                     | Some(crate::utils::ExeProvenance::NestedUserInstall) => {
                         Some("maps-rwx-provisional")

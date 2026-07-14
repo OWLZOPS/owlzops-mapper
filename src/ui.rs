@@ -680,9 +680,18 @@ fn render_security_health(report: &AgentReport) {
                 port.port, port.protocol, port.bind_address, exe
             );
 
-            match (loopback, crate::utils::exe_provenance(exe)) {
+            let prov = port
+                .pid
+                .map(|p| crate::utils::exe_provenance(exe, p))
+                .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
+
+            match (loopback, prov) {
+                // Root-owned tree: path alone is sufficient (need root to place binary).
                 (true, crate::utils::ExeProvenance::InstalledApp) => devtool_ports.push(label),
+                // User-writable tree: path does NOT clear; parentage needed later.
+                // For now — provisional trust.
                 (true, crate::utils::ExeProvenance::NestedUserInstall) => prov_ports.push(label),
+                // Lone/deleted binary OR exposed to the world → keep alert.
                 _ => shadow_it_ports.push(label),
             }
         }
@@ -798,7 +807,12 @@ fn render_network_listeners(report: &AgentReport) {
             && crate::utils::is_ephemeral_exec_path(exe)
             && loopback
         {
-            match crate::utils::exe_provenance(exe) {
+            let prov = p
+                .pid
+                .map(|pid| crate::utils::exe_provenance(exe, pid))
+                .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
+
+            match prov {
                 crate::utils::ExeProvenance::InstalledApp => {
                     proc_cell = proc_cell.fg(Color::Green);
                 }

@@ -297,7 +297,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             port.port, port.protocol, port.bind_address, exe
         );
 
-        match (loopback, crate::utils::exe_provenance(exe)) {
+        let prov = port
+            .pid
+            .map(|p| crate::utils::exe_provenance(exe, p))
+            .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
+
+        match (loopback, prov) {
             // Root-owned tree: path alone is sufficient (need root to place binary).
             (true, crate::utils::ExeProvenance::InstalledApp) => devtool_listeners.push(label),
             // User-writable tree: path does NOT clear; parentage needed later.
@@ -645,12 +650,14 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
         // Strong signal: path-based provenance (not the failable process name)
         if let Some(exe_path) = f.exe_path.as_deref() {
-            let prov = crate::utils::exe_provenance(exe_path);
-            return matches!(
+            let prov = crate::utils::exe_provenance(exe_path, f.pid);
+            if matches!(
                 prov,
                 crate::utils::ExeProvenance::InstalledApp
                     | crate::utils::ExeProvenance::NestedUserInstall
-            );
+            ) {
+                return true;
+            }
         }
         false
     }
@@ -674,6 +681,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             process == k
                 || process.starts_with(&format!("{k}."))
                 || process.starts_with(&format!("{k}:"))
+                || process.starts_with(&format!("{k} "))
         })
     }
 
