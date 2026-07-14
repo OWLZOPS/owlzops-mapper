@@ -782,19 +782,37 @@ fn render_network_listeners(report: &AgentReport) {
             continue;
         }
         let exposed = crate::utils::is_wildcard_bind(&p.bind_address);
+        let loopback = crate::utils::is_loopback_bind(&p.bind_address);
+
         let mut addr_cell = Cell::new(sanitize_terminal(&p.bind_address));
         let mut port_cell = Cell::new(&p.port);
         let mut proto_cell = Cell::new(&p.protocol);
         let mut proc_cell = Cell::new(sanitize_terminal(&p.process));
+
         if exposed {
-            addr_cell = addr_cell.fg(Color::Red);
-            port_cell = port_cell.fg(Color::Red);
-            proto_cell = proto_cell.fg(Color::Red);
-            proc_cell = proc_cell.fg(Color::Red);
+            addr_cell = addr_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            port_cell = port_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            proto_cell = proto_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            proc_cell = proc_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+        } else if let Some(exe) = &p.exe_path {
+            if crate::utils::is_ephemeral_exec_path(exe) && loopback {
+                match crate::utils::exe_provenance(exe) {
+                    crate::utils::ExeProvenance::InstalledApp => {
+                        proc_cell = proc_cell.fg(Color::Green);
+                    }
+                    crate::utils::ExeProvenance::NestedUserInstall => {
+                        proc_cell = proc_cell.fg(Color::Yellow);
+                    }
+                    _ => {
+                        proc_cell = proc_cell.fg(Color::Red);
+                    }
+                }
+            }
         }
+
         t_ports.add_row(vec![proto_cell, addr_cell, port_cell, proc_cell]);
     }
-    println!("Active Network Listeners (red = exposed on 0.0.0.0/::):");
+    println!("Active Network Listeners (Red = Exposed, Yellow = User IPC, Green = System IPC):");
     println!("{t_ports}\n");
 }
 
