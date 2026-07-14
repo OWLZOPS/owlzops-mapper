@@ -347,14 +347,12 @@ fn run_with_timeout_inner(
 // Structural provenance (exe install shape vs lone dropper)
 // ---------------------------------------------------------------------------
 
-/// Provenance of an executable on disk — distinguishes an INSTALLED application
-/// (populated tree under a known install convention) from a lone dropper or
-/// self-deleted implant. Name-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExeProvenance {
-    Deleted,      // "(deleted)" / memfd — image removed after launch
-    LoneDropped,  // ephemeral path, sparse directory — trojan shape
-    InstalledApp, // populated tree under a recognised install convention
+    Deleted,           // "(deleted)" / memfd — image removed after launch
+    LoneDropped,       // ephemeral path, sparse directory — trojan shape
+    NestedUserInstall, // populated tree, but USER-writable -> weak trust
+    InstalledApp,      // populated tree + ROOT-owned -> strong trust
 }
 
 /// Locations where applications are LEGITIMATELY installed (paths, NOT app names).
@@ -364,35 +362,56 @@ const INSTALL_ROOTS: &[&str] = &[
     "/.vscode/",
     "/.vscode-server/",
     "/.config/",
-    "/.var/app/", // flatpak per-user
-    "/.cache/JetBrains/",
+    "/.var/app/",
+    "/.cache/",
     "/opt/",
     "/snap/",
     "/usr/lib/",
     "/usr/share/",
     "/var/lib/flatpak/",
 ];
-const INSTALL_TREE_MIN_SIBLINGS: usize = 8;
+const INSTALL_TREE_MIN_FILES: usize = 8;
+const MAX_UPWARD_DEPTH: usize = 6;
+
+/// Walk ancestors (up to MAX_UPWARD_DEPTH) and return true if any directory
+/// contains at least INSTALL_TREE_MIN_FILES entries — indicating a populated
+/// install tree rather than a sparse dropper location.
+fn populated_tree_within(exe: &str) -> bool {
+    std::path::Path::new(exe)
+        .ancestors()
+        .skip(1) // skip the binary itself → start with its parent directory
+        .take(MAX_UPWARD_DEPTH)
+        .take_while(|dir| {
+            let d = dir.to_string_lossy();
+            INSTALL_ROOTS.iter().any(|r| d.contains(*r)) // stop once we leave the install root
+        })
+        .any(|dir| {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.take(INSTALL_TREE_MIN_FILES + 1).count() >= INSTALL_TREE_MIN_FILES)
+                .unwrap_or(false)
+        })
+}
 
 pub fn exe_provenance(exe: &str) -> ExeProvenance {
+    use std::os::unix::fs::MetadataExt;
+
     if exe.ends_with(" (deleted)") || exe.starts_with("/memfd:") {
         return ExeProvenance::Deleted;
     }
     if !INSTALL_ROOTS.iter().any(|r| exe.contains(*r)) {
         return ExeProvenance::LoneDropped; // ephemeral path outside any install convention
     }
-    // Structural fact: installed trees are POPULATED, droppers sit ~alone.
-    // Fail-closed → LoneDropped on any FS error (never blind the scanner).
-    let siblings = std::path::Path::new(exe)
-        .parent()
-        .and_then(|p| std::fs::read_dir(p).ok())
-        .map(|rd| rd.take(INSTALL_TREE_MIN_SIBLINGS + 1).count())
-        .unwrap_or(0);
-
-    if siblings >= INSTALL_TREE_MIN_SIBLINGS {
+    if !populated_tree_within(exe) {
+        return ExeProvenance::LoneDropped; // isolated even after limited upward traversal
+    }
+    // A populated tree exists. Trust strength = who COULD have placed this binary.
+    let root_owned = std::fs::metadata(exe)
+        .map(|m| m.uid() == 0)
+        .unwrap_or(false);
+    if root_owned {
         ExeProvenance::InstalledApp
     } else {
-        ExeProvenance::LoneDropped
+        ExeProvenance::NestedUserInstall
     }
 }
 

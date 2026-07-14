@@ -278,8 +278,9 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── Shadow IT & Suspicious Listeners — tiered by exposure × provenance ──
-    let mut suspicious_listeners = Vec::new(); // SEC-013 Warning
-    let mut devtool_listeners = Vec::new(); // SEC-030 Advisory (loopback IPC, installed app)
+    let mut suspicious_listeners = Vec::new(); // SEC-013 Warning (-20)
+    let mut devtool_listeners = Vec::new(); // SEC-030 Advisory (0)
+    let mut provisional_listeners = Vec::new(); // SEC-031 Provisional (0)
 
     for port in &report.network.listening_ports {
         let Some(exe) = port.exe_path.as_deref() else {
@@ -297,8 +298,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         );
 
         match (loopback, crate::utils::exe_provenance(exe)) {
-            // Installed application on loopback → dev-IPC. Advisory, no penalty.
+            // Root-owned tree: path alone is sufficient (need root to place binary).
             (true, crate::utils::ExeProvenance::InstalledApp) => devtool_listeners.push(label),
+            // User-writable tree: path does NOT clear; parentage needed later.
+            // For now — provisional trust.
+            (true, crate::utils::ExeProvenance::NestedUserInstall) => {
+                provisional_listeners.push(label)
+            }
             // Lone/deleted binary OR exposed to the world → keep alert.
             _ => suspicious_listeners.push(label),
         }
@@ -320,22 +326,39 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Loopback IPC of installed applications — honest informational state (not suppression).
+    // Loopback IPC of installed applications — honest informational state.
     if !devtool_listeners.is_empty() {
         findings.push(Finding {
             id: "SEC-030",
             title: "Developer tool listening on loopback (IPC) — informational".to_string(),
             category: Category::Security,
-            weight: 0, // visible and countable, but no penalty
+            weight: 0,
             evidence: format!(
-                "{} loopback-only listener(s) from installed applications (not network-reachable): {}",
+                "{} loopback-only listener(s) from root-owned installed applications: {}",
                 devtool_listeners.len(),
                 devtool_listeners.join(", ")
             ),
             suppressed: Some(
-                "Loopback-only bind (not reachable off-host) from a populated on-disk install tree \
-                 under a known install-convention path. Provenance is STRUCTURAL, not name-based."
-                    .to_string(),
+                "Loopback-only bind from a populated ROOT-OWNED install tree.".to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
+    // Loopback IPC from user-writable directory (e.g. JetBrains Cache) — Provisional Trust.
+    if !provisional_listeners.is_empty() {
+        findings.push(Finding {
+            id: "SEC-031",
+            title: "User-space tool listening on loopback (IPC) — PROVISIONAL".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} loopback-only listener(s) nested under user-writable install tree (parentage unverified): {}",
+                provisional_listeners.len(),
+                provisional_listeners.join(", ")
+            ),
+            suppressed: Some(
+                "Loopback-only bind from a user-writable directory. Trust is PROVISIONAL until parentage is verified.".to_string(),
             ),
             cis_ref: None,
         });

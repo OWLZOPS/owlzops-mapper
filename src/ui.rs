@@ -668,6 +668,7 @@ fn render_security_health(report: &AgentReport) {
     // ── Shadow IT & Suspicious Listeners ───────────────────────────────
     let mut shadow_it_ports = Vec::new();
     let mut devtool_ports = Vec::new();
+    let mut prov_ports = Vec::new();
 
     for port in &report.network.listening_ports {
         if let Some(exe) = &port.exe_path
@@ -681,6 +682,7 @@ fn render_security_health(report: &AgentReport) {
 
             match (loopback, crate::utils::exe_provenance(exe)) {
                 (true, crate::utils::ExeProvenance::InstalledApp) => devtool_ports.push(label),
+                (true, crate::utils::ExeProvenance::NestedUserInstall) => prov_ports.push(label),
                 _ => shadow_it_ports.push(label),
             }
         }
@@ -698,8 +700,14 @@ fn render_security_health(report: &AgentReport) {
 
     if !devtool_ports.is_empty() {
         let dev_cell =
-            Cell::new(format!("{} loopback IPC port(s)", devtool_ports.len())).fg(Color::Yellow);
+            Cell::new(format!("{} loopback IPC port(s)", devtool_ports.len())).fg(Color::Green);
         t_risk.add_row(vec![Cell::new("Developer Tools (IPC)"), dev_cell]);
+    }
+
+    if !prov_ports.is_empty() {
+        let prov_cell =
+            Cell::new(format!("{} user-space IPC port(s)", prov_ports.len())).fg(Color::Yellow);
+        t_risk.add_row(vec![Cell::new("User Tools (Provisional)"), prov_cell]);
     }
 
     println!("{t_risk}\n");
@@ -1568,8 +1576,14 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             println!("{t}");
             if rows.len() > CAP {
                 println!(
-                    "    …and {} more (process,pid) group(s) — run with -v or see JSON export\n",
+                    "    …and {} more (process,pid) group(s) — run with -v or see JSON export",
                     rows.len() - CAP
+                );
+            }
+
+            if !has_deep {
+                println!(
+                    "    \x1b[1;36m💡 HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n"
                 );
             } else {
                 println!();
