@@ -62,7 +62,7 @@ jobs:
 
       # Optimization: install cargo-cyclonedx via pre-built binary instead of compiling from source
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3  # Release 2.82.9
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853  # Release 2.83.2
         with:
           tool: cargo-cyclonedx
 
@@ -127,7 +127,7 @@ jobs:
           name: signed-artifacts
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3  # Release 2.82.9
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853  # Release 2.83.2
         with:
           tool: git-cliff
 
