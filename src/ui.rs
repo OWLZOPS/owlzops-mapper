@@ -1600,10 +1600,16 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                 );
             }
 
-            if !has_deep {
-                println!(
-                    "    \x1b[1;36m💡 HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n"
-                );
+            // HINT: only show if deep scan was NOT requested (fast path)
+            if !verbose {
+                let deep_requested = std::env::args().any(|arg| arg == "--deep");
+                if !deep_requested {
+                    println!(
+                        "\n    \x1b[1;36m💡 HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n"
+                    );
+                } else {
+                    println!();
+                }
             } else {
                 println!();
             }

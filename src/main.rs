@@ -12,6 +12,7 @@ mod scoring;
 mod ssh_engine;
 mod ui;
 mod utils;
+mod verdict_cache;
 
 use crate::utils::host_budget_secs;
 use clap::Parser;

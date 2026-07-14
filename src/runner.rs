@@ -90,10 +90,11 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         let storage_task =
             tokio::task::spawn_blocking(crate::scanners::storage::gather_storage_info);
 
-        // SecurityInfo теперь зависит от --deep
+        // SecurityInfo now depends on --deep and --verdict-cache
         let deep = args.deep;
+        let verdict_cache = args.verdict_cache.clone();
         let security_task = tokio::task::spawn_blocking(move || {
-            crate::scanners::security::gather_security_info(deep)
+            crate::scanners::security::gather_security_info(deep, verdict_cache)
         });
 
         let packages_task = tokio::task::spawn_blocking(move || {

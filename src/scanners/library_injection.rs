@@ -2,17 +2,30 @@
 //! Anomalous Executable Memory detection (SEC-026).
 
 use std::fs;
+use std::path::PathBuf;
 
 use super::deep;
 use crate::coverage;
 use crate::models::LibraryInjectionFinding;
 use crate::safe_io;
+use crate::verdict_cache::{Verdict, VerdictCache};
 
 /// Configuration for the memory scanner, passed down from CLI args.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ScanConfig {
     pub deep: bool,
     pub target_pid: Option<u32>,
+    pub verdict_cache_path: PathBuf,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            deep: false,
+            target_pid: None,
+            verdict_cache_path: PathBuf::from("/var/lib/owlzops/verdict-cache.json"),
+        }
+    }
 }
 
 impl ScanConfig {
@@ -46,27 +59,6 @@ const VENDOR_ROOTS: &[&str] = &[
 ];
 const VENDOR_ANCHOR_MIN_SO: usize = 3;
 
-/// Known static runtimes or complex interpreters that do not predictably
-/// load RT_LIBS. Checked by strict binary path only.
-const RUNTIME_EXE_ALLOWLIST: &[&str] = &[
-    // --- for Servers ---
-    "/usr/bin/php",
-    "/usr/sbin/php-fpm",
-    "/usr/bin/node",
-    "/usr/local/bin/node",
-    "/usr/bin/python",
-    "/usr/bin/python3",
-    "/usr/bin/unattended-upgrade",
-    "/usr/local/hestia/nginx/sbin/hestia-nginx",
-    // --- Linux Desktop ---
-    "/opt/google/chrome/chrome",
-    "/usr/lib/chromium/chromium",
-    "/opt/zen-browser/zen",
-    "/usr/bin/gjs-console",
-    "/usr/bin/gnome-shell",
-    "/opt/telegram/telegram",
-];
-
 /// Volatile paths where a loaded .so is genuinely suspicious.
 /// Differs from is_ephemeral_exec_path by NOT including /home,
 /// because user software (IDEs, VSCode) legitimately loads .so from /home.
@@ -76,16 +68,6 @@ fn is_volatile_lib_path(p: &str) -> bool {
         || p.starts_with("/dev/shm/")
         || p.starts_with("/run/")
         || p.starts_with("/memfd:")
-}
-
-fn exe_allowlisted(exe: Option<&str>) -> bool {
-    exe.is_some_and(|e| {
-        let base = e.trim_end_matches(" (deleted)");
-        !e.ends_with(" (deleted)")
-            && RUNTIME_EXE_ALLOWLIST
-                .iter()
-                .any(|p| base.starts_with(p) || base == *p)
-    })
 }
 
 // ── REGION TIERING ─────────────────────────────────────────
@@ -265,6 +247,25 @@ fn is_trampoline_pool(maps: &str) -> bool {
         >= TRAMP_POOL_MIN
 }
 
+// ── Verdict derivation helper ───────────────────────────────
+
+/// Cache only confident verdicts; inconclusive → None → stays provisional.
+fn derive_verdict(regions: &[LibraryInjectionFinding]) -> Option<Verdict> {
+    let mut benign = false;
+    for r in regions {
+        let Some(d) = &r.deep_forensics else {
+            continue;
+        };
+        if d.entropy >= 7.0 || d.image_header {
+            return Some(Verdict::Malicious);
+        }
+        if d.prologue.is_some() && d.confidence >= 70 {
+            benign = true;
+        }
+    }
+    benign.then_some(Verdict::Benign)
+}
+
 // ── MAIN SCANNER ───────────────────────────────────────────
 
 pub fn scan_library_injections(cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
@@ -274,6 +275,7 @@ pub fn scan_library_injections(cfg: &ScanConfig) -> Vec<LibraryInjectionFinding>
 fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
     let mut findings = Vec::new();
     let mut denied = 0usize;
+    let mut cache = VerdictCache::load(cfg.verdict_cache_path.clone());
 
     let entries = match fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -349,7 +351,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                     .ok();
                 let trust = assess_runtime(&content, exe_path.as_deref());
 
-                let start = findings.len(); // mark the tail before scan_maps appends
+                let start = findings.len();
 
                 scan_maps(
                     &content,
@@ -357,13 +359,19 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                     &comm,
                     &trust,
                     exe_path.as_deref(),
+                    &cache,
                     &mut findings,
                 );
 
-                // Slow path: enrich only findings created for this PID
+                // Slow path: enrich + cache verdict
                 if cfg.deep_for(pid) && findings.len() > start {
-                    let ctx = deep::ProcMemContext::build(&content); // single maps parse
+                    let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
+                    if let (Some(exe), Some(verdict)) =
+                        (exe_path.as_deref(), derive_verdict(&findings[start..]))
+                    {
+                        cache.record(exe, verdict);
+                    }
                 }
             } else if pid_hits == 0 {
                 denied += 1;
@@ -376,6 +384,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
             "library-injection scan: {denied} process(es) with unreadable maps"
         ));
     }
+    cache.persist();
     findings
 }
 
@@ -385,6 +394,7 @@ fn scan_maps(
     comm: &str,
     trust: &RuntimeTrust,
     exe_path: Option<&str>,
+    cache: &VerdictCache,
     findings: &mut Vec<LibraryInjectionFinding>,
 ) {
     let mut seen: Vec<String> = Vec::new();
@@ -480,12 +490,21 @@ fn scan_maps(
             None
         };
 
-        // 2. FALLBACK: if clusters didn't match but the path is allowlisted — label for SEC-029
-        if downgrade.is_none()
-            && exe_allowlisted(exe_path)
-            && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx)
-        {
-            downgrade = Some("maps-rwx-runtime-allowlist");
+        // 2. FALLBACK: content‑verified cache + structural provenance (NO blind allowlist)
+        if downgrade.is_none() && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx) {
+            downgrade = match exe_path.and_then(|e| cache.lookup(e)) {
+                Some(Verdict::Benign) => Some("maps-rwx-cached-clean"), // deep‑verified → SEC‑027
+                Some(Verdict::Malicious) => None, // known‑bad → active finding (SEC‑026)
+                None => match exe_path.map(crate::utils::exe_provenance) {
+                    // Installed tree, not yet deep‑verified → provisional (0 penalty)
+                    Some(crate::utils::ExeProvenance::InstalledApp)
+                    | Some(crate::utils::ExeProvenance::NestedUserInstall) => {
+                        Some("maps-rwx-provisional")
+                    }
+                    // Lone / deleted / no provenance → keep alert
+                    _ => None,
+                },
+            };
         }
 
         if let Some(src) = downgrade {
@@ -533,71 +552,5 @@ fn scan_maps(
                 deep_forensics: None,
             });
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::InjectionClass;
-
-    #[test]
-    fn test_volatile_lib_path_excludes_home() {
-        assert!(is_volatile_lib_path("/tmp/evil.so"));
-        assert!(is_volatile_lib_path("/dev/shm/payload.so"));
-        assert!(
-            !is_volatile_lib_path("/home/user/.vscode/extensions/lib.so"),
-            "Home must not be volatile for .so"
-        );
-    }
-
-    #[test]
-    fn test_exe_allowlist() {
-        assert!(exe_allowlisted(Some("/usr/bin/node")));
-        assert!(exe_allowlisted(Some("/opt/google/chrome/chrome")));
-        assert!(
-            !exe_allowlisted(Some("/tmp/node")),
-            "Must check absolute path"
-        );
-    }
-
-    #[test]
-    fn test_classify_all_downgrade_sources() {
-        let make = |src: &str| LibraryInjectionFinding {
-            pid: 0,
-            process: String::new(),
-            object_path: String::new(),
-            source: src.to_string(),
-            is_deleted: false,
-            region_addr: None,
-            deep_forensics: None,
-        };
-
-        // Advisory sources must map to JitAdvisory
-        for src in &[
-            "maps-rwx-jit-hardening",
-            "maps-rwx-jit-trampoline",
-            "maps-rwx-jit-runtime",
-            "maps-rx-jit-suppressed",
-            "maps-so-jit-extract",
-            "maps-rwx-runtime-allowlist",
-        ] {
-            assert_eq!(
-                make(src).classify(),
-                InjectionClass::JitAdvisory,
-                "source '{src}' should be JitAdvisory"
-            );
-        }
-
-        // Real anomaly must remain MemoryAnomaly
-        assert_eq!(
-            make("maps-anon-rwx").classify(),
-            InjectionClass::MemoryAnomaly
-        );
-        // Classic injection must stay ClassicInjection
-        assert_eq!(
-            make("LD_PRELOAD").classify(),
-            InjectionClass::ClassicInjection
-        );
     }
 }

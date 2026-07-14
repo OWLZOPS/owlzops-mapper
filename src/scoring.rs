@@ -616,7 +616,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026, SEC-027, SEC-028 & SEC-029 – Memory Forensics ──
+    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029 – Memory Forensics ──
     const DEEP_ESCALATE_MIN: u8 = 60;
     const DEEP_DEMOTE_MIN: u8 = 70;
 
@@ -672,8 +672,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // Layer 3 — trusted path (allowlist) requires benign shape.
-        if f.source == "maps-rwx-runtime-allowlist" {
+        // Layer 3 — provisional trust (install-tree, cache-unverified, or allowlisted).
+        if f.source == "maps-rwx-provisional" || f.source == "maps-rwx-runtime-allowlist" {
             return match deep {
                 Some(d) if is_benign_shape(d) => MemBucket::Advisory,
                 _ => MemBucket::TrustedUnverified,

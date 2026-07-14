@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -287,7 +288,7 @@ fn gather_sysctl_issues() -> Vec<String> {
 
 // ── Main gather function ─────────────────────────────────────────────────
 
-pub fn gather_security_info(deep: bool) -> SecurityInfo {
+pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> SecurityInfo {
     // --- SSH config parsing ------------------------------------------------
     let (
         ssh_password_auth_enabled,
@@ -459,8 +460,10 @@ pub fn gather_security_info(deep: bool) -> SecurityInfo {
 
     // --- Userspace rootkit / library injection (SEC-023) ------------------
     let scan_cfg = crate::scanners::library_injection::ScanConfig {
-        deep,             // --deep flag from CLI
-        target_pid: None, // future: --pid flag
+        deep,
+        target_pid: None,
+        verdict_cache_path: verdict_cache
+            .unwrap_or_else(|| PathBuf::from("/var/lib/owlzops/verdict-cache.json")),
     };
     let library_injections = crate::scanners::library_injection::scan_library_injections(&scan_cfg);
 

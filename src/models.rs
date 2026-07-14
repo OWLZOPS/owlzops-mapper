@@ -599,7 +599,9 @@ impl LibraryInjectionFinding {
         } else if self.source.starts_with("maps-rwx-jit")
             || self.source.starts_with("maps-rx-jit")
             || self.source == "maps-so-jit-extract"
-            || self.source == "maps-rwx-runtime-allowlist"
+            || self.source == "maps-rwx-cached-clean"
+            || self.source == "maps-rwx-provisional"
+            || self.source == "maps-rwx-runtime-allowlist" // legacy, replaced by cached-clean/provisional
             || self.source.ends_with("-jit")
         {
             InjectionClass::JitAdvisory
