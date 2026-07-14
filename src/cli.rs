@@ -85,6 +85,10 @@ pub struct AuditArgs {
     /// Enable heavy deep scans (Ghost PID, full capability walk, etc.)
     #[arg(long, default_value_t = false)]
     pub deep: bool,
+
+    /// Path to the verdict cache file (default: /var/lib/owlzops/verdict-cache.json).
+    #[arg(long)]
+    pub verdict_cache: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -16,7 +18,7 @@ fn tool_cache() -> &'static Mutex<HashMap<String, String>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// R10-04: poison‑tolerant lock helper
+// R10-04: poison-tolerant lock helper
 fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
     tool_cache()
         .lock()
@@ -26,7 +28,7 @@ fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
 /// Resolve a system tool by searching fixed standard directories.
 /// This avoids a fork of `which` and is resilient against PATH manipulation.
 pub fn resolve_tool(tool: &str) -> Option<String> {
-    // Fast path: hit the (poison‑tolerant) cache
+    // Fast path: hit the (poison-tolerant) cache
     if let Some(path) = lock_cache().get(tool) {
         return Some(path.clone());
     }
@@ -340,6 +342,148 @@ fn run_with_timeout_inner(
             unregister_child(child_pid);
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structural provenance (exe install shape vs lone dropper)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExeProvenance {
+    Deleted,           // "(deleted)" / memfd — image removed after launch
+    LoneDropped,       // ephemeral path, sparse directory — trojan shape
+    NestedUserInstall, // populated tree, but USER-writable -> weak trust
+    InstalledApp,      // populated tree + ROOT-owned -> strong trust
+}
+
+/// Locations where applications are LEGITIMATELY installed (paths, NOT app names).
+const INSTALL_ROOTS: &[&str] = &[
+    "/.local/share/",
+    "/.local/lib/",
+    "/.vscode/",
+    "/.vscode-server/",
+    "/.config/",
+    "/.var/app/",
+    "/.cache/",
+    "/opt/",
+    "/snap/",
+    "/usr/lib/",
+    "/usr/share/",
+    "/var/lib/flatpak/",
+];
+
+/// System binary paths — territory of the package manager (root-owned).
+const SYSTEM_BIN: &[&str] = &[
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/bin/",
+    "/sbin/",
+    "/usr/libexec/",
+    "/usr/local/bin/",
+    "/usr/local/sbin/",
+];
+
+/// Version-managed runtime roots (nvm/pyenv/rbenv/...). The binary here IS the runtime
+/// by convention. Membership-alone -> NestedUserInstall: the manager's layout keeps files
+/// in child branches, not up the ancestor chain, so the populated-tree heuristic misfits.
+/// User-writable -> WEAK tier (provisional-visible), residual risk is bound by parentage.
+const RUNTIME_MANAGER_ROOTS: &[&str] = &[
+    "/.nvm/",
+    "/.fnm/",
+    "/.volta/",
+    "/.asdf/",
+    "/.pyenv/",
+    "/.rbenv/",
+    "/.bun/",
+    "/.deno/",
+    "/linuxbrew/",
+    "/usr/lib/node_modules/",
+    "/node_modules/",
+];
+
+const INSTALL_TREE_MIN_FILES: usize = 8;
+const MAX_UPWARD_DEPTH: usize = 6;
+
+/// Factored out string check (SYSTEM_BIN ∪ RUNTIME_MANAGER ∪ INSTALL_ROOTS).
+fn is_standard_install_path(p: &str) -> bool {
+    SYSTEM_BIN.iter().any(|s| p.starts_with(s))
+        || RUNTIME_MANAGER_ROOTS.iter().any(|r| p.contains(r))
+        || INSTALL_ROOTS.iter().any(|r| p.contains(r))
+}
+
+/// Check if the given PID is running in a foreign mount namespace (i.e., a container).
+/// This relies on comparing its mount namespace to the host's init process (PID 1).
+pub fn in_foreign_mnt_ns(pid: u32) -> bool {
+    let p = std::fs::read_link(format!("/proc/{}/ns/mnt", pid)).ok();
+    let host = std::fs::read_link("/proc/1/ns/mnt").ok(); // host-init as reference
+    matches!((p, host), (Some(a), Some(b)) if a != b)
+}
+
+/// Walk ancestors (up to MAX_UPWARD_DEPTH) and return true if any directory
+/// contains at least INSTALL_TREE_MIN_FILES entries — indicating a populated
+/// install tree rather than a sparse dropper location.
+fn populated_tree_within(exe: &str) -> bool {
+    std::path::Path::new(exe)
+        .ancestors()
+        .skip(1) // skip the binary itself → start with its parent directory
+        .take(MAX_UPWARD_DEPTH)
+        .take_while(|dir| {
+            let d = dir.to_string_lossy();
+            INSTALL_ROOTS.iter().any(|r| d.contains(*r)) // stop once we leave the install root
+        })
+        .any(|dir| {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.take(INSTALL_TREE_MIN_FILES + 1).count() >= INSTALL_TREE_MIN_FILES)
+                .unwrap_or(false)
+        })
+}
+
+pub fn exe_provenance(exe: &str, pid: u32) -> ExeProvenance {
+    use std::os::unix::fs::MetadataExt;
+
+    if exe.ends_with(" (deleted)") || exe.starts_with("/memfd:") {
+        return ExeProvenance::Deleted;
+    }
+
+    // Foreign mount ns (container): CEILING at weak tier, classification by PATH STRING
+    // (the file doesn't exist on the host — it's a phantom path here).
+    // Ownership is irrelevant (container-root != trusted host-root), the file is never stat'd.
+    // Residual risk is closed by parentage.
+    if in_foreign_mnt_ns(pid) {
+        return if is_standard_install_path(exe) {
+            ExeProvenance::NestedUserInstall // provisional-visible
+        } else {
+            ExeProvenance::LoneDropped
+        };
+    }
+
+    // Host ns: ownership via PINNED inode (magic symlink) — immune to binary swap
+    // post-exec even on the host.
+    let root_owned = std::fs::metadata(format!("/proc/{pid}/exe"))
+        .map(|m| m.uid() == 0)
+        .unwrap_or(false);
+
+    if SYSTEM_BIN.iter().any(|p| exe.starts_with(p)) {
+        return if root_owned {
+            ExeProvenance::InstalledApp
+        } else {
+            ExeProvenance::LoneDropped
+        };
+    }
+
+    if RUNTIME_MANAGER_ROOTS.iter().any(|r| exe.contains(r)) {
+        return ExeProvenance::NestedUserInstall;
+    }
+
+    if !INSTALL_ROOTS.iter().any(|r| exe.contains(*r)) || !populated_tree_within(exe) {
+        return ExeProvenance::LoneDropped;
+    }
+
+    if root_owned {
+        ExeProvenance::InstalledApp
+    } else {
+        ExeProvenance::NestedUserInstall
     }
 }
 

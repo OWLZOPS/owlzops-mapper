@@ -574,6 +574,10 @@ pub struct LibraryInjectionFinding {
     /// `None` in fast‑path; silently omitted from JSON when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deep_forensics: Option<DeepMemoryAnalysis>,
+    /// Absolute path of the executable (/proc/pid/exe) — reputation through
+    /// provenance/cache. NOT derived from the failable process name.
+    #[serde(default)]
+    pub exe_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +603,9 @@ impl LibraryInjectionFinding {
         } else if self.source.starts_with("maps-rwx-jit")
             || self.source.starts_with("maps-rx-jit")
             || self.source == "maps-so-jit-extract"
-            || self.source == "maps-rwx-runtime-allowlist"
+            || self.source == "maps-rwx-cached-clean"
+            || self.source == "maps-rwx-provisional"
+            || self.source == "maps-rwx-runtime-allowlist" // legacy, replaced by cached-clean/provisional
             || self.source.ends_with("-jit")
         {
             InjectionClass::JitAdvisory
@@ -676,6 +682,8 @@ pub enum Origin {
     Pcre2Jit,
     UnknownPayload,
     Inconclusive,
+    ManagedJit,     // generic managed-JIT shape (V8, JSC, Zend, PCRE2)
+    ReservedBuffer, // empty/sparse reserved exec buffer — no payload
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

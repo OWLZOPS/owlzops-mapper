@@ -665,6 +665,60 @@ fn render_security_health(report: &AgentReport) {
         ]);
     }
 
+    // ── Shadow IT & Suspicious Listeners ───────────────────────────────
+    let mut shadow_it_ports = Vec::new();
+    let mut devtool_ports = Vec::new();
+    let mut prov_ports = Vec::new();
+
+    for port in &report.network.listening_ports {
+        if let Some(exe) = &port.exe_path
+            && crate::utils::is_ephemeral_exec_path(exe)
+        {
+            let loopback = crate::utils::is_loopback_bind(&port.bind_address);
+            let label = format!(
+                "{}/{} on {} ({})",
+                port.port, port.protocol, port.bind_address, exe
+            );
+
+            let prov = port
+                .pid
+                .map(|p| crate::utils::exe_provenance(exe, p))
+                .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
+
+            match (loopback, prov) {
+                // Root-owned tree: path alone is sufficient (need root to place binary).
+                (true, crate::utils::ExeProvenance::InstalledApp) => devtool_ports.push(label),
+                // User-writable tree: path does NOT clear; parentage needed later.
+                // For now — provisional trust.
+                (true, crate::utils::ExeProvenance::NestedUserInstall) => prov_ports.push(label),
+                // Lone/deleted binary OR exposed to the world → keep alert.
+                _ => shadow_it_ports.push(label),
+            }
+        }
+    }
+
+    if !shadow_it_ports.is_empty() {
+        let shadow_cell = Cell::new(format!("{} listener(s)", shadow_it_ports.len()))
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold);
+        t_risk.add_row(vec![
+            Cell::new("Shadow IT / Suspicious Listener"),
+            shadow_cell,
+        ]);
+    }
+
+    if !devtool_ports.is_empty() {
+        let dev_cell =
+            Cell::new(format!("{} loopback IPC port(s)", devtool_ports.len())).fg(Color::Green);
+        t_risk.add_row(vec![Cell::new("Developer Tools (IPC)"), dev_cell]);
+    }
+
+    if !prov_ports.is_empty() {
+        let prov_cell =
+            Cell::new(format!("{} user-space IPC port(s)", prov_ports.len())).fg(Color::Yellow);
+        t_risk.add_row(vec![Cell::new("User Tools (Provisional)"), prov_cell]);
+    }
+
     println!("{t_risk}\n");
     if !report.host.dmesg_errors.is_empty() {
         println!("\x1b[1;31m[!] Critical Kernel Logs (dmesg):\x1b[0m");
@@ -737,19 +791,43 @@ fn render_network_listeners(report: &AgentReport) {
             continue;
         }
         let exposed = crate::utils::is_wildcard_bind(&p.bind_address);
+        let loopback = crate::utils::is_loopback_bind(&p.bind_address);
+
         let mut addr_cell = Cell::new(sanitize_terminal(&p.bind_address));
         let mut port_cell = Cell::new(&p.port);
         let mut proto_cell = Cell::new(&p.protocol);
         let mut proc_cell = Cell::new(sanitize_terminal(&p.process));
+
         if exposed {
-            addr_cell = addr_cell.fg(Color::Red);
-            port_cell = port_cell.fg(Color::Red);
-            proto_cell = proto_cell.fg(Color::Red);
-            proc_cell = proc_cell.fg(Color::Red);
+            addr_cell = addr_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            port_cell = port_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            proto_cell = proto_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+            proc_cell = proc_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+        } else if let Some(exe) = &p.exe_path
+            && crate::utils::is_ephemeral_exec_path(exe)
+            && loopback
+        {
+            let prov = p
+                .pid
+                .map(|pid| crate::utils::exe_provenance(exe, pid))
+                .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
+
+            match prov {
+                crate::utils::ExeProvenance::InstalledApp => {
+                    proc_cell = proc_cell.fg(Color::Green);
+                }
+                crate::utils::ExeProvenance::NestedUserInstall => {
+                    proc_cell = proc_cell.fg(Color::Yellow);
+                }
+                _ => {
+                    proc_cell = proc_cell.fg(Color::Red);
+                }
+            }
         }
+
         t_ports.add_row(vec![proto_cell, addr_cell, port_cell, proc_cell]);
     }
-    println!("Active Network Listeners (red = exposed on 0.0.0.0/::):");
+    println!("Active Network Listeners (Red = Exposed, Yellow = User IPC, Green = System IPC):");
     println!("{t_ports}\n");
 }
 
@@ -1296,6 +1374,8 @@ fn origin_label(o: &Origin) -> &'static str {
         Origin::Pcre2Jit => "PCRE2 JIT",
         Origin::UnknownPayload => "Unknown",
         Origin::Inconclusive => "n/a",
+        Origin::ManagedJit => "Managed JIT",
+        Origin::ReservedBuffer => "Empty JIT",
     }
 }
 
@@ -1337,15 +1417,12 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     }
 
     // Memory anomalies (SEC-026 & SEC-028)
-    // Exclude findings that Deep Forensics has exonerated (benign origin with high confidence)
     let memory_anomalies: Vec<_> = inj
         .iter()
         .filter(|l| {
-            // 1. Base structural filter
             if l.classify() != InjectionClass::MemoryAnomaly {
                 return false;
             }
-            // 2. Exoneration by Deep Forensics: benign origin with confidence >= 70
             if let Some(d) = &l.deep_forensics {
                 let is_benign = matches!(
                     d.origin,
@@ -1354,9 +1431,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                         | Origin::HotSpot
                         | Origin::RuntimeTrampoline
                         | Origin::Pcre2Jit
+                        | Origin::ManagedJit
+                        | Origin::ReservedBuffer
                 );
                 if is_benign && d.confidence >= 70 {
-                    return false; // Remove from the warning table
+                    return false;
                 }
             }
             true
@@ -1367,7 +1446,6 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         let has_deep = memory_anomalies.iter().any(|l| l.deep_forensics.is_some());
 
         if verbose {
-            // -v: one row per VMA, full Raw Truth
             let mut t = create_dynamic_table();
             t.set_header(vec![
                 Cell::new("PID")
@@ -1394,7 +1472,6 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             println!("⚠️  Anomalous Executable Memory (SEC‑026) — verbose:");
             println!("{t}\n");
         } else {
-            // Compact default: group by (process, pid) with shape-aware merging
             struct Row {
                 process: String,
                 pids: Vec<u32>,
@@ -1536,15 +1613,26 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             println!("{t}");
             if rows.len() > CAP {
                 println!(
-                    "    …and {} more (process,pid) group(s) — run with -v or see JSON export\n",
+                    "    …and {} more (process,pid) group(s) — run with -v or see JSON export",
                     rows.len() - CAP
                 );
+            }
+
+            // HINT: only show if deep scan was NOT requested (fast path)
+            if !verbose {
+                let deep_requested = std::env::args().any(|arg| arg == "--deep");
+                if !deep_requested {
+                    println!(
+                        "\n    \x1b[1;36m💡 HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n"
+                    );
+                } else {
+                    println!();
+                }
             } else {
                 println!();
             }
         }
 
-        // Pointer resolution trace (only when deep analysis has resolved pointers)
         let traced: Vec<_> = memory_anomalies
             .iter()
             .filter(|l| {
@@ -1602,7 +1690,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // Provisional Trust (SEC-029)
     let prov_trust: Vec<_> = inj
         .iter()
-        .filter(|l| l.source == "maps-rwx-runtime-allowlist")
+        .filter(|l| {
+            l.source == "maps-rwx-provisional"
+                || l.source == "maps-rwx-cached-clean"
+                || l.source == "maps-rwx-runtime-allowlist"
+        })
         .collect();
     if !prov_trust.is_empty() {
         println!(

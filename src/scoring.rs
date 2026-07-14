@@ -277,28 +277,94 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Shadow IT & Suspicious Listeners ───────────────────────────────
-    let mut shadow_it_ports = Vec::new();
+    // ── Shadow IT & Suspicious Listeners — tiered by exposure × provenance ──
+    let mut suspicious_listeners = Vec::new(); // SEC-013 Warning (-20)
+    let mut devtool_listeners = Vec::new(); // SEC-030 Advisory (0)
+    let mut provisional_listeners = Vec::new(); // SEC-031 Provisional (0)
+
     for port in &report.network.listening_ports {
-        if let Some(exe) = &port.exe_path
-            && crate::utils::is_ephemeral_exec_path(exe)
-        {
-            shadow_it_ports.push(format!("{}/{} ({})", port.port, port.protocol, exe));
+        let Some(exe) = port.exe_path.as_deref() else {
+            continue;
+        };
+
+        if !crate::utils::is_ephemeral_exec_path(exe) {
+            continue; // packaged/system path → normal service
+        }
+
+        let loopback = crate::utils::is_loopback_bind(&port.bind_address);
+        let label = format!(
+            "{}/{} on {} ({})",
+            port.port, port.protocol, port.bind_address, exe
+        );
+
+        let prov = port
+            .pid
+            .map(|p| crate::utils::exe_provenance(exe, p))
+            .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
+
+        match (loopback, prov) {
+            // Root-owned tree: path alone is sufficient (need root to place binary).
+            (true, crate::utils::ExeProvenance::InstalledApp) => devtool_listeners.push(label),
+            // User-writable tree: path does NOT clear; parentage needed later.
+            // For now — provisional trust.
+            (true, crate::utils::ExeProvenance::NestedUserInstall) => {
+                provisional_listeners.push(label)
+            }
+            // Lone/deleted binary OR exposed to the world → keep alert.
+            _ => suspicious_listeners.push(label),
         }
     }
 
-    if !shadow_it_ports.is_empty() {
+    if !suspicious_listeners.is_empty() {
         findings.push(Finding {
             id: "SEC-013",
             title: "Suspicious process listening on network port (Shadow IT)".to_string(),
             category: Category::Security,
             weight: 20,
             evidence: format!(
-                "Found {} suspicious listeners: {}",
-                shadow_it_ports.len(),
-                shadow_it_ports.join(", ")
+                "{} suspicious listener(s): {}",
+                suspicious_listeners.len(),
+                suspicious_listeners.join(", ")
             ),
             suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // Loopback IPC of installed applications — honest informational state.
+    if !devtool_listeners.is_empty() {
+        findings.push(Finding {
+            id: "SEC-030",
+            title: "Developer tool listening on loopback (IPC) — informational".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} loopback-only listener(s) from root-owned installed applications: {}",
+                devtool_listeners.len(),
+                devtool_listeners.join(", ")
+            ),
+            suppressed: Some(
+                "Loopback-only bind from a populated ROOT-OWNED install tree.".to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
+    // Loopback IPC from user-writable directory (e.g. JetBrains Cache) — Provisional Trust.
+    if !provisional_listeners.is_empty() {
+        findings.push(Finding {
+            id: "SEC-031",
+            title: "User-space tool listening on loopback (IPC) — PROVISIONAL".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} loopback-only listener(s) nested under user-writable install tree (parentage unverified): {}",
+                provisional_listeners.len(),
+                provisional_listeners.join(", ")
+            ),
+            suppressed: Some(
+                "Loopback-only bind from a user-writable directory. Trust is PROVISIONAL until parentage is verified.".to_string(),
+            ),
             cis_ref: None,
         });
     }
@@ -555,7 +621,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026, SEC-027, SEC-028 & SEC-029 – Memory Forensics ──
+    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029 – Memory Forensics ──
     const DEEP_ESCALATE_MIN: u8 = 60;
     const DEEP_DEMOTE_MIN: u8 = 70;
 
@@ -574,6 +640,67 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             })
     }
 
+    fn reputable_exe(f: &crate::models::LibraryInjectionFinding) -> bool {
+        // Strong signal: already verified by cache or explicitly tagged
+        if f.source.contains("cached-clean")
+            || f.source.contains("provisional")
+            || f.source.contains("allowlist")
+        {
+            return true;
+        }
+        // Strong signal: path-based provenance (not the failable process name)
+        if let Some(exe_path) = f.exe_path.as_deref() {
+            let prov = crate::utils::exe_provenance(exe_path, f.pid);
+            if matches!(
+                prov,
+                crate::utils::ExeProvenance::InstalledApp
+                    | crate::utils::ExeProvenance::NestedUserInstall
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// WEAK label, not trust: comm is spoofable (PR_SET_NAME). Last-chance tie-breaker
+    /// for VISIBLE provisional, ONLY when exe_path is unavailable and content/behavior
+    /// checks have already passed. Declarative: one name = one line.
+    const KNOWN_RUNTIME_COMMS: &[&str] = &[
+        "php-fpm",
+        "php",
+        "nginx",
+        "hestia-nginx",
+        "node",
+        "next-server",
+        "gjs",
+        "telegram",
+    ];
+
+    fn comm_asserts_runtime(process: &str) -> bool {
+        KNOWN_RUNTIME_COMMS.iter().any(|&k| {
+            process == k
+                || process.starts_with(&format!("{k}."))
+                || process.starts_with(&format!("{k}:"))
+                || process.starts_with(&format!("{k} "))
+        })
+    }
+
+    fn process_behavior_clean(pid: u32, report: &AgentReport) -> bool {
+        let no_listener = !report
+            .network
+            .listening_ports
+            .iter()
+            .any(|p| p.pid == Some(pid) && !crate::utils::is_loopback_bind(&p.bind_address));
+
+        let no_ptrace_ioc = !report
+            .security
+            .library_injections
+            .iter()
+            .any(|f| f.pid == pid && f.source.contains("ptrace"));
+
+        no_listener && no_ptrace_ioc
+    }
+
     enum MemBucket {
         Classic,
         DeepCritical,
@@ -582,7 +709,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         TrustedUnverified,
     }
 
-    fn mem_bucket(f: &crate::models::LibraryInjectionFinding) -> MemBucket {
+    fn mem_bucket(f: &crate::models::LibraryInjectionFinding, report: &AgentReport) -> MemBucket {
         let deep = f.deep_forensics.as_ref();
 
         // Layer 1 — trumping malice overrides everything.
@@ -601,18 +728,31 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 Origin::FfiClosure
                 | Origin::GObjectCallback
                 | Origin::HotSpot
-                | Origin::RuntimeTrampoline
                 | Origin::Pcre2Jit
+                | Origin::JitCode
+                | Origin::ManagedJit
+                | Origin::ReservedBuffer
+                | Origin::RuntimeTrampoline
                     if d.confidence >= DEEP_DEMOTE_MIN =>
                 {
                     return MemBucket::Advisory;
+                }
+                Origin::Inconclusive
+                    if process_behavior_clean(f.pid, report)
+                        && (reputable_exe(f)
+                            || (f.exe_path.is_none() && comm_asserts_runtime(&f.process))) =>
+                {
+                    return MemBucket::TrustedUnverified;
                 }
                 _ => {}
             }
         }
 
-        // Layer 3 — trusted path (allowlist) requires benign shape.
-        if f.source == "maps-rwx-runtime-allowlist" {
+        // Layer 3 — provisional trust (install-tree, cache-unverified, or allowlisted).
+        if f.source == "maps-rwx-provisional"
+            || f.source == "maps-rwx-runtime-allowlist"
+            || f.source == "maps-rwx-cached-clean"
+        {
             return match deep {
                 Some(d) if is_benign_shape(d) => MemBucket::Advisory,
                 _ => MemBucket::TrustedUnverified,
@@ -634,7 +774,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut trusted_unverified = Vec::new();
 
     for finding in &report.security.library_injections {
-        match mem_bucket(finding) {
+        match mem_bucket(finding, report) {
             MemBucket::Classic => classic_injections.push(finding),
             MemBucket::DeepCritical => deep_critical.push(finding),
             MemBucket::Anomaly => memory_anomalies.push(finding),
@@ -2014,6 +2154,7 @@ mod tests {
             is_deleted: false,
             region_addr: None,
             deep_forensics: None,
+            exe_path: None,
         }];
         let f = evaluate(&r)
             .into_iter()
