@@ -794,18 +794,19 @@ fn render_network_listeners(report: &AgentReport) {
             port_cell = port_cell.fg(Color::Red).add_attribute(Attribute::Bold);
             proto_cell = proto_cell.fg(Color::Red).add_attribute(Attribute::Bold);
             proc_cell = proc_cell.fg(Color::Red).add_attribute(Attribute::Bold);
-        } else if let Some(exe) = &p.exe_path {
-            if crate::utils::is_ephemeral_exec_path(exe) && loopback {
-                match crate::utils::exe_provenance(exe) {
-                    crate::utils::ExeProvenance::InstalledApp => {
-                        proc_cell = proc_cell.fg(Color::Green);
-                    }
-                    crate::utils::ExeProvenance::NestedUserInstall => {
-                        proc_cell = proc_cell.fg(Color::Yellow);
-                    }
-                    _ => {
-                        proc_cell = proc_cell.fg(Color::Red);
-                    }
+        } else if let Some(exe) = &p.exe_path
+            && crate::utils::is_ephemeral_exec_path(exe)
+            && loopback
+        {
+            match crate::utils::exe_provenance(exe) {
+                crate::utils::ExeProvenance::InstalledApp => {
+                    proc_cell = proc_cell.fg(Color::Green);
+                }
+                crate::utils::ExeProvenance::NestedUserInstall => {
+                    proc_cell = proc_cell.fg(Color::Yellow);
+                }
+                _ => {
+                    proc_cell = proc_cell.fg(Color::Red);
                 }
             }
         }
