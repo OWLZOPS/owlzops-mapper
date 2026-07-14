@@ -332,8 +332,9 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                             object_path: path.to_string(),
                             source: matched_key.to_string(),
                             is_deleted: false,
-                            region_addr: None, // no address available from environ
+                            region_addr: None,
                             deep_forensics: None,
+                            exe_path: None,
                         });
                         pid_hits += 1;
                     }
@@ -455,6 +456,7 @@ fn scan_maps(
                         is_deleted,
                         region_addr: Some(addr.to_string()),
                         deep_forensics: None,
+                        exe_path: exe_path.map(|s| s.to_string()),
                     });
                     found_ephemeral = true;
                 }
@@ -493,15 +495,13 @@ fn scan_maps(
         // 2. FALLBACK: content‑verified cache + structural provenance (NO blind allowlist)
         if downgrade.is_none() && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx) {
             downgrade = match exe_path.and_then(|e| cache.lookup(e)) {
-                Some(Verdict::Benign) => Some("maps-rwx-cached-clean"), // deep‑verified → SEC‑027
-                Some(Verdict::Malicious) => None, // known‑bad → active finding (SEC‑026)
+                Some(Verdict::Benign) => Some("maps-rwx-cached-clean"),
+                Some(Verdict::Malicious) => None,
                 None => match exe_path.map(crate::utils::exe_provenance) {
-                    // Installed tree, not yet deep‑verified → provisional (0 penalty)
                     Some(crate::utils::ExeProvenance::InstalledApp)
                     | Some(crate::utils::ExeProvenance::NestedUserInstall) => {
                         Some("maps-rwx-provisional")
                     }
-                    // Lone / deleted / no provenance → keep alert
                     _ => None,
                 },
             };
@@ -519,6 +519,7 @@ fn scan_maps(
                     is_deleted: false,
                     region_addr: Some(addr.to_string()),
                     deep_forensics: None,
+                    exe_path: exe_path.map(|s| s.to_string()),
                 });
             }
             continue;
@@ -550,6 +551,7 @@ fn scan_maps(
                 is_deleted: false,
                 region_addr: Some(addr.to_string()),
                 deep_forensics: None,
+                exe_path: exe_path.map(|s| s.to_string()),
             });
         }
     }

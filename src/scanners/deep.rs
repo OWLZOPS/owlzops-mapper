@@ -253,6 +253,19 @@ fn has_image_header(b: &[u8]) -> bool {
         || b.windows(4).take(64).any(|w| w == b"PE\0\0")
 }
 
+/// Empty/sparse reserved region: JIT code buffer not yet filled
+/// (entropy ≈ 0, mostly zeros). No payload → nothing to attribute as malware.
+/// Content fact, not reputation — NOT evadable by renaming the process.
+fn attribute_reserved_buffer(buf: &[u8]) -> Option<(Origin, u8)> {
+    if buf.is_empty() {
+        return None;
+    }
+    let zeros = buf.iter().filter(|&&b| b == 0).count();
+    // ≥95% zeros AND no prologue = reserved-but-not-written. Real payload ≠ zeros.
+    (zeros * 100 >= buf.len() * 95 && detect_prologue(buf).is_none())
+        .then_some((Origin::ReservedBuffer, 70))
+}
+
 /// L1a: pointer‑table attribution (dynamically linked engines)
 const POINTER_SIGS: &[(&str, Origin, u8)] = &[
     ("libffi", Origin::FfiClosure, 70),
@@ -320,6 +333,10 @@ fn attribute(
     // L0 — trumping veto: positive malware overrides ANY benign attribution
     if shannon(buf) >= 7.0 || has_image_header(buf) {
         return (Origin::UnknownPayload, 65);
+    }
+    // L1-0 — content = "no payload" (zero/sparse reserved buffers)
+    if let Some(v) = attribute_reserved_buffer(buf) {
+        return v;
     }
     // L1a — dynamic engines via pointer table
     if let Some(v) = attribute_by_pointer(ptrs) {

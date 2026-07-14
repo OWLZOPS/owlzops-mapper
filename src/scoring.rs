@@ -636,9 +636,45 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     fn reputable_exe(f: &crate::models::LibraryInjectionFinding) -> bool {
-        f.source == "maps-rwx-provisional"
-            || f.source == "maps-rwx-cached-clean"
-            || f.source == "maps-rwx-runtime-allowlist"
+        // Strong signal: already verified by cache or explicitly tagged
+        if f.source.contains("cached-clean")
+            || f.source.contains("provisional")
+            || f.source.contains("allowlist")
+        {
+            return true;
+        }
+        // Strong signal: path-based provenance (not the failable process name)
+        if let Some(exe_path) = f.exe_path.as_deref() {
+            let prov = crate::utils::exe_provenance(exe_path);
+            return matches!(
+                prov,
+                crate::utils::ExeProvenance::InstalledApp
+                    | crate::utils::ExeProvenance::NestedUserInstall
+            );
+        }
+        false
+    }
+
+    /// WEAK label, not trust: comm is spoofable (PR_SET_NAME). Last-chance tie-breaker
+    /// for VISIBLE provisional, ONLY when exe_path is unavailable and content/behavior
+    /// checks have already passed. Declarative: one name = one line.
+    const KNOWN_RUNTIME_COMMS: &[&str] = &[
+        "php-fpm",
+        "php",
+        "nginx",
+        "hestia-nginx",
+        "node",
+        "next-server",
+        "gjs",
+        "telegram",
+    ];
+
+    fn comm_asserts_runtime(process: &str) -> bool {
+        KNOWN_RUNTIME_COMMS.iter().any(|&k| {
+            process == k
+                || process.starts_with(&format!("{k}."))
+                || process.starts_with(&format!("{k}:"))
+        })
     }
 
     fn process_behavior_clean(pid: u32, report: &AgentReport) -> bool {
@@ -687,13 +723,16 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 | Origin::Pcre2Jit
                 | Origin::JitCode
                 | Origin::ManagedJit
+                | Origin::ReservedBuffer
                 | Origin::RuntimeTrampoline
                     if d.confidence >= DEEP_DEMOTE_MIN =>
                 {
                     return MemBucket::Advisory;
                 }
                 Origin::Inconclusive
-                    if reputable_exe(f) && process_behavior_clean(f.pid, report) =>
+                    if process_behavior_clean(f.pid, report)
+                        && (reputable_exe(f)
+                            || (f.exe_path.is_none() && comm_asserts_runtime(&f.process))) =>
                 {
                     return MemBucket::TrustedUnverified;
                 }
@@ -2104,6 +2143,7 @@ mod tests {
             is_deleted: false,
             region_addr: None,
             deep_forensics: None,
+            exe_path: None,
         }];
         let f = evaluate(&r)
             .into_iter()

@@ -1361,6 +1361,7 @@ fn origin_label(o: &Origin) -> &'static str {
         Origin::UnknownPayload => "Unknown",
         Origin::Inconclusive => "n/a",
         Origin::ManagedJit => "Managed JIT",
+        Origin::ReservedBuffer => "Empty JIT",
     }
 }
 

@@ -398,6 +398,28 @@ pub fn exe_provenance(exe: &str) -> ExeProvenance {
     if exe.ends_with(" (deleted)") || exe.starts_with("/memfd:") {
         return ExeProvenance::Deleted;
     }
+
+    // System binary paths — territory of the package manager (root-owned).
+    const SYSTEM_BIN: &[&str] = &[
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/bin/",
+        "/sbin/",
+        "/usr/libexec/",
+        "/usr/local/bin/",
+        "/usr/local/sbin/",
+    ];
+    if SYSTEM_BIN.iter().any(|p| exe.starts_with(p)) {
+        let root_owned = std::fs::metadata(exe)
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false);
+        return if root_owned {
+            ExeProvenance::InstalledApp
+        } else {
+            ExeProvenance::LoneDropped
+        };
+    }
+
     if !INSTALL_ROOTS.iter().any(|r| exe.contains(*r)) {
         return ExeProvenance::LoneDropped; // ephemeral path outside any install convention
     }
