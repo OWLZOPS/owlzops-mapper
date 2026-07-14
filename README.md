@@ -41,7 +41,8 @@ sudo ./owlzops-mapper audit
 
 * **Active Compromise & Threat Hunting (IoC)** – Sweeps memory (`/memfd`), deleted executables, ephemeral paths (`/dev/shm`, `/tmp`), and network state to detect hidden rootkits, reverse shells, library injection, and fileless malware in milliseconds.
 * **Deep Memory Forensics** – When invoked with `--deep`, the mapper reads process memory via `process_vm_readv`, resolves pointers, calculates Shannon entropy, detects binary prologues and image headers. Untrusted executable payloads escalate directly to **SEC‑028** (Critical).
-* **Trust‑but‑Verify Policy** – Trusted binary paths (allowlist) no longer grant a free pass. Memory that cannot be positively attributed as legitimate JIT code is flagged as **SEC‑029** (Provisional Trust), visible to the operator and auditable.
+* **Trust‑but‑Verify Policy** – A content‑bound verdict cache replaces static allowlists. Memory that cannot be positively attributed as legitimate JIT code is flagged as **SEC‑029** (Provisional Trust), visible to the operator and auditable.
+* **Container‑aware Structural Provenance** – Mount namespace detection and secure `/proc/pid/exe` resolution prevent false positives for containerised JIT processes (node, next-server). Container‑root binaries are capped at provisional trust.
 * **Deep Container Forensics & Escape Detection** – Analyzes Docker/containerd runtimes for privileged container abuses, sensitive host mounts (`/var/run/docker.sock`), capability leakage, and missing resource limits. All mapped to CIS benchmarks.
 * **Agentless Fleet Orchestration** – Drop the binary via SSH, scan dozens of servers in parallel, and clean up automatically. Supports both passwordless sudo and **password‑based sudo** (`--ask-sudo-pass`). Zero permanent footprint.
 * **Snapshot Diffing & Drift Monitoring** – Capture server state as JSON snapshots, compare any two, and get color‑coded Excel/terminal diffs of exactly what changed (new open ports, changed capabilities, added cronjobs).
@@ -51,18 +52,15 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.5.14
+## Highlights v0.5.16
 
-**Deep Memory Forensics & Intelligent Alerting**
+**Multi‑Tier Trust Funnel & Verdict Cache**
 
-* **Deep Forensics (`--deep`)** – Reads process memory, resolves pointers, calculates entropy, and detects binary headers (MZ/ELF/PE). Unattributed executable payloads raise **SEC‑028** (Critical), while benign JIT shapes are verified and suppressed.
-* **Single Source of Truth for Injection Classification** – `InjectionClass` enum centralises policy; UI and scoring now use the same logic, eliminating false escalation mismatches.
-* **JetBrains False Positives Eliminated** – `/home` is no longer treated as a volatile path for `.so` libraries; 15 CRITICAL findings on JetBrains IDEs are removed.
-* **Smart UI Aggregation** – Memory anomaly tables show forensic anchors (VMA addresses, type breakdown, origin labels) and can be expanded with `-v`/`--verbose` for full per‑region detail.
-* **Trust‑but‑Verify** – Allowlisted binaries (Chrome, Zen, GNOME Shell, etc.) no longer receive blind trust. Their memory regions are labelled `maps‑rwx‑runtime‑allowlist` and enter the new **SEC‑029** provisional trust bucket until deep analysis confirms benign JIT shape or detects anomalies.
-* **Security** – `process_vm_readv` is used instead of `ptrace`, avoiding anti‑debugging conflicts; memory reads are capped and budgeted.
-
-(Previous R11 fixes — CPU‑DoS protection, IPv4‑mapped IPv6 fix, CAP‑002 heuristic, broader LD‑injection detection — are retained.)
+* **Content‑driven attribution (`--deep`)** – A layered analysis pipeline examines process memory for reserved buffers (empty JIT arenas), pointer signatures, managed‑JIT shapes, and libffi stubs, drastically reducing “n/a” (Inconclusive) findings.
+* **Self‑learning verdict cache** – Replaces the static `RUNTIME_EXE_ALLOWLIST`. Trust is bound to a file’s identity (inode + mtime + size), automatically revoked on modification. Populated by `--deep` scans and consulted during fast‑path audits.
+* **Container false‑positive fix** – Docker/Kubernetes workloads (node, next‑server) are no longer misclassified as `LoneDropped`. Mount namespace detection and secure `/proc/pid/exe` resolution provide accurate structural provenance, capping container‑root trust at `NestedUserInstall`.
+* **Provisional trust policy** – Findings that cannot be positively attributed but show clean behavior and strong provenance are routed to **SEC‑029** (Provisional Trust, weight 0) instead of SEC‑026 (Warning). A name‑based fallback is used only as a last resort when the binary path is unavailable.
+* **UI enhancements** – The “run with `--deep`” hint is suppressed when `--deep` is actually passed. Network listener tables are colour‑coded by risk and provenance. Origin labels for `ManagedJit` and `ReservedBuffer` are displayed in deep‑scan output.
 
 ---
 
@@ -230,6 +228,7 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `--keep-binary` | Skip cleanup — leave the binary on the remote host after the scan |
 | `--max-concurrent <N>` | Maximum number of simultaneous SSH sessions (default: 50) |
 | `--deep` | Enable deep forensic scan: memory pointer resolution, entropy, binary header detection, and ghost PID (LKM rootkit) scanning |
+| `--verdict-cache <PATH>` | Path to the deep‑forensics verdict cache (default: `/var/lib/owlzops/verdict-cache.json`) |
 | `-v, --verbose` | Show full per‑VMA detail in memory anomaly tables (useful with `--deep`) |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
@@ -242,7 +241,6 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `snapshot` | Run an audit and save the JSON snapshot to disk |
 | `compare <before> <after>` | Compare two JSON snapshots and show drift |
 | `dir-compare <dir>` | Compare the two most recent snapshots in a directory |
-| `--host <HOST>` | Single hostname/IP (or comma‑separated list) for remote scanning |
 | `--deep` | Enable deep forensic scan: ghost PID (LKM rootkit) detection, extended /proc probing, and memory forensics. Root only. |
 | `-v, --verbose` | Show full per‑region detail in memory tables (only effective with text output) |
 
@@ -338,7 +336,7 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Internals | Cron jobs (with severity classification), systemd timers, /etc/hosts overrides, kernel errors, failed systemd units |
 | Backups | Detection of restic, borg, duplicati, rsync/backup in cron |
 | NTP | Time synchronization status and offset |
-| **Memory Forensics (‑‑deep)** | **Process memory reading, pointer resolution (O(log N)), Shannon entropy, binary headers, prologue detection, origin attribution (FFI, GObject, JVM, trampoline)** |
+| **Memory Forensics (‑‑deep)** | **Process memory reading, pointer resolution (O(log N)), Shannon entropy, binary headers, prologue detection, origin attribution (FFI, GObject, JVM, trampoline), content‑bound verdict caching** |
 | **Malware & Intrusion** | **Full /proc sweep for known malicious processes, fileless executables, memfd implants, bind‑mount masking, reverse shells, library injection, hidden PIDs (LKM rootkit), container runtime capability tampering** |
 
 ---
@@ -421,6 +419,19 @@ See [LICENSE](LICENSE) for details.
 
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
+
+### v0.5.14 (2026-07-13)
+
+**Deep Memory Forensics & Intelligent Alerting**
+
+* **Deep Forensics (`--deep`)** – Reads process memory, resolves pointers, calculates entropy, and detects binary headers (MZ/ELF/PE). Unattributed executable payloads raise **SEC‑028** (Critical), while benign JIT shapes are verified and suppressed.
+* **Single Source of Truth for Injection Classification** – `InjectionClass` enum centralises policy; UI and scoring now use the same logic, eliminating false escalation mismatches.
+* **JetBrains False Positives Eliminated** – `/home` is no longer treated as a volatile path for `.so` libraries; 15 CRITICAL findings on JetBrains IDEs are removed.
+* **Smart UI Aggregation** – Memory anomaly tables show forensic anchors (VMA addresses, type breakdown, origin labels) and can be expanded with `-v`/`--verbose` for full per‑region detail.
+* **Trust‑but‑Verify** – Allowlisted binaries (Chrome, Zen, GNOME Shell, etc.) no longer receive blind trust. Their memory regions are labelled `maps‑rwx‑runtime‑allowlist` and enter the new **SEC‑029** provisional trust bucket until deep analysis confirms benign JIT shape or detects anomalies.
+* **Security** – `process_vm_readv` is used instead of `ptrace`, avoiding anti‑debugging conflicts; memory reads are capped and budgeted.
+
+(Previous R11 fixes — CPU‑DoS protection, IPv4‑mapped IPv6 fix, CAP‑002 heuristic, broader LD‑injection detection — are retained.)
 
 ### v0.5.13 (2026-07-12)
 
