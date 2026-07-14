@@ -678,6 +678,7 @@ pub enum Origin {
     Pcre2Jit,
     UnknownPayload,
     Inconclusive,
+    ManagedJit, // generic managed-JIT shape (V8, JSC, Zend, PCRE2)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

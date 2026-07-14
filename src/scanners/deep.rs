@@ -197,7 +197,7 @@ impl MemoryReader for ProcMemReader {
     }
 }
 
-// ── Analysis helpers and confidence engine ──
+// ── Analysis helpers (entropy, prologue, pointers) ──
 
 fn shannon(buf: &[u8]) -> f32 {
     if buf.is_empty() {
@@ -244,62 +244,107 @@ fn scan_pointers(buf: &[u8], r: &PointerResolver) -> Vec<ResolvedPointer> {
         .collect()
 }
 
-struct ConfidenceEngine {
-    votes: Vec<(Origin, u8)>,
+// ── Multi‑tier attribution funnel (replaces flat ConfidenceEngine) ──
+
+/// L0: image header detection
+fn has_image_header(b: &[u8]) -> bool {
+    b.starts_with(b"MZ")
+        || b.starts_with(&[0x7F, b'E', b'L', b'F'])
+        || b.windows(4).take(64).any(|w| w == b"PE\0\0")
 }
 
-impl ConfidenceEngine {
-    fn new() -> Self {
-        Self { votes: vec![] }
-    }
-    fn vote(mut self, cond: bool, o: Origin, w: u8) -> Self {
-        if cond {
-            self.votes.push((o, w));
-        }
-        self
-    }
-    fn conclude(self, has_prologue: bool) -> (Origin, u8) {
-        match self.votes.into_iter().max_by_key(|(_, w)| *w) {
-            Some((o, w)) => {
-                let bonus = if has_prologue && o != Origin::UnknownPayload {
-                    10
-                } else {
-                    0
-                };
-                (o, (w + bonus).min(100))
-            }
-            None => (Origin::Inconclusive, 0),
-        }
-    }
+/// L1a: pointer‑table attribution (dynamically linked engines)
+const POINTER_SIGS: &[(&str, Origin, u8)] = &[
+    ("libffi", Origin::FfiClosure, 70),
+    ("libjvm", Origin::HotSpot, 75),
+    ("libpcre2", Origin::Pcre2Jit, 75),
+    ("_gi", Origin::GObjectCallback, 70),
+    ("gobject", Origin::GObjectCallback, 70),
+];
+
+fn attribute_by_pointer(ptrs: &[ResolvedPointer]) -> Option<(Origin, u8)> {
+    POINTER_SIGS
+        .iter()
+        .find(|(n, _, _)| ptrs.iter().any(|p| p.target.contains(*n)))
+        .map(|&(_, ref o, c)| (o.clone(), c))
 }
 
-fn analyze(buf: &[u8], ctx: &ProcMemContext) -> DeepMemoryAnalysis {
+/// Check whether an address falls inside a runtime JIT reservation.
+fn is_inside_jit_cluster(region_lo: u64, clusters: &[ExecCluster]) -> bool {
+    clusters.iter().any(|c| {
+        (c.span >= 8 * 1024 * 1024 || c.pages >= 16) && region_lo >= c.lo && region_lo <= c.hi
+    })
+}
+
+/// L1b: engine‑agnostic managed‑JIT shape (V8, JSC, Zend, PCRE2)
+fn attribute_managed_jit(
+    buf: &[u8],
+    region_lo: u64,
+    ctx: &ProcMemContext,
+    ptrs: &[ResolvedPointer],
+) -> Option<(Origin, u8)> {
+    let in_reservation = is_inside_jit_cluster(region_lo, &ctx.clusters);
+    let self_ref = ptrs
+        .iter()
+        .any(|p| matches!(p.kind, PointerKind::LibText | PointerKind::JitCluster));
+    let native = detect_prologue(buf).is_some() && shannon(buf) < 6.5;
+
+    let signals = [in_reservation, self_ref, native]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+
+    (signals >= 2).then_some((Origin::ManagedJit, 70 + 15 * (signals as u8 - 2)))
+}
+
+/// L1c: libffi trampoline stub signature
+fn attribute_ffi_trampoline(buf: &[u8]) -> Option<(Origin, u8)> {
+    const FFI_STUB: &[&[u8]] = &[
+        &[0x49, 0xBB], // movabs r11, <closure> — unix64 classic stub
+        &[0x49, 0xBA], // movabs r10, <closure> — alternative
+    ];
+    FFI_STUB
+        .iter()
+        .any(|s| buf.windows(s.len()).take(8).any(|w| w == *s))
+        .then_some((Origin::FfiClosure, 60))
+}
+
+/// Ordered attribution funnel: cheaper/more reliable layers first, short‑circuit.
+fn attribute(
+    buf: &[u8],
+    region_lo: u64,
+    ctx: &ProcMemContext,
+    ptrs: &[ResolvedPointer],
+    _has_prologue: bool,
+) -> (Origin, u8) {
+    // L0 — trumping veto: positive malware overrides ANY benign attribution
+    if shannon(buf) >= 7.0 || has_image_header(buf) {
+        return (Origin::UnknownPayload, 65);
+    }
+    // L1a — dynamic engines via pointer table
+    if let Some(v) = attribute_by_pointer(ptrs) {
+        return v;
+    }
+    // L1b — generic managed‑JIT shape
+    if let Some(v) = attribute_managed_jit(buf, region_lo, ctx, ptrs) {
+        return v;
+    }
+    // L1c — libffi stub signature
+    if let Some(v) = attribute_ffi_trampoline(buf) {
+        return v;
+    }
+
+    (Origin::Inconclusive, 0)
+}
+
+/// Top‑level analysis: collects raw signals and runs the attribution funnel.
+fn analyze(buf: &[u8], region_lo: u64, ctx: &ProcMemContext) -> DeepMemoryAnalysis {
     let entropy = shannon(buf);
     let prologue = detect_prologue(buf);
     let ptrs = scan_pointers(buf, &ctx.resolver);
-    let has = |needle: &str| ptrs.iter().any(|p| p.target.contains(needle));
+    let image_header = has_image_header(buf);
 
-    // Detect binary headers (MZ, ELF, PE) indicative of reflective loading
-    let image_header = buf.starts_with(b"MZ")
-        || buf.starts_with(&[0x7F, b'E', b'L', b'F'])
-        || buf.windows(4).take(64).any(|w| w == b"PE\0\0");
-
-    let (origin, confidence) = ConfidenceEngine::new()
-        .vote(has("libffi"), Origin::FfiClosure, 70)
-        .vote(has("_gi") || has("gobject"), Origin::GObjectCallback, 70)
-        .vote(has("libjvm"), Origin::HotSpot, 75)
-        .vote(has("libpcre2"), Origin::Pcre2Jit, 75)
-        .vote(
-            ptrs.iter().any(|p| p.kind == PointerKind::JitCluster),
-            Origin::JitCode,
-            55,
-        )
-        .vote(
-            (entropy > 7.0 && ptrs.is_empty()) || image_header,
-            Origin::UnknownPayload,
-            60,
-        )
-        .conclude(prologue.is_some());
+    let (origin, confidence) = attribute(buf, region_lo, ctx, &ptrs, prologue.is_some());
 
     DeepMemoryAnalysis {
         origin,
@@ -343,7 +388,7 @@ pub fn enrich(findings: &mut [LibraryInjectionFinding], pid: u32, ctx: &ProcMemC
         };
 
         f.deep_forensics = Some(match reader.read_at(lo, DEEP_READ_LEN) {
-            Ok(buf) => analyze(&buf, ctx),
+            Ok(buf) => analyze(&buf, lo, ctx),
             Err(_) => DeepMemoryAnalysis::inconclusive(),
         });
         budget -= 1;

@@ -635,6 +635,28 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             })
     }
 
+    fn reputable_exe(f: &crate::models::LibraryInjectionFinding) -> bool {
+        f.source == "maps-rwx-provisional"
+            || f.source == "maps-rwx-cached-clean"
+            || f.source == "maps-rwx-runtime-allowlist"
+    }
+
+    fn process_behavior_clean(pid: u32, report: &AgentReport) -> bool {
+        let no_listener = !report
+            .network
+            .listening_ports
+            .iter()
+            .any(|p| p.pid == Some(pid) && !crate::utils::is_loopback_bind(&p.bind_address));
+
+        let no_ptrace_ioc = !report
+            .security
+            .library_injections
+            .iter()
+            .any(|f| f.pid == pid && f.source.contains("ptrace"));
+
+        no_listener && no_ptrace_ioc
+    }
+
     enum MemBucket {
         Classic,
         DeepCritical,
@@ -643,7 +665,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         TrustedUnverified,
     }
 
-    fn mem_bucket(f: &crate::models::LibraryInjectionFinding) -> MemBucket {
+    fn mem_bucket(f: &crate::models::LibraryInjectionFinding, report: &AgentReport) -> MemBucket {
         let deep = f.deep_forensics.as_ref();
 
         // Layer 1 — trumping malice overrides everything.
@@ -662,11 +684,18 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 Origin::FfiClosure
                 | Origin::GObjectCallback
                 | Origin::HotSpot
-                | Origin::RuntimeTrampoline
                 | Origin::Pcre2Jit
+                | Origin::JitCode
+                | Origin::ManagedJit
+                | Origin::RuntimeTrampoline
                     if d.confidence >= DEEP_DEMOTE_MIN =>
                 {
                     return MemBucket::Advisory;
+                }
+                Origin::Inconclusive
+                    if reputable_exe(f) && process_behavior_clean(f.pid, report) =>
+                {
+                    return MemBucket::TrustedUnverified;
                 }
                 _ => {}
             }
@@ -695,7 +724,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut trusted_unverified = Vec::new();
 
     for finding in &report.security.library_injections {
-        match mem_bucket(finding) {
+        match mem_bucket(finding, report) {
             MemBucket::Classic => classic_injections.push(finding),
             MemBucket::DeepCritical => deep_critical.push(finding),
             MemBucket::Anomaly => memory_anomalies.push(finding),
