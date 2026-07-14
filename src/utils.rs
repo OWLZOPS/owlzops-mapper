@@ -420,12 +420,33 @@ pub fn exe_provenance(exe: &str) -> ExeProvenance {
         };
     }
 
+    // Version-managed runtime roots (nvm/pyenv/rbenv/...). The binary here IS the runtime
+    // by convention. Membership-alone -> NestedUserInstall: the manager's layout keeps files
+    // in child branches, not up the ancestor chain, so the populated-tree heuristic misfits.
+    // User-writable -> WEAK tier (provisional-visible), residual risk is bound by parentage.
+    const RUNTIME_MANAGER_ROOTS: &[&str] = &[
+        "/.nvm/",
+        "/.fnm/",
+        "/.volta/",
+        "/.asdf/",
+        "/.pyenv/",
+        "/.rbenv/",
+        "/.bun/",
+        "/.deno/",
+        "/linuxbrew/",
+        "/usr/lib/node_modules/",
+    ];
+    if RUNTIME_MANAGER_ROOTS.iter().any(|r| exe.contains(r)) {
+        return ExeProvenance::NestedUserInstall; // weak, not InstalledApp — user-writable
+    }
+
     if !INSTALL_ROOTS.iter().any(|r| exe.contains(*r)) {
         return ExeProvenance::LoneDropped; // ephemeral path outside any install convention
     }
     if !populated_tree_within(exe) {
         return ExeProvenance::LoneDropped; // isolated even after limited upward traversal
     }
+
     // A populated tree exists. Trust strength = who COULD have placed this binary.
     let root_owned = std::fs::metadata(exe)
         .map(|m| m.uid() == 0)

@@ -375,7 +375,7 @@ fn analyze(buf: &[u8], region_lo: u64, ctx: &ProcMemContext) -> DeepMemoryAnalys
 }
 
 fn is_rwx_candidate(src: &str) -> bool {
-    src.contains("rwx") || src.contains("exec-")
+    src.contains("rwx") || src.contains("exec-") || src == "maps-anon-rx"
 }
 
 pub fn enrich(findings: &mut [LibraryInjectionFinding], pid: u32, ctx: &ProcMemContext) {

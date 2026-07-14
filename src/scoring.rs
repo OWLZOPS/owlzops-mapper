@@ -741,7 +741,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
 
         // Layer 3 — provisional trust (install-tree, cache-unverified, or allowlisted).
-        if f.source == "maps-rwx-provisional" || f.source == "maps-rwx-runtime-allowlist" {
+        if f.source == "maps-rwx-provisional"
+            || f.source == "maps-rwx-runtime-allowlist"
+            || f.source == "maps-rwx-cached-clean"
+        {
             return match deep {
                 Some(d) if is_benign_shape(d) => MemBucket::Advisory,
                 _ => MemBucket::TrustedUnverified,
