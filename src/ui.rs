@@ -1417,6 +1417,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                         | Origin::HotSpot
                         | Origin::RuntimeTrampoline
                         | Origin::Pcre2Jit
+                        | Origin::ManagedJit
+                        | Origin::ReservedBuffer
                 );
                 if is_benign && d.confidence >= 70 {
                     return false;
@@ -1674,7 +1676,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // Provisional Trust (SEC-029)
     let prov_trust: Vec<_> = inj
         .iter()
-        .filter(|l| l.source == "maps-rwx-runtime-allowlist")
+        .filter(|l| {
+            l.source == "maps-rwx-provisional"
+                || l.source == "maps-rwx-cached-clean"
+                || l.source == "maps-rwx-runtime-allowlist"
+        })
         .collect();
     if !prov_trust.is_empty() {
         println!(
