@@ -87,6 +87,10 @@ fn raise_nofile_limit() {
     }
 }
 
+fn style_or_default(tpl: &str) -> ProgressStyle {
+    ProgressStyle::with_template(tpl).unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
 async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> i32 {
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
@@ -200,8 +204,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                     let local_spinner = ProgressBar::new_spinner();
                     local_spinner.set_style(
-                        ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                            .unwrap()
+                        style_or_default("{spinner:.cyan} {msg} [{elapsed_precise}]")
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
@@ -265,8 +268,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     // 2. Scan spinner
                     let scan_bar = multi.add(ProgressBar::new_spinner());
                     scan_bar.set_style(
-                        ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                            .unwrap()
+                        style_or_default("{spinner:.cyan} {msg} [{elapsed_precise}]")
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
@@ -296,7 +298,14 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         let upload_pb = upload_bar.clone();
 
                         join_set.spawn(async move {
-                            let _permit = sem.acquire_owned().await;
+                            // R12-05: Explicitly handle semaphore permit acquisition
+                            let _permit = match sem.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    // semaphore closed (shutdown) – skip this host
+                                    return None;
+                                }
+                            };
 
                             if pass.is_some() {
                                 if let Err(e) = runner::validate_host(&host) {
@@ -373,6 +382,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     }
 
                     // Process results with immediate abort on shutdown signal
+                    // R12-02: shutdown-aware send — allow shutdown to interrupt blocked channel
                     loop {
                         tokio::select! {
                             biased;
@@ -388,7 +398,19 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         match result {
                                             Ok(Some(report)) => {
                                                 if let Some(sender) = &tx {
-                                                    let _ = sender.send(report).await;
+                                                    // Clone before select to satisfy borrow checker for both arms
+                                                    let report_clone = report.clone();
+                                                    tokio::select! {
+                                                        biased;
+                                                        _ = shutdown_notify.notified() => {
+                                                            let _ = sender.try_send(report_clone); // best-effort
+                                                            join_set.abort_all();
+                                                            scan_bar.finish_and_clear();
+                                                            if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
+                                                            break;
+                                                        }
+                                                        r = sender.send(report) => { let _ = r; }
+                                                    }
                                                 } else {
                                                     reports.push(report);
                                                 }
@@ -478,8 +500,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             // Single local scan (no hosts file or empty hosts)
             let local_spinner = ProgressBar::new_spinner();
             local_spinner.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                    .unwrap()
+                style_or_default("{spinner:.cyan} {msg} [{elapsed_precise}]")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
             );
             if args.deep {
