@@ -87,6 +87,7 @@ fn raise_nofile_limit() {
     }
 }
 
+// R12-06: Helper to replace unwrap() on ProgressStyle templates
 fn style_or_default(tpl: &str) -> ProgressStyle {
     ProgressStyle::with_template(tpl).unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
@@ -203,6 +204,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     }
 
                     let local_spinner = ProgressBar::new_spinner();
+                    // R12-06: use style_or_default instead of unwrap()
                     local_spinner.set_style(
                         style_or_default("{spinner:.cyan} {msg} [{elapsed_precise}]")
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
@@ -267,6 +269,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                     // 2. Scan spinner
                     let scan_bar = multi.add(ProgressBar::new_spinner());
+                    // R12-06: use style_or_default instead of unwrap()
                     scan_bar.set_style(
                         style_or_default("{spinner:.cyan} {msg} [{elapsed_precise}]")
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
@@ -499,6 +502,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
             // Single local scan (no hosts file or empty hosts)
             let local_spinner = ProgressBar::new_spinner();
+            // R12-06: use style_or_default instead of unwrap()
             local_spinner.set_style(
                 style_or_default("{spinner:.cyan} {msg} [{elapsed_precise}]")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
