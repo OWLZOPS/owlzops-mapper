@@ -6,7 +6,9 @@ use bollard::volume::ListVolumesOptions;
 use std::collections::HashMap;
 use std::default::Default;
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::warn;
 
@@ -110,7 +112,8 @@ pub async fn gather_docker_topology() -> TopologyInfo {
             };
 
             if !containers.is_empty() {
-                // Spawn inspect tasks with individual 5s timeouts
+                // R12-01: Limit concurrent inspect calls to avoid thundering herd
+                let inspect_sem = Arc::new(Semaphore::new(16));
                 let mut join_set: JoinSet<(
                     bollard::models::ContainerSummary,
                     Option<bollard::models::ContainerInspectResponse>,
@@ -121,7 +124,12 @@ pub async fn gather_docker_topology() -> TopologyInfo {
                         let docker = docker.clone();
                         let id = id.to_string();
                         let c = c.clone();
+                        let sem = inspect_sem.clone();
                         join_set.spawn(async move {
+                            let _permit = match sem.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => return (c, None), // semaphore closed, skip
+                            };
                             let inspect = tokio::time::timeout(
                                 Duration::from_secs(5),
                                 docker.inspect_container(&id, None),
