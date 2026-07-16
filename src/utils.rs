@@ -212,8 +212,17 @@ pub fn run_child_with_timeout(
         }
         data
     });
+
+    // R12-04: capture stderr truncation flag and record in coverage
+    let err_prog = program.to_string();
     let err_handle = thread::spawn(move || {
-        let (data, _trunc) = safe_io::read_reader_capped(err_pipe, 1024 * 1024);
+        let (data, trunc) = safe_io::read_reader_capped(err_pipe, 1024 * 1024);
+        if trunc {
+            coverage::record(format!(
+                "stderr of '{}' exceeded 1 MiB and was truncated",
+                err_prog
+            ));
+        }
         data
     });
 
@@ -281,6 +290,7 @@ pub fn run_with_timeout_any_exit(
 }
 
 // R10-05: capped stdout reader + defensive take() guard instead of `?`
+// R12-03: extended poll_wait grace to 5 seconds and record coverage on discard
 fn run_with_timeout_inner(
     program: &str,
     args: &[&str],
@@ -324,11 +334,17 @@ fn run_with_timeout_inner(
 
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(stdout) => {
-            let status = poll_wait(&mut child, Duration::from_secs(2));
+            // R12-03: increased grace from 2s to 5s for slow-exiting children
+            let status = poll_wait(&mut child, Duration::from_secs(5));
             let result = if require_success {
                 match status {
                     Some(s) if s.success() => Some(stdout),
-                    _ => None,
+                    _ => {
+                        coverage::record(format!(
+                            "'{program}' produced output but did not exit within grace period – result discarded"
+                        ));
+                        None
+                    }
                 }
             } else {
                 Some(stdout)
