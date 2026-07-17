@@ -752,6 +752,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         Anomaly,
         Advisory,
         TrustedUnverified,
+        UnlinkGhost,
     }
 
     fn mem_bucket(f: &crate::models::LibraryInjectionFinding, report: &AgentReport) -> MemBucket {
@@ -793,6 +794,17 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
+        // Layer 2b — unlink-on-load ghost inode (deleted jar-extract profile).
+        // NEVER reaches Advisory without content verification: only a benign
+        // deep shape of the still-mapped text promotes it; otherwise it stays
+        // in its own visible zero-weight lane.
+        if f.source == "maps-so-unlink-on-load" {
+            return match deep {
+                Some(d) if is_benign_shape(d) => MemBucket::Advisory,
+                _ => MemBucket::UnlinkGhost,
+            };
+        }
+
         // Layer 3 — provisional trust (install-tree, cache-unverified, allowlisted, or
         // unverified JNI .so extract).
         if f.source == "maps-rwx-provisional"
@@ -819,6 +831,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut memory_anomalies = Vec::new();
     let mut jit_advisories = Vec::new();
     let mut trusted_unverified = Vec::new();
+    let mut unlink_ghosts = Vec::new();
 
     for finding in &report.security.library_injections {
         match mem_bucket(finding, report) {
@@ -827,6 +840,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             MemBucket::Anomaly => memory_anomalies.push(finding),
             MemBucket::Advisory => jit_advisories.push(finding),
             MemBucket::TrustedUnverified => trusted_unverified.push(finding),
+            MemBucket::UnlinkGhost => unlink_ghosts.push(finding),
         }
     }
 
@@ -959,8 +973,46 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 list
             ),
             suppressed: Some(
-                "Trusted binary path; deep forensics found no malicious indicators but could not \
-                 positively attribute the JIT origin. Trust is PROVISIONAL, not verified."
+                "Trusted binary path; no malice indicators observed at the executed tier \
+                 (deep forensics, when run, found none). Trust is PROVISIONAL, not verified."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
+    // SEC-033 – Unlink-on-load ghost inode (deleted jar-extract, provisional)
+    if !unlink_ghosts.is_empty() {
+        let list = unlink_ghosts
+            .iter()
+            .map(|f| {
+                let anchor = f.region_addr.as_deref().unwrap_or("?");
+                format!(
+                    "{} (pid {}): {} — recover: /proc/{}/map_files/{}",
+                    f.process, f.pid, f.object_path, f.pid, anchor
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-033",
+            title: "Deleted temp-extract .so — unlink-on-load pattern (UNVERIFIED ghost inode)"
+                .to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} deleted .so mapping(s) matching the JVM unlink-on-load extract profile \
+                 (trusted runtime, ld.so segment family, W^X across family, no LD_* \
+                 co-occurrence): {}. The inode is alive while mapped — run --deep to \
+                 verify its content.",
+                unlink_ghosts.len(),
+                list
+            ),
+            suppressed: Some(
+                "Structural profile matches Netty/JNA-style unlink-after-dlopen extraction \
+                 in a trusted runtime. Trust is PROVISIONAL: the on-disk file no longer \
+                 exists and the ghost inode content has not been verified. A clean-ELF \
+                 implant loaded the same way is indistinguishable at this tier."
                     .to_string(),
             ),
             cis_ref: None,
