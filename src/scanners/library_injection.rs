@@ -146,10 +146,15 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
         !is_deleted && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
     });
 
+    // Structural fact: a real runtime .so is mapped from a NON-volatile absolute
+    // path and is not deleted. Install location is irrelevant — bundled JBR,
+    // SDKMAN, /opt/kafka all count. Spoofing requires actually running the runtime.
     let runtime_libs = maps.lines().any(|l| {
-        l.rsplit(char::is_whitespace)
-            .next()
-            .is_some_and(|p| p.starts_with("/usr/") && RT_LIBS.iter().any(|lib| p.contains(lib)))
+        let last = l.rsplit(char::is_whitespace).next().unwrap_or("");
+        last.starts_with('/')
+            && !last.ends_with("(deleted)")
+            && !is_volatile_lib_path(last)               // libjvm itself from /tmp = spoof
+            && RT_LIBS.iter().any(|lib| last.contains(lib))
     });
 
     let vendor_anchored = exe_path
@@ -247,23 +252,17 @@ fn is_trampoline_pool(maps: &str) -> bool {
         >= TRAMP_POOL_MIN
 }
 
-// ── Verdict derivation helper ───────────────────────────────
+// ── Verdict derivation ─────────────────────────────────────
 
-/// Cache only confident verdicts; inconclusive → None → stays provisional.
-fn derive_verdict(regions: &[LibraryInjectionFinding]) -> Option<Verdict> {
-    let mut benign = false;
-    for r in regions {
-        let Some(d) = &r.deep_forensics else {
-            continue;
-        };
-        if d.entropy >= 7.0 || d.image_header {
-            return Some(Verdict::Malicious);
-        }
-        if d.prologue.is_some() && d.confidence >= 70 {
-            benign = true;
-        }
+/// Single-region verdict for object-identity caching. Confident only.
+fn verdict_of_region(d: &crate::models::DeepMemoryAnalysis) -> Option<Verdict> {
+    if d.entropy >= 7.0 || d.image_header {
+        return Some(Verdict::Malicious);
     }
-    benign.then_some(Verdict::Benign)
+    if d.prologue.is_some() && d.confidence >= 70 {
+        return Some(Verdict::Benign);
+    }
+    None // inconclusive → stays provisional, never cached
 }
 
 // ── MAIN SCANNER ───────────────────────────────────────────
@@ -364,14 +363,14 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                     &mut findings,
                 );
 
-                // Slow path: enrich + cache verdict
+                // Slow path: enrich + cache verdict per object (not per exe)
                 if cfg.deep_for(pid) && findings.len() > start {
                     let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
-                    if let (Some(exe), Some(verdict)) =
-                        (exe_path.as_deref(), derive_verdict(&findings[start..]))
-                    {
-                        cache.record(exe, verdict);
+                    for f in &findings[start..] {
+                        if let Some(v) = f.deep_forensics.as_ref().and_then(verdict_of_region) {
+                            cache.record(&f.object_path, v);
+                        }
                     }
                 }
             } else if pid_hits == 0 {
@@ -440,11 +439,19 @@ fn scan_maps(
                 None => (p, false),
             };
             if (clean.ends_with(".so") || clean.contains(".so.")) && is_volatile_lib_path(clean) {
-                let source = if trust_met {
+                let pb = perms.as_bytes();
+                let writable_exec = pb.get(1) == Some(&b'w') && pb.get(2) == Some(&b'x');
+
+                let source = if is_deleted || writable_exec {
+                    // deleted or rwx .so from volatile path — never demote
+                    "maps"
+                } else if trust_met {
                     "maps-so-jit-extract"
                 } else {
-                    "maps"
+                    // r-x .so in unrecognized runtime context: provisional trust
+                    "maps-so-tmp-unverified"
                 };
+
                 let clean_str = clean.to_string();
                 if !seen.contains(&clean_str) {
                     seen.push(clean_str);
