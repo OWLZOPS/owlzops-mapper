@@ -475,6 +475,17 @@ pub struct SuspiciousProcess {
     pub euid: u32,
     #[serde(default)]
     pub is_mimic: bool,
+    /// Non-None = this record is the scanner's own process, attributed by a PID
+    /// identity established inside this process. The record is NEVER dropped
+    /// (Raw Truth); the string is the reason surfaced as SEC-032.
+    ///
+    /// Read ONLY by the footprint class (SEC-017/SEC-019). Injection-class
+    /// findings (SEC-023/026/028/029) must ignore this field: an implant in our
+    /// own address space is exactly what we must not go blind to.
+    /// `serde(default)` ⇒ legacy snapshots deserialize to None ⇒ pre-R12
+    /// behaviour preserved on `compare`.
+    #[serde(default)]
+    pub self_attributed: Option<String>,
 }
 
 // Process Capability Audit Models

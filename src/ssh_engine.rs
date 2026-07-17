@@ -2,6 +2,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh::*;
 use std::io::{IsTerminal, Read};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -147,6 +148,53 @@ pub(crate) fn split_host_port(host: &str) -> (String, u16) {
     (host.to_string(), 22)
 }
 
+/// Kernel-level dead-transport detection. Idle-death of a peer is detected
+/// within ~KEEPIDLE + KEEPINTVL*KEEPCNT seconds (≈60 s). TCP_USER_TIMEOUT
+/// ensures that unsent data does not hang in retransmissions beyond that window
+/// when the budget expires.
+fn harden_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    const KEEPIDLE_S: libc::c_int = 30;
+    const KEEPINTVL_S: libc::c_int = 10;
+    const KEEPCNT: libc::c_int = 3;
+
+    fn set<T>(
+        fd: std::os::fd::RawFd,
+        level: libc::c_int,
+        name: libc::c_int,
+        v: &T,
+    ) -> std::io::Result<()> {
+        // SAFETY: pointer and size match T; kernel copies value synchronously.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (v as *const T).cast(),
+                std::mem::size_of::<T>() as libc::socklen_t,
+            )
+        };
+        if rc == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    let fd = stream.as_raw_fd();
+    set(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &1i32)?;
+    set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &KEEPIDLE_S)?;
+    set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &KEEPINTVL_S)?;
+    set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &KEEPCNT)?;
+    let user_timeout_ms: libc::c_uint =
+        ((KEEPIDLE_S + KEEPINTVL_S * KEEPCNT) * 1000) as libc::c_uint;
+    set(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_USER_TIMEOUT,
+        &user_timeout_ms,
+    )
+}
+
 /// Upload a binary file over an existing russh channel by piping `cat > path`
 /// and feeding the file in chunks. If `upload_pb` is provided it is used to
 /// show progress; otherwise a hidden bar is substituted so call sites do not
@@ -157,7 +205,7 @@ async fn upload_via_channel(
     local_bin: &str,
     remote_path: &str,
     host: &str,
-    upload_pb: Option<ProgressBar>, // new parameter
+    upload_pb: Option<ProgressBar>,
 ) -> Result<(), RemoteError> {
     let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
         host: host.to_string(),
@@ -165,7 +213,6 @@ async fn upload_via_channel(
     })?;
     let file_size = metadata.len();
 
-    // Use provided bar or a hidden one so the progress API stays the same.
     let pb = if let Some(pb) = upload_pb {
         pb.set_length(file_size);
         pb.set_message(format!("Uploading to {host}"));
@@ -180,9 +227,7 @@ async fn upload_via_channel(
         ProgressBar::hidden()
     };
 
-    // Wrap the actual upload so we can react to errors without external crates.
     let res = async {
-        // Start remote cat command
         channel
             .exec(
                 true,
@@ -194,7 +239,6 @@ async fn upload_via_channel(
             .await
             .map_err(|e| RemoteError::from_russh(e, host))?;
 
-        // Stream file content in chunks.
         let mut file = std::fs::File::open(local_bin).map_err(|e| RemoteError::Io {
             host: host.to_string(),
             source: e,
@@ -219,7 +263,6 @@ async fn upload_via_channel(
             .await
             .map_err(|e| RemoteError::from_russh(e, host))?;
 
-        // Wait for the remote command to complete and verify success
         let mut exit: Option<u32> = None;
         while let Some(msg) = channel.wait().await {
             match msg {
@@ -242,10 +285,8 @@ async fn upload_via_channel(
     }
     .await;
 
-    // Always clear the progress bar from the terminal to prevent artifacts.
     pb.finish_and_clear();
 
-    // Log any failure to tracing (stderr), not to the terminal.
     if let Err(ref e) = res {
         tracing::warn!(host = %host, error = %e, "Binary upload failed");
     }
@@ -255,9 +296,7 @@ async fn upload_via_channel(
 
 /// Best-effort removal of the uploaded binary (including any leftover `.tmp`
 /// staging file) over a fresh channel. Failures are logged but never fatal —
-/// the audit outcome is already final by the time this runs. `remote_path` has
-/// passed `validate_remote_path` (only `[A-Za-z0-9-_./]`, absolute), so shell
-/// interpolation is safe here.
+/// the audit outcome is already final by the time this runs.
 async fn cleanup_remote_binary(
     session: &client::Handle<ClientHandler>,
     remote_path: &str,
@@ -265,7 +304,6 @@ async fn cleanup_remote_binary(
 ) {
     let fut = async {
         let mut ch = session.channel_open_session().await?;
-        // Remove both the final binary and any partial .tmp file
         ch.exec(true, format!("rm -f -- {remote_path} {remote_path}.tmp"))
             .await?;
         ch.eof().await?;
@@ -305,13 +343,13 @@ pub async fn run_remote_scan_russh(
     ssh_user: &str,
     ssh_key_path: &str,
     remote_path: &str,
-    sudo_pass: Option<&Zeroizing<String>>, // now optional
+    sudo_pass: Option<&Zeroizing<String>>,
     copy_binary: bool,
     keep_binary: bool,
     local_bin: Option<&str>,
     deep: bool,
     remote_timeout_secs: u64,
-    upload_pb: Option<ProgressBar>, // new parameter
+    upload_pb: Option<ProgressBar>,
 ) -> Result<Vec<u8>, RemoteError> {
     let (hostname, port) = split_host_port(host);
 
@@ -328,10 +366,6 @@ pub async fn run_remote_scan_russh(
         source: e,
     })?;
 
-    // Disable Nagle: SSH multiplexes small control messages (exec, eof,
-    // sudo password line, keepalives, window adjusts) with bulk data;
-    // Nagle + delayed ACK adds avoidable latency to each small write.
-    // OpenSSH sets this unconditionally. Best-effort — never fatal.
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!(
             host = %hostname,
@@ -340,10 +374,20 @@ pub async fn run_remote_scan_russh(
         );
     }
 
+    // R13-02: kernel-level dead-transport detection; best-effort
+    if let Err(e) = harden_tcp(&stream) {
+        tracing::warn!(
+            host = %hostname,
+            error = %e,
+            "failed to tune TCP keepalive/user-timeout — dead-transport detection degraded"
+        );
+    }
+
+    // R13-01: internal SSH timers removed – duration is entirely controlled
+    // by external tokio deadlines (connect / handshake+auth / overall).
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(30)),
-        keepalive_interval: Some(Duration::from_secs(15)),
-        keepalive_max: 3,
+        inactivity_timeout: None,
+        keepalive_interval: None,
         ..Default::default()
     });
 
@@ -355,23 +399,31 @@ pub async fn run_remote_scan_russh(
             }
         })?,
     };
-    let mut session = client::connect_stream(config, stream, handler).await?;
 
+    // R13-03: wrap handshake + auth in a 30‑second deadline; load key
+    // before the deadline so local disk I/O does not count against it.
     let key = load_secret_key(ssh_key_path, None).map_err(|_| RemoteError::Auth {
         host: hostname.clone(),
         user: ssh_user.to_string(),
     })?;
 
-    let auth = session
-        .authenticate_publickey(
-            ssh_user.to_string(),
-            PrivateKeyWithHashAlg::new(
-                Arc::new(key),
-                session.best_supported_rsa_hash().await?.flatten(),
-            ),
-        )
-        .await
-        .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+    const HANDSHAKE_AUTH_BUDGET: Duration = Duration::from_secs(30);
+    let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
+        let mut session = client::connect_stream(config, stream, handler).await?;
+        let hash = session.best_supported_rsa_hash().await?.flatten();
+        let auth = session
+            .authenticate_publickey(
+                ssh_user.to_string(),
+                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+        Ok::<_, RemoteError>((session, auth))
+    })
+    .await
+    .map_err(|_| RemoteError::Timeout {
+        host: hostname.clone(),
+    })??;
 
     if !auth.success() {
         return Err(RemoteError::Auth {
@@ -380,13 +432,11 @@ pub async fn run_remote_scan_russh(
         });
     }
 
-    // Apply overall timeout for the rest of the operation.
-    let hostname_for_timeout = hostname.clone();
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
 
+    // R13-04: `uploaded` is hoisted so the timeout path can still clean up.
+    let mut uploaded = false;
     let result = tokio::time::timeout(overall, async {
-        let mut uploaded = false;
-
         let outcome = async {
             if copy_binary {
                 let default_exe = std::path::PathBuf::from("./owlzops-mapper");
@@ -396,23 +446,22 @@ pub async fn run_remote_scan_russh(
                 let mut upload_channel = session
                     .channel_open_session()
                     .await
-                    .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+                    .map_err(|e| RemoteError::from_russh(e, &hostname))?;
                 uploaded = true;
                 upload_via_channel(
                     &mut upload_channel,
                     local,
                     remote_path,
-                    &hostname_for_timeout,
-                    upload_pb, // forward the progress bar
+                    &hostname,
+                    upload_pb,
                 )
                 .await?;
             }
 
-            // Execute audit, with sudo only if a password was provided
             let mut exec_channel = session
                 .channel_open_session()
                 .await
-                .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+                .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
             let deep_arg = if deep { " --deep" } else { "" };
             let cmd = if sudo_pass.is_some() {
@@ -429,21 +478,20 @@ pub async fn run_remote_scan_russh(
             exec_channel
                 .exec(true, cmd)
                 .await
-                .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+                .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
-            // Send password only if we have one
             if let Some(pass) = sudo_pass {
                 let mut line = Zeroizing::new(pass.to_string());
                 line.push('\n');
                 exec_channel
                     .data(line.as_bytes())
                     .await
-                    .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+                    .map_err(|e| RemoteError::from_russh(e, &hostname))?;
             }
             exec_channel
                 .eof()
                 .await
-                .map_err(|e| RemoteError::from_russh(e, &hostname_for_timeout))?;
+                .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
@@ -460,7 +508,7 @@ pub async fn run_remote_scan_russh(
                         } else if !stdout_truncated {
                             stdout_truncated = true;
                             tracing::warn!(
-                                host = %hostname_for_timeout,
+                                host = %hostname,
                                 "remote stdout exceeded cap ({} bytes), truncating",
                                 safe_io::CAP_CHILD_STDOUT
                             );
@@ -473,7 +521,7 @@ pub async fn run_remote_scan_russh(
                         } else if !stderr_truncated {
                             stderr_truncated = true;
                             tracing::warn!(
-                                host = %hostname_for_timeout,
+                                host = %hostname,
                                 "remote stderr exceeded cap ({} bytes), truncating",
                                 CAP_REMOTE_STDERR
                             );
@@ -481,33 +529,28 @@ pub async fn run_remote_scan_russh(
                     }
                     ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
                     ChannelMsg::Close => break,
-                    ChannelMsg::Eof => {
-                        // Do not break — ExitStatus arrives after EOF
-                    }
+                    ChannelMsg::Eof => {}
                     _ => {}
                 }
             }
 
-            // Classify the outcome
             match exit_code {
                 Some(code) => {
                     let se = String::from_utf8_lossy(&stderr);
-
-                    // sudo password rejection is only relevant when we sent one
                     if sudo_pass.is_some()
                         && (se.contains("incorrect password")
                             || se.contains("Sorry, try again")
                             || se.contains("a password is required"))
                     {
                         Err(RemoteError::SudoAuth {
-                            host: hostname_for_timeout.clone(),
+                            host: hostname.clone(),
                         })
                     } else if !stdout.is_empty() && stdout.starts_with(b"{") {
                         Ok(stdout)
                     } else if code != 0 {
                         let trimmed: String = se.trim().chars().take(300).collect();
                         Err(RemoteError::NonZeroExit {
-                            host: hostname_for_timeout.clone(),
+                            host: hostname.clone(),
                             code,
                             stderr: trimmed,
                         })
@@ -516,15 +559,15 @@ pub async fn run_remote_scan_russh(
                     }
                 }
                 None => Err(RemoteError::Timeout {
-                    host: hostname_for_timeout.clone(),
+                    host: hostname.clone(),
                 }),
             }
         }
         .await;
 
-        // Unconditional teardown: cleanup + disconnect
+        // Normal teardown: cleanup + disconnect
         if uploaded && !keep_binary {
-            cleanup_remote_binary(&session, remote_path, &hostname_for_timeout).await;
+            cleanup_remote_binary(&session, remote_path, &hostname).await;
         }
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "audit complete", "en")
@@ -536,6 +579,17 @@ pub async fn run_remote_scan_russh(
 
     match result {
         Ok(inner) => inner,
-        Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
+        Err(_elapsed) => {
+            // R13-04: on timeout, try to clean up and send a graceful disconnect.
+            if uploaded && !keep_binary {
+                cleanup_remote_binary(&session, remote_path, &hostname).await;
+            }
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                session.disconnect(russh::Disconnect::ByApplication, "budget exceeded", "en"),
+            )
+            .await;
+            Err(RemoteError::Timeout { host: hostname })
+        }
     }
 }

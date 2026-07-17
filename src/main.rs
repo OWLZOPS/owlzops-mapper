@@ -9,6 +9,7 @@ mod runner;
 mod safe_io;
 mod scanners;
 mod scoring;
+mod self_identity;
 mod ssh_engine;
 mod ui;
 mod utils;

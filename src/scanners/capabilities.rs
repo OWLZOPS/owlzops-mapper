@@ -378,6 +378,7 @@ fn classify_suspicious(
                 is_deleted: deleted_ephemeral,
                 euid,
                 is_mimic,
+                self_attributed: None,
             }),
             false,
         )
