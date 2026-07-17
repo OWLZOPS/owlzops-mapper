@@ -1,4 +1,5 @@
 use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin};
+use crate::scanners::security::SUDO_PRIVESC_MARKER;
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -130,11 +131,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Sudo NOPASSWD – distinguish ALL vs restricted
+    // Sudo NOPASSWD – distinguish ALL vs restricted, including replaceable paths
     if !report.security.sudo_nopasswd_entries.is_empty() {
         let has_all = report.security.sudo_nopasswd_entries.iter().any(|entry| {
             let lower = entry.to_lowercase();
-            lower.contains("nopasswd: all") || lower.ends_with("nopasswd:all")
+            lower.contains("nopasswd: all")
+                || lower.ends_with("nopasswd:all")
+                || entry.contains(SUDO_PRIVESC_MARKER)
         });
         let weight = if has_all { 15 } else { 5 };
         findings.push(Finding {
@@ -452,12 +455,17 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-017 — fileless malware executing from an ephemeral path ──
-    let fileless: Vec<&crate::models::SuspiciousProcess> = report
+    // Self-attributed records are partitioned out BEFORE the aggregate is built.
+    // This Finding covers many PIDs, so `suppressed` on the Finding itself would
+    // mute foreign implants too — and since unlink-on-exec puts us in this list
+    // on every scan, it would mute SEC-017 permanently. Element-level only.
+    let (fileless_self, fileless): (Vec<&crate::models::SuspiciousProcess>, Vec<_>) = report
         .security
         .suspicious_processes
         .iter()
         .filter(|p| p.is_deleted)
-        .collect();
+        .partition(|p| p.self_attributed.is_some());
+
     if !fileless.is_empty() {
         let list = fileless
             .iter()
@@ -484,6 +492,38 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-032 — scanner's own footprint, attributed and inert ──
+    if !fileless_self.is_empty() {
+        let list = fileless_self
+            .iter()
+            .map(|p| match p.exe_path.as_deref() {
+                Some(exe) => format!("{} (pid {}, deleted from {})", p.name, p.pid, exe),
+                None => format!("{} (pid {}, deleted)", p.name, p.pid),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-032",
+            title: "Scanner self-image: ephemeral privileged execution (attributed)".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} process(es) attributed to this scanner by a PID identity established inside \
+                 the process: {}. Injection-class findings (SEC-023/026/028/029) against these \
+                 PIDs are NOT suppressed. See self_integrity for exec-image provenance.",
+                fileless_self.len(),
+                list
+            ),
+            suppressed: Some(
+                "Unlink-on-exec is this scanner's own deployment footprint. Identity anchored on \
+                 an unforgeable PID, never on comm/argv. Footprint class only — self address \
+                 space remains under full injection scrutiny."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
     // ── SEC-019 — fileless implant that also holds critical kernel caps ──
     let mut fileless_priv: Vec<String> = Vec::new();
     for p in report
@@ -492,6 +532,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         .iter()
         .filter(|p| p.is_deleted)
     {
+        // Already documented by SEC-032; folding it in here would re-introduce
+        // the aggregate-suppression trap on a second finding id.
+        if p.self_attributed.is_some() {
+            continue;
+        }
         let where_ = match p.exe_path.as_deref() {
             Some(exe) if exe.starts_with("/memfd:") => "executing in-memory (memfd)".to_string(),
             Some(exe) => format!("deleted from {exe}"),
@@ -1800,6 +1845,7 @@ mod tests {
                 is_deleted: true,
                 euid: 1000,
                 is_mimic: false,
+                self_attributed: None,
             },
             // known miner, live → SEC-016 only
             SuspiciousProcess {
@@ -1809,6 +1855,7 @@ mod tests {
                 is_deleted: false,
                 euid: 1000,
                 is_mimic: false,
+                self_attributed: None,
             },
         ];
         let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
@@ -1838,6 +1885,54 @@ mod tests {
     }
 
     #[test]
+    fn sec017_self_attributed_split_and_sec032() {
+        use crate::models::SuspiciousProcess;
+        let mut r = minimal_report();
+        r.security.suspicious_processes = vec![
+            // Foreign fileless implant
+            SuspiciousProcess {
+                pid: 1337,
+                name: "miner".into(),
+                exe_path: Some("/dev/shm/miner".into()),
+                is_deleted: true,
+                euid: 1000,
+                is_mimic: false,
+                self_attributed: None,
+            },
+            // Own footprint (attributed)
+            SuspiciousProcess {
+                pid: 4242,
+                name: "owlzops-mapper".into(),
+                exe_path: Some("/tmp/owlzops-mapper".into()),
+                is_deleted: true,
+                euid: 0,
+                is_mimic: false,
+                self_attributed: Some("test-self".into()),
+            },
+        ];
+        let findings = evaluate(&r);
+        // SEC-017 contains only the foreign miner
+        let sec017 = findings
+            .iter()
+            .find(|f| f.id == "SEC-017")
+            .expect("SEC-017 missing");
+        assert!(sec017.evidence.contains("miner"));
+        assert!(!sec017.evidence.contains("owlzops-mapper"));
+        // SEC-032 contains the self-attributed entry
+        let sec032 = findings
+            .iter()
+            .find(|f| f.id == "SEC-032")
+            .expect("SEC-032 missing");
+        assert!(sec032.evidence.contains("owlzops-mapper"));
+        assert!(sec032.suppressed.is_some());
+        // SEC-019 must skip self-attributed
+        let sec019 = findings.iter().find(|f| f.id == "SEC-019");
+        assert!(sec019.is_none() || !sec019.unwrap().evidence.contains("owlzops-mapper"));
+        // Compromised host still fires because foreign implant exists
+        assert!(CriticalFlags::from_findings(&findings).compromised_host);
+    }
+
+    #[test]
     fn sec017_evidence_distinguishes_memfd_from_ondisk() {
         use crate::models::SuspiciousProcess;
         let mut r = minimal_report();
@@ -1849,6 +1944,7 @@ mod tests {
                 is_deleted: true,
                 euid: 1000,
                 is_mimic: false,
+                self_attributed: None,
             },
             SuspiciousProcess {
                 pid: 20,
@@ -1857,6 +1953,7 @@ mod tests {
                 is_deleted: true,
                 euid: 1000,
                 is_mimic: false,
+                self_attributed: None,
             },
         ];
         let sec017 = evaluate(&r)
@@ -1960,18 +2057,20 @@ mod tests {
             critical_caps: caps,
             reason: None,
         };
-        let fileless = |pid: u32, euid: u32, exe: Option<&str>| SuspiciousProcess {
-            pid,
-            name: "obfuscated".into(),
-            exe_path: exe.map(Into::into),
-            is_deleted: true,
-            euid,
-            is_mimic: false,
-        };
+        let fileless =
+            |pid: u32, euid: u32, exe: Option<&str>, self_attr: Option<&str>| SuspiciousProcess {
+                pid,
+                name: "obfuscated".into(),
+                exe_path: exe.map(Into::into),
+                is_deleted: true,
+                euid,
+                is_mimic: false,
+                self_attributed: self_attr.map(Into::into),
+            };
 
         // Branch A — ROOT fileless, capability_audit EMPTY → SEC-019 still fires.
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(1, 0, Some("/dev/shm/loader"))];
+        r.security.suspicious_processes = vec![fileless(1, 0, Some("/dev/shm/loader"), None)];
         let f = evaluate(&r)
             .into_iter()
             .find(|f| f.id == "SEC-019")
@@ -1986,7 +2085,7 @@ mod tests {
 
         // Branch B — non-root fileless WITH critical caps → fires with cap list.
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"))];
+        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"), None)];
         r.security.capability_audit = vec![cap(42, vec!["CAP_SYS_ADMIN".into(), "CAP_BPF".into()])];
         let f = evaluate(&r)
             .into_iter()
@@ -1997,7 +2096,7 @@ mod tests {
 
         // Branch B — non-root fileless WITHOUT caps → suppressed (SEC-017 still fires).
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"))];
+        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"), None)];
         assert!(
             !fires(&r),
             "non-root fileless without caps must not raise SEC-019"
@@ -2006,13 +2105,13 @@ mod tests {
 
         // Branch B — non-root, ambient-only audit entry (empty critical_caps) → suppressed.
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"))];
+        r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"), None)];
         r.security.capability_audit = vec![cap(42, vec![])];
         assert!(!fires(&r), "ambient-only entry must not raise SEC-019");
 
         // Branch A — memfd root: phrasing matches SEC-017, no "deleted from".
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![fileless(900, 0, Some("/memfd:stealth"))];
+        r.security.suspicious_processes = vec![fileless(900, 0, Some("/memfd:stealth"), None)];
         let f = evaluate(&r)
             .into_iter()
             .find(|f| f.id == "SEC-019")
@@ -2020,6 +2119,12 @@ mod tests {
         assert!(f.evidence.contains("executing in-memory (memfd)"));
         assert!(f.evidence.contains("root-run fileless implant"));
         assert!(!f.evidence.contains("deleted from /memfd:"));
+
+        // Self-attributed root fileless must be skipped (covered by SEC-032).
+        let mut r = minimal_report();
+        r.security.suspicious_processes =
+            vec![fileless(7, 0, Some("/tmp/owlzops-mapper"), Some("self"))];
+        assert!(!fires(&r), "self-attributed must not raise SEC-019");
     }
 
     #[test]
@@ -2218,6 +2323,24 @@ mod tests {
         assert!(
             !CriticalFlags::from_report(&r).compromised_host,
             "downgraded ghost must not set compromise"
+        );
+    }
+
+    #[test]
+    fn sudo_marker_triggers_all_weight() {
+        // A NOPASSWD entry with the PRIVESC marker should be treated as equivalent to NOPASSWD: ALL.
+        let mut r = minimal_report();
+        r.security.sudo_nopasswd_entries = vec![format!(
+            "/etc/sudoers: drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper  {} /tmp/owlzops-mapper is replaceable ...]",
+            SUDO_PRIVESC_MARKER
+        )];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-005")
+            .expect("SEC-005 fires");
+        assert_eq!(
+            f.weight, 15,
+            "PRIVESC-marker entry must be treated as NOPASSWD: ALL"
         );
     }
 }

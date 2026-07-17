@@ -3,8 +3,13 @@ use crate::{coverage, safe_io};
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
+
+/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
+/// unprivileged user. Shared with `scoring.rs` so the policy has exactly one
+/// source of truth and cannot drift.
+pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -171,12 +176,25 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                         continue;
                     }
                     if l.to_lowercase().contains("nopasswd") {
-                        // Exclude entries that are exclusively for the scanner itself,
-                        // to avoid flagging our own remote scanning capability.
-                        if is_self_only_sudo_line(l) {
-                            continue;
+                        match self_sudo_target(l) {
+                            // Scanner rule on a root-owned, tamper-proof path:
+                            // excluded — but recorded, never silently dropped.
+                            Some(t) if sudo_target_is_tamper_proof(t) => {
+                                coverage::record(format!(
+                                    "{file}: NOPASSWD entry for the scanner's own install path \
+                                     ({t}) excluded from the audit (every path component is \
+                                     root-owned and not group/world-writable)"
+                                ));
+                            }
+                            // Scanner rule on a path an unprivileged user can occupy.
+                            // This is not "self" — it is an unrestricted root grant.
+                            Some(t) => entries.push(format!(
+                                "{file}: {l}  {SUDO_PRIVESC_MARKER} {t} is replaceable by an \
+                                 unprivileged user (world-writable path or parent); this rule \
+                                 grants an unrestricted root shell]"
+                            )),
+                            None => entries.push(format!("{}: {}", file, l)),
                         }
-                        entries.push(format!("{}: {}", file, l));
                     }
                 }
             }
@@ -192,16 +210,51 @@ fn gather_sudo_nopasswd() -> Vec<String> {
     entries
 }
 
-/// Return `true` if the given sudoers line is solely for the scanner itself
-/// and should be excluded from the NOPASSWD audit.
-pub fn is_self_only_sudo_line(line: &str) -> bool {
-    const SELF_PATHS: &[&str] = &["/tmp/owlzops-mapper", "/usr/local/bin/owlzops-mapper"];
-    line.contains("owlzops-mapper")
-        && line
-            .rsplit(':')
-            .next()
-            .map(|cmd| cmd.split(',').all(|c| SELF_PATHS.contains(&c.trim())))
-            .unwrap_or(false)
+/// Returns the scanner path a NOPASSWD line grants, iff the line grants *only*
+/// that path. Pure string logic — the writability verdict is the caller's.
+///
+/// A hardcoded path allowlist is deliberately gone: `/tmp/owlzops-mapper` is in
+/// a mode-1777 directory, and our own unlink-on-exec frees that name after every
+/// scan. Anyone may then create it and `sudo` will exec it as root without
+/// checking owner or hash. Such a rule is equivalent to `NOPASSWD: ALL` and is
+/// never "self".
+pub fn self_sudo_target(line: &str) -> Option<&str> {
+    const SELF_BASENAME: &str = "owlzops-mapper";
+    if !line.contains(SELF_BASENAME) {
+        return None;
+    }
+    let mut cmds = line.rsplit(':').next()?.split(',').map(str::trim);
+    let first = cmds.next()?;
+    // "NOPASSWD: /path/owlzops-mapper, /usr/bin/other" grants more than us.
+    if cmds.next().is_some() {
+        return None;
+    }
+    let p = std::path::Path::new(first);
+    (p.is_absolute()
+        && p.file_name().is_some_and(|f| f == SELF_BASENAME)
+        && !first.contains(['*', '?', ' ']))
+    .then_some(first)
+}
+
+/// Excludable only when no unprivileged user can replace the binary: every path
+/// component must be root-owned and not group/world-writable. Fails closed —
+/// ENOENT means the name is free, which is exactly the dangerous case.
+fn sudo_target_is_tamper_proof(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return false;
+    }
+    let mut cur = std::path::PathBuf::new();
+    for c in p.components() {
+        cur.push(c);
+        let Ok(meta) = fs::metadata(&cur) else {
+            return false;
+        };
+        if meta.uid() != 0 || meta.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn get_sudoers_mode() -> Option<u32> {
@@ -449,8 +502,13 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     let secret_hygiene = crate::scanners::dlp::scan_process_memory();
 
     // --- Capability and malware sweep (single /proc walk) ------------------
-    let (capability_audit, suspicious_processes) =
+    let (capability_audit, mut suspicious_processes) =
         crate::scanners::capabilities::audit_host_processes(std::path::Path::new("/proc"));
+
+    // Attribute (never drop) our own record: unlink-on-exec makes the scanner a
+    // textbook SEC-017/019 hit. PID anchor — a renamed miner cannot inherit it.
+    // Injection-class scanners deliberately do not consult this marker.
+    crate::self_identity::identity().attribute(&mut suspicious_processes);
 
     // --- Bind-mount / overlay masking (SEC-021) ---------------------------
     let mount_masking = crate::scanners::mounts::scan_mount_masking();
@@ -543,34 +601,56 @@ mod tests {
         assert!(!is_local_ip("2001:db8::1"));
     }
 
-    // ── is_self_only_sudo_line (sudoers exclusion) ────────
+    // ── self_sudo_target & sudo_target_is_tamper_proof ──
 
     #[test]
-    fn self_only_single_canonical_path() {
-        assert!(is_self_only_sudo_line(
-            "drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper"
-        ));
-        assert!(is_self_only_sudo_line(
-            "user ALL=(ALL) NOPASSWD: /usr/local/bin/owlzops-mapper"
-        ));
+    fn tmp_path_is_never_self() {
+        // R12-02: this ASSERTED the vulnerable behaviour before. /tmp is 1777 and
+        // our own rm -f frees the name — the rule is NOPASSWD: ALL in disguise.
+        let t = self_sudo_target("drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper");
+        assert_eq!(t, Some("/tmp/owlzops-mapper"), "target must be recognised…");
+        assert!(
+            !sudo_target_is_tamper_proof("/tmp/owlzops-mapper"),
+            "…but never excluded"
+        );
     }
 
     #[test]
-    fn self_only_with_another_command() {
-        assert!(!is_self_only_sudo_line(
-            "operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper, /usr/bin/other"
-        ));
+    fn install_path_is_recognised_as_self_target() {
+        assert_eq!(
+            self_sudo_target("user ALL=(ALL) NOPASSWD: /usr/local/bin/owlzops-mapper"),
+            Some("/usr/local/bin/owlzops-mapper")
+        );
     }
 
     #[test]
-    fn self_only_all_is_not_self() {
-        assert!(!is_self_only_sudo_line("root ALL=(ALL) NOPASSWD: ALL"));
+    fn self_plus_another_command_is_not_self() {
+        assert_eq!(
+            self_sudo_target("operator ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper, /usr/bin/other"),
+            None
+        );
     }
 
     #[test]
-    fn self_only_does_not_exclude_non_canonical_path() {
-        assert!(!is_self_only_sudo_line(
-            "operator ALL=(ALL) NOPASSWD: /home/x/owlzops-mapper"
-        ));
+    fn wildcard_args_are_not_self() {
+        assert_eq!(
+            self_sudo_target("u ALL=(ALL) NOPASSWD: /usr/local/bin/owlzops-mapper *"),
+            None
+        );
+    }
+
+    #[test]
+    fn all_is_not_self() {
+        assert_eq!(self_sudo_target("root ALL=(ALL) NOPASSWD: ALL"), None);
+    }
+
+    #[test]
+    fn nonexistent_target_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("owlzops-mapper");
+        assert!(
+            !sudo_target_is_tamper_proof(p.to_str().unwrap()),
+            "free name in a user-owned dir must never be excluded"
+        );
     }
 }
