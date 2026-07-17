@@ -607,16 +607,17 @@ pub enum InjectionClass {
 }
 
 impl LibraryInjectionFinding {
-    /// Single source of truth for classifying a memory finding by its `source` field.
     pub fn classify(&self) -> InjectionClass {
         if self.source == "maps" || self.source.starts_with("LD_") {
             InjectionClass::ClassicInjection
         } else if self.source.starts_with("maps-rwx-jit")
             || self.source.starts_with("maps-rx-jit")
             || self.source == "maps-so-jit-extract"
+            || self.source == "maps-so-tmp-unverified"
+            || self.source == "maps-so-unlink-on-load"
             || self.source == "maps-rwx-cached-clean"
             || self.source == "maps-rwx-provisional"
-            || self.source == "maps-rwx-runtime-allowlist" // legacy, replaced by cached-clean/provisional
+            || self.source == "maps-rwx-runtime-allowlist"
             || self.source.ends_with("-jit")
         {
             InjectionClass::JitAdvisory

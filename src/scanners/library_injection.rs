@@ -140,16 +140,17 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
         let clean = e.trim_end_matches(" (deleted)");
         let is_deleted = e.ends_with(" (deleted)");
 
-        // Allow execution from /home if it's a confirmed vendor path (e.g. JetBrains)
         let is_vendor = VENDOR_ROOTS.iter().any(|r| clean.contains(*r));
 
         !is_deleted && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
     });
 
     let runtime_libs = maps.lines().any(|l| {
-        l.rsplit(char::is_whitespace)
-            .next()
-            .is_some_and(|p| p.starts_with("/usr/") && RT_LIBS.iter().any(|lib| p.contains(lib)))
+        let last = l.rsplit(char::is_whitespace).next().unwrap_or("");
+        last.starts_with('/')
+            && !last.ends_with("(deleted)")
+            && !is_volatile_lib_path(last)
+            && RT_LIBS.iter().any(|lib| last.contains(lib))
     });
 
     let vendor_anchored = exe_path
@@ -247,23 +248,63 @@ fn is_trampoline_pool(maps: &str) -> bool {
         >= TRAMP_POOL_MIN
 }
 
-// ── Verdict derivation helper ───────────────────────────────
+// ── Verdict derivation ─────────────────────────────────────
 
-/// Cache only confident verdicts; inconclusive → None → stays provisional.
-fn derive_verdict(regions: &[LibraryInjectionFinding]) -> Option<Verdict> {
-    let mut benign = false;
-    for r in regions {
-        let Some(d) = &r.deep_forensics else {
+/// Single-region verdict for object-identity caching. Confident only.
+fn verdict_of_region(d: &crate::models::DeepMemoryAnalysis) -> Option<Verdict> {
+    if d.entropy >= 7.0 || d.image_header {
+        return Some(Verdict::Malicious);
+    }
+    if d.prologue.is_some() && d.confidence >= 70 {
+        return Some(Verdict::Benign);
+    }
+    None
+}
+
+// ── Inode family analysis (for deleted .so unlink-on-load detection) ─
+
+#[derive(Default, Clone, Copy)]
+struct InodeFamily {
+    vmas: u16,
+    exec: bool,
+    any_wx: bool,
+}
+
+/// Segment families of DELETED volatile-path .so inodes, keyed by (dev, inode).
+/// ld.so's dlopen maps one .so as 2–4 VMAs from a single inode; a manual
+/// single-shot mmap stager maps exactly one. An rwx permission on ANY segment
+/// of the family poisons the whole inode.
+fn deleted_so_families(maps: &str) -> std::collections::HashMap<(&str, &str), InodeFamily> {
+    let mut fam = std::collections::HashMap::new();
+    for line in maps.lines() {
+        let mut it = line.splitn(6, char::is_whitespace);
+        let (Some(_a), Some(perms), Some(_o), Some(dev), Some(inode), Some(path)) = (
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+        ) else {
             continue;
         };
-        if d.entropy >= 7.0 || d.image_header {
-            return Some(Verdict::Malicious);
+        let path = path.trim();
+        if inode == "0" || !path.ends_with("(deleted)") {
+            continue;
         }
-        if d.prologue.is_some() && d.confidence >= 70 {
-            benign = true;
+        let clean = path.trim_end_matches(" (deleted)");
+        if !((clean.ends_with(".so") || clean.contains(".so.")) && is_volatile_lib_path(clean)) {
+            continue;
         }
+        let e: &mut InodeFamily = fam.entry((dev, inode)).or_default();
+        e.vmas = e.vmas.saturating_add(1);
+        let b = perms.as_bytes();
+        let w = b.get(1) == Some(&b'w');
+        let x = b.get(2) == Some(&b'x');
+        e.exec |= x;
+        e.any_wx |= w && x;
     }
-    benign.then_some(Verdict::Benign)
+    fam
 }
 
 // ── MAIN SCANNER ───────────────────────────────────────────
@@ -364,14 +405,14 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                     &mut findings,
                 );
 
-                // Slow path: enrich + cache verdict
+                // Slow path: enrich + cache verdict per object
                 if cfg.deep_for(pid) && findings.len() > start {
                     let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
-                    if let (Some(exe), Some(verdict)) =
-                        (exe_path.as_deref(), derive_verdict(&findings[start..]))
-                    {
-                        cache.record(exe, verdict);
+                    for f in &findings[start..] {
+                        if let Some(v) = f.deep_forensics.as_ref().and_then(verdict_of_region) {
+                            cache.record(&f.object_path, v);
+                        }
                     }
                 }
             } else if pid_hits == 0 {
@@ -401,6 +442,7 @@ fn scan_maps(
     let mut seen: Vec<String> = Vec::new();
     let clusters = build_exec_clusters(content);
     let pool = is_trampoline_pool(content);
+    let families = deleted_so_families(content);
     let trust_met = trust.exe_ok && (trust.runtime_libs || trust.vendor_anchored);
 
     for line in content.lines() {
@@ -409,7 +451,7 @@ fn scan_maps(
         }
 
         let mut it = line.splitn(6, char::is_whitespace);
-        let (addr, perms, _off, _dev, _inode, path) = (
+        let (addr, perms, _off, dev, inode, path) = (
             it.next(),
             it.next(),
             it.next(),
@@ -440,11 +482,41 @@ fn scan_maps(
                 None => (p, false),
             };
             if (clean.ends_with(".so") || clean.contains(".so.")) && is_volatile_lib_path(clean) {
-                let source = if trust_met {
+                let pb = perms.as_bytes();
+                let writable_exec = pb.get(1) == Some(&b'w') && pb.get(2) == Some(&b'x');
+
+                let source = if writable_exec {
+                    // rwx .so from a volatile path — hard signal, never demote
+                    "maps"
+                } else if is_deleted {
+                    // Unlink-on-load (Netty/JNA jar-extract) vs fileless stager.
+                    let family = dev
+                        .zip(inode)
+                        .and_then(|k| families.get(&k))
+                        .copied()
+                        .unwrap_or_default();
+                    let env_ioc = findings
+                        .iter()
+                        .any(|f| f.pid == pid && f.source.starts_with("LD_"));
+                    let real_tmp = clean.starts_with("/tmp/") || clean.starts_with("/var/tmp/");
+                    if trust_met
+                        && real_tmp                    // memfd / /dev/shm / /run stay hard
+                        && !env_ioc                    // no LD_* co-occurrence
+                        && family.vmas >= 2            // ld.so segment family
+                        && family.exec
+                        && !family.any_wx
+                    // W^X across whole family
+                    {
+                        "maps-so-unlink-on-load"
+                    } else {
+                        "maps"
+                    }
+                } else if trust_met {
                     "maps-so-jit-extract"
                 } else {
-                    "maps"
+                    "maps-so-tmp-unverified"
                 };
+
                 let clean_str = clean.to_string();
                 if !seen.contains(&clean_str) {
                     seen.push(clean_str);
@@ -474,7 +546,6 @@ fn scan_maps(
 
         let small = region_size(addr).is_some_and(|s| s <= TRAMP_MAX_BYTES);
 
-        // 1. Strict JIT cluster check
         let mut downgrade: Option<&str> = if trust_met {
             match tier {
                 ExecTier::AnonRx => Some("maps-rx-jit-suppressed"),
@@ -492,7 +563,6 @@ fn scan_maps(
             None
         };
 
-        // 2. FALLBACK: content‑verified cache + structural provenance (NO blind allowlist)
         if downgrade.is_none() && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx) {
             downgrade = match exe_path.and_then(|e| cache.lookup(e)) {
                 Some(Verdict::Benign) => Some("maps-rwx-cached-clean"),
@@ -554,5 +624,218 @@ fn scan_maps(
                 exe_path: exe_path.map(|s| s.to_string()),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::InjectionClass;
+
+    // Synthetic JVM maps: libjvm.so from a NON-/usr/ bundled path + JNI .so from /tmp.
+    fn jvm_maps(jni_perms: &str) -> String {
+        format!(
+            "\
+5566000000-5566001000 r-xp 00000000 08:01 100 /opt/kafka/jdk/bin/java
+7f00aa000000-7f00aa400000 r-xp 00000000 08:01 201 /opt/kafka/jdk/lib/server/libjvm.so
+7f00bb000000-7f00bb010000 r--p 00000000 08:01 202 /opt/kafka/jdk/lib/libjava.so
+7f00cc000000-7f00cc020000 {jni_perms} 00000000 08:01 303 /tmp/liblz4-java-1121051756510130003.so
+"
+        )
+    }
+
+    fn scan(maps: &str, exe: Option<&str>) -> Vec<LibraryInjectionFinding> {
+        let trust = assess_runtime(maps, exe);
+        let cache = VerdictCache::default();
+        let mut out = Vec::new();
+        scan_maps(maps, 4242, "java", &trust, exe, &cache, &mut out);
+        out
+    }
+
+    #[test]
+    fn bundled_jvm_rx_jni_is_not_classic() {
+        let maps = jvm_maps("r-xp");
+        let f = scan(&maps, Some("/opt/kafka/jdk/bin/java"));
+        let jni = f
+            .iter()
+            .find(|x| x.object_path.contains("lz4-java"))
+            .unwrap();
+        assert_ne!(jni.classify(), InjectionClass::ClassicInjection);
+        assert_eq!(jni.source, "maps-so-jit-extract");
+    }
+
+    #[test]
+    fn rwx_jni_from_tmp_stays_classic_even_in_jvm() {
+        let maps = jvm_maps("rwxp");
+        let f = scan(&maps, Some("/opt/kafka/jdk/bin/java"));
+        let jni = f
+            .iter()
+            .find(|x| x.object_path.contains("lz4-java"))
+            .unwrap();
+        assert_eq!(jni.source, "maps");
+        assert_eq!(jni.classify(), InjectionClass::ClassicInjection);
+    }
+
+    #[test]
+    fn rx_tmp_so_without_runtime_is_provisional_not_classic() {
+        let maps = "\
+55000000-55001000 r-xp 00000000 08:01 100 /opt/app/mystery-bin
+7fcc00000000-7fcc00020000 r-xp 00000000 08:01 303 /tmp/libsomething-9988.so
+";
+        let f = scan(maps, Some("/opt/app/mystery-bin"));
+        let hit = f
+            .iter()
+            .find(|x| x.object_path.contains("libsomething"))
+            .unwrap();
+        assert_eq!(hit.source, "maps-so-tmp-unverified");
+        assert_ne!(hit.classify(), InjectionClass::ClassicInjection);
+    }
+
+    #[test]
+    fn runtime_libs_accepts_non_usr_paths() {
+        let maps = jvm_maps("r-xp");
+        let trust = assess_runtime(&maps, Some("/opt/kafka/jdk/bin/java"));
+        assert!(
+            trust.runtime_libs,
+            "bundled/opt JDK must satisfy runtime_libs"
+        );
+    }
+
+    // ── Unlink-on-load (Netty/JNA ghost inode) tests ───────
+
+    const JVM_CTX: &str = "\
+5566000000-5566001000 r-xp 00000000 08:01 100 /opt/rustrover/jbr/bin/java
+7f00aa000000-7f00aa400000 r-xp 00000000 08:01 201 /opt/rustrover/jbr/lib/server/libjvm.so
+7f00bb000000-7f00bb010000 r--p 00000000 08:01 202 /opt/rustrover/jbr/lib/libjava.so
+";
+    const EXE: Option<&str> = Some("/opt/rustrover/jbr/bin/java");
+    const GHOST: &str = "/tmp/libio_grpc_netty_shaded_netty_transport_native_epoll123.so (deleted)";
+
+    fn netty_family(text_perms: &str) -> String {
+        format!(
+            "{JVM_CTX}\
+7f0000000000-7f0000004000 r--p 00000000 08:01 999 {GHOST}
+7f0000004000-7f0000010000 {text_perms} 00004000 08:01 999 {GHOST}
+7f0000010000-7f0000012000 rw-p 00010000 08:01 999 {GHOST}
+"
+        )
+    }
+
+    fn scan_into(maps: &str, out: &mut Vec<LibraryInjectionFinding>) {
+        let trust = assess_runtime(maps, EXE);
+        scan_maps(
+            maps,
+            4242,
+            "java",
+            &trust,
+            EXE,
+            &VerdictCache::default(),
+            out,
+        );
+    }
+
+    fn scan_single(maps: &str) -> Vec<LibraryInjectionFinding> {
+        let mut out = Vec::new();
+        scan_into(maps, &mut out);
+        out
+    }
+
+    #[test]
+    fn netty_unlink_on_load_reclassified_provisional() {
+        let f = scan_single(&netty_family("r-xp"));
+        let g = f.iter().find(|x| x.object_path.contains("netty")).unwrap();
+        assert_eq!(g.source, "maps-so-unlink-on-load");
+        assert!(g.is_deleted);
+        assert_ne!(g.classify(), InjectionClass::ClassicInjection);
+    }
+
+    #[test]
+    fn single_vma_deleted_stays_classic() {
+        let maps = format!(
+            "{JVM_CTX}7f0000000000-7f0000010000 r-xp 00000000 08:01 999 /tmp/evil.so (deleted)\n"
+        );
+        let f = scan_single(&maps);
+        assert_eq!(
+            f.iter()
+                .find(|x| x.object_path.contains("evil"))
+                .unwrap()
+                .source,
+            "maps"
+        );
+    }
+
+    #[test]
+    fn rwx_on_any_family_segment_poisons_the_inode() {
+        let f = scan_single(&netty_family("rwxp"));
+        assert_eq!(
+            f.iter()
+                .find(|x| x.object_path.contains("netty"))
+                .unwrap()
+                .source,
+            "maps"
+        );
+    }
+
+    #[test]
+    fn memfd_deleted_never_demotes() {
+        let maps = format!(
+            "{JVM_CTX}\
+7f0000000000-7f0000004000 r--p 00000000 00:01 999 /memfd:evil.so (deleted)
+7f0000004000-7f0000010000 r-xp 00004000 00:01 999 /memfd:evil.so (deleted)
+"
+        );
+        let f = scan_single(&maps);
+        assert_eq!(
+            f.iter()
+                .find(|x| x.object_path.contains("evil"))
+                .unwrap()
+                .source,
+            "maps"
+        );
+    }
+
+    #[test]
+    fn deleted_family_without_trust_stays_classic() {
+        let maps = "\
+55000000-55001000 r-xp 00000000 08:01 100 /opt/app/mystery-bin
+7f0000000000-7f0000004000 r--p 00000000 08:01 999 /tmp/x.so (deleted)
+7f0000004000-7f0000010000 r-xp 00004000 08:01 999 /tmp/x.so (deleted)
+";
+        let trust = assess_runtime(maps, Some("/opt/app/mystery-bin"));
+        let mut out = Vec::new();
+        scan_maps(
+            maps,
+            4242,
+            "app",
+            &trust,
+            Some("/opt/app/mystery-bin"),
+            &VerdictCache::default(),
+            &mut out,
+        );
+        assert_eq!(
+            out.iter()
+                .find(|x| x.object_path.contains("/tmp/x"))
+                .unwrap()
+                .source,
+            "maps"
+        );
+    }
+
+    #[test]
+    fn ld_preload_cooccurrence_disables_reclassification() {
+        let mut out = vec![LibraryInjectionFinding {
+            pid: 4242,
+            source: "LD_PRELOAD".into(),
+            object_path: "/tmp/pre.so".into(),
+            ..Default::default()
+        }];
+        scan_into(&netty_family("r-xp"), &mut out);
+        assert_eq!(
+            out.iter()
+                .find(|x| x.object_path.contains("netty"))
+                .unwrap()
+                .source,
+            "maps"
+        );
     }
 }
