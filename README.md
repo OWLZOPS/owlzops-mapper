@@ -52,15 +52,16 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.5.17
+## Highlights v0.5.18
 
-**Transport Resilience & Safe Self‑Suppression**
+**Structural JNI Trust — Netty/gRPC ghost inode reclassification**
 
-- **SSH transport hardening (R11):** Removed internal russh keepalive timers that were 20× stricter than the scan budget. Added kernel‑level dead‑peer detection (`SO_KEEPALIVE` + `TCP_USER_TIMEOUT`). Handshake and authentication now have a 30 s deadline, preventing tarpit hosts from occupying a slot forever. Teardown (binary cleanup + graceful disconnect) runs even on timeout.
-
-- **Safe self‑suppression (R12):** The scanner’s unlink‑on‑exec footprint no longer blinds the fileless malware detector. Self‑processes are partitioned into a new `SEC‑032` (weight 0, suppressed) while genuine fileless implants continue to raise `SEC‑017`/`SEC‑019` at full weight. Sudo NOPASSWD audit now checks path writability — rules on world‑writable paths like `/tmp` are flagged as equivalent to `NOPASSWD: ALL`.
-
-- **No new dependencies.** All changes are backward‑compatible (`#[serde(default)]`).
+- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates (runtime trust, path origin, inode family, W^X compliance, no `LD_*` interference) and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
+- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
+- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
+- **Re‑verified live‑implant detection:** All other deleted or `rwx`‑mapped `.so` files continue to trigger `SEC‑023` without change. The new classification is narrow and structural — no name‑based allowlists.
+- **Updated `SEC‑029` wording:** Clarifies that the trust is provisional and based on behaviour observed at the executed tier, including deep forensics when available.
+- **No new dependencies.** All changes are backward‑compatible.
 
 ---
 
@@ -420,6 +421,14 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.17 (2026-07-16)
+
+**Transport Resilience & Safe Self‑Suppression (R11, R12)**
+
+- **SSH transport hardening (R11):** Removed internal russh keepalive timers that were 20× stricter than the scan budget. Added kernel‑level dead‑peer detection (`SO_KEEPALIVE` + `TCP_USER_TIMEOUT`). Handshake and authentication now have a 30 s deadline, preventing tarpit hosts from occupying a slot forever. Teardown (binary cleanup + graceful disconnect) runs even on timeout.
+- **Safe self‑suppression (R12):** The scanner’s unlink‑on‑exec footprint no longer blinds the fileless malware detector. Self‑processes are partitioned into a new `SEC‑032` (weight 0, suppressed) while genuine fileless implants continue to raise `SEC‑017`/`SEC‑019` at full weight. Sudo NOPASSWD audit now checks path writability — rules on world‑writable paths like `/tmp` are flagged as equivalent to `NOPASSWD: ALL`.
+- **No new dependencies.** All changes are backward‑compatible (`#[serde(default)]`).
+
 ### v0.5.16 (2026-07-16)
 
 **Multi‑Tier Trust Funnel & Verdict Cache**
@@ -455,28 +464,5 @@ See [LICENSE](LICENSE) for details.
 * **R10 reliability hardening** – upload/cleanup parity, JSONL error tracking, poison‑tolerant tool resolution, child process reaping, terminal sanitisation.
 * **Performance** – Ghost PID scanner bounds to `ns_last_pid`; micro‑yield throttling.
 * **UI completeness** – dedicated sections for new IoC findings in terminal and Excel.
-
-### v0.5.11 (2026-07-10)
-
-**Indicators of Compromise (IoC) Detection Pipeline**
-
-* **SEC‑015 – Privileged non‑root implant on network** – flags processes holding critical kernel capabilities, listening on a wildcard address, and running from an ephemeral path (`/tmp`, `/dev/shm`, `/home`, `/var/tmp`). Weight: 60.
-* **SEC‑016 – Known malicious process names** – full `/proc` sweep against a compile‑time blocklist (`xmrig`, `kinsing`, `kdevtmpfsi`, `sysupdate`, `networkservice`). Explicit names are flagged unconditionally; ambiguous names (e.g., `networkservice`) require ephemeral‑path corroboration. Weight: 60.
-* **SEC‑017 – Fileless malware detection** – detects processes whose on‑disk executable has been deleted or that never touched the disk (`memfd_create`). FP‑protection excludes system‑path deletions (e.g., `apt upgrade`). Evidence differentiates “deleted from …” from “executing in‑memory (memfd)”. Weight: 60.
-* **SEC‑018 – Suspicious cron jobs** – cron entries are classified into `Ok`, `Warning`, `Critical` tiers during collection. Critical patterns (reverse shells, downloads) raise a finding. Weight: 20. JSON export includes severity per cron job.
-
-**Scoring & Predicate Hardening**
-
-* **CAP‑001 dynamic weight** – escalates from 8 to 20 when a privileged non‑root process listens on a wildcard address, aligning severity with SEC‑013.
-* **Unified network & path predicates** – `is_wildcard_bind`, `is_loopback_bind` (now covers full `127.0.0.0/8` and `::ffff:…`), and `is_ephemeral_exec_path` (includes `/memfd:`) extracted to `utils.rs`; all modules share a single source of truth.
-* **Exposure escalation guard** – compare logic now correctly ignores dual‑stack configurations where a wildcard was already present, preventing false drift alerts.
-* **Scoring version guard** – `SCORING_VERSION` bumped to **7** so fleet‑compare marks score changes from the expanded predicate coverage as `~ Changed` instead of false degradations.
-
-**UI & Export Improvements**
-
-* **Categorised Risk Breakdown** – findings are displayed in separate tables (🛡 Security, ⚙ Reliability, 🧹 Hygiene) for instant visual triage.
-* **Dynamic table widths** – all long‑content tables (Cron, Docker, Capabilities) use `ContentArrangement::Dynamic` with a safe fallback; borders never break in piped SSH sessions.
-* **Cron job classification in UI** – each cron entry is colour‑coded by severity (OK / Review / Suspicious!).
-* **Non‑root capability table** – replaced plain‑text listing with a structured table showing process, PID/EUID, capabilities, and security flags.
 
 </details>
