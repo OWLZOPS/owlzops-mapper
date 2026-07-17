@@ -52,15 +52,15 @@ sudo ./owlzops-mapper audit
 
 ---
 
-## Highlights v0.5.16
+## Highlights v0.5.17
 
-**Multi‑Tier Trust Funnel & Verdict Cache**
+**Transport Resilience & Safe Self‑Suppression**
 
-* **Content‑driven attribution (`--deep`)** – A layered analysis pipeline examines process memory for reserved buffers (empty JIT arenas), pointer signatures, managed‑JIT shapes, and libffi stubs, drastically reducing “n/a” (Inconclusive) findings.
-* **Self‑learning verdict cache** – Replaces the static `RUNTIME_EXE_ALLOWLIST`. Trust is bound to a file’s identity (inode + mtime + size), automatically revoked on modification. Populated by `--deep` scans and consulted during fast‑path audits.
-* **Container false‑positive fix** – Docker/Kubernetes workloads (node, next‑server) are no longer misclassified as `LoneDropped`. Mount namespace detection and secure `/proc/pid/exe` resolution provide accurate structural provenance, capping container‑root trust at `NestedUserInstall`.
-* **Provisional trust policy** – Findings that cannot be positively attributed but show clean behavior and strong provenance are routed to **SEC‑029** (Provisional Trust, weight 0) instead of SEC‑026 (Warning). A name‑based fallback is used only as a last resort when the binary path is unavailable.
-* **UI enhancements** – The “run with `--deep`” hint is suppressed when `--deep` is actually passed. Network listener tables are colour‑coded by risk and provenance. Origin labels for `ManagedJit` and `ReservedBuffer` are displayed in deep‑scan output.
+- **SSH transport hardening (R11):** Removed internal russh keepalive timers that were 20× stricter than the scan budget. Added kernel‑level dead‑peer detection (`SO_KEEPALIVE` + `TCP_USER_TIMEOUT`). Handshake and authentication now have a 30 s deadline, preventing tarpit hosts from occupying a slot forever. Teardown (binary cleanup + graceful disconnect) runs even on timeout.
+
+- **Safe self‑suppression (R12):** The scanner’s unlink‑on‑exec footprint no longer blinds the fileless malware detector. Self‑processes are partitioned into a new `SEC‑032` (weight 0, suppressed) while genuine fileless implants continue to raise `SEC‑017`/`SEC‑019` at full weight. Sudo NOPASSWD audit now checks path writability — rules on world‑writable paths like `/tmp` are flagged as equivalent to `NOPASSWD: ALL`.
+
+- **No new dependencies.** All changes are backward‑compatible (`#[serde(default)]`).
 
 ---
 
@@ -420,6 +420,16 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.16 (2026-07-16)
+
+**Multi‑Tier Trust Funnel & Verdict Cache**
+
+* **Content‑driven attribution (`--deep`)** – A layered analysis pipeline examines process memory for reserved buffers (empty JIT arenas), pointer signatures, managed‑JIT shapes, and libffi stubs, drastically reducing “n/a” (Inconclusive) findings.
+* **Self‑learning verdict cache** – Replaces the static `RUNTIME_EXE_ALLOWLIST`. Trust is bound to a file’s identity (inode + mtime + size), automatically revoked on modification. Populated by `--deep` scans and consulted during fast‑path audits.
+* **Container false‑positive fix** – Docker/Kubernetes workloads (node, next‑server) are no longer misclassified as `LoneDropped`. Mount namespace detection and secure `/proc/pid/exe` resolution provide accurate structural provenance, capping container‑root trust at `NestedUserInstall`.
+* **Provisional trust policy** – Findings that cannot be positively attributed but show clean behavior and strong provenance are routed to **SEC‑029** (Provisional Trust, weight 0) instead of SEC‑026 (Warning). A name‑based fallback is used only as a last resort when the binary path is unavailable.
+* **UI enhancements** – The “run with `--deep`” hint is suppressed when `--deep` is actually passed. Network listener tables are colour‑coded by risk and provenance. Origin labels for `ManagedJit` and `ReservedBuffer` are displayed in deep‑scan output.
+
 ### v0.5.14 (2026-07-13)
 
 **Deep Memory Forensics & Intelligent Alerting**
@@ -430,8 +440,6 @@ See [LICENSE](LICENSE) for details.
 * **Smart UI Aggregation** – Memory anomaly tables show forensic anchors (VMA addresses, type breakdown, origin labels) and can be expanded with `-v`/`--verbose` for full per‑region detail.
 * **Trust‑but‑Verify** – Allowlisted binaries (Chrome, Zen, GNOME Shell, etc.) no longer receive blind trust. Their memory regions are labelled `maps‑rwx‑runtime‑allowlist` and enter the new **SEC‑029** provisional trust bucket until deep analysis confirms benign JIT shape or detects anomalies.
 * **Security** – `process_vm_readv` is used instead of `ptrace`, avoiding anti‑debugging conflicts; memory reads are capped and budgeted.
-
-(Previous R11 fixes — CPU‑DoS protection, IPv4‑mapped IPv6 fix, CAP‑002 heuristic, broader LD‑injection detection — are retained.)
 
 ### v0.5.13 (2026-07-12)
 
@@ -470,60 +478,5 @@ See [LICENSE](LICENSE) for details.
 * **Dynamic table widths** – all long‑content tables (Cron, Docker, Capabilities) use `ContentArrangement::Dynamic` with a safe fallback; borders never break in piped SSH sessions.
 * **Cron job classification in UI** – each cron entry is colour‑coded by severity (OK / Review / Suspicious!).
 * **Non‑root capability table** – replaced plain‑text listing with a structured table showing process, PID/EUID, capabilities, and security flags.
-
-### v0.5.10 (2026-07-09)
-
-**Observability & Correctness**
-
-* Coverage warnings (truncated files, inaccessible /proc entries) are now displayed in both terminal and Excel reports.
-* Port attribution failures due to permission errors are now aggregated and reported as a coverage warning.
-* Binary upload via the russh channel now waits for the remote command to finish and checks its exit status. Failures (disk full, permissions) are surfaced as `UploadFailed` errors.
-
-**Fleet Orchestration**
-
-* JSONL writer uses a conditional 2‑second timeout only during shutdown.
-* `SIGINT` / `SIGTERM` immediately abort in‑flight SSH sessions via `tokio::sync::Notify` + `JoinSet::abort_all()`. Fixed lost‑signal edge case by switching from `notify_waiters` to `notify_one`.
-
-**Security & Platform Support**
-
-* Sudoers file filtering now follows `sudoers(5)` rules exactly (files containing `.` or ending with `~` are ignored). Read errors are logged as coverage warnings.
-* TOFU trust store fails closed when `$HOME` is unset (no `/tmp` fallback).
-* Legacy SSH path (`run_remote_scan`) now uses `split_host_port` and passes ports explicitly to `ssh`/`scp`. IPv6 addresses are correctly bracketed for SCP.
-
-**UX Improvements**
-
-* DNS upstreams: when `systemd-resolved` stub is detected, real upstream servers are shown alongside the stub.
-* Reboot reason: the packages triggering a reboot request are listed.
-* DLP context: secret leak findings now include the PID and process name.
-* Cronjobs: renamed to “System & Custom Cronjobs”; suspicious entries are highlighted, ordinary system cron is no longer marked as dangerous.
-* Risk Score: switched to penalty notation (e.g. `Security −60`) with a verbal health label (Healthy / At Risk / Critical).
-
-**Docker Metrics Migration**
-
-* Reclaimable Space: uses `docker system df` (bollard `df()`) to report real reclaimable space instead of summing virtual sizes.
-* Image sizes: total size now uses `df.layers_size` (real disk usage), dangling images show their virtual size for context, and container sizes include `SizeRw` (writable layer).
-* UI/Excel: headers updated to “Real Disk Size (Images)” and “Dangling Virtual Size (GB)”.
-
-**Container Runtime & Orchestrator Detection**
-
-* Added recognition of `dockerd`, `containerd`, and Kubernetes‑related processes in host scanning.
-
-### v0.5.9 (2026-07-08)
-
-**Observability**
-
-* Coverage warnings (truncated files, inaccessible /proc entries) are now displayed in both terminal and Excel reports.
-* Port attribution failures due to permission errors are now aggregated and reported as a coverage warning.
-
-**Reliability & Compatibility**
-
-* Fixed a lost‑signal edge case in graceful shutdown by switching from `notify_waiters` to `notify_one`.
-* Replaced `unwrap()` on output file paths with `to_string_lossy()` to prevent panics on non‑UTF‑8 paths.
-* `PackageManager` deserialization now maps unknown future variants to `Unknown` for forward compatibility.
-
-**Hygiene**
-
-* Removed ineffective `debug = "limited"` from the release profile.
-* Unified timeout budget calculation (`host_budget_secs`) shared between fleet orchestrator and russh engine.
 
 </details>
