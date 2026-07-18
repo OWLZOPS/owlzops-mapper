@@ -4,6 +4,7 @@ use russh::*;
 use std::io::{IsTerminal, Read};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -374,7 +375,7 @@ pub async fn run_remote_scan_russh(
         );
     }
 
-    // R13-02: kernel-level dead-transport detection; best-effort
+    // Kernel-level dead-transport detection; best-effort
     if let Err(e) = harden_tcp(&stream) {
         tracing::warn!(
             host = %hostname,
@@ -383,7 +384,7 @@ pub async fn run_remote_scan_russh(
         );
     }
 
-    // R13-01: internal SSH timers removed – duration is entirely controlled
+    // Internal SSH timers removed – duration is entirely controlled
     // by external tokio deadlines (connect / handshake+auth / overall).
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
@@ -400,7 +401,7 @@ pub async fn run_remote_scan_russh(
         })?,
     };
 
-    // R13-03: wrap handshake + auth in a 30‑second deadline; load key
+    // Wrap handshake + auth in a 30-second deadline; load key
     // before the deadline so local disk I/O does not count against it.
     let key = load_secret_key(ssh_key_path, None).map_err(|_| RemoteError::Auth {
         host: hostname.clone(),
@@ -434,162 +435,149 @@ pub async fn run_remote_scan_russh(
 
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
 
-    // R13-04: `uploaded` is hoisted so the timeout path can still clean up.
-    let mut uploaded = false;
-    let result = tokio::time::timeout(overall, async {
-        let outcome = async {
-            if copy_binary {
-                let default_exe = std::path::PathBuf::from("./owlzops-mapper");
-                let current_exe = std::env::current_exe().unwrap_or(default_exe);
-                let current_exe_lossy = current_exe.to_string_lossy();
-                let local = local_bin.unwrap_or(&current_exe_lossy);
-                let mut upload_channel = session
-                    .channel_open_session()
-                    .await
-                    .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-                uploaded = true;
-                upload_via_channel(
-                    &mut upload_channel,
-                    local,
-                    remote_path,
-                    &hostname,
-                    upload_pb,
-                )
-                .await?;
-            }
+    // The flag must outlive the timeout future to be readable after Elapsed.
+    let uploaded = AtomicBool::new(false);
 
-            let mut exec_channel = session
+    let result = tokio::time::timeout(overall, async {
+        if copy_binary {
+            let default_exe = std::path::PathBuf::from("./owlzops-mapper");
+            let current_exe = std::env::current_exe().unwrap_or(default_exe);
+            let current_exe_lossy = current_exe.to_string_lossy();
+            let local = local_bin.unwrap_or(&current_exe_lossy);
+            let mut upload_channel = session
                 .channel_open_session()
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+            uploaded.store(true, Ordering::Relaxed);
+            upload_via_channel(
+                &mut upload_channel,
+                local,
+                remote_path,
+                &hostname,
+                upload_pb,
+            )
+            .await?;
+        }
 
-            let deep_arg = if deep { " --deep" } else { "" };
-            let cmd = if sudo_pass.is_some() {
-                format!(
-                    "LC_ALL=C sudo -k -S -p '' -- {} audit --format json --offline{}",
-                    remote_path, deep_arg
-                )
-            } else {
-                format!(
-                    "LC_ALL=C {} audit --format json --offline{}",
-                    remote_path, deep_arg
-                )
-            };
+        let mut exec_channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+
+        let deep_arg = if deep { " --deep" } else { "" };
+        let cmd = if sudo_pass.is_some() {
+            format!(
+                "LC_ALL=C sudo -k -S -p '' -- {} audit --format json --offline{}",
+                remote_path, deep_arg
+            )
+        } else {
+            format!(
+                "LC_ALL=C {} audit --format json --offline{}",
+                remote_path, deep_arg
+            )
+        };
+        exec_channel
+            .exec(true, cmd)
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+
+        if let Some(pass) = sudo_pass {
+            let mut line = Zeroizing::new(pass.to_string());
+            line.push('\n');
             exec_channel
-                .exec(true, cmd)
+                .data(line.as_bytes())
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+        }
+        exec_channel
+            .eof()
+            .await
+            .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
-            if let Some(pass) = sudo_pass {
-                let mut line = Zeroizing::new(pass.to_string());
-                line.push('\n');
-                exec_channel
-                    .data(line.as_bytes())
-                    .await
-                    .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-            }
-            exec_channel
-                .eof()
-                .await
-                .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code: Option<u32> = None;
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
 
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut exit_code: Option<u32> = None;
-            let mut stdout_truncated = false;
-            let mut stderr_truncated = false;
-
-            while let Some(msg) = exec_channel.wait().await {
-                match msg {
-                    ChannelMsg::Data { ref data } => {
-                        let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
-                        if room > 0 {
-                            stdout.extend_from_slice(&data[..data.len().min(room)]);
-                        } else if !stdout_truncated {
-                            stdout_truncated = true;
-                            tracing::warn!(
-                                host = %hostname,
-                                "remote stdout exceeded cap ({} bytes), truncating",
-                                safe_io::CAP_CHILD_STDOUT
-                            );
-                        }
-                    }
-                    ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                        let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
-                        if room > 0 {
-                            stderr.extend_from_slice(&data[..data.len().min(room)]);
-                        } else if !stderr_truncated {
-                            stderr_truncated = true;
-                            tracing::warn!(
-                                host = %hostname,
-                                "remote stderr exceeded cap ({} bytes), truncating",
-                                CAP_REMOTE_STDERR
-                            );
-                        }
-                    }
-                    ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
-                    ChannelMsg::Close => break,
-                    ChannelMsg::Eof => {}
-                    _ => {}
-                }
-            }
-
-            match exit_code {
-                Some(code) => {
-                    let se = String::from_utf8_lossy(&stderr);
-                    if sudo_pass.is_some()
-                        && (se.contains("incorrect password")
-                            || se.contains("Sorry, try again")
-                            || se.contains("a password is required"))
-                    {
-                        Err(RemoteError::SudoAuth {
-                            host: hostname.clone(),
-                        })
-                    } else if !stdout.is_empty() && stdout.starts_with(b"{") {
-                        Ok(stdout)
-                    } else if code != 0 {
-                        let trimmed: String = se.trim().chars().take(300).collect();
-                        Err(RemoteError::NonZeroExit {
-                            host: hostname.clone(),
-                            code,
-                            stderr: trimmed,
-                        })
-                    } else {
-                        Ok(stdout)
+        while let Some(msg) = exec_channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } => {
+                    let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
+                    if room > 0 {
+                        stdout.extend_from_slice(&data[..data.len().min(room)]);
+                    } else if !stdout_truncated {
+                        stdout_truncated = true;
+                        tracing::warn!(
+                            host = %hostname,
+                            "remote stdout exceeded cap ({} bytes), truncating",
+                            safe_io::CAP_CHILD_STDOUT
+                        );
                     }
                 }
-                None => Err(RemoteError::Timeout {
-                    host: hostname.clone(),
-                }),
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
+                    if room > 0 {
+                        stderr.extend_from_slice(&data[..data.len().min(room)]);
+                    } else if !stderr_truncated {
+                        stderr_truncated = true;
+                        tracing::warn!(
+                            host = %hostname,
+                            "remote stderr exceeded cap ({} bytes), truncating",
+                            CAP_REMOTE_STDERR
+                        );
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+                ChannelMsg::Close => break,
+                ChannelMsg::Eof => {}
+                _ => {}
             }
         }
-        .await;
 
-        // Normal teardown: cleanup + disconnect
-        if uploaded && !keep_binary {
-            cleanup_remote_binary(&session, remote_path, &hostname).await;
+        match exit_code {
+            Some(code) => {
+                let se = String::from_utf8_lossy(&stderr);
+                if sudo_pass.is_some()
+                    && (se.contains("incorrect password")
+                        || se.contains("Sorry, try again")
+                        || se.contains("a password is required"))
+                {
+                    Err(RemoteError::SudoAuth {
+                        host: hostname.clone(),
+                    })
+                } else if !stdout.is_empty() && stdout.starts_with(b"{") {
+                    Ok(stdout)
+                } else if code != 0 {
+                    let trimmed: String = se.trim().chars().take(300).collect();
+                    Err(RemoteError::NonZeroExit {
+                        host: hostname.clone(),
+                        code,
+                        stderr: trimmed,
+                    })
+                } else {
+                    Ok(stdout)
+                }
+            }
+            None => Err(RemoteError::Timeout {
+                host: hostname.clone(),
+            }),
         }
-        let _ = session
-            .disconnect(russh::Disconnect::ByApplication, "audit complete", "en")
-            .await;
-
-        outcome
     })
+    .await;
+
+    // Teardown always executes, even after Elapsed.
+    if uploaded.load(Ordering::Relaxed) && !keep_binary {
+        cleanup_remote_binary(&session, remote_path, &hostname).await;
+    }
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.disconnect(russh::Disconnect::ByApplication, "audit complete", "en"),
+    )
     .await;
 
     match result {
         Ok(inner) => inner,
-        Err(_elapsed) => {
-            // R13-04: on timeout, try to clean up and send a graceful disconnect.
-            if uploaded && !keep_binary {
-                cleanup_remote_binary(&session, remote_path, &hostname).await;
-            }
-            let _ = tokio::time::timeout(
-                Duration::from_secs(3),
-                session.disconnect(russh::Disconnect::ByApplication, "budget exceeded", "en"),
-            )
-            .await;
-            Err(RemoteError::Timeout { host: hostname })
-        }
+        Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
     }
 }
