@@ -1,7 +1,6 @@
 use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 use chrono::Utc;
-use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{Instrument, info, warn};
 
@@ -63,6 +62,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
 
     async move {
+        // R14-01: scope coverage messages to this scan
+        crate::coverage::set_scope(scan_id.clone());
+
         let start = std::time::Instant::now();
         let is_root = crate::is_running_as_root();
 
@@ -90,7 +92,6 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         let storage_task =
             tokio::task::spawn_blocking(crate::scanners::storage::gather_storage_info);
 
-        // SecurityInfo now depends on --deep and --verdict-cache
         let deep = args.deep;
         let verdict_cache = args.verdict_cache.clone();
         let security_task = tokio::task::spawn_blocking(move || {
@@ -163,7 +164,10 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
+        // Drain coverage after all scanners finished
         let coverage_warnings = crate::coverage::drain();
+        // Clear scope for this thread
+        crate::coverage::clear_scope();
 
         let duration_secs = start.elapsed().as_secs_f64();
 
@@ -200,199 +204,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     .await
 }
 
-pub fn run_remote_scan(host: &str, args: &AuditArgs) -> Option<AgentReport> {
-    let remote_path = &args.remote_path;
-    let ssh_user = &args.ssh_user;
-    let ssh_key = shellexpand::tilde(&args.ssh_key).to_string();
-
-    if let Err(e) = validate_remote_path(remote_path) {
-        warn!("{e}");
-        return None;
-    }
-    if let Err(e) = validate_ssh_user(ssh_user) {
-        warn!("{e}");
-        return None;
-    }
-    if let Err(e) = validate_host(host) {
-        warn!("{e}");
-        return None;
-    }
-
-    // Use shared split_host_port from ssh_engine
-    let (h, port) = crate::ssh_engine::split_host_port(host);
-    let port_s = port.to_string();
-    let dest = format!("{}@{}", ssh_user, h);
-
-    // For SCP, IPv6 addresses need to be wrapped in square brackets
-    let scp_target = if h.contains(':') {
-        format!("{}@[{}]:{}", ssh_user, h, remote_path)
-    } else {
-        format!("{}@{}:{}", ssh_user, h, remote_path)
-    };
-
-    if args.copy_binary {
-        let current_exe = std::env::current_exe()
-            .unwrap_or_else(|_| std::path::PathBuf::from("./owlzops-mapper"));
-
-        let current_exe_lossy = current_exe.to_string_lossy();
-        let local_bin = args.local_binary.as_deref().unwrap_or(&current_exe_lossy);
-
-        // Determine file size for progress bar
-        let file_size = std::fs::metadata(local_bin).map(|m| m.len()).unwrap_or(0);
-
-        let pb = ProgressBar::new(file_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message(format!("Uploading to {host}"));
-
-        // 1. Remove old binary (owner can unlink even if running)
-        let _ = crate::utils::run_child_with_timeout(
-            "ssh",
-            &[
-                "-i",
-                &ssh_key,
-                "-p",
-                &port_s,
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=10",
-                &dest,
-                "rm",
-                "-f",
-                remote_path,
-            ],
-            10,
-        );
-
-        // 2. Upload the fresh binary directly
-        let status = match crate::utils::run_child_with_timeout(
-            "scp",
-            &[
-                "-i",
-                &ssh_key,
-                "-P",
-                &port_s,
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                local_bin,
-                &scp_target,
-            ],
-            args.remote_timeout_secs / 2,
-        ) {
-            Some(s) => s,
-            None => {
-                pb.finish_with_message("Upload timed out");
-                warn!(host = %host, "SCP timed out or failed");
-                return None;
-            }
-        };
-        if !status.status.success() {
-            pb.finish_with_message("Upload failed");
-            warn!(host = %host, "SCP returned non-zero exit code");
-            return None;
-        }
-
-        // 3. Make the binary executable
-        let _ = crate::utils::run_child_with_timeout(
-            "ssh",
-            &[
-                "-i",
-                &ssh_key,
-                "-p",
-                &port_s,
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=10",
-                &dest,
-                "chmod",
-                "+x",
-                remote_path,
-            ],
-            10,
-        );
-
-        pb.finish_with_message("Uploaded");
-    }
-
-    let output = crate::utils::run_child_with_timeout(
-        "ssh",
-        &[
-            "-i",
-            &ssh_key,
-            "-p",
-            &port_s,
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ConnectTimeout=30",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            &dest,
-            "--",
-            "sudo",
-            remote_path,
-            "audit",
-            "--format",
-            "json",
-            "--offline",
-        ],
-        args.remote_timeout_secs,
-    );
-
-    let output = match output {
-        Some(out) => out,
-        None => {
-            warn!(host = %host, "SSH command timed out after {}s", args.remote_timeout_secs);
-            return None;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Clean up the binary on the remote host unless --keep-binary is set
-    if !args.keep_binary {
-        let _ = crate::utils::run_child_with_timeout(
-            "ssh",
-            &[
-                "-i",
-                &ssh_key,
-                "-p",
-                &port_s,
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=10",
-                &dest,
-                "rm",
-                "-f",
-                remote_path,
-            ],
-            10,
-        );
-    }
-
-    if let Ok(report) = serde_json::from_str::<AgentReport>(&stdout) {
-        return Some(report);
-    }
-
-    warn!(host = %host, "remote scan failed");
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    if !stderr_str.trim().is_empty() {
-        warn!(host = %host, stderr = %stderr_str.trim(), "remote scan stderr");
-    } else if !stdout.trim().is_empty() {
-        let truncated: String = stdout.trim().chars().take(200).collect();
-        warn!(host = %host, stdout_truncated = %truncated, "remote scan stdout");
-    }
-    None
-}
+// ── Snapshot run (now fully russh‑based) ───────────────────
 
 pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
     let output_dir = if args.output_dir == "~/.owlzops/snapshots" && crate::is_running_as_root() {
@@ -411,14 +223,12 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
         let host = args.audit.host[0].clone();
         let host_for_msg = host.clone();
         let audit_args = args.audit.clone();
-        match tokio::task::spawn_blocking(move || run_remote_scan(&host, &audit_args)).await {
-            Ok(Some(report)) => report,
-            Ok(None) => {
-                eprintln!("Failed to scan remote host: {host_for_msg}");
-                return 1;
-            }
+
+        // R14-02: use russh instead of legacy ssh/scp
+        match run_remote_scan_russh(&host, &audit_args).await {
+            Ok(report) => report,
             Err(e) => {
-                eprintln!("Remote scan task panicked: {e} (host: {host_for_msg})");
+                eprintln!("Failed to scan remote host {host_for_msg}: {e}");
                 return 1;
             }
         }
@@ -431,16 +241,10 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
         if let Some(host) = first_host {
             let host_clone = host.clone();
             let audit_args = args.audit.clone();
-            match tokio::task::spawn_blocking(move || run_remote_scan(&host_clone, &audit_args))
-                .await
-            {
-                Ok(Some(report)) => report,
-                Ok(None) => {
-                    eprintln!("Failed to scan remote host: {host}");
-                    return 1;
-                }
+            match run_remote_scan_russh(&host_clone, &audit_args).await {
+                Ok(report) => report,
                 Err(e) => {
-                    eprintln!("Remote scan task panicked: {e} (host: {host})");
+                    eprintln!("Failed to scan remote host {host}: {e}");
                     return 1;
                 }
             }
@@ -480,6 +284,34 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
 
     println!("Snapshot saved to {}", file_path.display());
     0
+}
+
+// ── Helper: remote scan via russh (used by snapshot) ──────
+
+/// Runs a remote scan using the russh engine, similar to `main.rs` but without
+/// progress bars and sudo password (snapshot does not support password prompt).
+/// Returns the deserialized AgentReport or an error.
+async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentReport, String> {
+    let ssh_key_expanded = shellexpand::tilde(&args.ssh_key).to_string();
+
+    let stdout = crate::ssh_engine::run_remote_scan_russh(
+        host,
+        &args.ssh_user,
+        &ssh_key_expanded,
+        &args.remote_path,
+        None, // sudo_pass
+        args.copy_binary,
+        args.keep_binary,
+        args.local_binary.as_deref(),
+        args.deep,
+        args.remote_timeout_secs,
+        None, // upload_pb
+    )
+    .await
+    .map_err(|e| format!("russh scan failed: {e}"))?;
+
+    serde_json::from_slice::<AgentReport>(&stdout)
+        .map_err(|e| format!("remote output is not a valid AgentReport: {e}"))
 }
 
 fn read_user_home(username: &str) -> Option<String> {

@@ -318,6 +318,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 }
                             }
 
+                            // R14-01: scope coverage messages to this host
+                            crate::coverage::set_scope(format!("remote-{}", host));
+
                             // R13-02: grace budget for teardown after timeout
                             let overall =
                                 Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 35);
@@ -366,6 +369,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 }
                             })
                             .await;
+
+                            // Clear scope after scan is done (or failed)
+                            crate::coverage::clear_scope();
 
                             match result {
                                 Ok(Some(report)) => Some(report),
