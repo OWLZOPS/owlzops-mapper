@@ -5,12 +5,19 @@ use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksh
 // XLSX formula injection guard
 // ---------------------------------------------------------------------------
 
-/// Prefix a string with `'` if it starts with a character that might be
-/// interpreted as a formula (`=`, `+`, `-`, `@`) by Excel / LibreOffice.
+/// Prefix a string with `'` if its first *effective* character (after
+/// stripping leading whitespace and control characters) might be interpreted
+/// as a formula (`=`, `+`, `-`, `@`) by Excel / LibreOffice.  This prevents
+/// the trivial bypass where an attacker prepends a tab or space before the
+/// formula trigger.
 /// All attacker‑controlled strings written to a workbook MUST pass through
 /// this function (see PIVOT-2 in threat model).
 fn sanitize_xlsx(s: &str) -> String {
-    match s.chars().next() {
+    let first = s
+        .trim_start_matches(|c: char| c.is_whitespace() || c.is_control())
+        .chars()
+        .next();
+    match first {
         Some('=') | Some('+') | Some('-') | Some('@') => format!("'{}", s),
         _ => s.to_string(),
     }
