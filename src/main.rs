@@ -366,12 +366,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             })
                             .await;
 
-                            // Drain and log coverage for this host with proper scope
-                            let scope = format!("remote-{}", host);
-                            for warning in crate::coverage::drain_scoped(&scope) {
-                                tracing::warn!(scope = %scope, "{warning}");
-                            }
-
                             match result {
                                 Ok(Some(report)) => Some(report),
                                 Ok(None) => None,
@@ -418,6 +412,13 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 }
                             }
                         }
+                    }
+
+                    // R15-01: single sequential drain point after all fleet tasks complete.
+                    // No concurrent record() calls exist here, so drain-time tagging
+                    // is correct by construction.
+                    for warning in crate::coverage::drain_scoped("fleet-orchestrator") {
+                        warn!("{warning}");
                     }
                 }
 
