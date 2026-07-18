@@ -6,6 +6,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncReadExt; // for .read() on tokio::fs::File
 use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
@@ -208,10 +209,12 @@ async fn upload_via_channel(
     host: &str,
     upload_pb: Option<ProgressBar>,
 ) -> Result<(), RemoteError> {
-    let metadata = std::fs::metadata(local_bin).map_err(|e| RemoteError::Io {
-        host: host.to_string(),
-        source: e,
-    })?;
+    let metadata = tokio::fs::metadata(local_bin)
+        .await
+        .map_err(|e| RemoteError::Io {
+            host: host.to_string(),
+            source: e,
+        })?;
     let file_size = metadata.len();
 
     let pb = if let Some(pb) = upload_pb {
@@ -240,13 +243,15 @@ async fn upload_via_channel(
             .await
             .map_err(|e| RemoteError::from_russh(e, host))?;
 
-        let mut file = std::fs::File::open(local_bin).map_err(|e| RemoteError::Io {
-            host: host.to_string(),
-            source: e,
-        })?;
+        let mut file = tokio::fs::File::open(local_bin)
+            .await
+            .map_err(|e| RemoteError::Io {
+                host: host.to_string(),
+                source: e,
+            })?;
         let mut buf = [0u8; 32 * 1024];
         loop {
-            let n = file.read(&mut buf).map_err(|e| RemoteError::Io {
+            let n = file.read(&mut buf).await.map_err(|e| RemoteError::Io {
                 host: host.to_string(),
                 source: e,
             })?;
@@ -403,10 +408,19 @@ pub async fn run_remote_scan_russh(
 
     // Wrap handshake + auth in a 30-second deadline; load key
     // before the deadline so local disk I/O does not count against it.
-    let key = load_secret_key(ssh_key_path, None).map_err(|_| RemoteError::Auth {
-        host: hostname.clone(),
-        user: ssh_user.to_string(),
-    })?;
+    // The key loading itself is a blocking operation (disk I/O + parsing),
+    // so run it on a blocking thread to avoid stalling the async runtime.
+    let ssh_key_path = ssh_key_path.to_string();
+    let key = tokio::task::spawn_blocking(move || load_secret_key(&ssh_key_path, None))
+        .await
+        .map_err(|_| RemoteError::Auth {
+            host: hostname.clone(),
+            user: ssh_user.to_string(),
+        })?
+        .map_err(|_| RemoteError::Auth {
+            host: hostname.clone(),
+            user: ssh_user.to_string(),
+        })?;
 
     const HANDSHAKE_AUTH_BUDGET: Duration = Duration::from_secs(30);
     let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
