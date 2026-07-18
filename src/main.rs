@@ -298,7 +298,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                         join_set.spawn(async move {
                             // R13-03: explicit permit error handling.
-                            // If the semaphore has been closed (future shutdown), bail out.
                             let Ok(_permit) = sem.acquire_owned().await else {
                                 return None;
                             };
@@ -317,9 +316,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     return None;
                                 }
                             }
-
-                            // R14-01: scope coverage messages to this host
-                            crate::coverage::set_scope(format!("remote-{}", host));
 
                             // R13-02: grace budget for teardown after timeout
                             let overall =
@@ -370,8 +366,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             })
                             .await;
 
-                            // Clear scope after scan is done (or failed)
-                            crate::coverage::clear_scope();
+                            // Drain and log coverage for this host with proper scope
+                            let scope = format!("remote-{}", host);
+                            for warning in crate::coverage::drain_scoped(&scope) {
+                                tracing::warn!(scope = %scope, "{warning}");
+                            }
 
                             match result {
                                 Ok(Some(report)) => Some(report),
@@ -417,7 +416,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         break;
                                     }
                                 }
-                                crate::coverage::drain_and_log("fleet-orchestrator");
                             }
                         }
                     }

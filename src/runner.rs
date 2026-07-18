@@ -62,9 +62,6 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
 
     async move {
-        // R14-01: scope coverage messages to this scan
-        crate::coverage::set_scope(scan_id.clone());
-
         let start = std::time::Instant::now();
         let is_root = crate::is_running_as_root();
 
@@ -164,10 +161,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
-        // Drain coverage after all scanners finished
-        let coverage_warnings = crate::coverage::drain();
-        // Clear scope for this thread
-        crate::coverage::clear_scope();
+        // Drain coverage after all scanners finished – scope is attached here,
+        // not in the scanners, because they run on arbitrary blocking threads.
+        let coverage_warnings = crate::coverage::drain_scoped(&scan_id);
 
         let duration_secs = start.elapsed().as_secs_f64();
 
@@ -224,7 +220,6 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
         let host_for_msg = host.clone();
         let audit_args = args.audit.clone();
 
-        // R14-02: use russh instead of legacy ssh/scp
         match run_remote_scan_russh(&host, &audit_args).await {
             Ok(report) => report,
             Err(e) => {
@@ -288,9 +283,6 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
 
 // ── Helper: remote scan via russh (used by snapshot) ──────
 
-/// Runs a remote scan using the russh engine, similar to `main.rs` but without
-/// progress bars and sudo password (snapshot does not support password prompt).
-/// Returns the deserialized AgentReport or an error.
 async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentReport, String> {
     let ssh_key_expanded = shellexpand::tilde(&args.ssh_key).to_string();
 
