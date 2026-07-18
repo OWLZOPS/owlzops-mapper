@@ -39,7 +39,7 @@ use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::coverage;
 use crate::models::GhostPidFinding;
@@ -371,7 +371,31 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
         if inflight == 0 {
             break;
         }
-        ring.submit_and_wait(1).ok()?;
+
+        // R13-01: safe completion drain — never exit early with inflight SQEs.
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(_) => {
+                // Kernel still holds pointers to stx/paths — exit would be use-after-free.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while inflight > 0 && Instant::now() < deadline {
+                    let _ = ring.submit_and_wait(1);
+                    for cqe in ring.completion() {
+                        let slot = cqe.user_data() as usize;
+                        paths[slot] = None;
+                        free.push(slot);
+                        inflight -= 1;
+                    }
+                }
+                if inflight > 0 {
+                    // Leak is better than UB.
+                    std::mem::forget((paths, stx));
+                }
+                return None; // Tier-C will take over
+            }
+        }
+
         for cqe in ring.completion() {
             let slot = cqe.user_data() as usize;
             if cqe.result() >= 0 {
