@@ -42,7 +42,9 @@ pub struct ProcAttr {
 const TCP_LISTEN: u8 = 0x0A;
 const TCP_CLOSE: u8 = 0x07;
 
-fn decode_v4(hex: &str) -> Option<String> {
+/// Decode an IPv4 address from its little-endian hex representation
+/// (8 hex digits) as found in /proc/net/tcp{,6}.
+pub(crate) fn decode_v4(hex: &str) -> Option<String> {
     if hex.len() != 8 {
         return None;
     }
@@ -51,7 +53,9 @@ fn decode_v4(hex: &str) -> Option<String> {
     Some(Ipv4Addr::new(a, b, c, d).to_string())
 }
 
-fn decode_v6(hex: &str) -> Option<String> {
+/// Decode an IPv6 address from its little-endian hex representation
+/// (32 hex digits) as found in /proc/net/tcp6.
+pub(crate) fn decode_v6(hex: &str) -> Option<String> {
     if hex.len() != 32 {
         return None;
     }
@@ -62,6 +66,15 @@ fn decode_v6(hex: &str) -> Option<String> {
         octets[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
     Some(Ipv6Addr::from(octets).to_string())
+}
+
+/// Extract the socket inode from a link target like "socket:[12345]".
+pub(crate) fn socket_inode(link_target: &str) -> Option<u64> {
+    link_target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
 }
 
 fn parse_local(field: &str, v6: bool) -> Option<(String, u16)> {
@@ -156,14 +169,6 @@ pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
         parse_proc_net(p, &mut map);
     }
     map
-}
-
-fn socket_inode(link_target: &str) -> Option<u64> {
-    link_target
-        .strip_prefix("socket:[")?
-        .strip_suffix(']')?
-        .parse()
-        .ok()
 }
 
 pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, ProcAttr> {

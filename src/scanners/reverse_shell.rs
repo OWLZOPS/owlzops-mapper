@@ -21,6 +21,8 @@ use crate::coverage;
 use crate::models::ReverseShellFinding;
 use crate::safe_io;
 
+use super::proc_net::{decode_v4, decode_v6, socket_inode};
+
 const TCP_ESTABLISHED: u8 = 0x01;
 
 /// Interpreters that have no business owning a raw outbound socket on their
@@ -123,27 +125,6 @@ fn decode_endpoint(field: &str, v6: bool) -> Option<(String, u16)> {
     Some((ip, port))
 }
 
-fn decode_v4(hex: &str) -> Option<String> {
-    if hex.len() != 8 {
-        return None;
-    }
-    let raw = u32::from_str_radix(hex, 16).ok()?;
-    let [a, b, c, d] = raw.to_le_bytes();
-    Some(format!("{a}.{b}.{c}.{d}"))
-}
-
-fn decode_v6(hex: &str) -> Option<String> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut o = [0u8; 16];
-    for i in 0..4 {
-        let w = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).ok()?;
-        o[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    Some(std::net::Ipv6Addr::from(o).to_string())
-}
-
 // ── Public vs. internal address classification ────────────────────────────
 
 /// True only for globally-routable addresses. RFC1918, loopback, link-local,
@@ -177,14 +158,6 @@ fn is_public_addr(ip: &str) -> bool {
 }
 
 // ── /proc/<pid>/fd correlation ────────────────────────────────────────────
-
-fn socket_inode(link_target: &str) -> Option<u64> {
-    link_target
-        .strip_prefix("socket:[")?
-        .strip_suffix(']')?
-        .parse()
-        .ok()
-}
 
 fn correlate_with_processes(
     established: &HashMap<u64, EstSocket>,

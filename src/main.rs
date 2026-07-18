@@ -32,7 +32,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
 use zeroize::Zeroizing;
 
-// R11-02: sanitize hostname when printing to terminal in compare paths
+// sanitize hostname when printing to terminal in compare paths
 use crate::ui::sanitize_terminal as st;
 
 fn is_running_as_root() -> bool {
@@ -297,7 +297,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         let upload_pb = upload_bar.clone();
 
                         join_set.spawn(async move {
-                            let _permit = sem.acquire_owned().await;
+                            // R13-03: explicit permit error handling.
+                            // If the semaphore has been closed (future shutdown), bail out.
+                            let Ok(_permit) = sem.acquire_owned().await else {
+                                return None;
+                            };
 
                             if pass.is_some() {
                                 if let Err(e) = runner::validate_host(&host) {
@@ -314,8 +318,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 }
                             }
 
+                            // R14-01: scope coverage messages to this host
+                            crate::coverage::set_scope(format!("remote-{}", host));
+
+                            // R13-02: grace budget for teardown after timeout
                             let overall =
-                                Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 5);
+                                Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 35);
 
                             let result = tokio::time::timeout(overall, async {
                                 let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
@@ -361,6 +369,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 }
                             })
                             .await;
+
+                            // Clear scope after scan is done (or failed)
+                            crate::coverage::clear_scope();
 
                             match result {
                                 Ok(Some(report)) => Some(report),
