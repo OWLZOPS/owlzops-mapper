@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(feature = "local-scan")]
 use super::deep;
 use crate::coverage;
 use crate::models::LibraryInjectionFinding;
@@ -456,6 +457,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 );
 
                 // Slow path: enrich + cache verdict per object
+                #[cfg(feature = "local-scan")]
                 if cfg.deep_for(pid) && findings.len() > start {
                     let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
