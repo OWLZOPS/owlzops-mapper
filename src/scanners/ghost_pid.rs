@@ -315,7 +315,9 @@ fn probe_live_set(proc_root: &Path) -> BTreeSet<u32> {
     probe_live_set_sync(proc_root)
 }
 
-#[cfg(target_os = "linux")]
+// Full io_uring implementation is only available on glibc Linux.
+// musl libc does not expose `statx` or `AT_STATX_DONT_SYNC`.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     use io_uring::{IoUring, opcode, types};
     const RING_DEPTH: u32 = 4096;
@@ -412,7 +414,8 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     Some(set)
 }
 
-#[cfg(not(target_os = "linux"))]
+// Stub for musl Linux (no `libc::statx`) and non-Linux platforms.
+#[cfg(any(not(target_os = "linux"), target_env = "musl"))]
 fn probe_live_set_iouring(_proc_root: &Path) -> Option<BTreeSet<u32>> {
     None
 }
