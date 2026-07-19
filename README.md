@@ -65,19 +65,16 @@ curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzo
 
 ---
 
-## Highlights v0.5.18
+## Highlights v0.5.21
 
-**Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
+**macOS Orchestrator, False‑Positive Elimination & Transport Resilience**
 
-- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
-- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
-- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
-- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts. The fleet orchestrator adds a grace budget to accommodate teardown.
+- **macOS orchestrator (Apple Silicon):** A native `aarch64-apple-darwin` build is now available. It runs any remote scan (single host, fleet, snapshot) from macOS without requiring local audit support. The install script automatically selects the correct build, and the CI pipeline compiles the orchestrator on every push.
+- **SEC‑026 false‑positive elimination:** Chrome V8 code‑cage (executable `[heap]` inside a JIT reservation) and heavy standalone applications (Telegram, AppImage) are now recognised by VMA‑topology and file‑text anchors, respectively. They are routed to **SEC‑029** (Provisional Trust, weight 0) instead of raising false alarms. All other detection remains intact — droppers and real heap‑spray still fire.
+- **Drain‑time coverage scoping:** Coverage warnings from concurrent local and remote scans are now tagged with the correct scope at drain time. A single sequential drain point after fleet tasks guarantees correct attribution even if `coverage::record()` is later added to the SSH engine.
+- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts.
 - **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
-- **Coverage scope isolation:** Coverage warnings from concurrent local and remote scans are now tagged with the originating scan, preventing misleading attribution in fleet reports.
-- **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
-- **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
-- **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
+- **Minor hardening:** Unified network decoders; XLSX formula injection guard now handles leading whitespace; semaphore acquisition correctly bails out when the scheduler is closed; `exe_provenance` is computed once per PID, not per memory region.
 
 ---
 
@@ -437,6 +434,20 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.18 (2026-07-18)
+
+**Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
+
+- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
+- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
+- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
+- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts. The fleet orchestrator adds a grace budget to accommodate teardown.
+- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
+- **Coverage scope isolation:** Coverage warnings from concurrent local and remote scans are now tagged with the originating scan, preventing misleading attribution in fleet reports.
+- **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
+- **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
+- **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
+
 ### v0.5.17 (2026-07-16)
 
 **Transport Resilience & Safe Self‑Suppression (R11, R12)**
@@ -473,12 +484,5 @@ See [LICENSE](LICENSE) for details.
 * **False zombie fix** – mapper‑spawned transient zombies are excluded from the zombie count.
 * **Clean progress UI** – `MultiProgress` coordinates upload bar and scan spinner; all bars are cleared with `finish_and_clear()` for a clean terminal.
 * **Spinner message respects `--deep` flag** – “Deep forensic scan in progress” vs. “Auditing systems…”.
-
-### v0.5.12 (2026-07-11)
-
-* **SEC‑021 – SEC‑025** – new active compromise detectors for bind‑mount masking, reverse shells, library injection, and hidden PIDs.
-* **R10 reliability hardening** – upload/cleanup parity, JSONL error tracking, poison‑tolerant tool resolution, child process reaping, terminal sanitisation.
-* **Performance** – Ghost PID scanner bounds to `ns_last_pid`; micro‑yield throttling.
-* **UI completeness** – dedicated sections for new IoC findings in terminal and Excel.
 
 </details>
