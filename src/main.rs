@@ -115,18 +115,18 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             // If local-scan is disabled (non-Linux), reject local-only audits early.
             if !hosts.is_empty() {
                 let mut remote = Vec::new();
+                #[cfg(feature = "local-scan")]
                 let mut local = Vec::new();
+                #[cfg(feature = "local-scan")]
                 let mut local_seen = false;
                 for h in hosts {
                     #[cfg(feature = "local-scan")]
-                    {
-                        if is_local_host(&h) {
-                            if !local_seen {
-                                local.push(h);
-                                local_seen = true;
-                            }
-                            continue;
+                    if is_local_host(&h) {
+                        if !local_seen {
+                            local.push(h);
+                            local_seen = true;
                         }
+                        continue;
                     }
                     remote.push(h);
                 }
