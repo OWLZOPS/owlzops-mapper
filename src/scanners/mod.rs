@@ -1,6 +1,6 @@
 #[cfg(feature = "local-scan")]
 mod access;
-pub mod capabilities;                // needed by scoring & ui on all platforms
+pub mod capabilities;
 #[cfg(feature = "local-scan")]
 mod deep;
 #[cfg(feature = "local-scan")]
@@ -23,7 +23,8 @@ pub mod packages;
 mod proc_net;
 #[cfg(feature = "local-scan")]
 mod reverse_shell;
-pub mod security;                    // needed by scoring & ui on all platforms
+#[cfg(feature = "local-scan")]
+pub mod security;
 #[cfg(feature = "local-scan")]
 pub mod self_integrity;
 #[cfg(feature = "local-scan")]

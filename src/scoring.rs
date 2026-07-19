@@ -1,5 +1,8 @@
 use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin};
-use crate::scanners::security::SUDO_PRIVESC_MARKER;
+/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
+/// unprivileged user. Shared with `security.rs` so the policy has exactly one
+/// source of truth and cannot drift.
+const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
