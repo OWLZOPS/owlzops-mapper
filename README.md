@@ -35,39 +35,19 @@ curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.
 sudo ./owlzops-mapper audit
 ```
 
+
 **Option 3 – macOS orchestrator (remote-only):**
-
 ```bash
-# Install the orchestrator (auto-detects macOS)
 curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
-```
 
-```bash
-# Download the Linux agent SEPARATELY and rename it to avoid overwriting the orchestrator
+# You also need the Linux static binary to deploy to remote Linux hosts
 curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzops-mapper-linux-x86_64.tar.gz | tar xz
-mv owlzops-mapper owlzops-agent-linux
-```
-```Bash
-# Run a remote audit – you MUST pass --local-binary so the Linux agent is uploaded
-./owlzops-mapper audit --deep \
-  --host 192.168.1.10 \
+# Run a remote audit from your Mac
+./owlzops-mapper audit --host 192.168.1.10 \
   --ssh-user operator \
-  --ssh-key ~/.ssh/id_rsa \
-  --remote-path /tmp/owlzops-mapper \
   --copy-binary \
-  --local-binary ./owlzops-agent-linux \
-  --ask-sudo-pass
+  --local-binary ./owlzops-mapper-linux-x86_64
 ```
-
-> **Important for macOS users:** The macOS orchestrator cannot perform local scans.  
-> Always download the Linux agent separately and rename it (`owlzops-agent-linux`).  
-> If you do not rename it, the Linux binary will overwrite the macOS orchestrator,  
-> resulting in a «cannot execute binary file» error.  
-> Use `--local-binary` to point to the Linux agent when scanning remote hosts.
-```
-
-После этого обновлённый README.md можно коммитить прямо в main.
-
 ---
 
 ## Core Features (Agentless EDR-lite)
