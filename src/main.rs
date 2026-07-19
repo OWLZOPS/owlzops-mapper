@@ -20,7 +20,9 @@ use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use models::{AgentReport, HostDiffStatus, SelfIntegrityReport};
-use runner::{is_local_host, run_local_scan_async, snapshot_run};
+use runner::snapshot_run;
+#[cfg(feature = "local-scan")]
+use runner::{is_local_host, run_local_scan_async};
 use scoring::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -110,19 +112,23 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             let mut seen = HashSet::new();
             hosts.retain(|h| seen.insert(h.clone()));
 
+            // If local-scan is disabled (non-Linux), reject local-only audits early.
             if !hosts.is_empty() {
                 let mut remote = Vec::new();
                 let mut local = Vec::new();
                 let mut local_seen = false;
                 for h in hosts {
-                    if is_local_host(&h) {
-                        if !local_seen {
-                            local.push(h);
-                            local_seen = true;
+                    #[cfg(feature = "local-scan")]
+                    {
+                        if is_local_host(&h) {
+                            if !local_seen {
+                                local.push(h);
+                                local_seen = true;
+                            }
+                            continue;
                         }
-                    } else {
-                        remote.push(h);
                     }
+                    remote.push(h);
                 }
 
                 // Resolve sudo password once (before any progress bars)
@@ -194,6 +200,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 };
 
                 // Process local hosts synchronously (no SSH needed)
+                #[cfg(feature = "local-scan")]
                 for _host in local {
                     if shutdown.load(Ordering::Relaxed) {
                         break;
@@ -487,40 +494,50 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             }
 
             // Single local scan (no hosts file or empty hosts)
-            let local_spinner = ProgressBar::new_spinner();
-            local_spinner.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                    .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
-            );
-            if args.deep {
-                local_spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
-            } else {
-                local_spinner.set_message("Auditing local system...");
+            #[cfg(feature = "local-scan")]
+            {
+                let local_spinner = ProgressBar::new_spinner();
+                local_spinner.set_style(
+                    ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
+                        .unwrap()
+                        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
+                );
+                if args.deep {
+                    local_spinner.set_message("Deep forensic scan in progress (may take 10–30s)");
+                } else {
+                    local_spinner.set_message("Auditing local system...");
+                }
+                local_spinner.enable_steady_tick(Duration::from_millis(100));
+
+                // Self‑integrity preflight
+                let integrity = scanners::self_integrity::run_self_integrity_check();
+                let mut report = run_local_scan_async(&args).await;
+                report.self_integrity = Some(SelfIntegrityReport {
+                    compromised: integrity.compromised,
+                    warnings: integrity.warnings,
+                });
+
+                local_spinner.finish_and_clear();
+
+                let exit_code = compute_exit_code(&report);
+                if let Err(e) = output::output_single(
+                    &report,
+                    &args.format,
+                    args.output.as_deref().map(std::path::Path::new),
+                    verbose,
+                ) {
+                    warn!("output error: {e}");
+                    return 2;
+                }
+                exit_code
             }
-            local_spinner.enable_steady_tick(Duration::from_millis(100));
-
-            // Self‑integrity preflight
-            let integrity = scanners::self_integrity::run_self_integrity_check();
-            let mut report = run_local_scan_async(&args).await;
-            report.self_integrity = Some(SelfIntegrityReport {
-                compromised: integrity.compromised,
-                warnings: integrity.warnings,
-            });
-
-            local_spinner.finish_and_clear();
-
-            let exit_code = compute_exit_code(&report);
-            if let Err(e) = output::output_single(
-                &report,
-                &args.format,
-                args.output.as_deref().map(std::path::Path::new),
-                verbose,
-            ) {
-                warn!("output error: {e}");
+            #[cfg(not(feature = "local-scan"))]
+            {
+                eprintln!(
+                    "Local audit is not supported on this platform. Use --host to scan a remote host."
+                );
                 return 2;
             }
-            exit_code
         }
 
         Commands::Snapshot(args) => snapshot_run(args).await,

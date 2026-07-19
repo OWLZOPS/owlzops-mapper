@@ -57,6 +57,7 @@ pub fn is_local_host(host: &str) -> bool {
 
 // ── Scan execution ─────────────────────────────────────────
 
+#[cfg(feature = "local-scan")]
 pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let scan_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
@@ -244,10 +245,30 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
                 }
             }
         } else {
-            run_local_scan_async(&args.audit).await
+            #[cfg(feature = "local-scan")]
+            {
+                run_local_scan_async(&args.audit).await
+            }
+            #[cfg(not(feature = "local-scan"))]
+            {
+                eprintln!(
+                    "Local audit is not supported on this platform. Please provide a remote host."
+                );
+                return 1;
+            }
         }
     } else {
-        run_local_scan_async(&args.audit).await
+        #[cfg(feature = "local-scan")]
+        {
+            run_local_scan_async(&args.audit).await
+        }
+        #[cfg(not(feature = "local-scan"))]
+        {
+            eprintln!(
+                "Local audit is not supported on this platform. Please provide a remote host."
+            );
+            return 1;
+        }
     };
 
     let hostname = &report.host.hostname;
