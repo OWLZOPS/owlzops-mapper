@@ -8,6 +8,9 @@
 - **local-scan:** Resolve local host handling indentation and cfg attribute order
 - **local-scan:** Add conditional handling for deep enrichment with cfg attributes
 - **ci:** Add conditional build logic for macOS targets in release workflow
+- Gate host-scan modules under local-scan feature (R17-01)
+- Make key scanner modules available on all platforms for scoring & UI
+- Restrict `security` module to `local-scan` feature and consolidate `SUDO_PRIVESC_MARKER` definition
 
 ## CI/CD
 
@@ -16,6 +19,9 @@
 ## Documentation
 
 - Update CHANGELOG for v0.5.20
+- Update CHANGELOG for v0.5.21
+- **readme:** Update remote audit instructions and macOS guidance
+- **readme:** Clarify macOS remote audit setup and binary handling
 
 ## Features
 
