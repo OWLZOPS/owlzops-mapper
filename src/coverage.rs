@@ -18,9 +18,9 @@ fn sink() -> &'static Mutex<Vec<String>> {
 /// The sink is capped: when the limit is reached a single suppression marker
 /// is appended and further records are silently dropped.
 ///
-/// INVARIANT: callers that run concurrently with other scans (russh fleet
-/// tasks, ssh_engine, known_hosts) MUST NOT call this — drain-time scoping
-/// cannot attribute concurrent writers. Scanner (spawn_blocking) paths only.
+/// INVARIANT: only scanner (spawn_blocking) paths call this. Callers running
+/// concurrently with other scans (russh fleet tasks, ssh_engine, known_hosts)
+/// MUST NOT — drain-time scoping cannot attribute concurrent writers.
 pub fn record(msg: impl Into<String>) {
     if let Ok(mut v) = sink().lock() {
         use std::cmp::Ordering::*;
