@@ -1,5 +1,6 @@
 mod access;
 pub mod capabilities;
+#[cfg(feature = "local-scan")]
 mod deep;
 mod dlp;
 pub mod docker;

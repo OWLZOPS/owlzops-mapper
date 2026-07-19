@@ -35,6 +35,19 @@ curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.
 sudo ./owlzops-mapper audit
 ```
 
+
+**Option 3 – macOS orchestrator (remote-only):**
+```bash
+curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
+
+# You also need the Linux static binary to deploy to remote Linux hosts
+curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzops-mapper-linux-x86_64.tar.gz | tar xz
+# Run a remote audit from your Mac
+./owlzops-mapper audit --host 192.168.1.10 \
+  --ssh-user operator \
+  --copy-binary \
+  --local-binary ./owlzops-mapper-linux-x86_64
+```
 ---
 
 ## Core Features (Agentless EDR-lite)

@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(feature = "local-scan")]
 use super::deep;
 use crate::coverage;
 use crate::models::LibraryInjectionFinding;
@@ -46,6 +47,13 @@ const RT_LIBS: &[&str] = &[
     "libv8",
     "libcef.so",
 ];
+
+/// A heavy standalone application (Telegram, AppImage, static Electron) maps
+/// tens of MiB of *file-backed* executable text from its real on-disk image.
+/// A fileless dropper does not — its executable surface is anonymous/deleted.
+/// Anchor is VMA topology, not name or file count in a directory.
+const FILE_TEXT_ANCHOR_MIN: u64 = 16 * 1024 * 1024;
+const FILE_TEXT_ANON_RATIO: u64 = 8; // anon-exec ≤ 1/8 file-exec
 
 // ── VENDOR & RUNTIME ANCHORS ───────────────────────────────
 
@@ -133,6 +141,7 @@ struct RuntimeTrust {
     exe_ok: bool,
     runtime_libs: bool,
     vendor_anchored: bool,
+    file_text_anchored: bool,
 }
 
 fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
@@ -167,10 +176,52 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
                 >= VENDOR_ANCHOR_MIN_SO
         });
 
+    // Anchor trust in address-space topology: dominance of file-backed
+    // exec text. Key is VMA layout of already-parsed maps, NOT comm
+    // (spoofable via PR_SET_NAME) and NOT file count (spoofable via rename,
+    // false-negative on standalone layout).
+    let (mut file_exec, mut anon_exec): (u64, u64) = (0, 0);
+    for l in maps.lines() {
+        let mut it = l.splitn(6, char::is_whitespace);
+        let (Some(addr), Some(perms), _, _, _, path) = (
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+        ) else {
+            continue;
+        };
+        if perms.as_bytes().get(2) != Some(&b'x') {
+            continue;
+        }
+        let Some(sz) = region_size(addr) else {
+            continue;
+        };
+        let backed = path.map(str::trim).is_some_and(|p| {
+            p.starts_with('/') && !p.ends_with("(deleted)") && !is_volatile_lib_path(p)
+        });
+        if backed {
+            file_exec = file_exec.saturating_add(sz);
+        } else {
+            anon_exec = anon_exec.saturating_add(sz);
+        }
+    }
+    // Intentionally NOT using exe_ok/is_ephemeral_exec_path: standalone lives
+    // in /home, and the whole point of the anchor is to bypass that overly
+    // broad heuristic. A live main image is the sole extra condition.
+    let main_exe_present =
+        exe_path.is_some_and(|e| !e.ends_with(" (deleted)") && !e.starts_with("/memfd:"));
+    let file_text_anchored = main_exe_present
+        && file_exec >= FILE_TEXT_ANCHOR_MIN
+        && anon_exec.saturating_mul(FILE_TEXT_ANON_RATIO) <= file_exec;
+
     RuntimeTrust {
         exe_ok,
         runtime_libs,
         vendor_anchored,
+        file_text_anchored,
     }
 }
 
@@ -406,6 +457,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 );
 
                 // Slow path: enrich + cache verdict per object
+                #[cfg(feature = "local-scan")]
                 if cfg.deep_for(pid) && findings.len() > start {
                     let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
@@ -444,6 +496,8 @@ fn scan_maps(
     let pool = is_trampoline_pool(content);
     let families = deleted_so_families(content);
     let trust_met = trust.exe_ok && (trust.runtime_libs || trust.vendor_anchored);
+    // provenance is a per‑PID fact, not per‑region – compute once.
+    let prov = exe_path.map(|p| crate::utils::exe_provenance(p, pid));
 
     for line in content.lines() {
         if findings.len() >= MAX_FINDINGS {
@@ -546,9 +600,18 @@ fn scan_maps(
 
         let small = region_size(addr).is_some_and(|s| s <= TRAMP_MAX_BYTES);
 
+        // V8/pointer-compression code cage: kernel maps as executable [heap].
+        // Gate is the same JIT reservation as for AnonRwx (VMA layout, not name).
+        let heap_in_reservation =
+            tier == ExecTier::ExecHeap && is_inside_jit_cluster(addr_lo, &clusters);
+
         let mut downgrade: Option<&str> = if trust_met {
             match tier {
                 ExecTier::AnonRx => Some("maps-rx-jit-suppressed"),
+                // exec-heap → provisional (VISIBLE), not suppressed hardening lane:
+                // executable [heap] is more anomalous than anon-rwx and stays on
+                // the auditor's radar even under runtime trust.
+                ExecTier::ExecHeap if heap_in_reservation => Some("maps-rwx-provisional"),
                 ExecTier::AnonRwx if is_inside_jit_cluster(addr_lo, &clusters) => {
                     Some("maps-rwx-jit-hardening")
                 }
@@ -563,15 +626,20 @@ fn scan_maps(
             None
         };
 
-        if downgrade.is_none() && matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx) {
+        if downgrade.is_none()
+            && (matches!(tier, ExecTier::AnonRwx | ExecTier::AnonRx) || heap_in_reservation)
+        {
             downgrade = match exe_path.and_then(|e| cache.lookup(e)) {
                 Some(Verdict::Benign) => Some("maps-rwx-cached-clean"),
                 Some(Verdict::Malicious) => None,
-                None => match exe_path.map(|p| crate::utils::exe_provenance(p, pid)) {
+                None => match prov {
                     Some(crate::utils::ExeProvenance::InstalledApp)
                     | Some(crate::utils::ExeProvenance::NestedUserInstall) => {
                         Some("maps-rwx-provisional")
                     }
+                    // Heavy standalone (Telegram/AppImage): trust from
+                    // file-text dominance, not from spuofable file count.
+                    _ if trust.file_text_anchored => Some("maps-rwx-provisional"),
                     _ => None,
                 },
             };
@@ -836,6 +904,84 @@ mod tests {
                 .unwrap()
                 .source,
             "maps"
+        );
+    }
+
+    // ── SEC-026 fast-path tests (ExecHeap & file_text_anchored) ──
+
+    fn scan_with(maps: &str, exe: Option<&str>) -> Vec<LibraryInjectionFinding> {
+        let trust = assess_runtime(maps, exe);
+        let cache = VerdictCache::default();
+        let mut out = Vec::new();
+        scan_maps(maps, 4242, "app", &trust, exe, &cache, &mut out);
+        out
+    }
+
+    fn src_of<'a>(f: &'a [LibraryInjectionFinding], addr: &str) -> Option<&'a str> {
+        f.iter()
+            .find(|x| x.region_addr.as_deref() == Some(addr))
+            .map(|x| x.source.as_str())
+    }
+
+    #[test]
+    fn v8_exec_heap_in_cage_is_provisional() {
+        let maps = "\
+0000400000-0000c00000 r-xp 00000000 08:01 100 /opt/google/chrome/chrome
+0000c00000-0000c01000 r-xp 00000000 00:00 0 [heap]
+7f0000000000-7f0000001000 r--p 00000000 08:01 201 /opt/google/chrome/libGLESv2.so
+7f0000100000-7f0000101000 r--p 00000000 08:01 202 /opt/google/chrome/libEGL.so
+7f0000200000-7f0000201000 r--p 00000000 08:01 203 /opt/google/chrome/libvulkan.so.1
+";
+        let f = scan_with(maps, Some("/opt/google/chrome/chrome"));
+        assert_eq!(
+            src_of(&f, "0000c00000-0000c01000"),
+            Some("maps-rwx-provisional"),
+            "exec-heap inside genuine JIT cage must become visible provisional"
+        );
+    }
+
+    #[test]
+    fn lone_exec_heap_still_alarms() {
+        let maps = "\
+0000400000-0000401000 r-xp 00000000 08:01 100 /opt/google/chrome/chrome
+0000900000-0000901000 r-xp 00000000 00:00 0 [heap]
+7f0000000000-7f0000001000 r--p 00000000 08:01 201 /opt/google/chrome/libGLESv2.so
+7f0000100000-7f0000101000 r--p 00000000 08:01 202 /opt/google/chrome/libEGL.so
+7f0000200000-7f0000201000 r--p 00000000 08:01 203 /opt/google/chrome/libvulkan.so.1
+";
+        let f = scan_with(maps, Some("/opt/google/chrome/chrome"));
+        assert_eq!(
+            src_of(&f, "0000900000-0000901000"),
+            Some("maps-exec-heap"),
+            "executable heap outside cage = heap-spray, must not be silenced"
+        );
+    }
+
+    #[test]
+    fn heavy_standalone_rwx_is_text_anchored() {
+        let maps = "\
+0000400000-0001400000 r-xp 00000000 08:01 100 /home/u/Downloads/Telegram/Telegram
+74f637607000-74f637617000 rwxp 00000000 00:00 0 [anon:qt-jit]
+";
+        let f = scan_with(maps, Some("/home/u/Downloads/Telegram/Telegram"));
+        assert_eq!(
+            src_of(&f, "74f637607000-74f637617000"),
+            Some("maps-rwx-provisional"),
+            "file-text dominance should give visible provisional to standalone app"
+        );
+    }
+
+    #[test]
+    fn lone_dropper_rwx_still_alarms() {
+        let maps = "\
+0000400000-0000401000 r-xp 00000000 08:01 100 /home/u/.cache/x
+74f000000000-74f000010000 rwxp 00000000 00:00 0 [anon:.bss]
+";
+        let f = scan_with(maps, Some("/home/u/.cache/x"));
+        assert_eq!(
+            src_of(&f, "74f000000000-74f000010000"),
+            Some("maps-anon-rwx"),
+            "dropper without file-text anchor must stay an active finding"
         );
     }
 }

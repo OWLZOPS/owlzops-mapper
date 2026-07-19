@@ -154,6 +154,7 @@ pub(crate) fn split_host_port(host: &str) -> (String, u16) {
 /// within ~KEEPIDLE + KEEPINTVL*KEEPCNT seconds (≈60 s). TCP_USER_TIMEOUT
 /// ensures that unsent data does not hang in retransmissions beyond that window
 /// when the budget expires.
+#[cfg(target_os = "linux")]
 fn harden_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     const KEEPIDLE_S: libc::c_int = 30;
     const KEEPINTVL_S: libc::c_int = 10;
@@ -195,6 +196,13 @@ fn harden_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
         libc::TCP_USER_TIMEOUT,
         &user_timeout_ms,
     )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harden_tcp(_stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    // macOS: SO_KEEPALIVE exists, but TCP_KEEPIDLE/USER_TIMEOUT don't.
+    // Dead-transport detection is handled by application-level tokio deadlines.
+    Ok(())
 }
 
 /// Upload a binary file over an existing russh channel by piping `cat > path`

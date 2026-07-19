@@ -18,6 +18,9 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive: owlzops-mapper-linux-arm64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: owlzops-mapper-macos-arm64.tar.gz
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
@@ -28,11 +31,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
-      - name: Install musl tools
+      - name: Install musl tools (Linux only)
+        if: matrix.target != 'aarch64-apple-darwin'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features
 
       - name: Package
         run: |
