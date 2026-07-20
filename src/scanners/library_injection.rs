@@ -38,7 +38,7 @@ impl ScanConfig {
 }
 
 const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
-const MAX_FINDINGS: usize = 64;
+const MAX_FINDINGS: usize = 128;
 const INJECT_ENV_KEYS: [&str; 4] = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE"];
 const RT_LIBS: &[&str] = &[
     "libjvm.so",
