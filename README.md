@@ -79,16 +79,16 @@ mv owlzops-mapper owlzops-agent-linux
 
 ---
 
-## Highlights v0.5.21
+## Highlights v0.5.22
 
-**macOS Orchestrator, False‑Positive Elimination & Transport Resilience**
+**Sixth Gate: Ghost Inode Content Recovery via `map_files`**
 
-- **macOS orchestrator (Apple Silicon):** A native `aarch64-apple-darwin` build is now available. It runs any remote scan (single host, fleet, snapshot) from macOS without requiring local audit support. The install script automatically selects the correct build, and the CI pipeline compiles the orchestrator on every push.
-- **SEC‑026 false‑positive elimination:** Chrome V8 code‑cage (executable `[heap]` inside a JIT reservation) and heavy standalone applications (Telegram, AppImage) are now recognised by VMA‑topology and file‑text anchors, respectively. They are routed to **SEC‑029** (Provisional Trust, weight 0) instead of raising false alarms. All other detection remains intact — droppers and real heap‑spray still fire.
-- **Drain‑time coverage scoping:** Coverage warnings from concurrent local and remote scans are now tagged with the correct scope at drain time. A single sequential drain point after fleet tasks guarantees correct attribution even if `coverage::record()` is later added to the SSH engine.
-- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts.
-- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
-- **Minor hardening:** Unified network decoders; XLSX formula injection guard now handles leading whitespace; semaphore acquisition correctly bails out when the scheduler is closed; `exe_provenance` is computed once per PID, not per memory region.
+- **Ghost inode forensics (`--deep`)** – For deleted `.so` files still mapped in memory (`maps-so-unlink-on-load`), the scanner now reads the backing inode through `/proc/<pid>/map_files/<addr>` and performs streaming, constant‑memory entropy + ELF structure analysis.
+- **Three new `Origin` variants** – `GhostCleanImage` (valid ET_DYN/ET_EXEC, low entropy), `GhostSuspectImage` (high entropy or non‑ELF), `GhostInconclusive` (mid‑band / truncated). Clean images are routed to SEC‑027 (Advisory), suspect payloads to SEC‑028 (Critical), unverifiable ones remain in SEC‑033 (visible, weight 0).
+- **Invariant: `image_header` always false for ghost paths** – An ELF header in a recovered file is expected and benign. Setting `image_header = true` would cause Layer‑1 to escalate every clean recovered `.so` into a false SEC‑028. This invariant is enforced in the implementation and tested.
+- **Graceful degradation** – If `map_files` is unreadable (EACCES, EPERM, ENOENT), the finding stays in SEC‑033 with `deep_forensics = None`. Remote SSH hosts cannot open `map_files` locally, so they remain in SEC‑033 by design.
+- **Scoring & UI** – Layer 2b now branches on the new `Origin` values. New display strings in the terminal UI and JSON reports.
+- **Increased `MAX_FINDINGS` from 64 → 128** – Prevents ghost‑eligible PIDs from being squeezed out by JIT‑advisory findings on machines with many Java processes.
 
 ---
 
@@ -365,7 +365,7 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Backups | Detection of restic, borg, duplicati, rsync/backup in cron |
 | NTP | Time synchronization status and offset |
 | **Memory Forensics (‑‑deep)** | **Process memory reading, pointer resolution (O(log N)), Shannon entropy, binary headers, prologue detection, origin attribution (FFI, GObject, JVM, trampoline), content‑bound verdict caching** |
-| **Malware & Intrusion** | **Full /proc sweep for known malicious processes, fileless executables, memfd implants, bind‑mount masking, reverse shells, library injection, hidden PIDs (LKM rootkit), container runtime capability tampering** |
+| **Malware & Intrusion** | **Full /proc sweep for known malicious processes, fileless executables, memfd implants, bind‑mount masking, reverse shells, library injection, hidden PIDs (LKM rootkit), container runtime capability tampering, ghost inode recovery via map_files** |
 
 ---
 
@@ -448,7 +448,46 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
-### v0.5.18 (2026-07-18)
+### v0.5.21 (2026-07-18)
+
+**macOS Orchestrator, False‑Positive Elimination & Transport Resilience**
+
+- **macOS orchestrator (Apple Silicon):** A native `aarch64-apple-darwin` build is now available. It runs any remote scan (single host, fleet, snapshot) from macOS without requiring local audit support. The install script automatically selects the correct build, and the CI pipeline compiles the orchestrator on every push.
+- **SEC‑026 false‑positive elimination:** Chrome V8 code‑cage (executable `[heap]` inside a JIT reservation) and heavy standalone applications (Telegram, AppImage) are now recognised by VMA‑topology and file‑text anchors, respectively. They are routed to **SEC‑029** (Provisional Trust, weight 0) instead of raising false alarms. All other detection remains intact — droppers and real heap‑spray still fire.
+- **Drain‑time coverage scoping:** Coverage warnings from concurrent local and remote scans are now tagged with the correct scope at drain time. A single sequential drain point after fleet tasks guarantees correct attribution even if `coverage::record()` is later added to the SSH engine.
+- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts.
+- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
+- **Minor hardening:** Unified network decoders; XLSX formula injection guard now handles leading whitespace; semaphore acquisition correctly bails out when the scheduler is closed; `exe_provenance` is computed once per PID, not per memory region.
+
+### v0.5.20 (2026-07-18)
+
+**Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
+
+- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
+- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
+- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
+- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts. The fleet orchestrator adds a grace budget to accommodate teardown.
+- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
+- **Coverage scope isolation:** Coverage warnings from concurrent local and remote scans are now tagged with the originating scan, preventing misleading attribution in fleet reports.
+- **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
+- **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
+- **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
+
+### v0.5.19 (2026-07-17)
+
+**Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
+
+- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
+- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
+- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
+- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts. The fleet orchestrator adds a grace budget to accommodate teardown.
+- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
+- **Coverage scope isolation:** Coverage warnings from concurrent local and remote scans are now tagged with the originating scan, preventing misleading attribution in fleet reports.
+- **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
+- **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
+- **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
+
+### v0.5.18 (2026-07-16)
 
 **Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
 
@@ -469,34 +508,5 @@ See [LICENSE](LICENSE) for details.
 - **SSH transport hardening (R11):** Removed internal russh keepalive timers that were 20× stricter than the scan budget. Added kernel‑level dead‑peer detection (`SO_KEEPALIVE` + `TCP_USER_TIMEOUT`). Handshake and authentication now have a 30 s deadline, preventing tarpit hosts from occupying a slot forever. Teardown (binary cleanup + graceful disconnect) runs even on timeout.
 - **Safe self‑suppression (R12):** The scanner’s unlink‑on‑exec footprint no longer blinds the fileless malware detector. Self‑processes are partitioned into a new `SEC‑032` (weight 0, suppressed) while genuine fileless implants continue to raise `SEC‑017`/`SEC‑019` at full weight. Sudo NOPASSWD audit now checks path writability — rules on world‑writable paths like `/tmp` are flagged as equivalent to `NOPASSWD: ALL`.
 - **No new dependencies.** All changes are backward‑compatible (`#[serde(default)]`).
-
-### v0.5.16 (2026-07-16)
-
-**Multi‑Tier Trust Funnel & Verdict Cache**
-
-* **Content‑driven attribution (`--deep`)** – A layered analysis pipeline examines process memory for reserved buffers (empty JIT arenas), pointer signatures, managed‑JIT shapes, and libffi stubs, drastically reducing “n/a” (Inconclusive) findings.
-* **Self‑learning verdict cache** – Replaces the static `RUNTIME_EXE_ALLOWLIST`. Trust is bound to a file’s identity (inode + mtime + size), automatically revoked on modification. Populated by `--deep` scans and consulted during fast‑path audits.
-* **Container false‑positive fix** – Docker/Kubernetes workloads (node, next‑server) are no longer misclassified as `LoneDropped`. Mount namespace detection and secure `/proc/pid/exe` resolution provide accurate structural provenance, capping container‑root trust at `NestedUserInstall`.
-* **Provisional trust policy** – Findings that cannot be positively attributed but show clean behavior and strong provenance are routed to **SEC‑029** (Provisional Trust, weight 0) instead of SEC‑026 (Warning). A name‑based fallback is used only as a last resort when the binary path is unavailable.
-* **UI enhancements** – The “run with `--deep`” hint is suppressed when `--deep` is actually passed. Network listener tables are colour‑coded by risk and provenance. Origin labels for `ManagedJit` and `ReservedBuffer` are displayed in deep‑scan output.
-
-### v0.5.14 (2026-07-13)
-
-**Deep Memory Forensics & Intelligent Alerting**
-
-* **Deep Forensics (`--deep`)** – Reads process memory, resolves pointers, calculates entropy, and detects binary headers (MZ/ELF/PE). Unattributed executable payloads raise **SEC‑028** (Critical), while benign JIT shapes are verified and suppressed.
-* **Single Source of Truth for Injection Classification** – `InjectionClass` enum centralises policy; UI and scoring now use the same logic, eliminating false escalation mismatches.
-* **JetBrains False Positives Eliminated** – `/home` is no longer treated as a volatile path for `.so` libraries; 15 CRITICAL findings on JetBrains IDEs are removed.
-* **Smart UI Aggregation** – Memory anomaly tables show forensic anchors (VMA addresses, type breakdown, origin labels) and can be expanded with `-v`/`--verbose` for full per‑region detail.
-* **Trust‑but‑Verify** – Allowlisted binaries (Chrome, Zen, GNOME Shell, etc.) no longer receive blind trust. Their memory regions are labelled `maps‑rwx‑runtime‑allowlist` and enter the new **SEC‑029** provisional trust bucket until deep analysis confirms benign JIT shape or detects anomalies.
-* **Security** – `process_vm_readv` is used instead of `ptrace`, avoiding anti‑debugging conflicts; memory reads are capped and budgeted.
-
-### v0.5.13 (2026-07-12)
-
-* **Unified russh remote path** – legacy `ssh`/`scp` fallback removed; all remote scans now use the pure‑Rust `russh` engine.
-* **Optional sudo** – `sudo_pass` is now `Option`, allowing direct execution without `sudo` when the SSH user already has root privileges.
-* **False zombie fix** – mapper‑spawned transient zombies are excluded from the zombie count.
-* **Clean progress UI** – `MultiProgress` coordinates upload bar and scan spinner; all bars are cleared with `finish_and_clear()` for a clean terminal.
-* **Spinner message respects `--deep` flag** – “Deep forensic scan in progress” vs. “Auditing systems…”.
 
 </details>
