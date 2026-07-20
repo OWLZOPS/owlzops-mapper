@@ -27,7 +27,7 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Disable Clang to force GCC for aws-lc-sys
         if: matrix.os == 'ubuntu-22.04'
@@ -60,7 +60,7 @@ jobs:
     name: Build macOS orchestrator
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # action HEAD as of 2026-06-28
@@ -94,7 +94,7 @@ jobs:
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install system dependencies (build-only)
         run: |
@@ -137,7 +137,7 @@ jobs:
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Run tests in openSUSE container
         run: |
