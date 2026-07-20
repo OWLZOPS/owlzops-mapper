@@ -571,7 +571,8 @@ pub async fn run_remote_scan_russh(
                 } else if !stdout.is_empty() && stdout.starts_with(b"{") {
                     Ok(stdout)
                 } else if code != 0 {
-                    let trimmed: String = se.trim().chars().take(300).collect();
+                    let raw_trimmed: String = se.trim().chars().take(300).collect();
+                    let trimmed = crate::utils::sanitize_for_log(&raw_trimmed);
                     Err(RemoteError::NonZeroExit {
                         host: hostname.clone(),
                         code,

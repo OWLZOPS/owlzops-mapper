@@ -1791,6 +1791,7 @@ fn render_ghost_pids(report: &AgentReport) {
 }
 
 fn render_footer() {
+    println!();
     println!(
         "\x1b[3mRun `owlzops-mapper --format json` to export full payload for Blueprint Engine.\x1b[0m\n"
     );

@@ -34,7 +34,14 @@ pub fn resolve_tool(tool: &str) -> Option<String> {
     }
 
     use std::os::unix::fs::PermissionsExt;
-    for dir in ["/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+    for dir in [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ] {
         let candidate = format!("{dir}/{tool}");
         if let Ok(md) = std::fs::metadata(&candidate)
             && md.is_file()
@@ -92,6 +99,26 @@ pub fn is_ephemeral_exec_path(path: &str) -> bool {
         || path.starts_with("/dev/shm/")
         || path.starts_with("/home/")
         || path.starts_with("/memfd:")
+}
+
+// ---------------------------------------------------------------------------
+// Log sanitization (R16 hardening)
+// ---------------------------------------------------------------------------
+
+/// Neutralise C0/C1 control bytes (incl. \n and ESC) before they reach a
+/// terminal-backed tracing sink. \t is kept as a single space for readability.
+pub fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\t' {
+                ' '
+            } else if c.is_control() {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

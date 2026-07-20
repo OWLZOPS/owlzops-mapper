@@ -309,19 +309,19 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 return None;
                             };
 
-                            if pass.is_some() {
-                                if let Err(e) = runner::validate_host(&host) {
-                                    warn!("{e}");
-                                    return None;
-                                }
-                                if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
-                                    warn!("{e}");
-                                    return None;
-                                }
-                                if let Err(e) = runner::validate_remote_path(&a.remote_path) {
-                                    warn!("{e}");
-                                    return None;
-                                }
+                            // R16 hardening: validation must not depend on the presence
+                            // of a sudo password.
+                            if let Err(e) = runner::validate_host(&host) {
+                                warn!("{e}");
+                                return None;
+                            }
+                            if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
+                                warn!("{e}");
+                                return None;
+                            }
+                            if let Err(e) = runner::validate_remote_path(&a.remote_path) {
+                                warn!("{e}");
+                                return None;
                             }
 
                             // R13-02: grace budget for teardown after timeout
@@ -350,11 +350,13 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         match serde_json::from_slice::<AgentReport>(&stdout) {
                                             Ok(report) => Some(report),
                                             Err(e) => {
-                                                let preview: String =
+                                                let raw_preview: String =
                                                     String::from_utf8_lossy(&stdout)
                                                         .chars()
                                                         .take(200)
                                                         .collect();
+                                                let preview =
+                                                    crate::utils::sanitize_for_log(&raw_preview);
                                                 warn!(
                                                     host = %host,
                                                     error = %e,
