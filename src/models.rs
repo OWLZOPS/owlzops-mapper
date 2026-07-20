@@ -696,6 +696,12 @@ pub enum Origin {
     Inconclusive,
     ManagedJit,     // generic managed-JIT shape (V8, JSC, Zend, PCRE2)
     ReservedBuffer, // empty/sparse reserved exec buffer — no payload
+    /// Sixth Gate: map_files recovered a well-formed, low-entropy ET_DYN/ET_EXEC.
+    GhostCleanImage,
+    /// Sixth Gate: recovered payload failed ELF sanity or breached the entropy ceiling.
+    GhostSuspectImage,
+    /// Sixth Gate: read succeeded but content is mid-band / truncated — no assertion.
+    GhostInconclusive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

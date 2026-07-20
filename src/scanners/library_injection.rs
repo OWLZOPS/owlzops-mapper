@@ -461,6 +461,11 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 if cfg.deep_for(pid) && findings.len() > start {
                     let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
+
+                    // Sixth Gate — ghost inode content recovery (local only).
+                    let start_epoch = deep::proc_start_epoch(proc_root, pid);
+                    deep::enrich_ghosts(&mut findings[start..], pid, proc_root, start_epoch);
+
                     for f in &findings[start..] {
                         if let Some(v) = f.deep_forensics.as_ref().and_then(verdict_of_region) {
                             cache.record(&f.object_path, v);

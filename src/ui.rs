@@ -1376,6 +1376,9 @@ fn origin_label(o: &Origin) -> &'static str {
         Origin::Inconclusive => "n/a",
         Origin::ManagedJit => "Managed JIT",
         Origin::ReservedBuffer => "Empty JIT",
+        Origin::GhostCleanImage => "Clean Ghost ELF",
+        Origin::GhostSuspectImage => "Suspect Ghost Payload",
+        Origin::GhostInconclusive => "Inconclusive Ghost",
     }
 }
 
