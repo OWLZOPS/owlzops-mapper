@@ -797,14 +797,26 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // Layer 2b — unlink-on-load ghost inode (deleted jar-extract profile).
-        // NEVER reaches Advisory without content verification: only a benign
-        // deep shape of the still-mapped text promotes it; otherwise it stays
-        // in its own visible zero-weight lane.
+        // Layer 2b — unlink-on-load ghost inode. Sixth Gate now supplies a content verdict.
         if f.source == "maps-so-unlink-on-load" {
             return match deep {
-                Some(d) if is_benign_shape(d) => MemBucket::Advisory,
-                _ => MemBucket::UnlinkGhost,
+                Some(d) => match d.origin {
+                    // Recovered a well-formed, low-entropy image → real extract.
+                    Origin::GhostCleanImage if d.confidence >= DEEP_DEMOTE_MIN => {
+                        MemBucket::Advisory
+                    }
+                    // Recovered payload failed ELF sanity / entropy ceiling → live IoC.
+                    Origin::GhostSuspectImage if d.confidence >= DEEP_ESCALATE_MIN => {
+                        MemBucket::DeepCritical
+                    }
+                    // Read succeeded but inconclusive (mid-band / truncated): stay visible.
+                    Origin::GhostInconclusive => MemBucket::UnlinkGhost,
+                    // Legacy in-memory benign text shape, if some other path populated it.
+                    _ if is_benign_shape(d) => MemBucket::Advisory,
+                    _ => MemBucket::UnlinkGhost,
+                },
+                // map_files unreadable (EACCES/ENOENT): unchanged — stay SEC-033.
+                None => MemBucket::UnlinkGhost,
             };
         }
 
@@ -1014,7 +1026,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             suppressed: Some(
                 "Structural profile matches Netty/JNA-style unlink-after-dlopen extraction \
                  in a trusted runtime. Trust is PROVISIONAL: the on-disk file no longer \
-                 exists and the ghost inode content has not been verified. A clean-ELF \
+                 exists and the ghost inode verification attempted; unreadable or inconclusive. A clean-ELF \
                  implant loaded the same way is indistinguishable at this tier."
                     .to_string(),
             ),

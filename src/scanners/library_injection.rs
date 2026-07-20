@@ -38,7 +38,7 @@ impl ScanConfig {
 }
 
 const CAP_PROC_MAPS: usize = 4 * 1024 * 1024;
-const MAX_FINDINGS: usize = 64;
+const MAX_FINDINGS: usize = 128;
 const INJECT_ENV_KEYS: [&str; 4] = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE"];
 const RT_LIBS: &[&str] = &[
     "libjvm.so",
@@ -461,6 +461,11 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 if cfg.deep_for(pid) && findings.len() > start {
                     let ctx = deep::ProcMemContext::build(&content);
                     deep::enrich(&mut findings[start..], pid, &ctx);
+
+                    // Sixth Gate — ghost inode content recovery (local only).
+                    let start_epoch = deep::proc_start_epoch(proc_root, pid);
+                    deep::enrich_ghosts(&mut findings[start..], pid, proc_root, start_epoch);
+
                     for f in &findings[start..] {
                         if let Some(v) = f.deep_forensics.as_ref().and_then(verdict_of_region) {
                             cache.record(&f.object_path, v);
