@@ -61,15 +61,15 @@ where
     {
         for e in entries.flatten() {
             let p = e.path();
-            if p.is_file()
-                && p.extension()
-                    .map(|x| x == "sudoers" || x == "conf")
-                    .unwrap_or(false)
-                && !p
-                    .file_name()
-                    .map(|n| n == ".gitkeep" || n == "README")
-                    .unwrap_or(false)
-            {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // Ignore files containing '.' or ending with '~' (backups, editors),
+            // unless the extension is explicitly ".conf" (some distros use this).
+            let has_disallowed_char = name.contains('.') || name.ends_with('~');
+            let is_conf = p.extension().map(|x| x == "conf").unwrap_or(false);
+            if has_disallowed_char && !is_conf {
+                continue;
+            }
+            if p.is_file() && !name.starts_with('.') && name != "README" {
                 files.push(p.to_string_lossy().to_string());
             }
         }
@@ -85,9 +85,10 @@ where
 }
 
 /// Check if the given entry contains a NOPASSWD tag.
-/// Designed to be fast and allocation‑free.
+/// Case‑insensitive, matches any occurrence of the substring "nopasswd"
+/// (with or without a following colon/space), mirroring the original behaviour.
 pub fn entry_has_nopasswd(entry: &str) -> bool {
-    contains_icase(entry, "nopasswd:")
+    contains_icase(entry, "nopasswd")
 }
 
 #[cfg(test)]
@@ -117,5 +118,13 @@ mod tests {
         assert!(contains_icase("Nopasswd: all", "nopasswd:"));
         assert!(!contains_icase("PASSWD: ALL", "nopasswd:"));
         assert!(!contains_icase("nopassw", "nopasswd:"));
+    }
+
+    #[test]
+    fn entry_has_nopasswd_detects_variants() {
+        assert!(entry_has_nopasswd("user ALL=(ALL) NOPASSWD: /bin/foo"));
+        assert!(entry_has_nopasswd("user ALL=(ALL) NOPASSWD : /bin/foo"));
+        assert!(entry_has_nopasswd("user ALL=(ALL) NOPASSWD  : /bin/foo"));
+        assert!(!entry_has_nopasswd("user ALL=(ALL) PASSWD: ALL"));
     }
 }
