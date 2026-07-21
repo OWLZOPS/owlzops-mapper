@@ -1735,7 +1735,7 @@ static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
     ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
 ];
 
-fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
+pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
     let basename = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())

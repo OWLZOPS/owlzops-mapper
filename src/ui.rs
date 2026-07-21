@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
+use crate::scoring::is_known_cap_binary;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -1706,10 +1707,30 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         );
     }
 
-    // SEC‑034 – Files with capabilities (suppressed, informational)
-    if !report.security.file_capabilities.is_empty() {
-        let count = report.security.file_capabilities.len();
-        println!("🛡  Files with capabilities (setcap) (SEC‑034): {count} suppressed finding(s).\n",);
+    // SEC‑034 / SEC‑036 – File capabilities with risk-tiering
+    let file_caps = &report.security.file_capabilities;
+    if !file_caps.is_empty() {
+        let suppressed: Vec<_> = file_caps
+            .iter()
+            .filter(|fc| is_known_cap_binary(&fc.path, &fc.capabilities))
+            .collect();
+        let active: Vec<_> = file_caps
+            .iter()
+            .filter(|fc| !is_known_cap_binary(&fc.path, &fc.capabilities))
+            .collect();
+
+        if !suppressed.is_empty() {
+            println!(
+                "🛡  Files with expected capabilities (SEC‑034): {} suppressed finding(s).\n",
+                suppressed.len()
+            );
+        }
+        if !active.is_empty() {
+            println!(
+                "🛡  Unexpected file capabilities (SEC‑036): {} active finding(s) — review required.\n",
+                active.len()
+            );
+        }
     }
 
     // SEC‑035 – eBPF inventory (suppressed, informational)
