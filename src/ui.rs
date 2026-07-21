@@ -1709,7 +1709,19 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑034 – Files with capabilities (suppressed, informational)
     if !report.security.file_capabilities.is_empty() {
         let count = report.security.file_capabilities.len();
-        println!("🛡  Files with capabilities (setcap) (SEC‑034): {count} suppressed finding(s).",);
+        println!("🛡  Files with capabilities (setcap) (SEC‑034): {count} suppressed finding(s).\n",);
+    }
+
+    // SEC‑035 – eBPF inventory (suppressed, informational)
+    let ebpf = &report.security.ebpf_inventory;
+    let ebpf_total = ebpf.programs.len() + ebpf.maps.len() + ebpf.pins.len();
+    if ebpf_total > 0 {
+        println!(
+            "🛡  eBPF inventory (SEC‑035): {} program(s), {} map(s), {} pin(s).",
+            ebpf.programs.len(),
+            ebpf.maps.len(),
+            ebpf.pins.len(),
+        );
     }
 }
 

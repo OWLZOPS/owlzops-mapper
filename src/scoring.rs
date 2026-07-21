@@ -1060,6 +1060,30 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // SEC‑035 – eBPF inventory (informational)
+    let ebpf = &report.security.ebpf_inventory;
+    if !ebpf.programs.is_empty() || !ebpf.maps.is_empty() || !ebpf.pins.is_empty() {
+        let total = ebpf.programs.len() + ebpf.maps.len() + ebpf.pins.len();
+        findings.push(Finding {
+            id: "SEC-035",
+            title: "eBPF programs, maps, and pins (informational)".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} BPF programs, {} maps, {} pinned objects (total: {})",
+                ebpf.programs.len(),
+                ebpf.maps.len(),
+                ebpf.pins.len(),
+                total
+            ),
+            suppressed: Some(
+                "Routine systemd/container BPF usage is expected. Review unknown programs manually."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
     // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
