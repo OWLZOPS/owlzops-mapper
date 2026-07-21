@@ -29,3 +29,4 @@ pub mod security;
 pub mod self_integrity;
 #[cfg(feature = "local-scan")]
 pub mod storage;
+mod sudoers;

@@ -11,6 +11,9 @@ use std::path::PathBuf;
 /// source of truth and cannot drift.
 pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
 
+// ── Unified sudoers parser (R16 hardening) ────────────────────────────────
+use crate::scanners::sudoers;
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Extract a directive value from `sshd -T` output (format: "directive value").
@@ -149,64 +152,29 @@ fn is_local_ip(ip: &str) -> bool {
 
 fn gather_sudo_nopasswd() -> Vec<String> {
     let mut entries = Vec::new();
-    let mut files = vec!["/etc/sudoers".to_string()];
-    if let Ok(dir) = fs::read_dir("/etc/sudoers.d") {
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Strictly follow sudoers(5): ignore files containing '.' or ending with '~'
-            if !name.contains('.') && !name.ends_with('~') {
-                files.push(path.display().to_string());
-            }
-        }
-    }
 
-    for file in files {
-        match safe_io::read_file_capped(&file, 4 * 1024 * 1024) {
-            Ok((contents, truncated)) => {
-                if truncated {
-                    coverage::record(format!("sudoers file {} truncated", file));
-                }
-                for line in contents.lines() {
-                    let l = line.trim();
-                    if l.is_empty() || l.starts_with('#') {
-                        continue;
-                    }
-                    if l.to_lowercase().contains("nopasswd") {
-                        match self_sudo_target(l) {
-                            // Scanner rule on a root-owned, tamper-proof path:
-                            // excluded — but recorded, never silently dropped.
-                            Some(t) if sudo_target_is_tamper_proof(t) => {
-                                coverage::record(format!(
-                                    "{file}: NOPASSWD entry for the scanner's own install path \
-                                     ({t}) excluded from the audit (every path component is \
-                                     root-owned and not group/world-writable)"
-                                ));
-                            }
-                            // Scanner rule on a path an unprivileged user can occupy.
-                            // This is not "self" — it is an unrestricted root grant.
-                            Some(t) => entries.push(format!(
-                                "{file}: {l}  {SUDO_PRIVESC_MARKER} {t} is replaceable by an \
-                                 unprivileged user (world-writable path or parent); this rule \
-                                 grants an unrestricted root shell]"
-                            )),
-                            None => entries.push(format!("{}: {}", file, l)),
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                // Log EACCES etc. so they appear in coverage_warnings
+    sudoers::each_sudoers_entry(|file, entry| {
+        if !sudoers::entry_has_nopasswd(entry) {
+            return;
+        }
+        // Check for self-target (tamper-proof path of the scanner itself)
+        match self_sudo_target(entry) {
+            Some(t) if sudo_target_is_tamper_proof(t) => {
                 coverage::record(format!(
-                    "sudoers file {} unreadable ({}) — NOPASSWD audit incomplete",
-                    file, e
+                    "{file}: NOPASSWD entry for the scanner's own install path \
+                     ({t}) excluded from the audit (every path component is \
+                     root-owned and not group/world-writable)"
                 ));
             }
+            Some(t) => entries.push(format!(
+                "{file}: {entry}  {SUDO_PRIVESC_MARKER} {t} is replaceable by an \
+                 unprivileged user (world-writable path or parent); this rule \
+                 grants an unrestricted root shell]"
+            )),
+            None => entries.push(format!("{}: {}", file, entry)),
         }
-    }
+    });
+
     entries
 }
 

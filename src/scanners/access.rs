@@ -1,6 +1,9 @@
 use crate::models::{AccessAuditResult, SshKeyAudit, SudoersEntry};
 use russh::keys::ssh_key::{Algorithm, EcdsaCurve, PublicKey};
 
+// ── Unified sudoers parser (R16 hardening) ────────────────────────────────
+use crate::scanners::sudoers;
+
 const KEY_TYPES: &[&str] = &[
     "ssh-ed25519",
     "ssh-rsa",
@@ -96,102 +99,19 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
     })
 }
 
-fn spec_nopasswd_all(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
+/// Check whether an entry is a NOPASSWD: ALL rule.
+/// Uses the unified parser for consistency with security.rs.
+fn is_nopasswd_all(entry: &str) -> bool {
+    if !sudoers::entry_has_nopasswd(entry) {
+        return false;
     }
-    let first = line.split_whitespace().next()?;
-    if first == "Defaults" || first.ends_with("_Alias") {
-        return None;
-    }
-
-    let eq = line.find('=')?;
-    let principal = first.to_string();
-    let mut rhs = line[eq + 1..].trim_start();
-    if let Some(open) = rhs.strip_prefix('(') {
-        rhs = open.find(')').map(|c| &open[c + 1..]).unwrap_or(open);
-    }
-
-    let mut nopasswd = false;
-    for raw in rhs
-        .split([',', ' ', '\t'])
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        let mut tok = raw;
-        if let Some(rest) = tok.strip_prefix("NOPASSWD:") {
-            nopasswd = true;
-            tok = rest.trim();
-        } else if let Some(rest) = tok.strip_prefix("PASSWD:") {
-            nopasswd = false;
-            tok = rest.trim();
-        } else if tok == "NOPASSWD" {
-            nopasswd = true;
-            continue;
-        } else if tok == "PASSWD" {
-            nopasswd = false;
-            continue;
-        } else if tok.ends_with(':') {
-            continue;
-        }
-        if tok == "ALL" && nopasswd {
-            return Some(principal);
-        }
-    }
-    None
-}
-
-fn parse_sudoers_file(path: &std::path::Path, out: &mut Vec<SudoersEntry>) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let src = path.display().to_string();
-    let mut logical = String::new();
-
-    let flush = |full: &str, out: &mut Vec<SudoersEntry>| {
-        if let Some(principal) = spec_nopasswd_all(full) {
-            out.push(SudoersEntry {
-                principal,
-                source_file: src.clone(),
-                scope: "ALL".into(),
-            });
-        }
-    };
-
-    for raw in content.lines() {
-        let line = raw.trim_end();
-        if let Some(cont) = line.strip_suffix('\\') {
-            logical.push_str(cont);
-            logical.push(' ');
-            continue;
-        }
-        logical.push_str(line);
-        let full = std::mem::take(&mut logical);
-        flush(&full, out);
-    }
-    if !logical.is_empty() {
-        flush(&logical, out);
-    }
-}
-
-fn parse_sudoers_dir(dir: &str, out: &mut Vec<SudoersEntry>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut files: Vec<_> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            if name.contains('.') || name.ends_with('~') {
-                return None;
-            }
-            Some(e.path())
-        })
-        .collect();
-    files.sort();
-    for path in files {
-        parse_sudoers_file(&path, out);
+    // Look for an "ALL" token after a colon (the command list)
+    if let Some(tail) = entry.rsplit(':').next() {
+        tail.split([',', ' ', '\t'])
+            .map(str::trim)
+            .any(|t| t == "ALL")
+    } else {
+        false
     }
 }
 
@@ -240,10 +160,18 @@ pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
             .push("/etc/passwd unreadable — account enumeration incomplete".into());
     }
 
-    parse_sudoers_file(
-        std::path::Path::new("/etc/sudoers"),
-        &mut result.sudoers_nopasswd_all,
-    );
-    parse_sudoers_dir("/etc/sudoers.d", &mut result.sudoers_nopasswd_all);
+    // Use the unified sudoers parser for NOPASSWD: ALL detection.
+    sudoers::each_sudoers_entry(|file, entry| {
+        if is_nopasswd_all(entry) {
+            // Extract the principal (first word) from the logical entry.
+            let principal = entry.split_whitespace().next().unwrap_or("?").to_string();
+            result.sudoers_nopasswd_all.push(SudoersEntry {
+                principal,
+                source_file: file.to_string(),
+                scope: "ALL".into(),
+            });
+        }
+    });
+
     result
 }
