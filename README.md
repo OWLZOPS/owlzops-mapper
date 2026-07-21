@@ -375,13 +375,13 @@ Owlzops provides high-tier engineering and security consulting to remediate the 
 
 | Finding Category | Business Impact | Our Service |
 | --- | --- | --- |
-| **Active compromise detected (SEC‑015…024, SEC‑028)** | Evidence of a rootkit, backdoor, or fileless malware. Immediate incident response is required to isolate and expel the threat. | **Compromise Assessment:** Deep forensic analysis to answer "Who is in our servers right now?" and secure the perimeter. |
-| **Risk Score ≥ 70 / Firewall disabled / Socket Mounts** | The infrastructure has systemic architectural flaws exposing you to automated exploitation or container escapes. | **Infrastructure Hardening:** We rebuild your VPCs, implement strict firewall policies, and deploy secure rootless container environments. |
-| **Pending updates / CIS Benchmark gaps** | You are accumulating technical debt and will fail compliance audits. | **Compliance Readiness:** Engineering consultation to align your infrastructure with strict SOC 2 and ISO 27001 requirements before the official auditor arrives. |
+| **Active compromise detected (SEC‑015…024, SEC‑028)** | Evidence of a rootkit, backdoor, or fileless malware. Immediate incident response is required to isolate and expel the threat. | **[Infrastructure Security Audit](https://owlzops.com/#assessment:~:text=here%20%C2%B7%20one%2Doff-,Infrastructure%20Security%20Audit,-%22What%20is%20exposed):** Deep forensic analysis to answer "Who is in our servers right now?" and secure the perimeter. |
+| **Risk Score ≥ 70 / Firewall disabled / Socket Mounts** | The infrastructure has systemic architectural flaws exposing you to automated exploitation or container escapes. | **[Infrastructure Hardening](https://owlzops.com/#hardening:~:text=hands%2Don-,Infrastructure%20Hardening,-%22We%20close%20the%20gaps):** We rebuild your VPCs, implement strict firewall policies, and deploy secure rootless container environments. |
+| **Pending updates / CIS Benchmark gaps** | You are accumulating technical debt and will fail compliance audits. | **[Compliance Readiness](https://owlzops.com/#assessment:~:text=SOC%202%20or%20ISO%2027001%20auditor):** Engineering consultation to align your infrastructure with strict SOC 2 and ISO 27001 requirements before the official auditor arrives. |
 
 If `owlzops-mapper` flagged critical issues on your production fleet, we can review your JSON report and provide a concrete remediation plan.
 
-→ [Book a free Compromise Assessment consultation](https://owlzops.com/contact?utm_source=github&utm_medium=readme&utm_campaign=mapper_table)
+→ [Book a free Infrastructure Security Audit consultation](https://owlzops.com/contact?service=assessment&utm_source=github&utm_medium=readme&utm_campaign=mapper_table)
 
 We review your scan before the call. No pitch — just engineering facts.
 
