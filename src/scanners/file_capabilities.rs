@@ -19,10 +19,8 @@ const SCAN_DIRS: &[&str] = &[
 const MAX_FILES_PER_DIR: usize = 512;
 
 /// Convert a capability bitmask (u64) into a list of human‑readable names.
-/// Only the lower 40 bits are defined (CAP_LAST_CAP = 40 on Linux 6.x).
+/// Only the lower 41 bits are defined (CAP_LAST_CAP = 40 on Linux 6.x).
 fn cap_mask_to_names(mask: u64) -> Vec<String> {
-    // Direct mapping from bit index to CAP_* name
-    // (generated from /usr/include/linux/capability.h, trimmed to 40 entries)
     const CAP_NAMES: &[&str] = &[
         "CAP_CHOWN",              // 0
         "CAP_DAC_OVERRIDE",       // 1
@@ -76,33 +74,23 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
     out
 }
 
-/// Parse a raw xattr value into (effective_mask, inheritable_mask) for root namespace.
-fn parse_vfs_cap_data(bytes: &[u8]) -> Option<(u64, u64)> {
-    if bytes.len() < 12 {
+/// Parse a raw `security.capability` xattr value into (permitted, inheritable, effective_flag).
+/// Handles both v2 (20 bytes) and v3 (24 bytes) structures, reading full 64-bit capability masks
+/// from the two 32-bit halves (data[0] and data[1]) for each set.
+fn parse_vfs_cap_data(bytes: &[u8]) -> Option<(u64, u64, bool)> {
+    if bytes.len() < 20 {
         return None;
     }
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let version = (magic >> 24) & 0xFF;
-    let effective: u32;
-    let inheritable: u32;
-
-    if version == 2 {
-        if bytes.len() < 20 {
-            return None;
-        }
-        effective = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        inheritable = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    } else if version == 3 {
-        if bytes.len() < 24 {
-            return None;
-        }
-        effective = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        inheritable = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    } else {
-        return None;
+    match (magic >> 24) & 0xFF {
+        2 | 3 => {}
+        _ => return None,
     }
-
-    Some((effective as u64, inheritable as u64))
+    let le = |o: usize| -> u64 { u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as u64 };
+    let permitted = le(4) | (le(12) << 32); // data[0].permitted | data[1].permitted << 32
+    let inheritable = le(8) | (le(16) << 32); // data[0].inheritable | data[1].inheritable << 32
+    let effective_flag = magic & 0x1 != 0; // VFS_CAP_FLAGS_EFFECTIVE
+    Some((permitted, inheritable, effective_flag))
 }
 
 // ── Linux-specific implementation ──────────────────────────────────────────
@@ -151,8 +139,8 @@ mod linux_impl {
         }
         buf.truncate(res as usize);
 
-        let (eff, _) = parse_vfs_cap_data(&buf).unwrap_or_default();
-        Ok(cap_mask_to_names(eff))
+        let (permitted, _inheritable, _effective) = parse_vfs_cap_data(&buf).unwrap_or_default();
+        Ok(cap_mask_to_names(permitted))
     }
 
     /// Scan the provided directories for files with capabilities, returning findings.
@@ -215,16 +203,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_v2_cap_data_basic() {
+    fn parse_v2_cap_data_low_bit() {
         let mut data = vec![0u8; 20];
-        data[0..4].copy_from_slice(&0x02000000u32.to_le_bytes());
-        let eff: u32 = 1 << 10;
-        data[4..8].copy_from_slice(&eff.to_le_bytes());
-        data[8..12].copy_from_slice(&[0u8; 4]);
-        let (eff_mask, _) = parse_vfs_cap_data(&data).unwrap();
-        assert_eq!(eff_mask, 1 << 10);
-        let names = cap_mask_to_names(eff_mask);
+        data[0..4].copy_from_slice(&0x02000000u32.to_le_bytes()); // v2, effective flag not set
+        // Set CAP_NET_BIND_SERVICE (bit 10) in data[0].permitted
+        let p: u32 = 1 << 10;
+        data[4..8].copy_from_slice(&p.to_le_bytes());
+        // inheritable all zeros
+        let (permitted, inheritable, effective) = parse_vfs_cap_data(&data).unwrap();
+        assert_eq!(permitted, 1 << 10);
+        assert_eq!(inheritable, 0);
+        assert!(!effective);
+        let names = cap_mask_to_names(permitted);
         assert_eq!(names, vec!["CAP_NET_BIND_SERVICE"]);
+    }
+
+    #[test]
+    fn parse_v2_cap_data_high_bit() {
+        let mut data = vec![0u8; 20];
+        // v2 with effective flag
+        data[0..4].copy_from_slice(&0x02000001u32.to_le_bytes());
+        // Set CAP_BPF (bit 39) in data[1].permitted (offset 12)
+        // data[1].permitted is at bytes 12..16
+        let high: u32 = 1 << (39 - 32); // bit 7 in the high word
+        data[12..16].copy_from_slice(&high.to_le_bytes());
+        let (permitted, _inheritable, effective) = parse_vfs_cap_data(&data).unwrap();
+        assert_eq!(permitted, 1 << 39);
+        assert!(effective);
+        let names = cap_mask_to_names(permitted);
+        assert_eq!(names, vec!["CAP_BPF"]);
     }
 
     #[test]
