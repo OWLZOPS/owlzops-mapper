@@ -308,6 +308,9 @@ pub struct SecurityInfo {
     /// Files with persistent capabilities (setcap).
     #[serde(default)]
     pub file_capabilities: Vec<FileCapFinding>,
+    /// eBPF inventory – loaded programs, maps, and pinned objects.
+    #[serde(default)]
+    pub ebpf_inventory: EbpfInventory,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -670,6 +673,47 @@ pub struct FileCapFinding {
     /// Why this finding was flagged, for the evidence string
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+// ── eBPF Inventory (R17) ─────────────────────────────────────────────────
+
+/// A loaded BPF program attached to a process.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BpfProgInfo {
+    pub prog_id: u32,
+    pub prog_type: String,
+    pub prog_name: Option<String>,
+    pub prog_tag: String,
+    pub pid: u32,
+    pub comm: String,
+}
+
+/// A BPF map used by a process.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BpfMapInfo {
+    pub map_id: u32,
+    pub map_type: String,
+    pub pid: u32,
+    pub comm: String,
+}
+
+/// A pinned BPF object visible in /sys/fs/bpf.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BpfPinInfo {
+    pub path: String,     // path in /sys/fs/bpf
+    pub obj_type: String, // "prog", "map", "link"
+    pub obj_id: u32,
+}
+
+/// Full eBPF inventory collected from /proc and /sys/fs/bpf.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EbpfInventory {
+    #[serde(default)]
+    pub programs: Vec<BpfProgInfo>,
+    #[serde(default)]
+    pub maps: Vec<BpfMapInfo>,
+    #[serde(default)]
+    pub pins: Vec<BpfPinInfo>,
 }
 
 // ── Deep Forensics (Pointer Resolution & Memory Analysis) ──
