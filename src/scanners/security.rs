@@ -524,6 +524,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         library_injections, // SEC-023
         ghost_pids,         // SEC-024 true ghost PID / LKM rootkit
         file_capabilities,  // R16 file capability inventory
+        ebpf_inventory: crate::scanners::ebpf::gather_ebpf_inventory(),
     }
 }
 
