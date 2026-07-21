@@ -1709,7 +1709,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑034 – Files with capabilities (suppressed, informational)
     if !report.security.file_capabilities.is_empty() {
         let count = report.security.file_capabilities.len();
-        println!("\n🛡  Files with capabilities (setcap) (SEC‑034): {count} suppressed finding(s).",);
+        println!("🛡  Files with capabilities (setcap) (SEC‑034): {count} suppressed finding(s).",);
     }
 }
 

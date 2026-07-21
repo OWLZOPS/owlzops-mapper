@@ -4,11 +4,6 @@
 //! using only `libc::getxattr` and binary parsing – no external tools.
 
 use crate::models::FileCapFinding;
-use std::ffi::CString;
-use std::fs;
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 
 // Directories to scan for capabilities (common binary paths)
 const SCAN_DIRS: &[&str] = &[
@@ -110,90 +105,109 @@ fn parse_vfs_cap_data(bytes: &[u8]) -> Option<(u64, u64)> {
     Some((effective as u64, inheritable as u64))
 }
 
-/// Read the `security.capability` xattr of a file and return its effective
-/// and inheritable capability sets (human-readable names).
-fn get_file_caps(path: &Path) -> io::Result<Vec<String>> {
-    let cpath = CString::new(path.as_os_str().as_bytes())?;
-    // First, query the size of the attribute
-    let size = unsafe {
-        libc::getxattr(
-            cpath.as_ptr(),
-            c"security.capability".as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if size <= 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENODATA) || err.kind() == io::ErrorKind::NotFound {
-            return Ok(Vec::new());
+// ── Linux-specific implementation ──────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::*;
+    use std::ffi::CString;
+    use std::fs;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// Read the `security.capability` xattr of a file and return its effective
+    /// and inheritable capability sets (human-readable names).
+    fn get_file_caps(path: &Path) -> io::Result<Vec<String>> {
+        let cpath = CString::new(path.as_os_str().as_bytes())?;
+        // First, query the size of the attribute
+        let size = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                c"security.capability".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size <= 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENODATA) || err.kind() == io::ErrorKind::NotFound {
+                return Ok(Vec::new());
+            }
+            return Err(err);
         }
-        return Err(err);
+
+        let mut buf = vec![0u8; size as usize];
+        let res = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                c"security.capability".as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                size as libc::size_t,
+            )
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(res as usize);
+
+        let (eff, _) = parse_vfs_cap_data(&buf).unwrap_or_default();
+        Ok(cap_mask_to_names(eff))
     }
 
-    let mut buf = vec![0u8; size as usize];
-    let res = unsafe {
-        libc::getxattr(
-            cpath.as_ptr(),
-            c"security.capability".as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            size as libc::size_t,
-        )
-    };
-    if res < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    buf.truncate(res as usize);
+    /// Scan the provided directories for files with capabilities, returning findings.
+    pub fn scan_directories(dirs: &[&str]) -> Vec<FileCapFinding> {
+        let mut findings = Vec::new();
 
-    let (eff, _) = parse_vfs_cap_data(&buf).unwrap_or_default();
-    Ok(cap_mask_to_names(eff))
-}
-
-/// Scan the provided directories for files with capabilities, returning findings.
-fn scan_directories(dirs: &[&str]) -> Vec<FileCapFinding> {
-    let mut findings = Vec::new();
-
-    for dir in dirs {
-        let path = Path::new(dir);
-        if !path.is_dir() {
-            continue;
-        }
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten().take(MAX_FILES_PER_DIR) {
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-                match get_file_caps(&p) {
-                    Ok(caps) if !caps.is_empty() => {
-                        findings.push(FileCapFinding {
-                            path: p.to_string_lossy().to_string(),
-                            capabilities: caps,
-                            reason: Some(
-                                "file capabilities granted via extended attributes".into(),
-                            ),
-                        });
+        for dir in dirs {
+            let path = Path::new(dir);
+            if !path.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten().take(MAX_FILES_PER_DIR) {
+                    let p = entry.path();
+                    if !p.is_file() {
+                        continue;
                     }
-                    Ok(_) => {} // no caps
-                    Err(e) => {
-                        if e.kind() != io::ErrorKind::PermissionDenied {
-                            crate::coverage::record(format!(
-                                "file_capabilities: error reading {}: {}",
-                                p.display(),
-                                e
-                            ));
+                    match get_file_caps(&p) {
+                        Ok(caps) if !caps.is_empty() => {
+                            findings.push(FileCapFinding {
+                                path: p.to_string_lossy().to_string(),
+                                capabilities: caps,
+                                reason: Some(
+                                    "file capabilities granted via extended attributes".into(),
+                                ),
+                            });
+                        }
+                        Ok(_) => {} // no caps
+                        Err(e) => {
+                            if e.kind() != io::ErrorKind::PermissionDenied {
+                                crate::coverage::record(format!(
+                                    "file_capabilities: error reading {}: {}",
+                                    p.display(),
+                                    e
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
+        findings
     }
-    findings
 }
 
 /// Main entry point – returns all files with capabilities found in common binary paths.
+#[cfg(target_os = "linux")]
 pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
-    scan_directories(SCAN_DIRS)
+    linux_impl::scan_directories(SCAN_DIRS)
+}
+
+/// Stub for non-Linux platforms – file capabilities are a Linux-specific feature.
+#[cfg(not(target_os = "linux"))]
+pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
+    Vec::new()
 }
 
 #[cfg(test)]
