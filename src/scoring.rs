@@ -669,7 +669,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029 – Memory Forensics ──
+    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029, SEC-034 – Memory & Capability Forensics ──
     const DEEP_ESCALATE_MIN: u8 = 60;
     const DEEP_DEMOTE_MIN: u8 = 70;
 
@@ -1026,8 +1026,34 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             suppressed: Some(
                 "Structural profile matches Netty/JNA-style unlink-after-dlopen extraction \
                  in a trusted runtime. Trust is PROVISIONAL: the on-disk file no longer \
-                 exists and the ghost inode verification attempted; unreadable or inconclusive. A clean-ELF \
+                 exists and the ghost inode content has not been verified. A clean-ELF \
                  implant loaded the same way is indistinguishable at this tier."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
+    // ── SEC-034 – File capabilities inventory ────────────────────────────
+    let file_cap_findings = &report.security.file_capabilities;
+    if !file_cap_findings.is_empty() {
+        let list = file_cap_findings
+            .iter()
+            .map(|f| format!("{}: [{}]", f.path, f.capabilities.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "SEC-034",
+            title: "Files with capabilities (setcap)".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: format!(
+                "{} file(s) with extended capability attributes: {}",
+                file_cap_findings.len(),
+                list
+            ),
+            suppressed: Some(
+                "File capabilities may be legitimate (e.g. ping, mtr). Review each manually."
                     .to_string(),
             ),
             cis_ref: None,
