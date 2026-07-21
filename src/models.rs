@@ -305,6 +305,9 @@ pub struct SecurityInfo {
     pub library_injections: Vec<LibraryInjectionFinding>,
     #[serde(default)]
     pub ghost_pids: Vec<GhostPidFinding>,
+    /// Files with persistent capabilities (setcap).
+    #[serde(default)]
+    pub file_capabilities: Vec<FileCapFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -653,6 +656,20 @@ pub struct GhostPidFinding {
     /// Corroboration: this hidden PID also owns a network socket.
     #[serde(default)]
     pub holds_socket: bool,
+}
+
+// ── File Capability Inventory (R16) ──
+
+/// A file that has been granted capabilities via extended attributes
+/// (e.g. `setcap cap_net_bind_service+ep /usr/bin/node`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileCapFinding {
+    pub path: String,
+    /// Human‑readable capability names (e.g. "CAP_NET_BIND_SERVICE")
+    pub capabilities: Vec<String>,
+    /// Why this finding was flagged, for the evidence string
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // ── Deep Forensics (Pointer Resolution & Memory Analysis) ──

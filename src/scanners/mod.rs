@@ -7,6 +7,7 @@ mod deep;
 mod dlp;
 #[cfg(feature = "local-scan")]
 pub mod docker;
+mod file_capabilities;
 #[cfg(feature = "local-scan")]
 mod ghost_pid;
 #[cfg(feature = "local-scan")]

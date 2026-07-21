@@ -484,6 +484,9 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     // --- Reverse-shell / C2 correlation (SEC-022) -------------------------
     let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
 
+    // --- File capabilities inventory (R16) --------------------------------
+    let file_capabilities = crate::scanners::file_capabilities::gather_file_capabilities();
+
     // --- Userspace rootkit / library injection (SEC-023) ------------------
     let scan_cfg = crate::scanners::library_injection::ScanConfig {
         deep,
@@ -520,6 +523,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         reverse_shells,     // SEC-022
         library_injections, // SEC-023
         ghost_pids,         // SEC-024 true ghost PID / LKM rootkit
+        file_capabilities,  // R16 file capability inventory
     }
 }
 
