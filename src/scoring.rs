@@ -669,7 +669,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029, SEC-034 – Memory & Capability Forensics ──
+    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029 – Memory Forensics ──
     const DEEP_ESCALATE_MIN: u8 = 60;
     const DEEP_DEMOTE_MIN: u8 = 70;
 
@@ -1034,30 +1034,66 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-034 – File capabilities inventory ────────────────────────────
+    // ── SEC-034 / SEC-036 – File capabilities inventory with risk-tiering ─
     let file_cap_findings = &report.security.file_capabilities;
     if !file_cap_findings.is_empty() {
-        let list = file_cap_findings
-            .iter()
-            .map(|f| format!("{}: [{}]", f.path, f.capabilities.join(", ")))
-            .collect::<Vec<_>>()
-            .join("; ");
-        findings.push(Finding {
-            id: "SEC-034",
-            title: "Files with capabilities (setcap)".to_string(),
-            category: Category::Security,
-            weight: 0,
-            evidence: format!(
-                "{} file(s) with extended capability attributes: {}",
-                file_cap_findings.len(),
-                list
-            ),
-            suppressed: Some(
-                "File capabilities may be legitimate (e.g. ping, mtr). Review each manually."
-                    .to_string(),
-            ),
-            cis_ref: None,
-        });
+        let mut suppressed_caps = Vec::new();
+        let mut active_caps = Vec::new();
+
+        for fc in file_cap_findings {
+            if is_known_cap_binary(&fc.path, &fc.capabilities) {
+                suppressed_caps.push(fc);
+            } else {
+                active_caps.push(fc);
+            }
+        }
+
+        // Suppressed (expected) – informational
+        if !suppressed_caps.is_empty() {
+            let list = suppressed_caps
+                .iter()
+                .map(|f| format!("{}: [{}]", f.path, f.capabilities.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-034",
+                title: "Files with capabilities (setcap) – expected".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} file(s) with known capability attributes: {}",
+                    suppressed_caps.len(),
+                    list
+                ),
+                suppressed: Some(
+                    "These capabilities are expected for standard system tools (e.g. ping, mtr)."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
+
+        // Active (unexpected / suspicious) – visible, weighted
+        if !active_caps.is_empty() {
+            let list = active_caps
+                .iter()
+                .map(|f| format!("{}: [{}]", f.path, f.capabilities.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-036",
+                title: "Unexpected file capabilities (setcap) – review required".to_string(),
+                category: Category::Security,
+                weight: 8,
+                evidence: format!(
+                    "{} file(s) with unexpected or unknown capability attributes: {}",
+                    active_caps.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
     }
 
     // SEC‑035 – eBPF inventory (informational)
@@ -1683,6 +1719,33 @@ impl CriticalFlags {
     pub fn is_compromised(&self) -> bool {
         self.compromised_host
     }
+}
+
+// ── Risk-tiering helper for SEC-034 ──────────────────────────
+
+/// Files whose basename is known to have specific, expected capabilities.
+/// If a file's capabilities are a subset of the listed ones, it's considered
+/// benign and will be suppressed.
+static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
+    ("ping", &["CAP_NET_RAW"]),
+    ("ping4", &["CAP_NET_RAW"]),
+    ("ping6", &["CAP_NET_RAW"]),
+    ("mtr", &["CAP_NET_RAW"]),
+    ("mtr-packet", &["CAP_NET_RAW"]),
+    ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
+];
+
+pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    for (name, allowed) in KNOWN_CAP_BINARIES {
+        if basename == *name {
+            return caps.iter().all(|c| allowed.contains(&c.as_str()));
+        }
+    }
+    false
 }
 
 // ── Tests ─────────────────────────────────────────────────
