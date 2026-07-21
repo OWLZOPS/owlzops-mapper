@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
-use crate::scoring::is_known_cap_binary;
+use crate::scoring::{is_known_cap_binary, is_known_suid_binary};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -1729,6 +1729,32 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             println!(
                 "🛡  Unexpected file capabilities (SEC‑036): {} active finding(s) — review required.\n",
                 active.len()
+            );
+        }
+    }
+
+    // SEC‑037 – Setuid/setgid files with risk-tiering
+    let setuid_files = &report.security.setuid_files;
+    if !setuid_files.is_empty() {
+        let suppressed_su: Vec<_> = setuid_files
+            .iter()
+            .filter(|f| is_known_suid_binary(&f.path))
+            .collect();
+        let active_su: Vec<_> = setuid_files
+            .iter()
+            .filter(|f| !is_known_suid_binary(&f.path))
+            .collect();
+
+        if !suppressed_su.is_empty() {
+            println!(
+                "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).\n",
+                suppressed_su.len()
+            );
+        }
+        if !active_su.is_empty() {
+            println!(
+                "🛡  Unexpected setuid/setgid files (SEC‑037): {} active finding(s) — review required.\n",
+                active_su.len()
             );
         }
     }
