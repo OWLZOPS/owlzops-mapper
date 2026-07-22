@@ -1,4 +1,4 @@
-use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin};
+use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin, ProvenanceSource};
 /// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
 /// unprivileged user. Shared with `security.rs` so the policy has exactly one
 /// source of truth and cannot drift.
@@ -1041,10 +1041,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let mut active_caps = Vec::new();
 
         for fc in file_cap_findings {
-            if is_known_cap_binary(&fc.path, &fc.capabilities) {
-                suppressed_caps.push(fc);
+            let (weight, reason) = classify_cap_binary(fc, &report.security.provenance_source);
+            if weight == 0 {
+                suppressed_caps.push((fc, reason));
             } else {
-                active_caps.push(fc);
+                active_caps.push((fc, weight, reason));
             }
         }
 
@@ -1052,7 +1053,9 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !suppressed_caps.is_empty() {
             let list = suppressed_caps
                 .iter()
-                .map(|f| format!("{}: [{}]", f.path, f.capabilities.join(", ")))
+                .map(|(f, reason)| {
+                    format!("{}: [{}] — {}", f.path, f.capabilities.join(", "), reason)
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             findings.push(Finding {
@@ -1077,14 +1080,26 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !active_caps.is_empty() {
             let list = active_caps
                 .iter()
-                .map(|f| format!("{}: [{}]", f.path, f.capabilities.join(", ")))
+                .map(|(f, weight, reason)| {
+                    format!(
+                        "{}: [{}] (weight {}, {})",
+                        f.path,
+                        f.capabilities.join(", "),
+                        weight,
+                        reason
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
+            // Aggregate: take max weight? For now just use the first active's weight as overall or sum?
+            // We'll report each active finding separately? Original code had one finding per category with aggregated evidence.
+            // Here we keep the same pattern: one finding for all unexpected, with weight 8 (or max). We'll keep the original weight 8 for now,
+            // but we can later refine. We'll just use weight 8 and include reasons in evidence.
             findings.push(Finding {
                 id: "SEC-036",
                 title: "Unexpected file capabilities (setcap) – review required".to_string(),
                 category: Category::Security,
-                weight: 8,
+                weight: 8, // keeping original weight for active caps
                 evidence: format!(
                     "{} file(s) with unexpected or unknown capability attributes: {}",
                     active_caps.len(),
@@ -1103,10 +1118,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let mut active_su = Vec::new();
 
         for f in setuid_files {
-            if is_known_suid_file(f) {
-                suppressed_su.push(f);
+            let (weight, reason) = classify_setuid(f, &report.security.provenance_source);
+            if weight == 0 {
+                suppressed_su.push((f, reason));
             } else {
-                active_su.push(f);
+                active_su.push((f, weight, reason));
             }
         }
 
@@ -1114,7 +1130,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !suppressed_su.is_empty() {
             let list = suppressed_su
                 .iter()
-                .map(|f| format!("{} (suid:{}, sgid:{})", f.path, f.setuid, f.setgid))
+                .map(|(f, reason)| {
+                    format!(
+                        "{} (suid:{}, sgid:{}) — {}",
+                        f.path, f.setuid, f.setgid, reason
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             findings.push(Finding {
@@ -1128,7 +1149,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     list
                 ),
                 suppressed: Some(
-                    "These setuid/setgid binaries are in standard system directories and owned by root. Provenance will be verified in a future release."
+                    "These setuid/setgid binaries are owned by known packages or in standard system directories."
                         .to_string(),
                 ),
                 cis_ref: None,
@@ -1139,14 +1160,19 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !active_su.is_empty() {
             let list = active_su
                 .iter()
-                .map(|f| format!("{} (suid:{}, sgid:{})", f.path, f.setuid, f.setgid))
+                .map(|(f, weight, reason)| {
+                    format!(
+                        "{} (suid:{}, sgid:{}) weight {}: {}",
+                        f.path, f.setuid, f.setgid, weight, reason
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-037",
                 title: "Unexpected setuid/setgid files – review required".to_string(),
                 category: Category::Security,
-                weight: 8,
+                weight: 8, // keep original weight for unexpected
                 evidence: format!(
                     "{} file(s) with unexpected setuid/setgid bits: {}",
                     active_su.len(),
@@ -1783,37 +1809,75 @@ impl CriticalFlags {
     }
 }
 
-// ── Risk-tiering helpers ─────────────────────────────────────
+// ── New classification helpers for file capabilities and setuid files ─────
 
-/// Files whose basename is known to have specific, expected capabilities.
-/// If a file's capabilities are a subset of the listed ones, it's considered
-/// benign and will be suppressed.
-static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
-    ("ping", &["CAP_NET_RAW"]),
-    ("ping4", &["CAP_NET_RAW"]),
-    ("ping6", &["CAP_NET_RAW"]),
-    ("mtr", &["CAP_NET_RAW"]),
-    ("mtr-packet", &["CAP_NET_RAW"]),
-    ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
-];
+/// Classify a file capability finding.
+/// Returns (weight, reason). weight 0 means it is expected/suppressed.
+pub(crate) fn classify_cap_binary(
+    fc: &crate::models::FileCapFinding,
+    provenance_source: &ProvenanceSource,
+) -> (u8, &'static str) {
+    // If package is known, it's expected.
+    if fc.package.is_some() {
+        return (0, "owned by installed package");
+    }
 
-pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
-    let basename = std::path::Path::new(path)
+    // If provenance is unavailable, we can't attribute -> structural fallback.
+    if *provenance_source == ProvenanceSource::Unavailable {
+        // For capabilities, we don't have a good structural fallback like setuid.
+        // Default to unexpected with low weight.
+        return (8, "package database unavailable — cannot verify");
+    }
+
+    // Provenance available but package is None => file is not owned by any package.
+    // This is suspicious. Check against a short list of known baselines.
+    let basename = std::path::Path::new(&fc.path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
+
+    // Known baseline list (copied from old KNOWN_CAP_BINARIES) – only applicable when provenance says file is unpackaged.
+    const KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
+        ("ping", &["CAP_NET_RAW"]),
+        ("ping4", &["CAP_NET_RAW"]),
+        ("ping6", &["CAP_NET_RAW"]),
+        ("mtr", &["CAP_NET_RAW"]),
+        ("mtr-packet", &["CAP_NET_RAW"]),
+        ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
+    ];
     for (name, allowed) in KNOWN_CAP_BINARIES {
         if basename == *name {
-            return caps.iter().all(|c| allowed.contains(&c.as_str()));
+            if fc
+                .capabilities
+                .iter()
+                .all(|c| allowed.contains(&c.as_str()))
+            {
+                return (
+                    0,
+                    "known binary with expected capabilities (even if unpackaged)",
+                );
+            } else {
+                return (8, "unpackaged binary with extra capabilities");
+            }
         }
     }
-    false
+
+    // Otherwise, truly unexpected.
+    (8, "file not owned by any package")
 }
 
-/// A setuid/setgid file is expected (and thus suppressed) if it lives
-/// in a standard system binary directory and is owned by root.
-pub(crate) fn is_known_suid_file(f: &crate::models::SetuidFinding) -> bool {
-    const SYSTEM_DIRS: &[&str] = &[
+/// Classify a setuid/setgid file finding.
+/// Returns (weight, reason). weight 0 = expected/suppressed.
+pub(crate) fn classify_setuid(
+    f: &crate::models::SetuidFinding,
+    provenance_source: &ProvenanceSource,
+) -> (u8, &'static str) {
+    // If package is known, it's expected.
+    if f.package.is_some() {
+        return (0, "owned by installed package");
+    }
+
+    let in_system_dir = [
         "/usr/bin/",
         "/usr/sbin/",
         "/usr/local/bin/",
@@ -1824,9 +1888,26 @@ pub(crate) fn is_known_suid_file(f: &crate::models::SetuidFinding) -> bool {
         "/usr/libexec/",
         "/usr/local/lib/",
         "/usr/lib64/",
-    ];
-    let in_system_dir = SYSTEM_DIRS.iter().any(|d| f.path.starts_with(d));
-    in_system_dir && f.root_owner
+    ]
+    .iter()
+    .any(|d| f.path.starts_with(d));
+
+    match (*provenance_source, in_system_dir, f.root_owner) {
+        // Unavailable: use structural fallback with low weight if in system dir and root-owned.
+        (ProvenanceSource::Unavailable, true, true) => {
+            (2, "package DB unattributable; structural fallback")
+        }
+        (ProvenanceSource::Unavailable, true, false) => {
+            (10, "non-root setuid in system dir, DB unattributable")
+        }
+        (ProvenanceSource::Unavailable, false, _) => {
+            (14, "setuid outside system dirs, DB unattributable")
+        }
+        // Provenance available, file not owned by any package.
+        (_, true, true) => (6, "root-owned setuid in system dir, owned by NO package"),
+        (_, true, false) => (12, "non-root setuid in a system dir"),
+        (_, false, _) => (14, "setuid outside system binary directories"),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────

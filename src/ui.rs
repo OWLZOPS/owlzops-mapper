@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
-use crate::scoring::{is_known_cap_binary, is_known_suid_file};
+use crate::scoring::{classify_cap_binary, classify_setuid};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -108,12 +108,15 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
     ]);
 
     for r in reports {
-        let score_cell = if r.risk_score >= 70 {
-            Cell::new(r.risk_score.to_string()).fg(Color::Red)
-        } else if r.risk_score >= 40 {
-            Cell::new(r.risk_score.to_string()).fg(Color::Yellow)
+        let scored = crate::scoring::score(crate::scoring::evaluate(r));
+        let risk_score = scored.total;
+
+        let score_cell = if risk_score >= 70 {
+            Cell::new(risk_score.to_string()).fg(Color::Red)
+        } else if risk_score >= 40 {
+            Cell::new(risk_score.to_string()).fg(Color::Yellow)
         } else {
-            Cell::new(r.risk_score.to_string()).fg(Color::Green)
+            Cell::new(risk_score.to_string()).fg(Color::Green)
         };
 
         t.add_row(vec![
@@ -155,18 +158,23 @@ fn render_header(report: &AgentReport) {
         ("", "", "", "")
     };
 
-    let risk_label = if report.risk_score < 40 {
+    // Always compute the score locally to avoid depending on a possibly
+    // stale `risk_score` from an older remote agent.
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    let risk_score = scored.total;
+
+    let risk_label = if risk_score < 40 {
         "Healthy"
-    } else if report.risk_score < 70 {
+    } else if risk_score < 70 {
         "At Risk"
     } else {
         "Critical"
     };
 
     let risk_color = if is_tty {
-        if report.risk_score >= 70 {
+        if risk_score >= 70 {
             "\x1b[1;31m"
-        } else if report.risk_score >= 40 {
+        } else if risk_score >= 40 {
             "\x1b[1;33m"
         } else {
             "\x1b[1;32m"
@@ -179,10 +187,9 @@ fn render_header(report: &AgentReport) {
     println!("{}Scan completed in {:.2}s", icon_spy, report.duration_secs);
     println!(
         "{}Risk Score: {}{}/100{}  ({}) \n",
-        icon_shield, risk_color, report.risk_score, color_reset, risk_label
+        icon_shield, risk_color, risk_score, color_reset, risk_label
     );
 
-    let scored = crate::scoring::score(crate::scoring::evaluate(report));
     println!(
         "  Security −{}  Reliability −{}  Hygiene −{}",
         scored.security, scored.reliability, scored.hygiene
@@ -1710,13 +1717,14 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑034 / SEC‑036 – File capabilities with risk-tiering
     let file_caps = &report.security.file_capabilities;
     if !file_caps.is_empty() {
+        let src = &report.security.provenance_source;
         let suppressed: Vec<_> = file_caps
             .iter()
-            .filter(|fc| is_known_cap_binary(&fc.path, &fc.capabilities))
+            .filter(|fc| classify_cap_binary(fc, src).0 == 0)
             .collect();
         let active: Vec<_> = file_caps
             .iter()
-            .filter(|fc| !is_known_cap_binary(&fc.path, &fc.capabilities))
+            .filter(|fc| classify_cap_binary(fc, src).0 != 0)
             .collect();
 
         if !suppressed.is_empty() {
@@ -1736,16 +1744,15 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑037 – Setuid/setgid files with risk-tiering
     let setuid_files = &report.security.setuid_files;
     if !setuid_files.is_empty() {
-        let (suppressed_su, active_su): (Vec<_>, Vec<_>) =
-            setuid_files.iter().partition(|f| is_known_suid_file(f));
+        let src = &report.security.provenance_source;
+        let (suppressed_su, active_su): (Vec<_>, Vec<_>) = setuid_files
+            .iter()
+            .partition(|f| classify_setuid(f, src).0 == 0);
 
         if !suppressed_su.is_empty() {
             println!(
                 "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).",
                 suppressed_su.len()
-            );
-            println!(
-                "     Note: Provenance not yet verified; all system setuid files are currently suppressed."
             );
         }
         if !active_su.is_empty() {

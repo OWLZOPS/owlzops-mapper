@@ -13,19 +13,20 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 const SCAN_DIRS: &[(&str, u8)] = &[
-    ("/usr/bin", 0),
-    ("/usr/sbin", 0),
-    ("/usr/local/bin", 0),
-    ("/usr/local/sbin", 0),
-    ("/bin", 0),
-    ("/sbin", 0),
+    ("/usr/bin", 1), // 1 = only this directory, no recursion
+    ("/usr/sbin", 1),
+    ("/usr/local/bin", 1),
+    ("/usr/local/sbin", 1),
+    ("/bin", 1),
+    ("/sbin", 1),
     ("/usr/lib", 4),
     ("/usr/libexec", 4),
     ("/usr/local/lib", 4),
     ("/usr/lib64", 4),
 ];
 
-const MAX_FILES_PER_DIR: usize = 512;
+const BUDGET_FLAT: usize = 4_096; // per flat bin directory
+const BUDGET_DEEP: usize = 40_000; // per recursive lib root
 
 /// Convert a capability bitmask (u64) into a list of human‑readable names.
 fn cap_mask_to_names(mask: u64) -> Vec<String> {
@@ -159,7 +160,7 @@ fn scan_dir_recursive(
     notsup_devs: &mut HashSet<u64>,
     budget: &mut usize,
 ) {
-    if max_depth == 0 || *budget == 0 {
+    if *budget == 0 {
         return;
     }
     let entries = match fs::read_dir(dir) {
@@ -223,6 +224,7 @@ fn scan_dir_recursive(
                                 effective: caps.effective,
                                 revision: caps.revision,
                                 rootid: caps.rootid,
+                                package: None, // <-- Добавлено
                             });
                         }
                     }
@@ -263,14 +265,13 @@ pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
     let mut findings = Vec::new();
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut notsup_devs: HashSet<u64> = HashSet::new();
-    let mut budget = MAX_FILES_PER_DIR * SCAN_DIRS.len();
 
     for (dir, depth) in SCAN_DIRS {
         let path = Path::new(dir);
         if !path.is_dir() {
             continue;
         }
-        let before = findings.len();
+        let mut budget = if *depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
         scan_dir_recursive(
             path,
             *depth,
@@ -279,16 +280,11 @@ pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
             &mut notsup_devs,
             &mut budget,
         );
-        if findings.len() - before >= MAX_FILES_PER_DIR {
+        if budget == 0 {
             crate::coverage::record(format!(
-                "file_capabilities: {dir} scan truncated at {MAX_FILES_PER_DIR} entries — inventory incomplete"
+                "file_capabilities: {dir} entry budget exhausted — inventory INCOMPLETE for this root"
             ));
         }
-    }
-    if budget == 0 {
-        crate::coverage::record(
-            "file_capabilities: global entry budget exhausted — inventory INCOMPLETE",
-        );
     }
     findings
 }

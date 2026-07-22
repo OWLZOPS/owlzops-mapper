@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -99,6 +100,22 @@ pub fn is_ephemeral_exec_path(path: &str) -> bool {
         || path.starts_with("/dev/shm/")
         || path.starts_with("/home/")
         || path.starts_with("/memfd:")
+}
+
+// ---------------------------------------------------------------------------
+// Usrmerge-aware canonical path
+// ---------------------------------------------------------------------------
+
+/// Canonical path under usrmerge: /bin/su → /usr/bin/su, /lib/foo → /usr/lib/foo.
+/// Idempotent; returns `Cow::Borrowed` if no change, avoiding allocation in the
+/// common case.
+pub fn canon_path(path: &str) -> Cow<'_, str> {
+    const MERGED: &[&str] = &["/bin/", "/sbin/", "/lib/", "/lib64/"];
+    if MERGED.iter().any(|p| path.starts_with(p)) {
+        Cow::Owned(format!("/usr{}", path))
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -633,5 +650,16 @@ mod tests {
         assert!(is_ambiguous_malware("networkservice"));
         assert!(!is_ambiguous_malware("NetworkManager"));
         assert!(!is_known_malware("networkservice"));
+    }
+
+    #[test]
+    fn canon_path_usrmerge() {
+        assert_eq!(canon_path("/bin/su"), "/usr/bin/su");
+        assert_eq!(canon_path("/lib/foo"), "/usr/lib/foo");
+        assert_eq!(canon_path("/sbin/ip"), "/usr/sbin/ip");
+        assert_eq!(canon_path("/lib64/bar"), "/usr/lib64/bar");
+        assert_eq!(canon_path("/usr/bin/su"), "/usr/bin/su"); // idempotent
+        assert_eq!(canon_path("/opt/app"), "/opt/app");
+        assert_eq!(canon_path("/home/user"), "/home/user");
     }
 }

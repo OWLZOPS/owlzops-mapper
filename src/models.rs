@@ -276,6 +276,20 @@ impl ContainerInfo {
     }
 }
 
+// ── Provenance source (moved from provenance.rs for model visibility) ──
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceSource {
+    /// Debian / Ubuntu database was used.
+    Dpkg,
+    /// Alpine database was used.
+    Apk,
+    /// No parseable database (RPM/pacman, or missing DB).
+    #[default]
+    Unavailable,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
@@ -314,6 +328,11 @@ pub struct SecurityInfo {
     /// Setuid/setgid files found in common binary directories.
     #[serde(default)]
     pub setuid_files: Vec<SetuidFinding>,
+    /// Which package database was used for provenance attribution.
+    /// Crosses the SSH boundary so the orchestrator can distinguish
+    /// “file not owned by any package” from “could not check”.
+    #[serde(default)]
+    pub provenance_source: ProvenanceSource,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -687,6 +706,11 @@ pub struct FileCapFinding {
     pub revision: u8,
     #[serde(default)]
     pub rootid: Option<u32>,
+    /// Name of the installed package that owns this file, resolved at scan time.
+    /// `None` + `provenance_source == Unavailable` → could not check.
+    /// `None` + `provenance_source != Unavailable` → file is NOT from a package.
+    #[serde(default)]
+    pub package: Option<String>,
 }
 
 // ── Setuid/Setgid Inventory (R17) ─────────────────────────────────────────
@@ -698,6 +722,9 @@ pub struct SetuidFinding {
     pub setuid: bool,
     pub setgid: bool,
     pub root_owner: bool,
+    /// Name of the installed package that owns this file, resolved at scan time.
+    #[serde(default)]
+    pub package: Option<String>,
 }
 
 // ── eBPF Inventory (R17) ─────────────────────────────────────────────────
