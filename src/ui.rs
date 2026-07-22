@@ -108,12 +108,15 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
     ]);
 
     for r in reports {
-        let score_cell = if r.risk_score >= 70 {
-            Cell::new(r.risk_score.to_string()).fg(Color::Red)
-        } else if r.risk_score >= 40 {
-            Cell::new(r.risk_score.to_string()).fg(Color::Yellow)
+        let scored = crate::scoring::score(crate::scoring::evaluate(r));
+        let risk_score = scored.total;
+
+        let score_cell = if risk_score >= 70 {
+            Cell::new(risk_score.to_string()).fg(Color::Red)
+        } else if risk_score >= 40 {
+            Cell::new(risk_score.to_string()).fg(Color::Yellow)
         } else {
-            Cell::new(r.risk_score.to_string()).fg(Color::Green)
+            Cell::new(risk_score.to_string()).fg(Color::Green)
         };
 
         t.add_row(vec![
@@ -155,18 +158,23 @@ fn render_header(report: &AgentReport) {
         ("", "", "", "")
     };
 
-    let risk_label = if report.risk_score < 40 {
+    // Always compute the score locally to avoid depending on a possibly
+    // stale `risk_score` from an older remote agent.
+    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+    let risk_score = scored.total;
+
+    let risk_label = if risk_score < 40 {
         "Healthy"
-    } else if report.risk_score < 70 {
+    } else if risk_score < 70 {
         "At Risk"
     } else {
         "Critical"
     };
 
     let risk_color = if is_tty {
-        if report.risk_score >= 70 {
+        if risk_score >= 70 {
             "\x1b[1;31m"
-        } else if report.risk_score >= 40 {
+        } else if risk_score >= 40 {
             "\x1b[1;33m"
         } else {
             "\x1b[1;32m"
@@ -179,10 +187,9 @@ fn render_header(report: &AgentReport) {
     println!("{}Scan completed in {:.2}s", icon_spy, report.duration_secs);
     println!(
         "{}Risk Score: {}{}/100{}  ({}) \n",
-        icon_shield, risk_color, report.risk_score, color_reset, risk_label
+        icon_shield, risk_color, risk_score, color_reset, risk_label
     );
 
-    let scored = crate::scoring::score(crate::scoring::evaluate(report));
     println!(
         "  Security −{}  Reliability −{}  Hygiene −{}",
         scored.security, scored.reliability, scored.hygiene
