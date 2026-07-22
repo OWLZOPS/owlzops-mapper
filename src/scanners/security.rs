@@ -485,31 +485,31 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
 
     // --- File capabilities inventory (R16) --------------------------------
-    let file_capabilities = crate::scanners::file_capabilities::gather_file_capabilities();
+    let mut file_capabilities = crate::scanners::file_capabilities::gather_file_capabilities();
 
     // --- Setuid/setgid inventory (R17) ------------------------------------
-    let setuid_files = crate::scanners::setuid::gather_setuid_files();
+    let mut setuid_files = crate::scanners::setuid::gather_setuid_files();
 
-    // --- Resolve package provenance for file capabilities and setuid files --
-    let mut provenance_candidates = HashSet::new();
-    for fc in &file_capabilities {
-        provenance_candidates.insert(fc.path.clone());
-        // usrmerge dual entry: also add the variant without /usr
-        if let Some(rest) = fc.path.strip_prefix("/usr") {
-            provenance_candidates.insert(rest.to_string());
-        } else if !fc.path.starts_with("/usr") {
-            provenance_candidates.insert(format!("/usr{}", fc.path));
-        }
+    // --- Resolve package provenance and attach to findings --------------------
+    let candidates: HashSet<String> = file_capabilities
+        .iter()
+        .map(|f| crate::utils::canon_path(&f.path).into_owned())
+        .chain(
+            setuid_files
+                .iter()
+                .map(|f| crate::utils::canon_path(&f.path).into_owned()),
+        )
+        .collect();
+
+    let prov = crate::scanners::provenance::resolve_batch(&candidates);
+
+    for f in &mut file_capabilities {
+        f.package = prov.lookup(&f.path);
     }
-    for sf in &setuid_files {
-        provenance_candidates.insert(sf.path.clone());
-        if let Some(rest) = sf.path.strip_prefix("/usr") {
-            provenance_candidates.insert(rest.to_string());
-        } else if !sf.path.starts_with("/usr") {
-            provenance_candidates.insert(format!("/usr{}", sf.path));
-        }
+    for f in &mut setuid_files {
+        f.package = prov.lookup(&f.path);
     }
-    let provenance = crate::scanners::provenance::resolve_batch(&provenance_candidates);
+    let provenance_source = prov.source;
 
     // --- Userspace rootkit / library injection (SEC-023) ------------------
     let scan_cfg = crate::scanners::library_injection::ScanConfig {
@@ -550,7 +550,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         file_capabilities,  // R16 file capability inventory
         ebpf_inventory: crate::scanners::ebpf::gather_ebpf_inventory(),
         setuid_files,
-        provenance,
+        provenance_source,
     }
 }
 

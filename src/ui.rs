@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
-use crate::scoring::{is_known_cap_binary, is_known_suid_file};
+use crate::scoring::{classify_cap_binary, classify_setuid};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -1717,17 +1717,14 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑034 / SEC‑036 – File capabilities with risk-tiering
     let file_caps = &report.security.file_capabilities;
     if !file_caps.is_empty() {
+        let src = &report.security.provenance_source;
         let suppressed: Vec<_> = file_caps
             .iter()
-            .filter(|fc| {
-                is_known_cap_binary(&fc.path, &fc.capabilities, &report.security.provenance)
-            })
+            .filter(|fc| classify_cap_binary(fc, src).0 == 0)
             .collect();
         let active: Vec<_> = file_caps
             .iter()
-            .filter(|fc| {
-                !is_known_cap_binary(&fc.path, &fc.capabilities, &report.security.provenance)
-            })
+            .filter(|fc| classify_cap_binary(fc, src).0 != 0)
             .collect();
 
         if !suppressed.is_empty() {
@@ -1747,20 +1744,16 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑037 – Setuid/setgid files with risk-tiering
     let setuid_files = &report.security.setuid_files;
     if !setuid_files.is_empty() {
+        let src = &report.security.provenance_source;
         let (suppressed_su, active_su): (Vec<_>, Vec<_>) = setuid_files
             .iter()
-            .partition(|f| is_known_suid_file(f, &report.security.provenance));
+            .partition(|f| classify_setuid(f, src).0 == 0);
 
         if !suppressed_su.is_empty() {
             println!(
                 "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).",
                 suppressed_su.len()
             );
-            if report.security.provenance.is_empty() {
-                println!(
-                    "     Note: Provenance not yet verified; all system setuid files are currently suppressed."
-                );
-            }
         }
         if !active_su.is_empty() {
             println!(
