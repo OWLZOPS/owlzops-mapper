@@ -1096,6 +1096,68 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-037 – Setuid/setgid files inventory with risk-tiering ─────────
+    let setuid_files = &report.security.setuid_files;
+    if !setuid_files.is_empty() {
+        let mut suppressed_su = Vec::new();
+        let mut active_su = Vec::new();
+
+        for f in setuid_files {
+            if is_known_suid_file(f) {
+                suppressed_su.push(f);
+            } else {
+                active_su.push(f);
+            }
+        }
+
+        // Suppressed (expected) – informational
+        if !suppressed_su.is_empty() {
+            let list = suppressed_su
+                .iter()
+                .map(|f| format!("{} (suid:{}, sgid:{})", f.path, f.setuid, f.setgid))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-037",
+                title: "Setuid/setgid files – expected".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} file(s) with expected setuid/setgid bits: {}",
+                    suppressed_su.len(),
+                    list
+                ),
+                suppressed: Some(
+                    "These setuid/setgid binaries are in standard system directories and owned by root. Provenance will be verified in a future release."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
+
+        // Active (unexpected / suspicious) – visible, weighted
+        if !active_su.is_empty() {
+            let list = active_su
+                .iter()
+                .map(|f| format!("{} (suid:{}, sgid:{})", f.path, f.setuid, f.setgid))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-037",
+                title: "Unexpected setuid/setgid files – review required".to_string(),
+                category: Category::Security,
+                weight: 8,
+                evidence: format!(
+                    "{} file(s) with unexpected setuid/setgid bits: {}",
+                    active_su.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     // SEC‑035 – eBPF inventory (informational)
     let ebpf = &report.security.ebpf_inventory;
     if !ebpf.programs.is_empty() || !ebpf.maps.is_empty() || !ebpf.pins.is_empty() {
@@ -1721,7 +1783,7 @@ impl CriticalFlags {
     }
 }
 
-// ── Risk-tiering helper for SEC-034 ──────────────────────────
+// ── Risk-tiering helpers ─────────────────────────────────────
 
 /// Files whose basename is known to have specific, expected capabilities.
 /// If a file's capabilities are a subset of the listed ones, it's considered
@@ -1746,6 +1808,25 @@ pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
         }
     }
     false
+}
+
+/// A setuid/setgid file is expected (and thus suppressed) if it lives
+/// in a standard system binary directory and is owned by root.
+pub(crate) fn is_known_suid_file(f: &crate::models::SetuidFinding) -> bool {
+    const SYSTEM_DIRS: &[&str] = &[
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/local/bin/",
+        "/usr/local/sbin/",
+        "/bin/",
+        "/sbin/",
+        "/usr/lib/",
+        "/usr/libexec/",
+        "/usr/local/lib/",
+        "/usr/lib64/",
+    ];
+    let in_system_dir = SYSTEM_DIRS.iter().any(|d| f.path.starts_with(d));
+    in_system_dir && f.root_owner
 }
 
 // ── Tests ─────────────────────────────────────────────────

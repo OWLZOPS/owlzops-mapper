@@ -311,6 +311,9 @@ pub struct SecurityInfo {
     /// eBPF inventory – loaded programs, maps, and pinned objects.
     #[serde(default)]
     pub ebpf_inventory: EbpfInventory,
+    /// Setuid/setgid files found in common binary directories.
+    #[serde(default)]
+    pub setuid_files: Vec<SetuidFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -673,6 +676,28 @@ pub struct FileCapFinding {
     /// Why this finding was flagged, for the evidence string
     #[serde(default)]
     pub reason: Option<String>,
+    // R17-07: raw capability masks and metadata
+    #[serde(default)]
+    pub permitted: u64,
+    #[serde(default)]
+    pub inheritable: u64,
+    #[serde(default)]
+    pub effective: bool,
+    #[serde(default)]
+    pub revision: u8,
+    #[serde(default)]
+    pub rootid: Option<u32>,
+}
+
+// ── Setuid/Setgid Inventory (R17) ─────────────────────────────────────────
+
+/// A file with setuid or setgid permission bits.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SetuidFinding {
+    pub path: String,
+    pub setuid: bool,
+    pub setgid: bool,
+    pub root_owner: bool,
 }
 
 // ── eBPF Inventory (R17) ─────────────────────────────────────────────────

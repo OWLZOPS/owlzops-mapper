@@ -487,6 +487,9 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     // --- File capabilities inventory (R16) --------------------------------
     let file_capabilities = crate::scanners::file_capabilities::gather_file_capabilities();
 
+    // --- Setuid/setgid inventory (R17) ------------------------------------
+    let setuid_files = crate::scanners::setuid::gather_setuid_files();
+
     // --- Userspace rootkit / library injection (SEC-023) ------------------
     let scan_cfg = crate::scanners::library_injection::ScanConfig {
         deep,
@@ -525,6 +528,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         ghost_pids,         // SEC-024 true ghost PID / LKM rootkit
         file_capabilities,  // R16 file capability inventory
         ebpf_inventory: crate::scanners::ebpf::gather_ebpf_inventory(),
+        setuid_files,
     }
 }
 

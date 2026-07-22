@@ -29,6 +29,7 @@ mod reverse_shell;
 pub mod security;
 #[cfg(feature = "local-scan")]
 pub mod self_integrity;
+mod setuid;
 #[cfg(feature = "local-scan")]
 pub mod storage;
 mod sudoers;
