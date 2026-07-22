@@ -66,9 +66,11 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> HashMap<String, String> {
                 owned.insert(line.to_string(), pkg.clone());
             }
             // Check usrmerge alias while scanning
-            if let Some(usr_path) = line.strip_prefix("/usr") {
-                if candidates.contains(usr_path) {
-                    owned.insert(usr_path.to_string(), pkg.clone());
+            if let Some(stripped) = line.strip_prefix("/usr") {
+                // stripped already has a leading slash, e.g. "/lib/foo"
+                let without_usr = stripped.to_owned();
+                if candidates.contains(&without_usr) {
+                    owned.insert(without_usr, pkg.clone());
                 }
             } else if !line.starts_with("/usr") && line.starts_with('/') {
                 let usr_variant = format!("/usr{}", line);
@@ -132,9 +134,10 @@ fn resolve_apk(candidates: &HashSet<String>) -> HashMap<String, String> {
                 owned.insert(f.clone(), pkg_name.clone());
             }
             // usrmerge aliases
-            if let Some(without_usr) = f.strip_prefix("/usr") {
-                if candidates.contains(without_usr) {
-                    owned.insert(without_usr.to_string(), pkg_name.clone());
+            if let Some(stripped) = f.strip_prefix("/usr") {
+                let without_usr = stripped.to_owned(); // already has leading slash
+                if candidates.contains(&without_usr) {
+                    owned.insert(without_usr, pkg_name.clone());
                 }
             } else if !f.starts_with("/usr") {
                 let with_usr = format!("/usr{}", f);
