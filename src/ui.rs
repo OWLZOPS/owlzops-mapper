@@ -1751,7 +1751,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
 
         if !suppressed_su.is_empty() {
             println!(
-                "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).",
+                "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).\n",
                 suppressed_su.len()
             );
         }

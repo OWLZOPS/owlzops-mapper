@@ -79,16 +79,17 @@ mv owlzops-mapper owlzops-agent-linux
 
 ---
 
-## Highlights v0.5.22
+## Highlights v0.5.23
 
-**Sixth Gate: Ghost Inode Content Recovery via `map_files`**
+**Provenance‑Resolved Suppression for File Capabilities & Setuid**
 
-- **Ghost inode forensics (`--deep`)** – For deleted `.so` files still mapped in memory (`maps-so-unlink-on-load`), the scanner now reads the backing inode through `/proc/<pid>/map_files/<addr>` and performs streaming, constant‑memory entropy + ELF structure analysis.
-- **Three new `Origin` variants** – `GhostCleanImage` (valid ET_DYN/ET_EXEC, low entropy), `GhostSuspectImage` (high entropy or non‑ELF), `GhostInconclusive` (mid‑band / truncated). Clean images are routed to SEC‑027 (Advisory), suspect payloads to SEC‑028 (Critical), unverifiable ones remain in SEC‑033 (visible, weight 0).
-- **Invariant: `image_header` always false for ghost paths** – An ELF header in a recovered file is expected and benign. Setting `image_header = true` would cause Layer‑1 to escalate every clean recovered `.so` into a false SEC‑028. This invariant is enforced in the implementation and tested.
-- **Graceful degradation** – If `map_files` is unreadable (EACCES, EPERM, ENOENT), the finding stays in SEC‑033 with `deep_forensics = None`. Remote SSH hosts cannot open `map_files` locally, so they remain in SEC‑033 by design.
-- **Scoring & UI** – Layer 2b now branches on the new `Origin` values. New display strings in the terminal UI and JSON reports.
-- **Increased `MAX_FINDINGS` from 64 → 128** – Prevents ghost‑eligible PIDs from being squeezed out by JIT‑advisory findings on machines with many Java processes.
+- **Provenance crosses the SSH boundary.** The old `HashMap` transport is replaced by a `provenance_source` enum and per‑finding `package` fields. All findings are classified locally, but the verdict survives serialisation — fleet‑mode scoring is now consistent with local scans.
+- **usrmerge‑aware canonical paths.** A single `canon_path` normaliser maps `/bin/su` → `/usr/bin/su` and `/lib/foo` → `/usr/lib/foo`. Both dpkg and APK backends use it on every line, eliminating manual alias branches.
+- **Scan‑depth fix.** `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/usr/local/bin`, `/usr/local/sbin` were previously skipped (`max_depth = 0`). Depth is now `1` — those directories are finally audited, dramatically increasing the setuid/capability inventory.
+- **Per‑root budgets with exhaustion reporting.** Flat directories get 4 096 entries, recursive lib‑roots get 40 000. Truncation is reported per directory, so you know exactly which root was incomplete.
+- **APK backend rewritten.** `/lib/apk/db/installed` is correctly parsed as a text file; `P:`, `F:`, and `R:` lines are interpreted according to the APK spec. Alpine‑based images work out of the box.
+- **New classification functions.** `classify_cap_binary` and `classify_setuid` replace the old `is_known_*` helpers. Expected system files are suppressed (weight 0), while truly unattributed files receive appropriate weights based on location and ownership.
+- **False‑positive suppression for snapd, GStreamer, sudo, ping, etc.** Standard system binaries with setcap/setuid are no longer flagged as “Unexpected”. The SEC‑036/‑037 warnings disappear on modern Ubuntu and Debian hosts.
 
 ---
 
@@ -448,6 +449,17 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.22 (2026-07-18)
+
+**Sixth Gate: Ghost Inode Content Recovery via `map_files`**
+
+- **Ghost inode forensics (`--deep`)** – For deleted `.so` files still mapped in memory (`maps-so-unlink-on-load`), the scanner now reads the backing inode through `/proc/<pid>/map_files/<addr>` and performs streaming, constant‑memory entropy + ELF structure analysis.
+- **Three new `Origin` variants** – `GhostCleanImage` (valid ET_DYN/ET_EXEC, low entropy), `GhostSuspectImage` (high entropy or non‑ELF), `GhostInconclusive` (mid‑band / truncated). Clean images are routed to SEC‑027 (Advisory), suspect payloads to SEC‑028 (Critical), unverifiable ones remain in SEC‑033 (visible, weight 0).
+- **Invariant: `image_header` always false for ghost paths** – An ELF header in a recovered file is expected and benign. Setting `image_header = true` would cause Layer‑1 to escalate every clean recovered `.so` into a false SEC‑028. This invariant is enforced in the implementation and tested.
+- **Graceful degradation** – If `map_files` is unreadable (EACCES, EPERM, ENOENT), the finding stays in SEC‑033 with `deep_forensics = None`. Remote SSH hosts cannot open `map_files` locally, so they remain in SEC‑033 by design.
+- **Scoring & UI** – Layer 2b now branches on the new `Origin` values. New display strings in the terminal UI and JSON reports.
+- **Increased `MAX_FINDINGS` from 64 → 128** – Prevents ghost‑eligible PIDs from being squeezed out by JIT‑advisory findings on machines with many Java processes.
+
 ### v0.5.21 (2026-07-18)
 
 **macOS Orchestrator, False‑Positive Elimination & Transport Resilience**
@@ -500,13 +512,5 @@ See [LICENSE](LICENSE) for details.
 - **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
 - **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
 - **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
-
-### v0.5.17 (2026-07-16)
-
-**Transport Resilience & Safe Self‑Suppression (R11, R12)**
-
-- **SSH transport hardening (R11):** Removed internal russh keepalive timers that were 20× stricter than the scan budget. Added kernel‑level dead‑peer detection (`SO_KEEPALIVE` + `TCP_USER_TIMEOUT`). Handshake and authentication now have a 30 s deadline, preventing tarpit hosts from occupying a slot forever. Teardown (binary cleanup + graceful disconnect) runs even on timeout.
-- **Safe self‑suppression (R12):** The scanner’s unlink‑on‑exec footprint no longer blinds the fileless malware detector. Self‑processes are partitioned into a new `SEC‑032` (weight 0, suppressed) while genuine fileless implants continue to raise `SEC‑017`/`SEC‑019` at full weight. Sudo NOPASSWD audit now checks path writability — rules on world‑writable paths like `/tmp` are flagged as equivalent to `NOPASSWD: ALL`.
-- **No new dependencies.** All changes are backward‑compatible (`#[serde(default)]`).
 
 </details>
