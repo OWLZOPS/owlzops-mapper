@@ -23,6 +23,7 @@ pub mod network;
 pub mod packages;
 #[cfg(feature = "local-scan")]
 mod proc_net;
+mod provenance;
 #[cfg(feature = "local-scan")]
 mod reverse_shell;
 #[cfg(feature = "local-scan")]

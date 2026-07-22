@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 fn default_scoring_version() -> u8 {
     1
@@ -314,6 +315,11 @@ pub struct SecurityInfo {
     /// Setuid/setgid files found in common binary directories.
     #[serde(default)]
     pub setuid_files: Vec<SetuidFinding>,
+    /// Package provenance for files in file_capabilities and setuid_files.
+    /// Key: file path, Value: package name.
+    /// Skipped in JSON output to avoid bloat.
+    #[serde(skip)]
+    pub provenance: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -1,6 +1,6 @@
 use crate::models::{SecurityInfo, UserInfo};
 use crate::{coverage, safe_io};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -490,6 +490,16 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     // --- Setuid/setgid inventory (R17) ------------------------------------
     let setuid_files = crate::scanners::setuid::gather_setuid_files();
 
+    // --- Resolve package provenance for file capabilities and setuid files --
+    let mut provenance_candidates = HashSet::new();
+    for fc in &file_capabilities {
+        provenance_candidates.insert(fc.path.clone());
+    }
+    for sf in &setuid_files {
+        provenance_candidates.insert(sf.path.clone());
+    }
+    let provenance = crate::scanners::provenance::resolve_batch(&provenance_candidates);
+
     // --- Userspace rootkit / library injection (SEC-023) ------------------
     let scan_cfg = crate::scanners::library_injection::ScanConfig {
         deep,
@@ -529,6 +539,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         file_capabilities,  // R16 file capability inventory
         ebpf_inventory: crate::scanners::ebpf::gather_ebpf_inventory(),
         setuid_files,
+        provenance,
     }
 }
 

@@ -3,6 +3,7 @@ use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin};
 /// unprivileged user. Shared with `security.rs` so the policy has exactly one
 /// source of truth and cannot drift.
 const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
+use std::collections::HashMap;
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -1041,7 +1042,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let mut active_caps = Vec::new();
 
         for fc in file_cap_findings {
-            if is_known_cap_binary(&fc.path, &fc.capabilities) {
+            if is_known_cap_binary(&fc.path, &fc.capabilities, &report.security.provenance) {
                 suppressed_caps.push(fc);
             } else {
                 active_caps.push(fc);
@@ -1103,7 +1104,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let mut active_su = Vec::new();
 
         for f in setuid_files {
-            if is_known_suid_file(f) {
+            if is_known_suid_file(f, &report.security.provenance) {
                 suppressed_su.push(f);
             } else {
                 active_su.push(f);
@@ -1797,7 +1798,15 @@ static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
     ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
 ];
 
-pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
+pub(crate) fn is_known_cap_binary(
+    path: &str,
+    caps: &[String],
+    provenance: &HashMap<String, String>,
+) -> bool {
+    if provenance.contains_key(path) {
+        return true;
+    }
+    // Fallback: existing name-based list
     let basename = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1812,7 +1821,15 @@ pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
 
 /// A setuid/setgid file is expected (and thus suppressed) if it lives
 /// in a standard system binary directory and is owned by root.
-pub(crate) fn is_known_suid_file(f: &crate::models::SetuidFinding) -> bool {
+pub(crate) fn is_known_suid_file(
+    f: &crate::models::SetuidFinding,
+    provenance: &HashMap<String, String>,
+) -> bool {
+    // If we have a package owner, it's expected
+    if provenance.contains_key(&f.path) {
+        return true;
+    }
+    // Fallback: structural heuristic
     const SYSTEM_DIRS: &[&str] = &[
         "/usr/bin/",
         "/usr/sbin/",

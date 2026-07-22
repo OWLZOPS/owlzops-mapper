@@ -1712,11 +1712,15 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     if !file_caps.is_empty() {
         let suppressed: Vec<_> = file_caps
             .iter()
-            .filter(|fc| is_known_cap_binary(&fc.path, &fc.capabilities))
+            .filter(|fc| {
+                is_known_cap_binary(&fc.path, &fc.capabilities, &report.security.provenance)
+            })
             .collect();
         let active: Vec<_> = file_caps
             .iter()
-            .filter(|fc| !is_known_cap_binary(&fc.path, &fc.capabilities))
+            .filter(|fc| {
+                !is_known_cap_binary(&fc.path, &fc.capabilities, &report.security.provenance)
+            })
             .collect();
 
         if !suppressed.is_empty() {
@@ -1736,17 +1740,20 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     // SEC‑037 – Setuid/setgid files with risk-tiering
     let setuid_files = &report.security.setuid_files;
     if !setuid_files.is_empty() {
-        let (suppressed_su, active_su): (Vec<_>, Vec<_>) =
-            setuid_files.iter().partition(|f| is_known_suid_file(f));
+        let (suppressed_su, active_su): (Vec<_>, Vec<_>) = setuid_files
+            .iter()
+            .partition(|f| is_known_suid_file(f, &report.security.provenance));
 
         if !suppressed_su.is_empty() {
             println!(
                 "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).",
                 suppressed_su.len()
             );
-            println!(
-                "     Note: Provenance not yet verified; all system setuid files are currently suppressed."
-            );
+            if report.security.provenance.is_empty() {
+                println!(
+                    "     Note: Provenance not yet verified; all system setuid files are currently suppressed."
+                );
+            }
         }
         if !active_su.is_empty() {
             println!(
