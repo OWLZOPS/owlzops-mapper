@@ -1820,8 +1820,12 @@ pub(crate) fn is_known_suid_file(f: &crate::models::SetuidFinding) -> bool {
         "/usr/local/sbin/",
         "/bin/",
         "/sbin/",
+        "/usr/lib/",
+        "/usr/libexec/",
+        "/usr/local/lib/",
+        "/usr/lib64/",
     ];
-    let in_system_dir = SYSTEM_DIRS.iter().any(|dir| f.path.starts_with(dir));
+    let in_system_dir = SYSTEM_DIRS.iter().any(|d| f.path.starts_with(d));
     in_system_dir && f.root_owner
 }
 
