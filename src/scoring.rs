@@ -1103,7 +1103,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let mut active_su = Vec::new();
 
         for f in setuid_files {
-            if is_known_suid_binary(&f.path) {
+            if is_known_suid_file(f) {
                 suppressed_su.push(f);
             } else {
                 active_su.push(f);
@@ -1809,18 +1809,19 @@ pub(crate) fn is_known_cap_binary(path: &str, caps: &[String]) -> bool {
     false
 }
 
-/// Known setuid/setgid binaries that are expected on most Linux systems.
-static KNOWN_SUID_BINARIES: &[&str] = &[
-    "su", "sudo", "newgrp", "pkexec", "passwd", "mount", "umount", "chsh", "chfn", "gpasswd",
-    "chage", "expiry",
-];
-
-pub(crate) fn is_known_suid_binary(path: &str) -> bool {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|name| KNOWN_SUID_BINARIES.contains(&name))
-        .unwrap_or(false)
+/// A setuid/setgid file is expected (and thus suppressed) if it lives
+/// in a standard system binary directory and is owned by root.
+pub(crate) fn is_known_suid_file(f: &crate::models::SetuidFinding) -> bool {
+    const SYSTEM_DIRS: &[&str] = &[
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/local/bin/",
+        "/usr/local/sbin/",
+        "/bin/",
+        "/sbin/",
+    ];
+    let in_system_dir = SYSTEM_DIRS.iter().any(|dir| f.path.starts_with(dir));
+    in_system_dir && f.root_owner
 }
 
 // ── Tests ─────────────────────────────────────────────────

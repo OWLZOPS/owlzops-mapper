@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
-use crate::scoring::{is_known_cap_binary, is_known_suid_binary};
+use crate::scoring::{is_known_cap_binary, is_known_suid_file};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -1738,11 +1738,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     if !setuid_files.is_empty() {
         let suppressed_su: Vec<_> = setuid_files
             .iter()
-            .filter(|f| is_known_suid_binary(&f.path))
+            .filter(|f| is_known_suid_file(f))
             .collect();
         let active_su: Vec<_> = setuid_files
             .iter()
-            .filter(|f| !is_known_suid_binary(&f.path))
+            .filter(|f| !is_known_suid_file(f))
             .collect();
 
         if !suppressed_su.is_empty() {
