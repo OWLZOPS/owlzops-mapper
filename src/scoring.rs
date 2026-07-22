@@ -1128,7 +1128,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     list
                 ),
                 suppressed: Some(
-                    "These setuid/setgid binaries are standard system tools.".to_string(),
+                    "These setuid/setgid binaries are in standard system directories and owned by root. Provenance will be verified in a future release."
+                        .to_string(),
                 ),
                 cis_ref: None,
             });

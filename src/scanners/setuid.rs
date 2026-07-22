@@ -1,26 +1,33 @@
 //! Agentless setuid/setgid inventory.
-//! Scans common binary directories for files with the setuid (S_ISUID) or
+//! Scans common binary directories and library paths for files with the setuid (S_ISUID) or
 //! setgid (S_ISGID) permission bits.  Root‑owned setuid files are flagged
 //! with `root_owner = true`.  No external tools needed.
 
 use crate::models::SetuidFinding;
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-const SCAN_DIRS: &[&str] = &[
-    "/usr/bin",
-    "/usr/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-    "/bin",
-    "/sbin",
+/// Directories to scan.  We add `/usr/lib`, `/usr/libexec`, `/usr/local/lib` with
+/// a limited recursion depth of 4 to catch helpers like `ssh-keysign`, `dbus-daemon-launch-helper`,
+/// `polkit-agent-helper-1`, `snap-confine`, etc.
+const SCAN_DIRS: &[(&str, u8)] = &[
+    ("/usr/bin", 0),
+    ("/usr/sbin", 0),
+    ("/usr/local/bin", 0),
+    ("/usr/local/sbin", 0),
+    ("/bin", 0),
+    ("/sbin", 0),
+    ("/usr/lib", 4),
+    ("/usr/libexec", 4),
+    ("/usr/local/lib", 4),
+    ("/usr/lib64", 4),
 ];
 
 const MAX_FILES_PER_DIR: usize = 512;
 
-/// Check a single file for setuid/setgid bits.  Returns `None` if neither
-/// bit is set.
+/// Check a single file for setuid/setgid bits.  Uses `lstat` semantics.
 fn inspect_file(path: &Path) -> Option<SetuidFinding> {
     let meta = path.symlink_metadata().ok()?;
     let mode = meta.permissions().mode();
@@ -40,35 +47,85 @@ fn inspect_file(path: &Path) -> Option<SetuidFinding> {
     })
 }
 
-/// Scan the given directories and collect all files with setuid/setgid bits.
-pub fn scan_directories(dirs: &[&str]) -> Vec<SetuidFinding> {
-    let mut findings = Vec::new();
+fn scan_dir_recursive(
+    dir: &Path,
+    max_depth: u8,
+    results: &mut Vec<SetuidFinding>,
+    seen: &mut HashSet<(u64, u64)>,
+    budget: &mut usize,
+) {
+    if max_depth == 0 || *budget == 0 {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
 
-    for dir in dirs {
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() && max_depth > 1 {
+            scan_dir_recursive(&entry.path(), max_depth - 1, results, seen, budget);
+            continue;
+        }
+
+        if !ft.is_file() {
+            continue;
+        }
+
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Deduplication by device + inode (handles usrmerge and hardlinks)
+        let dev_ino = (meta.dev(), meta.ino());
+        if !seen.insert(dev_ino) {
+            continue;
+        }
+
+        if let Some(finding) = inspect_file(&entry.path()) {
+            results.push(finding);
+        }
+    }
+}
+
+/// Entry point for Linux.  Returns deduplicated list of setuid/setgid files.
+#[cfg(target_os = "linux")]
+pub fn gather_setuid_files() -> Vec<SetuidFinding> {
+    let mut findings = Vec::new();
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut budget = MAX_FILES_PER_DIR * SCAN_DIRS.len();
+
+    for (dir, depth) in SCAN_DIRS {
         let path = Path::new(dir);
         if !path.is_dir() {
             continue;
         }
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten().take(MAX_FILES_PER_DIR) {
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-                if let Some(finding) = inspect_file(&p) {
-                    findings.push(finding);
-                }
-            }
+        let before = findings.len();
+        scan_dir_recursive(path, *depth, &mut findings, &mut seen, &mut budget);
+        // Emit coverage if we hit the per-directory limit
+        if findings.len() - before >= MAX_FILES_PER_DIR {
+            crate::coverage::record(format!(
+                "setuid: {dir} scan truncated at {MAX_FILES_PER_DIR} entries — inventory incomplete"
+            ));
         }
     }
-
+    if budget == 0 {
+        crate::coverage::record(
+            "setuid: global entry budget exhausted — inventory INCOMPLETE".to_string(),
+        );
+    }
     findings
-}
-
-/// Entry point for Linux (only).  Returns the list of setuid/setgid files.
-#[cfg(target_os = "linux")]
-pub fn gather_setuid_files() -> Vec<SetuidFinding> {
-    scan_directories(SCAN_DIRS)
 }
 
 /// Stub for non‑Linux platforms.
@@ -84,7 +141,6 @@ mod tests {
     #[test]
     fn inspect_file_suid() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        // Set SUID bit on a temporary file
         let mut perms = tmp.as_file().metadata().unwrap().permissions();
         let mode = perms.mode();
         perms.set_mode(mode | libc::S_ISUID);
