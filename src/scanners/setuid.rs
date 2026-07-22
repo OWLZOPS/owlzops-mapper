@@ -9,9 +9,6 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-/// Directories to scan.  We add `/usr/lib`, `/usr/libexec`, `/usr/local/lib` with
-/// a limited recursion depth of 4 to catch helpers like `ssh-keysign`, `dbus-daemon-launch-helper`,
-/// `polkit-agent-helper-1`, `snap-confine`, etc.
 const SCAN_DIRS: &[(&str, u8)] = &[
     ("/usr/bin", 0),
     ("/usr/sbin", 0),
@@ -27,13 +24,14 @@ const SCAN_DIRS: &[(&str, u8)] = &[
 
 const MAX_FILES_PER_DIR: usize = 512;
 
-/// Check a single file for setuid/setgid bits.  Uses `lstat` semantics.
 fn inspect_file(path: &Path) -> Option<SetuidFinding> {
     let meta = path.symlink_metadata().ok()?;
     let mode = meta.permissions().mode();
 
-    let is_suid = mode & libc::S_ISUID != 0;
-    let is_sgid = mode & libc::S_ISGID != 0;
+    #[allow(clippy::unnecessary_cast)]
+    let is_suid = mode & libc::S_ISUID as u32 != 0;
+    #[allow(clippy::unnecessary_cast)]
+    let is_sgid = mode & libc::S_ISGID as u32 != 0;
 
     if !is_suid && !is_sgid {
         return None;
@@ -87,7 +85,6 @@ fn scan_dir_recursive(
             Err(_) => continue,
         };
 
-        // Deduplication by device + inode (handles usrmerge and hardlinks)
         let dev_ino = (meta.dev(), meta.ino());
         if !seen.insert(dev_ino) {
             continue;
@@ -99,7 +96,6 @@ fn scan_dir_recursive(
     }
 }
 
-/// Entry point for Linux.  Returns deduplicated list of setuid/setgid files.
 #[cfg(target_os = "linux")]
 pub fn gather_setuid_files() -> Vec<SetuidFinding> {
     let mut findings = Vec::new();
@@ -113,7 +109,6 @@ pub fn gather_setuid_files() -> Vec<SetuidFinding> {
         }
         let before = findings.len();
         scan_dir_recursive(path, *depth, &mut findings, &mut seen, &mut budget);
-        // Emit coverage if we hit the per-directory limit
         if findings.len() - before >= MAX_FILES_PER_DIR {
             crate::coverage::record(format!(
                 "setuid: {dir} scan truncated at {MAX_FILES_PER_DIR} entries — inventory incomplete"
@@ -128,13 +123,13 @@ pub fn gather_setuid_files() -> Vec<SetuidFinding> {
     findings
 }
 
-/// Stub for non‑Linux platforms.
 #[cfg(not(target_os = "linux"))]
 pub fn gather_setuid_files() -> Vec<SetuidFinding> {
     Vec::new()
 }
 
 #[cfg(test)]
+#[allow(clippy::unnecessary_cast)]
 mod tests {
     use super::*;
 
@@ -143,7 +138,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut perms = tmp.as_file().metadata().unwrap().permissions();
         let mode = perms.mode();
-        perms.set_mode(mode | libc::S_ISUID);
+        perms.set_mode(mode | libc::S_ISUID as u32);
         tmp.as_file().set_permissions(perms).unwrap();
         let f = inspect_file(tmp.path()).unwrap();
         assert!(f.setuid);
