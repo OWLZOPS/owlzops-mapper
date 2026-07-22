@@ -11,9 +11,20 @@ use std::path::Path;
 /// Resolve provenance for a batch of candidate paths.
 /// Returns a map from each candidate path to the owning package name (if found).
 pub fn resolve_batch(candidates: &HashSet<String>) -> HashMap<String, String> {
-    let result = resolve_dpkg(candidates);
-    // TODO: add apk support here
-    result
+    // 1. Try dpkg (Debian/Ubuntu)
+    let dpkg_result = resolve_dpkg(candidates);
+    if !dpkg_result.is_empty() {
+        return dpkg_result;
+    }
+
+    // 2. Try APK (Alpine)
+    let apk_result = resolve_apk(candidates);
+    if !apk_result.is_empty() {
+        return apk_result;
+    }
+
+    // 3. RPM – honest degradation without heavy BDB/SQLite parsers
+    resolve_rpm(candidates)
 }
 
 /// Resolve multiple candidate paths via dpkg's file lists.
@@ -71,6 +82,81 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> HashMap<String, String> {
         }
     }
     owned
+}
+
+/// Resolve multiple candidate paths via APK's installed database.
+fn resolve_apk(candidates: &HashSet<String>) -> HashMap<String, String> {
+    let mut owned = HashMap::new();
+    let apk_db = Path::new("/lib/apk/db/installed");
+    let dir_iter = match fs::read_dir(apk_db) {
+        Ok(it) => it,
+        Err(_) => {
+            crate::coverage::record(
+                "provenance: /lib/apk/db/installed unreadable — apk attribution degraded"
+                    .to_string(),
+            );
+            return owned;
+        }
+    };
+
+    for entry in dir_iter.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut pkg_name = String::new();
+        let mut files = Vec::new();
+
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("P:") {
+                pkg_name = rest.to_owned();
+            } else if let Some(rest) = line.strip_prefix("F:") {
+                // APK paths are relative to root, without a leading slash
+                let abs_path = format!("/{}", rest);
+                files.push(abs_path);
+            }
+        }
+
+        if pkg_name.is_empty() {
+            continue;
+        }
+
+        // Match candidates against owned files, including usrmerge aliases
+        for f in &files {
+            if candidates.contains(f.as_str()) {
+                owned.insert(f.clone(), pkg_name.clone());
+            }
+            // usrmerge aliases
+            if let Some(without_usr) = f.strip_prefix("/usr") {
+                if candidates.contains(without_usr) {
+                    owned.insert(without_usr.to_string(), pkg_name.clone());
+                }
+            } else if !f.starts_with("/usr") {
+                let with_usr = format!("/usr{}", f);
+                if candidates.contains(&with_usr) {
+                    owned.insert(with_usr, pkg_name.clone());
+                }
+            }
+        }
+
+        if owned.len() == candidates.len() {
+            break;
+        }
+    }
+
+    owned
+}
+
+/// RPM backend stub – we consciously skip heavy BDB/SQLite parsing.
+/// Returns an empty map so that further fallback heuristics can take over.
+fn resolve_rpm(_candidates: &HashSet<String>) -> HashMap<String, String> {
+    crate::coverage::record("provenance: RPM backend skipped (no BDB/SQLite parser)".to_string());
+    HashMap::new()
 }
 
 #[cfg(test)]

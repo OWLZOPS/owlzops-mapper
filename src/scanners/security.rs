@@ -494,9 +494,20 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     let mut provenance_candidates = HashSet::new();
     for fc in &file_capabilities {
         provenance_candidates.insert(fc.path.clone());
+        // usrmerge dual entry: also add the variant without /usr
+        if let Some(rest) = fc.path.strip_prefix("/usr") {
+            provenance_candidates.insert(rest.to_string());
+        } else if !fc.path.starts_with("/usr") {
+            provenance_candidates.insert(format!("/usr{}", fc.path));
+        }
     }
     for sf in &setuid_files {
         provenance_candidates.insert(sf.path.clone());
+        if let Some(rest) = sf.path.strip_prefix("/usr") {
+            provenance_candidates.insert(rest.to_string());
+        } else if !sf.path.starts_with("/usr") {
+            provenance_candidates.insert(format!("/usr{}", sf.path));
+        }
     }
     let provenance = crate::scanners::provenance::resolve_batch(&provenance_candidates);
 
