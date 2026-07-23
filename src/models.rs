@@ -757,6 +757,16 @@ pub struct BpfPinInfo {
     pub obj_id: u32,
 }
 
+/// A loaded BPF link (attachment) associated with a process.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BpfLinkInfo {
+    pub link_id: u32,
+    pub prog_id: u32,
+    pub attach_type: String,
+    pub pid: u32,
+    pub comm: String,
+}
+
 /// Full eBPF inventory collected from /proc and /sys/fs/bpf.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EbpfInventory {
@@ -766,6 +776,8 @@ pub struct EbpfInventory {
     pub maps: Vec<BpfMapInfo>,
     #[serde(default)]
     pub pins: Vec<BpfPinInfo>,
+    #[serde(default)]
+    pub links: Vec<BpfLinkInfo>,
 }
 
 // ── Deep Forensics (Pointer Resolution & Memory Analysis) ──

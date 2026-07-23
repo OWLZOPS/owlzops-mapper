@@ -1078,6 +1078,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         // Active (unexpected / suspicious) – visible, weighted
         if !active_caps.is_empty() {
+            let max_weight = active_caps.iter().map(|(_, w, _)| *w).max().unwrap_or(0);
             let list = active_caps
                 .iter()
                 .map(|(f, weight, reason)| {
@@ -1091,15 +1092,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            // Aggregate: take max weight? For now just use the first active's weight as overall or sum?
-            // We'll report each active finding separately? Original code had one finding per category with aggregated evidence.
-            // Here we keep the same pattern: one finding for all unexpected, with weight 8 (or max). We'll keep the original weight 8 for now,
-            // but we can later refine. We'll just use weight 8 and include reasons in evidence.
             findings.push(Finding {
                 id: "SEC-036",
                 title: "Unexpected file capabilities (setcap) – review required".to_string(),
                 category: Category::Security,
-                weight: 8, // keeping original weight for active caps
+                weight: max_weight,
                 evidence: format!(
                     "{} file(s) with unexpected or unknown capability attributes: {}",
                     active_caps.len(),
@@ -1158,6 +1155,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         // Active (unexpected / suspicious) – visible, weighted
         if !active_su.is_empty() {
+            let max_weight = active_su.iter().map(|(_, w, _)| *w).max().unwrap_or(0);
             let list = active_su
                 .iter()
                 .map(|(f, weight, reason)| {
@@ -1172,7 +1170,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 id: "SEC-037",
                 title: "Unexpected setuid/setgid files – review required".to_string(),
                 category: Category::Security,
-                weight: 8, // keep original weight for unexpected
+                weight: max_weight,
                 evidence: format!(
                     "{} file(s) with unexpected setuid/setgid bits: {}",
                     active_su.len(),
@@ -1811,58 +1809,53 @@ impl CriticalFlags {
 
 // ── New classification helpers for file capabilities and setuid files ─────
 
+/// Files whose basename is known to have specific, expected capabilities.
+/// This is a structural baseline – applied regardless of package DB availability.
+static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
+    ("ping", &["CAP_NET_RAW"]),
+    ("ping4", &["CAP_NET_RAW"]),
+    ("ping6", &["CAP_NET_RAW"]),
+    ("mtr", &["CAP_NET_RAW"]),
+    ("mtr-packet", &["CAP_NET_RAW"]),
+    ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
+];
+
 /// Classify a file capability finding.
 /// Returns (weight, reason). weight 0 means it is expected/suppressed.
 pub(crate) fn classify_cap_binary(
     fc: &crate::models::FileCapFinding,
     provenance_source: &ProvenanceSource,
 ) -> (u8, &'static str) {
-    // If package is known, it's expected.
+    // Owned by a package → expected
     if fc.package.is_some() {
         return (0, "owned by installed package");
     }
 
-    // If provenance is unavailable, we can't attribute -> structural fallback.
-    if *provenance_source == ProvenanceSource::Unavailable {
-        // For capabilities, we don't have a good structural fallback like setuid.
-        // Default to unexpected with low weight.
-        return (8, "package database unavailable — cannot verify");
-    }
-
-    // Provenance available but package is None => file is not owned by any package.
-    // This is suspicious. Check against a short list of known baselines.
+    // Structural baseline – works even when package DB is unavailable
     let basename = std::path::Path::new(&fc.path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-
-    // Known baseline list (copied from old KNOWN_CAP_BINARIES) – only applicable when provenance says file is unpackaged.
-    const KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
-        ("ping", &["CAP_NET_RAW"]),
-        ("ping4", &["CAP_NET_RAW"]),
-        ("ping6", &["CAP_NET_RAW"]),
-        ("mtr", &["CAP_NET_RAW"]),
-        ("mtr-packet", &["CAP_NET_RAW"]),
-        ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
-    ];
     for (name, allowed) in KNOWN_CAP_BINARIES {
         if basename == *name {
-            if fc
+            return if fc
                 .capabilities
                 .iter()
                 .all(|c| allowed.contains(&c.as_str()))
             {
-                return (
-                    0,
-                    "known binary with expected capabilities (even if unpackaged)",
-                );
+                (0, "known binary with expected capabilities")
             } else {
-                return (8, "unpackaged binary with extra capabilities");
-            }
+                (8, "known binary carrying capabilities beyond its baseline")
+            };
         }
     }
 
-    // Otherwise, truly unexpected.
+    // Package DB unavailable – we could not verify, but no structural match
+    if *provenance_source == ProvenanceSource::Unavailable {
+        return (2, "package DB unattributable; no structural match");
+    }
+
+    // DB available, file not in any package
     (8, "file not owned by any package")
 }
 
@@ -1872,7 +1865,7 @@ pub(crate) fn classify_setuid(
     f: &crate::models::SetuidFinding,
     provenance_source: &ProvenanceSource,
 ) -> (u8, &'static str) {
-    // If package is known, it's expected.
+    // Owned by a package → expected
     if f.package.is_some() {
         return (0, "owned by installed package");
     }
@@ -1893,7 +1886,7 @@ pub(crate) fn classify_setuid(
     .any(|d| f.path.starts_with(d));
 
     match (*provenance_source, in_system_dir, f.root_owner) {
-        // Unavailable: use structural fallback with low weight if in system dir and root-owned.
+        // Package DB unavailable – use structural fallback with low weight
         (ProvenanceSource::Unavailable, true, true) => {
             (2, "package DB unattributable; structural fallback")
         }
@@ -1903,7 +1896,7 @@ pub(crate) fn classify_setuid(
         (ProvenanceSource::Unavailable, false, _) => {
             (14, "setuid outside system dirs, DB unattributable")
         }
-        // Provenance available, file not owned by any package.
+        // DB available, file not in any package
         (_, true, true) => (6, "root-owned setuid in system dir, owned by NO package"),
         (_, true, false) => (12, "non-root setuid in a system dir"),
         (_, false, _) => (14, "setuid outside system binary directories"),

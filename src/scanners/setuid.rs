@@ -25,8 +25,7 @@ const SCAN_DIRS: &[(&str, u8)] = &[
 const BUDGET_FLAT: usize = 4_096; // per flat bin directory
 const BUDGET_DEEP: usize = 40_000; // per recursive lib root
 
-fn inspect_file(path: &Path) -> Option<SetuidFinding> {
-    let meta = path.symlink_metadata().ok()?;
+fn inspect_file(meta: &fs::Metadata, path: &Path) -> Option<SetuidFinding> {
     let mode = meta.permissions().mode();
 
     #[allow(clippy::unnecessary_cast)]
@@ -43,7 +42,7 @@ fn inspect_file(path: &Path) -> Option<SetuidFinding> {
         setuid: is_suid,
         setgid: is_sgid,
         root_owner: meta.uid() == 0,
-        package: None, // <-- Добавлено
+        package: None,
     })
 }
 
@@ -92,7 +91,7 @@ fn scan_dir_recursive(
             continue;
         }
 
-        if let Some(finding) = inspect_file(&entry.path()) {
+        if let Some(finding) = inspect_file(&meta, &entry.path()) {
             results.push(finding);
         }
     }
@@ -136,7 +135,8 @@ mod tests {
         let mode = perms.mode();
         perms.set_mode(mode | libc::S_ISUID as u32);
         tmp.as_file().set_permissions(perms).unwrap();
-        let f = inspect_file(tmp.path()).unwrap();
+        let meta = tmp.as_file().metadata().unwrap();
+        let f = inspect_file(&meta, tmp.path()).unwrap();
         assert!(f.setuid);
         assert!(!f.setgid);
     }
@@ -144,6 +144,7 @@ mod tests {
     #[test]
     fn inspect_file_no_bits() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        assert!(inspect_file(tmp.path()).is_none());
+        let meta = tmp.as_file().metadata().unwrap();
+        assert!(inspect_file(&meta, tmp.path()).is_none());
     }
 }
