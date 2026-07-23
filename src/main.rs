@@ -386,12 +386,43 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         });
                     }
 
-                    // Process results with immediate abort on shutdown signal
+                    // Process results with two-phase shutdown on Ctrl‑C
                     loop {
                         tokio::select! {
                             biased;
                             _ = shutdown_notify.notified() => {
-                                join_set.abort_all();
+                                // Phase 1: stop spawning new hosts, give grace for teardown
+                                let grace = Duration::from_secs(10);
+                                let deadline = tokio::time::Instant::now() + grace;
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        // Second Ctrl‑C – abort immediately
+                                        _ = shutdown_notify.notified() => {
+                                            warn!("second interrupt — aborting all tasks");
+                                            join_set.abort_all();
+                                            break;
+                                        }
+                                        // Grace period expired – abort remaining tasks
+                                        _ = tokio::time::sleep_until(deadline) => {
+                                            warn!("teardown grace expired — aborting remaining tasks; remote binaries may persist");
+                                            join_set.abort_all();
+                                            break;
+                                        }
+                                        res = join_set.join_next() => {
+                                            match res {
+                                                Some(Ok(Some(report))) => {
+                                                    if let Some(s) = &tx {
+                                                        let _ = s.send(report).await;
+                                                    }
+                                                }
+                                                Some(_) => {}
+                                                // All tasks finished cleanly during grace period
+                                                None => break,
+                                            }
+                                        }
+                                    }
+                                }
                                 scan_bar.finish_and_clear();
                                 if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
                                 break;
