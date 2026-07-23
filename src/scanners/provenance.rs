@@ -8,14 +8,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use crate::models::ProvenanceSource;
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+const MAX_LIST_BYTES: usize = 8 * 1024 * 1024; // largest real .list ≈ 2 MB
 
 /// The result of a batch resolution together with the database that produced it.
 pub struct ProvenanceIndex {
@@ -24,63 +21,66 @@ pub struct ProvenanceIndex {
 }
 
 impl ProvenanceIndex {
-    /// Look up a raw scanner path in the index.  The path is first normalised
-    /// via [`canon_path`] so that `/bin/su` and `/usr/bin/su` map to the same
-    /// key.
     pub fn lookup(&self, path: &str) -> Option<String> {
         self.map
             .get(crate::utils::canon_path(path).as_ref())
             .cloned()
     }
 
-    /// Returns `true` if the index is completely empty.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 }
 
-/// Resolve provenance for a batch of **canonical** candidate paths.
 pub fn resolve_batch(candidates: &HashSet<String>) -> ProvenanceIndex {
-    // Pick a backend based on which database actually exists.
+    let unavailable = |why: &str| {
+        crate::coverage::record(format!("provenance: {why} — attribution unavailable"));
+        ProvenanceIndex {
+            source: ProvenanceSource::Unavailable,
+            map: HashMap::new(),
+        }
+    };
+
     if Path::new("/var/lib/dpkg/info").is_dir() {
-        return ProvenanceIndex {
-            source: ProvenanceSource::Dpkg,
-            map: resolve_dpkg(candidates),
+        return match resolve_dpkg(candidates) {
+            Some(map) => ProvenanceIndex {
+                source: ProvenanceSource::Dpkg,
+                map,
+            },
+            None => unavailable("dpkg DB present but not a single .list was readable"),
         };
     }
     if Path::new("/lib/apk/db/installed").is_file() {
-        return ProvenanceIndex {
-            source: ProvenanceSource::Apk,
-            map: resolve_apk(candidates),
+        return match resolve_apk(candidates) {
+            Some(map) => ProvenanceIndex {
+                source: ProvenanceSource::Apk,
+                map,
+            },
+            None => unavailable("apk DB present but unreadable"),
         };
     }
-
-    crate::coverage::record(
-        "provenance: no parseable package DB (rpm/pacman) — attribution unavailable",
-    );
-    ProvenanceIndex {
-        source: ProvenanceSource::Unavailable,
-        map: HashMap::new(),
-    }
+    unavailable("no parseable package DB (rpm/pacman)")
 }
 
 // ---------------------------------------------------------------------------
-// DPKG backend
+// DPKG backend (capped, basename-prefiltered)
 // ---------------------------------------------------------------------------
 
-fn resolve_dpkg(candidates: &HashSet<String>) -> HashMap<String, String> {
+fn resolve_dpkg(candidates: &HashSet<String>) -> Option<HashMap<String, String>> {
+    if candidates.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    // Basename index – zero allocations for ~99.9% of .list lines
+    let basenames: HashSet<&str> = candidates
+        .iter()
+        .filter_map(|c| c.rsplit('/').next())
+        .collect();
+
     let mut owned = HashMap::new();
-    let info_dir = Path::new("/var/lib/dpkg/info");
-    let rd = match fs::read_dir(info_dir) {
-        Ok(rd) => rd,
-        Err(_) => {
-            crate::coverage::record(
-                "provenance: /var/lib/dpkg/info unreadable — dpkg attribution degraded",
-            );
-            return owned;
-        }
-    };
+    let mut lists_read = 0usize;
+    let rd = fs::read_dir("/var/lib/dpkg/info").ok()?;
 
     for entry in rd.flatten() {
         let path = entry.path();
@@ -88,54 +88,83 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> HashMap<String, String> {
             continue;
         }
 
-        // Package name: "libfoo:amd64.list" → "libfoo"
         let Some(pkg) = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .map(|s| s.split_once(':').map_or(s, |(n, _arch)| n).to_string())
+            .map(|s| s.split_once(':').map_or(s, |(n, _arch)| n))
         else {
             continue;
         };
 
-        let file = match fs::File::open(&path) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let Ok((content, truncated)) =
+            crate::safe_io::read_file_capped(&path.to_string_lossy(), MAX_LIST_BYTES)
+        else {
+            continue;
         };
-
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let line = line.trim();
-            // All paths – both from the .list and from the scanner – are
-            // normalised through canon_path before comparison.
-            let key = crate::utils::canon_path(line);
-            if candidates.contains(key.as_ref()) {
-                owned.insert(key.into_owned(), pkg.clone());
-            }
+        lists_read += 1;
+        if truncated {
+            crate::coverage::record(format!(
+                "provenance: {} truncated at {MAX_LIST_BYTES} B — attribution partial for {pkg}",
+                path.display()
+            ));
         }
 
+        for line in content.lines() {
+            let line = line.trim_end();
+            let Some(base) = line.rsplit('/').next() else {
+                continue;
+            };
+            if !basenames.contains(base) {
+                continue; // fast rejection without allocation
+            }
+            let key = crate::utils::canon_path(line);
+            if candidates.contains(key.as_ref()) {
+                owned.insert(key.into_owned(), pkg.to_string());
+            }
+        }
         if owned.len() == candidates.len() {
             break;
         }
     }
-    owned
+
+    (lists_read > 0).then_some(owned)
 }
 
 // ---------------------------------------------------------------------------
-// APK backend
+// APK backend (capped, basename-prefiltered)
 // ---------------------------------------------------------------------------
 
-fn resolve_apk(candidates: &HashSet<String>) -> HashMap<String, String> {
+fn resolve_apk(candidates: &HashSet<String>) -> Option<HashMap<String, String>> {
     let mut owned = HashMap::new();
     let file = match fs::File::open("/lib/apk/db/installed") {
         Ok(f) => f,
-        Err(_) => return owned,
+        Err(e) => {
+            crate::coverage::record(format!(
+                "provenance: /lib/apk/db/installed unreadable ({}) — apk attribution unavailable",
+                e.kind()
+            ));
+            return None;
+        }
     };
+
+    // APK DB is a single text file – read it capped.
+    use std::io::Read;
+    let mut buf = Vec::new();
+    file.take(MAX_LIST_BYTES as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let content = String::from_utf8_lossy(&buf);
+
+    let basenames: HashSet<&str> = candidates
+        .iter()
+        .filter_map(|c| c.rsplit('/').next())
+        .collect();
 
     let mut pkg_name = String::new();
     let mut dir = String::new();
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in content.lines() {
         if line.is_empty() {
-            // End of a package record – reset state for the next one.
             pkg_name.clear();
             dir.clear();
             continue;
@@ -150,6 +179,13 @@ fn resolve_apk(candidates: &HashSet<String>) -> HashMap<String, String> {
                 } else {
                     format!("/{dir}/{v}")
                 };
+                // fast basename check
+                let Some(base) = full.rsplit('/').next() else {
+                    continue;
+                };
+                if !basenames.contains(base) {
+                    continue;
+                }
                 let key = crate::utils::canon_path(&full);
                 if candidates.contains(key.as_ref()) {
                     owned.insert(key.into_owned(), pkg_name.clone());
@@ -159,7 +195,7 @@ fn resolve_apk(candidates: &HashSet<String>) -> HashMap<String, String> {
         }
     }
 
-    owned
+    Some(owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +216,6 @@ fn resolve_rpm(_candidates: &HashSet<String>) -> HashMap<String, String> {
 mod tests {
     use super::*;
 
-    /// Smoke test: on a Debian system /bin/ls must be attributed.
     #[test]
     fn resolve_batch_basics() {
         if Path::new("/var/lib/dpkg/info").is_dir() {
