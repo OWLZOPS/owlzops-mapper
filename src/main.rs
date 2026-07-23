@@ -37,6 +37,14 @@ use zeroize::Zeroizing;
 // sanitize hostname when printing to terminal in compare paths
 use crate::ui::sanitize_terminal as st;
 
+// ---------------------------------------------------------------------------
+// Fleet teardown constants (R19V-03)
+// ---------------------------------------------------------------------------
+/// Grace period for fleet teardown after first Ctrl-C.
+pub(crate) const FLEET_TEARDOWN_GRACE: Duration = Duration::from_secs(10);
+/// Extra margin before the external timeout kills the whole process.
+const HARD_EXIT_MARGIN: Duration = Duration::from_secs(5);
+
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
@@ -392,8 +400,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             biased;
                             _ = shutdown_notify.notified() => {
                                 // Phase 1: stop spawning new hosts, give grace for teardown
-                                let grace = Duration::from_secs(10);
-                                let deadline = tokio::time::Instant::now() + grace;
+                                let deadline = tokio::time::Instant::now() + FLEET_TEARDOWN_GRACE;
                                 loop {
                                     tokio::select! {
                                         biased;
@@ -414,11 +421,14 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                 Some(Ok(Some(report))) => {
                                                     if let Some(s) = &tx {
                                                         let _ = s.send(report).await;
+                                                    } else {
+                                                        reports.push(report);
                                                     }
                                                 }
-                                                Some(_) => {}
-                                                // All tasks finished cleanly during grace period
-                                                None => break,
+                                                Some(Ok(None)) => {}
+                                                Some(Err(e)) if e.is_panic() => warn!("scan task panicked during teardown: {e}"),
+                                                Some(Err(e)) => warn!("scan task failed during teardown: {e}"),
+                                                None => break, // All tasks finished cleanly
                                             }
                                         }
                                     }
@@ -809,51 +819,59 @@ async fn main() {
 
     let mut cmd_handle = tokio::spawn(run_command(cli, shutdown_clone, shutdown_notify_clone));
 
-    // Listen for SIGINT (Ctrl+C) and SIGTERM
-    let mut sig_int = signal::unix::signal(signal::unix::SignalKind::interrupt())
-        .expect("failed to install SIGINT handler");
-    let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
+    // ---- Signal handler runs for the entire lifetime (R19V-03) ----
+    let notify_sig = shutdown_notify.clone();
+    let flag_sig = shutdown.clone();
+    tokio::spawn(async move {
+        let mut sig_int = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .expect("failed to install SIGINT handler");
+        let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        let mut hits = 0u8;
+        loop {
+            tokio::select! {
+                _ = sig_int.recv()  => {}
+                _ = sig_term.recv() => {}
+            }
+            hits += 1;
+            flag_sig.store(true, Ordering::Relaxed);
+            notify_sig.notify_one();
+            crate::utils::terminate_registered_children();
+            match hits {
+                1 => eprintln!(
+                    "Interrupt received — finishing in-flight hosts (grace {:?})",
+                    FLEET_TEARDOWN_GRACE
+                ),
+                2 => eprintln!("Second interrupt — aborting remaining tasks"),
+                _ => {
+                    eprintln!("Third interrupt — forcing exit");
+                    std::process::exit(130);
+                }
+            }
+        }
+    });
 
-    let exit_code = tokio::select! {
-        res = &mut cmd_handle => {
-            match res {
-                Ok(code) => code,
-                Err(join_err) => {
-                    if join_err.is_panic() {
-                        eprintln!("Main task panicked");
-                        130
-                    } else {
-                        1
-                    }
-                }
+    // ---- External timeout must exceed the internal grace period ----
+    let exit_code = match tokio::time::timeout(
+        FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN,
+        &mut cmd_handle,
+    )
+    .await
+    {
+        Ok(Ok(code)) => code,
+        Ok(Err(join_err)) => {
+            if join_err.is_panic() {
+                eprintln!("Main task panicked");
+                130
+            } else {
+                1
             }
         }
-        _ = sig_int.recv() => {
-            eprintln!("Received interrupt signal, shutting down gracefully...");
+        Err(_elapsed) => {
+            eprintln!("Graceful shutdown timed out, forcing exit.");
             shutdown.store(true, Ordering::Relaxed);
             shutdown_notify.notify_one();
-            crate::utils::terminate_registered_children();
-            match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
-                Ok(Ok(code)) => code,
-                _ => {
-                    eprintln!("Graceful shutdown timed out, forcing exit.");
-                    130
-                }
-            }
-        }
-        _ = sig_term.recv() => {
-            eprintln!("Received termination signal, shutting down gracefully...");
-            shutdown.store(true, Ordering::Relaxed);
-            shutdown_notify.notify_one();
-            crate::utils::terminate_registered_children();
-            match tokio::time::timeout(Duration::from_secs(5), &mut cmd_handle).await {
-                Ok(Ok(code)) => code,
-                _ => {
-                    eprintln!("Graceful shutdown timed out, forcing exit.");
-                    130
-                }
-            }
+            130
         }
     };
 
