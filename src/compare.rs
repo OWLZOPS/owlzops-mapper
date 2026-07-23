@@ -539,6 +539,92 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
+    // --- security.setuid_files (R19-10) ---
+    let before_suid: HashSet<&str> = before
+        .security
+        .setuid_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    let after_suid: HashSet<&str> = after
+        .security
+        .setuid_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    for added in after_suid.difference(&before_suid) {
+        changes.push(Change {
+            field: "security.setuid_files".into(),
+            before: None,
+            after: Some((*added).to_string()),
+            severity: Severity::Degraded,
+        });
+    }
+    for removed in before_suid.difference(&after_suid) {
+        changes.push(Change {
+            field: "security.setuid_files".into(),
+            before: Some((*removed).to_string()),
+            after: None,
+            severity: Severity::Improved,
+        });
+    }
+
+    // --- security.file_capabilities (R19-10) ---
+    let cap_key = |f: &crate::models::FileCapFinding| {
+        let mut caps = f.capabilities.clone();
+        caps.sort();
+        format!("{}:[{}]", f.path, caps.join(","))
+    };
+    let before_caps: HashSet<String> = before
+        .security
+        .file_capabilities
+        .iter()
+        .map(cap_key)
+        .collect();
+    let after_caps: HashSet<String> = after
+        .security
+        .file_capabilities
+        .iter()
+        .map(cap_key)
+        .collect();
+    for added in after_caps.difference(&before_caps) {
+        changes.push(Change {
+            field: "security.file_capabilities".into(),
+            before: None,
+            after: Some(added.clone()),
+            severity: Severity::Degraded,
+        });
+    }
+    for removed in before_caps.difference(&after_caps) {
+        changes.push(Change {
+            field: "security.file_capabilities".into(),
+            before: Some(removed.clone()),
+            after: None,
+            severity: Severity::Improved,
+        });
+    }
+
+    // --- security.ebpf_inventory (R19-10) ---
+    let ebpf_snapshot = |inv: &crate::models::EbpfInventory| {
+        format!(
+            "progs:{} maps:{} links:{} pins:{}",
+            inv.programs.len(),
+            inv.maps.len(),
+            inv.links.len(),
+            inv.pins.len()
+        )
+    };
+    let before_ebpf = ebpf_snapshot(&before.security.ebpf_inventory);
+    let after_ebpf = ebpf_snapshot(&after.security.ebpf_inventory);
+    if before_ebpf != after_ebpf {
+        changes.push(Change {
+            field: "security.ebpf_inventory".into(),
+            before: Some(before_ebpf),
+            after: Some(after_ebpf),
+            severity: Severity::Changed,
+        });
+    }
+
     // Deterministic sort: Degraded first, then Changed, then Improved;
     // within same severity, stable order by field/before/after
     changes.sort_unstable_by(|a, b| {
