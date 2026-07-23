@@ -55,11 +55,12 @@ jobs:
                  masking:    .security.mount_masking}' audit_result.json
           fi
 
-          # `provjobd` is the only known false positive on the GitHub runner.
-          # Any new suspicious process must break the build.
+          # `provjobd` (with optional numeric suffix) is the only known false
+          # positive on the GitHub runner. Any new suspicious process must
+          # break the build.
           UNEXPECTED=$(jq -r '
             [.security.suspicious_processes[]?.name]
-            | map(select(. != "provjobd")) | length' audit_result.json)
+            | map(select(test("^provjobd") | not)) | length' audit_result.json)
           if [ "$UNEXPECTED" -ne 0 ]; then
             echo "::error::$UNEXPECTED unexpected suspicious process(es) — new false positive or real regression"
             exit 1
