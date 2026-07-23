@@ -199,10 +199,16 @@ where
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                coverage::record(format!(
-                    "sudoers: {file} referenced by an include directive but does not exist \
-                     (config defect, not a coverage gap)"
-                ));
+                if depth == 0 {
+                    coverage::record(format!(
+                        "sudoers: {file} does not exist — sudo is likely not installed"
+                    ));
+                } else {
+                    coverage::record(format!(
+                        "sudoers: {file} referenced by an include directive but does not exist \
+                         (config defect, not a coverage gap)"
+                    ));
+                }
             }
             Err(e) => {
                 coverage::record(format!(

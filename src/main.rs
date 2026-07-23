@@ -565,6 +565,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             "Local scan interrupted — no report emitted \
                              (partial state would be indistinguishable from real findings)."
                         );
+                        // Cancelling the future does not stop spawn_blocking scanners;
+                        // their helpers would outlive us without our timeout.
+                        crate::utils::terminate_registered_children();
                         for w in crate::coverage::drain_scoped("local-interrupted") {
                             warn!("{w}");
                         }
