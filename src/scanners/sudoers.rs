@@ -2,8 +2,11 @@
 //! handling line continuations, and providing logical entries.
 //! Used by both `security.rs` (NOPASSWD detection) and `access.rs` (NOPASSWD: ALL).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+
+use crate::{coverage, safe_io};
 
 /// Yield logical (continuation-joined) lines from sudoers content.
 /// Lines ending with a backslash are joined with the next line, preserving
@@ -48,37 +51,125 @@ fn contains_icase(hay: &str, needle_lower: &str) -> bool {
         .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
-/// Callback for each logical entry found in sudoers files.
-/// `path` is the source file, `entry` is the logical (joined) line.
+/// Attempt to parse an include directive from a sudoers line.
+/// Returns Some((path, is_dir)) on success, None otherwise.
+fn include_target(line: &str) -> Option<(&str, bool)> {
+    for (prefix, is_dir) in &[
+        ("#includedir", true),
+        ("@includedir", true),
+        ("#include", false),
+        ("@include", false),
+    ] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let path = rest.trim();
+            if !path.is_empty() {
+                return Some((path, *is_dir));
+            }
+        }
+    }
+    None
+}
+
+const MAX_SUDOERS_BYTES: usize = 4 * 1024 * 1024;
+
+/// Walk all sudoers files (including those referenced via #include/@include)
+/// and call the callback for each logical line.
 pub fn each_sudoers_entry<F>(mut callback: F)
 where
     F: FnMut(&str, &str),
 {
-    let sudoers_dir = Path::new("/etc/sudoers.d");
-    let mut files = vec!["/etc/sudoers".to_string()];
-    if sudoers_dir.is_dir()
-        && let Ok(entries) = fs::read_dir(sudoers_dir)
-    {
-        for e in entries.flatten() {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            // Ignore files containing '.' or ending with '~' (backups, editors),
-            // unless the extension is explicitly ".conf" (some distros use this).
-            let has_disallowed_char = name.contains('.') || name.ends_with('~');
-            let is_conf = p.extension().map(|x| x == "conf").unwrap_or(false);
-            if has_disallowed_char && !is_conf {
-                continue;
-            }
-            if p.is_file() && !name.starts_with('.') && name != "README" {
-                files.push(p.to_string_lossy().to_string());
-            }
-        }
-    }
+    let mut queue: Vec<String> = vec!["/etc/sudoers".to_string(), "/etc/sudoers.d".to_string()];
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut depth_budget = 32usize;
 
-    for file in &files {
-        if let Ok(content) = fs::read_to_string(file) {
-            for entry in logical_lines(&content) {
-                callback(file, &entry);
+    while let Some(file) = queue.pop() {
+        if depth_budget == 0 {
+            crate::coverage::record(
+                "sudoers: include depth limit reached — NOPASSWD audit INCOMPLETE",
+            );
+            break;
+        }
+        if !visited.insert(file.clone()) {
+            continue;
+        }
+        depth_budget -= 1;
+
+        let path = Path::new(&file);
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(&file) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    // Ignore files containing '.' or ending with '~' (backups, editors),
+                    // unless the extension is explicitly ".conf" (some distros use this).
+                    let has_disallowed_char = name.contains('.') || name.ends_with('~');
+                    let is_conf = entry
+                        .path()
+                        .extension()
+                        .map(|x| x == "conf")
+                        .unwrap_or(false);
+                    if has_disallowed_char && !is_conf {
+                        continue;
+                    }
+                    if entry.path().is_file() && !name.starts_with('.') && name != "README" {
+                        queue.push(entry.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
+        match safe_io::read_file_capped(&file, MAX_SUDOERS_BYTES) {
+            Ok((content, truncated)) => {
+                if truncated {
+                    coverage::record(format!(
+                        "sudoers: {file} truncated — NOPASSWD audit partial"
+                    ));
+                }
+
+                // Process include directives before parsing entries, so that
+                // included files are added to the queue for scanning.
+                for raw in content.lines() {
+                    let line = raw.trim();
+                    if let Some((target, is_dir)) = include_target(line) {
+                        if is_dir {
+                            if let Ok(entries) = fs::read_dir(target) {
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name();
+                                    let name = name.to_string_lossy();
+                                    let has_disallowed_char =
+                                        name.contains('.') || name.ends_with('~');
+                                    let is_conf = entry
+                                        .path()
+                                        .extension()
+                                        .map(|x| x == "conf")
+                                        .unwrap_or(false);
+                                    if has_disallowed_char && !is_conf {
+                                        continue;
+                                    }
+                                    if entry.path().is_file()
+                                        && !name.starts_with('.')
+                                        && name != "README"
+                                    {
+                                        queue.push(format!("{}/{}", target, name));
+                                    }
+                                }
+                            }
+                        } else {
+                            queue.push(target.to_string());
+                        }
+                    }
+                }
+
+                for entry in logical_lines(&content) {
+                    callback(&file, &entry);
+                }
+            }
+            Err(e) => {
+                coverage::record(format!(
+                    "sudoers: {file} unreadable ({}) — NOPASSWD audit INCOMPLETE for this file",
+                    e.kind()
+                ));
             }
         }
     }
