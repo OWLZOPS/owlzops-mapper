@@ -2,6 +2,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh::*;
 use std::io::{IsTerminal, Read};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

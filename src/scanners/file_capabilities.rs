@@ -3,6 +3,11 @@
 //! attributes (set via `setcap`). Capability sets are decoded from raw xattr
 //! using only `libc::lgetxattr` and binary parsing – no external tools.
 
+// On non-Linux targets the Linux-specific imports and the `VfsCaps` struct are
+// genuinely unused (the `gather_file_capabilities` stub just returns an empty
+// vector).  Suppress those warnings only there so that Linux builds stay strict.
+#![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
+
 use crate::models::FileCapFinding;
 use std::collections::HashSet;
 use std::ffi::CString;

@@ -19,7 +19,9 @@ use crate::utils::host_budget_secs;
 use clap::Parser;
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use models::{AgentReport, HostDiffStatus, SelfIntegrityReport};
+#[cfg(feature = "local-scan")]
+use models::SelfIntegrityReport;
+use models::{AgentReport, HostDiffStatus};
 use runner::snapshot_run;
 #[cfg(feature = "local-scan")]
 use runner::{is_local_host, run_local_scan_async};
@@ -638,7 +640,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 eprintln!(
                     "Local audit is not supported on this platform. Use --host to scan a remote host."
                 );
-                return 2;
+                2 // ← clippy: needless_return removed
             }
         }
 

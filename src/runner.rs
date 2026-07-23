@@ -1,7 +1,9 @@
 use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
+#[cfg(feature = "local-scan")]
 use chrono::Utc;
 use std::path::PathBuf;
+#[cfg(feature = "local-scan")]
 use tracing::{Instrument, info, warn};
 
 // ── Validation helpers (public – also used in main) ────────
