@@ -38,12 +38,14 @@ use zeroize::Zeroizing;
 use crate::ui::sanitize_terminal as st;
 
 // ---------------------------------------------------------------------------
-// Fleet teardown constants (R19V-03)
+// Fleet teardown constants (R19V2‑01 / R19V2‑04)
 // ---------------------------------------------------------------------------
-/// Grace period for fleet teardown after first Ctrl-C.
+/// Grace period for fleet teardown after first Ctrl‑C.
 pub(crate) const FLEET_TEARDOWN_GRACE: Duration = Duration::from_secs(10);
-/// Extra margin before the external timeout kills the whole process.
+/// Extra margin before the **post‑signal** watchdog kills the process.
 const HARD_EXIT_MARGIN: Duration = Duration::from_secs(5);
+/// Time allowed for the JSONL writer to drain after the scan loop finishes.
+pub(crate) const JSONL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -399,7 +401,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         tokio::select! {
                             biased;
                             _ = shutdown_notify.notified() => {
-                                // Phase 1: stop spawning new hosts, give grace for teardown
+                                // Phase 1: drain in-flight hosts; queued tasks abort
+                                // footprint-free at the semaphore.
                                 let deadline = tokio::time::Instant::now() + FLEET_TEARDOWN_GRACE;
                                 loop {
                                     tokio::select! {
@@ -477,7 +480,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 }
                 if let Some(writer) = writer_task {
                     let joined = if shutdown.load(Ordering::Relaxed) {
-                        match tokio::time::timeout(Duration::from_secs(2), writer).await {
+                        match tokio::time::timeout(JSONL_DRAIN_TIMEOUT, writer).await {
                             Ok(r) => r,
                             Err(_) => {
                                 warn!(
@@ -554,7 +557,20 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                 // Self‑integrity preflight
                 let integrity = scanners::self_integrity::run_self_integrity_check();
-                let mut report = run_local_scan_async(&args).await;
+                let mut report = tokio::select! {
+                    r = run_local_scan_async(&args) => r,
+                    _ = shutdown_notify.notified() => {
+                        local_spinner.finish_and_clear();
+                        eprintln!(
+                            "Local scan interrupted — no report emitted \
+                             (partial state would be indistinguishable from real findings)."
+                        );
+                        for w in crate::coverage::drain_scoped("local-interrupted") {
+                            warn!("{w}");
+                        }
+                        return 130;
+                    }
+                };
                 report.self_integrity = Some(SelfIntegrityReport {
                     compromised: integrity.compromised,
                     warnings: integrity.warnings,
@@ -817,9 +833,9 @@ async fn main() {
     let shutdown_clone = shutdown.clone();
     let shutdown_notify_clone = shutdown_notify.clone();
 
-    let mut cmd_handle = tokio::spawn(run_command(cli, shutdown_clone, shutdown_notify_clone));
+    let cmd_handle = tokio::spawn(run_command(cli, shutdown_clone, shutdown_notify_clone));
 
-    // ---- Signal handler runs for the entire lifetime (R19V-03) ----
+    // ---- Signal handler (runs for the entire lifetime) ----
     let notify_sig = shutdown_notify.clone();
     let flag_sig = shutdown.clone();
     tokio::spawn(async move {
@@ -836,14 +852,28 @@ async fn main() {
             hits += 1;
             flag_sig.store(true, Ordering::Relaxed);
             notify_sig.notify_one();
-            crate::utils::terminate_registered_children();
             match hits {
-                1 => eprintln!(
-                    "Interrupt received — finishing in-flight hosts (grace {:?})",
-                    FLEET_TEARDOWN_GRACE
-                ),
-                2 => eprintln!("Second interrupt — aborting remaining tasks"),
+                1 => {
+                    eprintln!(
+                        "Interrupt received — finishing in-flight hosts (grace {:?})",
+                        FLEET_TEARDOWN_GRACE
+                    );
+                    // Hard ceiling from the moment of first signal.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN).await;
+                        eprintln!("Graceful shutdown timed out, forcing exit.");
+                        // Kill any remaining helpers so they don't become orphans.
+                        crate::utils::terminate_registered_children();
+                        std::process::exit(130);
+                    });
+                }
+                2 => {
+                    eprintln!("Second interrupt — aborting remaining tasks");
+                    // Now we are no longer promising a clean report — helpers can be killed.
+                    crate::utils::terminate_registered_children();
+                }
                 _ => {
+                    crate::utils::terminate_registered_children();
                     eprintln!("Third interrupt — forcing exit");
                     std::process::exit(130);
                 }
@@ -851,29 +881,14 @@ async fn main() {
         }
     });
 
-    // ---- External timeout must exceed the internal grace period ----
-    let exit_code = match tokio::time::timeout(
-        FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN,
-        &mut cmd_handle,
-    )
-    .await
-    {
-        Ok(Ok(code)) => code,
-        Ok(Err(join_err)) => {
-            if join_err.is_panic() {
-                eprintln!("Main task panicked");
-                130
-            } else {
-                1
-            }
-        }
-        Err(_elapsed) => {
-            eprintln!("Graceful shutdown timed out, forcing exit.");
-            shutdown.store(true, Ordering::Relaxed);
-            shutdown_notify.notify_one();
+    let exit_code = cmd_handle.await.unwrap_or_else(|join_err| {
+        if join_err.is_panic() {
+            eprintln!("Main task panicked");
             130
+        } else {
+            1
         }
-    };
+    });
 
     std::process::exit(exit_code);
 }
@@ -973,5 +988,13 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(compute_exit_code(&r), 3);
+    }
+
+    #[test]
+    fn hard_exit_ceiling_covers_grace_plus_drain() {
+        assert!(
+            FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN > FLEET_TEARDOWN_GRACE + JSONL_DRAIN_TIMEOUT,
+            "watchdog must not fire before the JSONL writer has drained"
+        );
     }
 }

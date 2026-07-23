@@ -80,6 +80,7 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> Option<HashMap<String, String>>
 
     let mut owned = HashMap::new();
     let mut lists_read = 0usize;
+    let mut lists_skipped = 0usize;
     let rd = fs::read_dir("/var/lib/dpkg/info").ok()?;
 
     for entry in rd.flatten() {
@@ -99,6 +100,7 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> Option<HashMap<String, String>>
         let Ok((content, truncated)) =
             crate::safe_io::read_file_capped(&path.to_string_lossy(), MAX_LIST_BYTES)
         else {
+            lists_skipped += 1;
             continue;
         };
         lists_read += 1;
@@ -127,17 +129,30 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> Option<HashMap<String, String>>
         }
     }
 
+    if lists_skipped > 0 {
+        crate::coverage::record(format!(
+            "provenance: {lists_skipped} of {} dpkg .list file(s) unreadable — \
+             files owned by those packages will be reported as unpackaged",
+            lists_read + lists_skipped
+        ));
+    }
     (lists_read > 0).then_some(owned)
 }
 
 // ---------------------------------------------------------------------------
-// APK backend (capped, basename-prefiltered)
+// APK backend (capped, basename-prefiltered, truncation-aware)
 // ---------------------------------------------------------------------------
 
 fn resolve_apk(candidates: &HashSet<String>) -> Option<HashMap<String, String>> {
-    let mut owned = HashMap::new();
-    let file = match fs::File::open("/lib/apk/db/installed") {
-        Ok(f) => f,
+    if candidates.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    let (content, truncated) = match crate::safe_io::read_file_capped(
+        "/lib/apk/db/installed",
+        MAX_LIST_BYTES,
+    ) {
+        Ok((c, t)) => (c, t),
         Err(e) => {
             crate::coverage::record(format!(
                 "provenance: /lib/apk/db/installed unreadable ({}) — apk attribution unavailable",
@@ -146,15 +161,14 @@ fn resolve_apk(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
             return None;
         }
     };
+    if truncated {
+        crate::coverage::record(
+            "provenance: apk DB truncated at cap — attribution PARTIAL, \
+             unresolved files may be misreported as unpackaged",
+        );
+    }
 
-    // APK DB is a single text file – read it capped.
-    use std::io::Read;
-    let mut buf = Vec::new();
-    file.take(MAX_LIST_BYTES as u64)
-        .read_to_end(&mut buf)
-        .ok()?;
-    let content = String::from_utf8_lossy(&buf);
-
+    let mut owned = HashMap::new();
     let basenames: HashSet<&str> = candidates
         .iter()
         .filter_map(|c| c.rsplit('/').next())
@@ -179,7 +193,6 @@ fn resolve_apk(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
                 } else {
                     format!("/{dir}/{v}")
                 };
-                // fast basename check
                 let Some(base) = full.rsplit('/').next() else {
                     continue;
                 };

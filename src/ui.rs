@@ -1765,12 +1765,13 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
 
     // SEC‑035 – eBPF inventory (suppressed, informational)
     let ebpf = &report.security.ebpf_inventory;
-    let ebpf_total = ebpf.programs.len() + ebpf.maps.len() + ebpf.pins.len();
+    let ebpf_total = ebpf.programs.len() + ebpf.maps.len() + ebpf.links.len() + ebpf.pins.len();
     if ebpf_total > 0 {
         println!(
-            "🛡  eBPF inventory (SEC‑035): {} program(s), {} map(s), {} pin(s).",
+            "🛡  eBPF inventory (SEC‑035): {} program(s), {} map(s), {} link(s), {} pin(s).",
             ebpf.programs.len(),
             ebpf.maps.len(),
+            ebpf.links.len(),
             ebpf.pins.len(),
         );
     }

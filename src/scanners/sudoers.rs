@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{coverage, safe_io};
 
@@ -16,20 +16,17 @@ pub fn logical_lines(content: &str) -> Vec<String> {
     let mut continuation = String::new();
     for raw in content.lines() {
         let line = raw.trim();
-        // Skip comments and empty lines
         if line.is_empty() || line.starts_with('#') {
             if !continuation.is_empty() {
                 result.push(std::mem::take(&mut continuation));
             }
             continue;
         }
-        // Join with previous continuation
         if !continuation.is_empty() {
             continuation.push(' ');
         }
         continuation.push_str(line);
         if line.ends_with('\\') {
-            // Remove trailing backslash, continue accumulating
             continuation.truncate(continuation.len() - 1);
         } else {
             result.push(std::mem::take(&mut continuation));
@@ -53,6 +50,8 @@ fn contains_icase(hay: &str, needle_lower: &str) -> bool {
 
 /// Attempt to parse an include directive from a sudoers line.
 /// Returns Some((path, is_dir)) on success, None otherwise.
+/// The directive must be followed by whitespace to avoid matching comments
+/// like "#includes are handled below" (R19V5‑03).
 fn include_target(line: &str) -> Option<(&str, bool)> {
     for (prefix, is_dir) in &[
         ("#includedir", true),
@@ -61,6 +60,9 @@ fn include_target(line: &str) -> Option<(&str, bool)> {
         ("@include", false),
     ] {
         if let Some(rest) = line.strip_prefix(prefix) {
+            if !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
             let path = rest.trim();
             if !path.is_empty() {
                 return Some((path, *is_dir));
@@ -71,6 +73,17 @@ fn include_target(line: &str) -> Option<(&str, bool)> {
 }
 
 const MAX_SUDOERS_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INCLUDE_DEPTH: u8 = 16;
+const MAX_SUDOERS_FILES: usize = 512;
+
+/// Canonical key for the visited set – always an absolute, cleaned path.
+fn canon_path_key(path: &str) -> String {
+    Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .to_string_lossy()
+        .to_string()
+}
 
 /// Walk all sudoers files (including those referenced via #include/@include)
 /// and call the callback for each logical line.
@@ -78,21 +91,32 @@ pub fn each_sudoers_entry<F>(mut callback: F)
 where
     F: FnMut(&str, &str),
 {
-    let mut queue: Vec<String> = vec!["/etc/sudoers".to_string(), "/etc/sudoers.d".to_string()];
+    let mut queue: Vec<(String, u8)> = vec![
+        ("/etc/sudoers".to_string(), 0),
+        ("/etc/sudoers.d".to_string(), 0),
+    ];
     let mut visited: HashSet<String> = HashSet::new();
-    let mut depth_budget = 32usize;
+    let mut files_seen = 0usize;
 
-    while let Some(file) = queue.pop() {
-        if depth_budget == 0 {
-            crate::coverage::record(
-                "sudoers: include depth limit reached — NOPASSWD audit INCOMPLETE",
-            );
+    while let Some((file, depth)) = queue.pop() {
+        if files_seen >= MAX_SUDOERS_FILES {
+            coverage::record(format!(
+                "sudoers: file budget {MAX_SUDOERS_FILES} exhausted — NOPASSWD audit INCOMPLETE"
+            ));
             break;
         }
-        if !visited.insert(file.clone()) {
+        if depth > MAX_INCLUDE_DEPTH {
+            coverage::record(format!(
+                "sudoers: include depth limit at {file} — subtree skipped"
+            ));
             continue;
         }
-        depth_budget -= 1;
+
+        let key = canon_path_key(&file);
+        if !visited.insert(key) {
+            continue;
+        }
+        files_seen += 1;
 
         let path = Path::new(&file);
         if path.is_dir() {
@@ -100,8 +124,6 @@ where
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
-                    // Ignore files containing '.' or ending with '~' (backups, editors),
-                    // unless the extension is explicitly ".conf" (some distros use this).
                     let has_disallowed_char = name.contains('.') || name.ends_with('~');
                     let is_conf = entry
                         .path()
@@ -112,7 +134,7 @@ where
                         continue;
                     }
                     if entry.path().is_file() && !name.starts_with('.') && name != "README" {
-                        queue.push(entry.path().to_string_lossy().to_string());
+                        queue.push((entry.path().to_string_lossy().to_string(), depth + 1));
                     }
                 }
             }
@@ -127,13 +149,21 @@ where
                     ));
                 }
 
-                // Process include directives before parsing entries, so that
-                // included files are added to the queue for scanning.
+                // Process include directives, resolving relative paths against the
+                // parent directory of the including file (R19V‑09).
+                let parent = Path::new(&file).parent().map(Path::to_path_buf);
                 for raw in content.lines() {
                     let line = raw.trim();
                     if let Some((target, is_dir)) = include_target(line) {
+                        let resolved = if target.starts_with('/') {
+                            target.to_string()
+                        } else if let Some(ref p) = parent {
+                            p.join(target).to_string_lossy().to_string()
+                        } else {
+                            target.to_string()
+                        };
                         if is_dir {
-                            if let Ok(entries) = fs::read_dir(target) {
+                            if let Ok(entries) = fs::read_dir(&resolved) {
                                 for entry in entries.flatten() {
                                     let name = entry.file_name();
                                     let name = name.to_string_lossy();
@@ -151,12 +181,15 @@ where
                                         && !name.starts_with('.')
                                         && name != "README"
                                     {
-                                        queue.push(format!("{}/{}", target, name));
+                                        queue.push((
+                                            entry.path().to_string_lossy().to_string(),
+                                            depth + 1,
+                                        ));
                                     }
                                 }
                             }
                         } else {
-                            queue.push(target.to_string());
+                            queue.push((resolved, depth + 1));
                         }
                     }
                 }
@@ -164,6 +197,12 @@ where
                 for entry in logical_lines(&content) {
                     callback(&file, &entry);
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                coverage::record(format!(
+                    "sudoers: {file} referenced by an include directive but does not exist \
+                     (config defect, not a coverage gap)"
+                ));
             }
             Err(e) => {
                 coverage::record(format!(
