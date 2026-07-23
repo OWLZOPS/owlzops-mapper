@@ -1,48 +1,106 @@
-name: E2E Smoke Test
+name: E2E
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
-  local-audit:
-    name: Local audit smoke test
-    runs-on: ubuntu-latest
+  e2e:
+    name: End-to-End Audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # action HEAD as of 2026-06-28
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # action HEAD as of 2026-06-28
         with:
           toolchain: stable
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
-      - name: Build executable (debug for speed)
+      - name: Build (debug)
         run: cargo build --locked
 
       - name: Run Local Audit & Validate JSON
         run: |
           set +e
-          # Removed 2>/dev/null to capture stderr logs in GitHub Actions
           sudo ./target/debug/owlzops-mapper audit --format json > audit_result.json
           MAPPER_EXIT=$?
           set -e
 
-          # Accept exit codes 0 (clean), 1 (findings), 2 (incomplete), and 3 (compromised) as valid runs.
-          # Code 3 is expected here due to false positives from Azure runner components (e.g., provjobd).
           if [ $MAPPER_EXIT -gt 3 ]; then
             echo "❌ Mapper crashed or failed setup with exit code: $MAPPER_EXIT"
             cat audit_result.json 2>/dev/null || true
             exit $MAPPER_EXIT
           fi
 
-          jq -e '.scan_id != null' audit_result.json > /dev/null
-          jq -e '.risk_score != null' audit_result.json > /dev/null
-          jq -e '.host.hostname != null' audit_result.json > /dev/null
+          # Always log IoC-related arrays when exit code is 3, so that any
+          # false positive is immediately visible and triageable.
+          if [ $MAPPER_EXIT -eq 3 ]; then
+            echo "--- IoC-bearing arrays (exit 3) ---"
+            jq '{suspicious: .security.suspicious_processes,
+                 injections: .security.library_injections,
+                 ghosts:     .security.ghost_pids,
+                 shells:     .security.reverse_shells,
+                 masking:    .security.mount_masking}' audit_result.json
+          fi
+
+          # `provjobd` is the only known false positive on the GitHub runner.
+          # Any new suspicious process must break the build.
+          UNEXPECTED=$(jq -r '
+            [.security.suspicious_processes[]?.name]
+            | map(select(. != "provjobd")) | length' audit_result.json)
+          if [ "$UNEXPECTED" -ne 0 ]; then
+            echo "::error::$UNEXPECTED unexpected suspicious process(es) — new false positive or real regression"
+            exit 1
+          fi
+
+          jq -e '.scan_id != null'                  audit_result.json > /dev/null
+          jq -e '.risk_score != null'               audit_result.json > /dev/null
+          jq -e '.host.hostname != null'            audit_result.json > /dev/null
           jq -e '.packages.installed_count != null' audit_result.json > /dev/null
-          echo "✅ Lightweight E2E passed! (mapper exit code: $MAPPER_EXIT)"
+
+          # Fields introduced in v0.5.23/v0.5.24 — guard against regressions
+          # where a field is collected but not delivered to the consumer.
+          jq -e '.security | has("provenance_source")'    audit_result.json > /dev/null
+          jq -e '.security | has("setuid_files")'         audit_result.json > /dev/null
+          jq -e '.security | has("file_capabilities")'    audit_result.json > /dev/null
+          jq -e '.security.ebpf_inventory | has("links")' audit_result.json > /dev/null
+
+      - name: Deep forensic run (smoke)
+        run: |
+          set +e
+          sudo ./target/debug/owlzops-mapper audit --deep --format json > deep_result.json
+          DEEP_EXIT=$?
+          set -e
+          [ $DEEP_EXIT -le 3 ] || { echo "❌ deep run failed: $DEEP_EXIT"; cat deep_result.json; exit $DEEP_EXIT; }
+          jq -e '.scan_id != null' deep_result.json > /dev/null
+          echo "✅ deep audit completed"
+
+      - name: Interrupt semantics (SIGINT)
+        run: |
+          set +e
+          ./target/debug/owlzops-mapper audit --deep --format json --output interrupted.json &
+          PID=$!
+          sleep 3
+          kill -INT $PID
+          wait $PID
+          CODE=$?
+          set -e
+
+          [ "$CODE" -eq 130 ] || { echo "::error::expected exit 130 on SIGINT, got $CODE"; exit 1; }
+          if [ -s interrupted.json ]; then
+            echo "::error::interrupted run published a report — partial state must never be emitted"
+            exit 1
+          fi
+          echo "✅ interrupt contract holds"
