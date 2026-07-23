@@ -57,6 +57,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+# R19-16 — INVARIANT, DO NOT CHANGE TO "abort".
+# Scanner isolation relies on panic interception at task boundaries:
+# JoinError::is_panic() in main.rs (fleet loop, phase‑1 teardown, main).
+# With abort the process dies immediately and reports from other hosts are lost.
+# Introduced and reverted in v0.5.4.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0

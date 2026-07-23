@@ -209,6 +209,13 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     None
                 };
 
+                // R19V5-04: flag to return 130 after drain when local scan is
+                // interrupted by the user in a mixed (local+remote) run.
+                // Without `local-scan` the only assignment is compiled out, so the
+                // `mut` is genuinely redundant there — but only there.
+                #[cfg_attr(not(feature = "local-scan"), allow(unused_mut))]
+                let mut interrupted = false;
+
                 // Process local hosts synchronously (no SSH needed)
                 #[cfg(feature = "local-scan")]
                 for _host in local {
@@ -243,7 +250,31 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                     // Self‑integrity preflight
                     let integrity = scanners::self_integrity::run_self_integrity_check();
-                    let mut local_report = run_local_scan_async(&a).await;
+
+                    // R19V5-04: race‑free cancellation of the local scan.
+                    // If the user presses Ctrl‑C during this scan we must
+                    //   - not publish a half‑finished report (indistinguishable
+                    //     from real findings),
+                    //   - signal all registered helper processes,
+                    //   - set the `interrupted` flag to return exit code 130
+                    //     after the writer has drained.
+                    let mut local_report = tokio::select! {
+                        r = run_local_scan_async(&a) => r,
+                        _ = shutdown_notify.notified() => {
+                            local_spinner.finish_and_clear();
+                            eprintln!(
+                                "Local scan interrupted — no report emitted \
+                                 (partial state would be indistinguishable from real findings)."
+                            );
+                            crate::utils::terminate_registered_children();
+                            for w in crate::coverage::drain_scoped("local-interrupted") {
+                                warn!("{w}");
+                            }
+                            interrupted = true;
+                            break;
+                        }
+                    };
+
                     local_report.self_integrity = Some(SelfIntegrityReport {
                         compromised: integrity.compromised,
                         warnings: integrity.warnings,
@@ -502,6 +533,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 );
                                 return 2;
                             }
+                            if interrupted {
+                                return 130;
+                            }
                             return if written == 0 { 2 } else { worst };
                         }
                         Err(_) => {
@@ -509,6 +543,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             return 2;
                         }
                     }
+                }
+
+                // R19V5-04: honour interruption when local scan was cancelled
+                // in a streaming-less run.
+                if interrupted {
+                    return 130;
                 }
 
                 // Fallback to legacy multi-host output
