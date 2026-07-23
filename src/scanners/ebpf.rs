@@ -2,13 +2,15 @@
 //! Scans /proc/<pid>/fd for BPF programs, maps, and links, and /sys/fs/bpf
 //! for pinned objects. No bpf() syscall required – pure VFS reading.
 
-use crate::models::{BpfMapInfo, BpfPinInfo, BpfProgInfo, EbpfInventory};
+use crate::models::{BpfLinkInfo, BpfMapInfo, BpfPinInfo, BpfProgInfo, EbpfInventory};
 use std::fs;
 use std::io;
 use std::path::Path;
 
 /// Maximum number of BPF objects to collect per category
 const MAX_BPF_OBJECTS: usize = 256;
+/// Maximum recursion depth for pin scanning (R19-08)
+const MAX_PIN_DEPTH: u8 = 8;
 
 /// Try to parse a u32 from a line like "prog_id:\t123"
 fn parse_u32_field(line: &str, prefix: &str) -> Option<u32> {
@@ -16,11 +18,13 @@ fn parse_u32_field(line: &str, prefix: &str) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// Parse fdinfo content for a BPF file descriptor
-fn parse_bpf_fdinfo(fdinfo: &str) -> Option<(String, u32, Option<String>)> {
+/// Parse fdinfo content for a BPF file descriptor.
+/// Returns (obj_type, id, type_or_name, prog_tag).
+fn parse_bpf_fdinfo(fdinfo: &str) -> Option<(String, u32, Option<String>, String)> {
     let mut obj_type = String::new();
     let mut id: Option<u32> = None;
     let mut name: Option<String> = None;
+    let mut prog_tag = String::new();
 
     for line in fdinfo.lines() {
         if let Some(prog_id) = parse_u32_field(line, "prog_id:") {
@@ -37,13 +41,16 @@ fn parse_bpf_fdinfo(fdinfo: &str) -> Option<(String, u32, Option<String>)> {
         } else if let Some(map_type) = line.strip_prefix("map_type:") {
             name = Some(map_type.trim().to_string());
         } else if let Some(prog_name) = line.strip_prefix("prog_name:") {
-            // Prefer prog_name over prog_type for the name field
             name = Some(prog_name.trim().to_string());
+        } else if let Some(tag) = line.strip_prefix("prog_tag:") {
+            prog_tag = tag.trim().to_string();
         }
     }
 
     match (id, obj_type.as_str()) {
-        (Some(id), "prog") | (Some(id), "map") | (Some(id), "link") => Some((obj_type, id, name)),
+        (Some(id), "prog") | (Some(id), "map") | (Some(id), "link") => {
+            Some((obj_type, id, name, prog_tag))
+        }
         _ => None,
     }
 }
@@ -59,18 +66,33 @@ fn read_fd_link(pid: u32, fdnum: u32) -> io::Result<String> {
     std::fs::read_link(&path).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Push an item into a collection, respecting the global cap.
+/// Records dropped objects for later coverage reporting.
+fn push_capped<T>(vec: &mut Vec<T>, item: T, dropped: &mut usize) {
+    if vec.len() < MAX_BPF_OBJECTS {
+        vec.push(item);
+    } else {
+        *dropped += 1;
+    }
+}
+
 /// Scan all PIDs for BPF file descriptors
-fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>) {
+fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usize) {
     let mut programs = Vec::new();
     let mut maps = Vec::new();
+    let mut links = Vec::new();
+    let mut dropped = 0usize;
 
     let proc_dir = match fs::read_dir("/proc") {
         Ok(dir) => dir,
-        Err(_) => return (programs, maps),
+        Err(_) => return (programs, maps, links, dropped),
     };
 
     for entry in proc_dir.flatten() {
-        if programs.len() >= MAX_BPF_OBJECTS && maps.len() >= MAX_BPF_OBJECTS {
+        if programs.len() >= MAX_BPF_OBJECTS
+            && maps.len() >= MAX_BPF_OBJECTS
+            && links.len() >= MAX_BPF_OBJECTS
+        {
             break;
         }
 
@@ -91,7 +113,10 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>) {
         };
 
         for fd_entry in fd_dir.flatten() {
-            if programs.len() >= MAX_BPF_OBJECTS && maps.len() >= MAX_BPF_OBJECTS {
+            if programs.len() >= MAX_BPF_OBJECTS
+                && maps.len() >= MAX_BPF_OBJECTS
+                && links.len() >= MAX_BPF_OBJECTS
+            {
                 break;
             }
 
@@ -121,47 +146,66 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>) {
                 Err(_) => continue,
             };
 
-            let (obj_type, id, type_or_name) = match parse_bpf_fdinfo(&fdinfo) {
+            let (obj_type, id, type_or_name, prog_tag) = match parse_bpf_fdinfo(&fdinfo) {
                 Some(info) => info,
                 None => continue,
             };
 
             match obj_type.as_str() {
-                "prog" if programs.len() < MAX_BPF_OBJECTS => {
-                    programs.push(BpfProgInfo {
+                "prog" => push_capped(
+                    &mut programs,
+                    BpfProgInfo {
                         prog_id: id,
                         prog_type: type_or_name.unwrap_or_default(),
                         prog_name: None,
-                        prog_tag: String::new(),
+                        prog_tag,
                         pid,
                         comm: comm.clone(),
-                    });
-                }
-                "map" if maps.len() < MAX_BPF_OBJECTS => {
-                    maps.push(BpfMapInfo {
+                    },
+                    &mut dropped,
+                ),
+                "map" => push_capped(
+                    &mut maps,
+                    BpfMapInfo {
                         map_id: id,
                         map_type: type_or_name.unwrap_or_default(),
                         pid,
                         comm: comm.clone(),
-                    });
-                }
+                    },
+                    &mut dropped,
+                ),
+                "link" => push_capped(
+                    &mut links,
+                    BpfLinkInfo {
+                        link_id: id,
+                        prog_id: 0, // link fdinfo doesn't expose prog_id via current parser
+                        attach_type: type_or_name.unwrap_or_default(),
+                        pid,
+                        comm: comm.clone(),
+                    },
+                    &mut dropped,
+                ),
                 _ => {}
             }
         }
     }
 
-    (programs, maps)
+    (programs, maps, links, dropped)
 }
 
 /// Recursively scan /sys/fs/bpf for pinned objects
 fn scan_bpf_pins() -> Vec<BpfPinInfo> {
     let mut pins = Vec::new();
-    scan_bpf_dir(Path::new("/sys/fs/bpf"), &mut pins);
+    scan_bpf_dir(Path::new("/sys/fs/bpf"), MAX_PIN_DEPTH, &mut pins);
     pins
 }
 
-fn scan_bpf_dir(dir: &Path, pins: &mut Vec<BpfPinInfo>) {
-    if pins.len() >= MAX_BPF_OBJECTS {
+/// Depth‑limited, symlink‑safe pin scanner (R19‑08)
+fn scan_bpf_dir(dir: &Path, depth: u8, pins: &mut Vec<BpfPinInfo>) {
+    if pins.len() >= MAX_BPF_OBJECTS || depth == 0 {
+        if depth == 0 {
+            crate::coverage::record(format!("ebpf: pin scan depth limit at {}", dir.display()));
+        }
         return;
     }
 
@@ -176,14 +220,21 @@ fn scan_bpf_dir(dir: &Path, pins: &mut Vec<BpfPinInfo>) {
         }
 
         let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
 
-        if path.is_dir() {
-            scan_bpf_dir(&path, pins);
+        // Symlinks inside bpffs are anomalous – skip and treat as signal
+        if ft.is_symlink() {
             continue;
         }
 
-        // Record any file in /sys/fs/bpf as a pinned BPF object.
-        // Detailed type/id extraction can be added later if needed.
+        if ft.is_dir() {
+            scan_bpf_dir(&path, depth - 1, pins);
+            continue;
+        }
+
         pins.push(BpfPinInfo {
             path: path.to_string_lossy().into_owned(),
             obj_type: "unknown".into(),
@@ -195,12 +246,20 @@ fn scan_bpf_dir(dir: &Path, pins: &mut Vec<BpfPinInfo>) {
 /// Main entry point
 #[cfg(target_os = "linux")]
 pub fn gather_ebpf_inventory() -> EbpfInventory {
-    let (programs, maps) = scan_proc_bpf();
+    let (programs, maps, links, dropped) = scan_proc_bpf();
     let pins = scan_bpf_pins();
+
+    if dropped > 0 {
+        crate::coverage::record(format!(
+            "ebpf: {dropped} object(s) dropped at MAX_BPF_OBJECTS — inventory INCOMPLETE"
+        ));
+    }
+
     EbpfInventory {
         programs,
         maps,
         pins,
+        links,
     }
 }
 
