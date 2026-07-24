@@ -18,6 +18,9 @@
 - **e2e:** Deduplicate IoC check, exclude downgraded ghost_pids
 - **e2e:** Sync workflow with main, use shared IoC check script
 - Drop callback Result and unify setuid detection
+- **rpm:** Use run_with_timeout and correct parsing (R20-01, R20-02)
+- **scoring:** Exclude ambient-only entries from CAP-001 count (R20V-01)
+- **scoring:** Exclude ambient-only entries from ephemeral-port correlation (R20V2-01)
 
 ## CI/CD
 
@@ -28,12 +31,15 @@
 
 - Update CHANGELOG for v0.5.24
 - Update CHANGELOG for v0.5.25
+- Update CHANGELOG for v0.5.25
 
 ## Features
 
 - **provenance:** Distinguish truncated APK database from complete
 - Implement RPM package provenance backend
 - Add prog_tags to eBPF inventory for stable drift detection (R19V-10)
+- Feat(scoring): add CAP-002 for ambient caps without NoNewPrivs (R20-03)
+chore: clarify comment on root euid skip (R20-04)
 
 ## Miscellaneous
 
