@@ -9,6 +9,7 @@ mod dlp;
 pub mod docker;
 mod ebpf;
 mod file_capabilities;
+mod fs_inventory;
 #[cfg(feature = "local-scan")]
 mod ghost_pid;
 #[cfg(feature = "local-scan")]

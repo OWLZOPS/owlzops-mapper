@@ -9,29 +9,13 @@
 #![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
 use crate::models::FileCapFinding;
+use crate::scanners::fs_inventory;
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-
-const SCAN_DIRS: &[(&str, u8)] = &[
-    ("/usr/bin", 1), // 1 = only this directory, no recursion
-    ("/usr/sbin", 1),
-    ("/usr/local/bin", 1),
-    ("/usr/local/sbin", 1),
-    ("/bin", 1),
-    ("/sbin", 1),
-    ("/usr/lib", 4),
-    ("/usr/libexec", 4),
-    ("/usr/local/lib", 4),
-    ("/usr/lib64", 4),
-];
-
-const BUDGET_FLAT: usize = 4_096; // per flat bin directory
-const BUDGET_DEEP: usize = 40_000; // per recursive lib root
 
 /// Convert a capability bitmask (u64) into a list of human‑readable names.
 /// Bits beyond the last known constant (40) are reported as `cap_<N>` so that
@@ -163,59 +147,22 @@ fn read_caps_raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// Unified inventory using the common `fs_inventory` walker.
 #[cfg(target_os = "linux")]
-fn scan_dir_recursive(
-    dir: &Path,
-    max_depth: u8,
-    results: &mut Vec<FileCapFinding>,
-    seen: &mut HashSet<(u64, u64)>,
-    notsup_devs: &mut HashSet<u64>,
-    budget: &mut usize,
-) {
-    if *budget == 0 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
+    let mut findings = Vec::new();
+    let mut notsup_devs: HashSet<u64> = HashSet::new();
 
-    for entry in entries.flatten() {
-        if *budget == 0 {
-            break;
-        }
-        *budget -= 1;
-
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-
-        if ft.is_dir() && max_depth > 1 {
-            scan_dir_recursive(
-                &entry.path(),
-                max_depth - 1,
-                results,
-                seen,
-                notsup_devs,
-                budget,
-            );
-            continue;
-        }
-
-        if !ft.is_file() {
-            continue;
-        }
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
+    fs_inventory::walk_scannable_dirs("file_capabilities", &mut |entry: &std::fs::DirEntry,
+                                                                 meta: &std::fs::Metadata,
+                                                                 seen: &mut HashSet<(
+        u64,
+        u64,
+    )>| {
         // Deduplication
         let dev_ino = (meta.dev(), meta.ino());
         if !seen.insert(dev_ino) {
-            continue;
+            return Ok(());
         }
 
         match read_caps_raw(&entry.path()) {
@@ -227,7 +174,7 @@ fn scan_dir_recursive(
                         // were previously silently dropped.
                         if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
                             let names = cap_mask_to_names(caps.permitted);
-                            results.push(FileCapFinding {
+                            findings.push(FileCapFinding {
                                 path: entry.path().to_string_lossy().into_owned(),
                                 capabilities: names,
                                 reason: Some(
@@ -261,7 +208,7 @@ fn scan_dir_recursive(
                         ));
                     }
                 }
-                _ if e.kind() != io::ErrorKind::PermissionDenied => {
+                _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
                     crate::coverage::record(format!(
                         "file_capabilities: error reading {}: {}",
                         entry.path().display(),
@@ -271,35 +218,8 @@ fn scan_dir_recursive(
                 _ => {}
             },
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
-    let mut findings = Vec::new();
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut notsup_devs: HashSet<u64> = HashSet::new();
-
-    for (dir, depth) in SCAN_DIRS {
-        let path = Path::new(dir);
-        if !path.is_dir() {
-            continue;
-        }
-        let mut budget = if *depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
-        scan_dir_recursive(
-            path,
-            *depth,
-            &mut findings,
-            &mut seen,
-            &mut notsup_devs,
-            &mut budget,
-        );
-        if budget == 0 {
-            crate::coverage::record(format!(
-                "file_capabilities: {dir} entry budget exhausted — inventory INCOMPLETE for this root"
-            ));
-        }
-    }
+        Ok(())
+    });
     findings
 }
 
