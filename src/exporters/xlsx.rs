@@ -1861,6 +1861,7 @@ mod tests {
     use super::*;
     use crate::models::*;
 
+    #[cfg(feature = "local-scan")]
     fn minimal_report() -> AgentReport {
         AgentReport {
             scan_id: "test".into(),
