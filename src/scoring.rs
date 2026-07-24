@@ -1365,40 +1365,39 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Non-root processes with critical kernel capabilities ──
-    if !report.security.capability_audit.is_empty() {
-        let n = report.security.capability_audit.len();
-        let nnp_open = report
-            .security
-            .capability_audit
+    // ── Non-root processes with critical kernel capabilities (CAP-001) ──
+    let cap_findings: Vec<&crate::models::ProcCapFinding> = report
+        .security
+        .capability_audit
+        .iter()
+        .filter(|f| !f.critical_caps.is_empty())
+        .collect();
+    if !cap_findings.is_empty() {
+        let n = cap_findings.len();
+        let nnp_open = cap_findings
             .iter()
             .filter(|f| f.no_new_privs == Some(false))
             .count();
 
         let ports = &report.network.listening_ports;
-        let (listening, exposed) =
-            report
-                .security
-                .capability_audit
-                .iter()
-                .fold((0usize, 0usize), |(l, e), f| {
-                    let pid = Some(f.pid);
-                    let mut on_net = false;
-                    let mut global = false;
-                    for p in ports {
-                        if p.pid == pid {
-                            on_net = true;
-                            if crate::utils::is_wildcard_bind(&p.bind_address) {
-                                global = true;
-                                break;
-                            }
-                        }
+        let (listening, exposed) = cap_findings.iter().fold((0usize, 0usize), |(l, e), f| {
+            let pid = Some(f.pid);
+            let mut on_net = false;
+            let mut global = false;
+            for p in ports {
+                if p.pid == pid {
+                    on_net = true;
+                    if crate::utils::is_wildcard_bind(&p.bind_address) {
+                        global = true;
+                        break;
                     }
-                    (l + on_net as usize, e + global as usize)
-                });
+                }
+            }
+            (l + on_net as usize, e + global as usize)
+        });
 
         let mut evidence = format!(
-            "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets"
+            "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW capability sets"
         );
         if nnp_open > 0 {
             evidence.push_str(&format!(
