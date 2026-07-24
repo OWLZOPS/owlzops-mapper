@@ -14,6 +14,10 @@
 - **scanners:** Complete R19-05/06/14/15 — inheritable caps, shared budget, st_dev
 - **scoring:** Strip (inh) suffix before matching known capability baseline
 - **e2e:** Apply IoC allowlist to deep forensic result
+- **e2e:** Define check_ioc in deep forensic step to fix command-not-found
+- **e2e:** Deduplicate IoC check, exclude downgraded ghost_pids
+- **e2e:** Sync workflow with main, use shared IoC check script
+- Drop callback Result and unify setuid detection
 
 ## CI/CD
 
@@ -23,10 +27,13 @@
 ## Documentation
 
 - Update CHANGELOG for v0.5.24
+- Update CHANGELOG for v0.5.25
 
 ## Features
 
 - **provenance:** Distinguish truncated APK database from complete
+- Implement RPM package provenance backend
+- Add prog_tags to eBPF inventory for stable drift detection (R19V-10)
 
 ## Miscellaneous
 
