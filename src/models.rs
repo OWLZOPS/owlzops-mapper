@@ -782,6 +782,10 @@ pub struct EbpfInventory {
     pub pins: Vec<BpfPinInfo>,
     #[serde(default)]
     pub links: Vec<BpfLinkInfo>,
+    /// Stable set of program tags (from fdinfo prog_tag) for drift detection.
+    /// Sorted for reproducibility. Empty on legacy snapshots.
+    #[serde(default)]
+    pub prog_tags: Vec<String>,
 }
 
 // ── Deep Forensics (Pointer Resolution & Memory Analysis) ──
