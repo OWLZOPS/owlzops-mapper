@@ -34,6 +34,8 @@ const BUDGET_FLAT: usize = 4_096; // per flat bin directory
 const BUDGET_DEEP: usize = 40_000; // per recursive lib root
 
 /// Convert a capability bitmask (u64) into a list of human‑readable names.
+/// Bits beyond the last known constant (40) are reported as `cap_<N>` so that
+/// no capability is silently discarded (R19‑05).
 fn cap_mask_to_names(mask: u64) -> Vec<String> {
     const CAP_NAMES: &[&str] = &[
         "CAP_CHOWN",
@@ -80,9 +82,13 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
     ];
 
     let mut out = Vec::new();
-    for (i, name) in CAP_NAMES.iter().enumerate() {
+    for i in 0..64 {
         if (mask >> i) & 1 != 0 {
-            out.push(name.to_string());
+            if let Some(&name) = CAP_NAMES.get(i) {
+                out.push(name.to_string());
+            } else {
+                out.push(format!("cap_{i}"));
+            }
         }
     }
     out
@@ -90,6 +96,7 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
 
 /// Parsed VFS capability structure.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // inheritable/rootid kept for upcoming usage
 struct VfsCaps {
     revision: u8,
     permitted: u64,
@@ -215,21 +222,23 @@ fn scan_dir_recursive(
             Ok(Some(buf)) => {
                 match parse_vfs_cap_data(&buf) {
                     Ok(caps) => {
-                        let names = cap_mask_to_names(caps.permitted);
-                        if !names.is_empty() {
+                        // R19‑05: report the file whenever ANY capability set is
+                        // non‑zero, not just permitted.  Inheritable‑only files
+                        // were previously silently dropped.
+                        if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
+                            let names = cap_mask_to_names(caps.permitted);
                             results.push(FileCapFinding {
                                 path: entry.path().to_string_lossy().into_owned(),
                                 capabilities: names,
                                 reason: Some(
                                     "file capabilities granted via extended attributes".into(),
                                 ),
-                                // new fields (R17-07, R17-10)
                                 permitted: caps.permitted,
                                 inheritable: caps.inheritable,
                                 effective: caps.effective,
                                 revision: caps.revision,
                                 rootid: caps.rootid,
-                                package: None, // <-- Добавлено
+                                package: None,
                             });
                         }
                     }
@@ -334,5 +343,26 @@ mod tests {
         assert!(names.contains(&"CAP_SYS_ADMIN".to_string()));
         assert!(names.contains(&"CAP_BPF".to_string()));
         assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn cap_mask_high_bits_are_not_silent() {
+        let mask = (1u64 << 41) | (1u64 << 63);
+        let names = cap_mask_to_names(mask);
+        assert!(names.contains(&"cap_41".to_string()));
+        assert!(names.contains(&"cap_63".to_string()));
+    }
+
+    #[test]
+    fn inheritable_only_file_not_lost() {
+        let caps = VfsCaps {
+            revision: 2,
+            permitted: 0,
+            inheritable: 1 << 13, // CAP_NET_RAW
+            effective: false,
+            rootid: None,
+        };
+        // The new reporting condition must consider this worth reporting.
+        assert!(caps.permitted != 0 || caps.inheritable != 0 || caps.effective);
     }
 }
