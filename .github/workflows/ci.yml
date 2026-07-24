@@ -18,6 +18,7 @@ jobs:
   test-native:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       CC: gcc
       CXX: g++
@@ -70,6 +71,7 @@ jobs:
   build-macos-orchestrator:
     name: Build macOS orchestrator
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -77,15 +79,16 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # action HEAD as of 2026-06-28
         with:
           toolchain: stable
-          # clippy deferred: dead-code audit under --no-default-features → v0.5.25
+          components: clippy   # R19V11‑01: re‑enable after dead‑code cleanup
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
-      # R19V11-01: tests do not depend on the dead-code audit and must run now —
-      # this is the only verification of the published macOS artifact beyond compilation.
       - name: Run tests (orchestrator config)
         run: cargo test --locked --no-default-features
+
+      - name: Clippy (orchestrator config)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: Build orchestrator (remote-only)
         run: cargo build --release --no-default-features
@@ -93,6 +96,7 @@ jobs:
   test-containers:
     name: Test in ${{ matrix.container }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
@@ -150,6 +154,7 @@ jobs:
   test-opensuse:
     name: Test in openSUSE Tumbleweed
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:

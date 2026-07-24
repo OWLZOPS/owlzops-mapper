@@ -921,6 +921,7 @@ fn write_storage_section(
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 fn sheet_storage(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Storage")?;
@@ -1052,6 +1053,7 @@ fn write_security_section(
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 fn sheet_security(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Security")?;
@@ -1141,6 +1143,7 @@ fn write_network_section(
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 fn sheet_network(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Network")?;
@@ -1244,6 +1247,7 @@ fn write_docker_section(
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 fn sheet_docker(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Docker")?;
@@ -1471,6 +1475,7 @@ fn write_packages_section(
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 fn sheet_packages(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Packages")?;
@@ -1503,6 +1508,7 @@ fn write_databases_section(
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 fn sheet_databases(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Databases")?;
@@ -1516,6 +1522,7 @@ fn sheet_databases(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xl
 // Wrappers for single‑host report (backward compatible)
 // =====================================================================
 
+#[cfg(feature = "local-scan")]
 fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, XlsxError> {
     let mut sheet = Worksheet::new();
     sheet.set_name("Overview")?;
@@ -1699,6 +1706,7 @@ fn sheet_overview(report: &AgentReport, fmts: &Formats) -> Result<Worksheet, Xls
 // =====================================================================
 // WRITE REPORT (single host)
 // =====================================================================
+#[cfg(feature = "local-scan")]
 pub fn write_report(report: &AgentReport, path: &str) -> Result<(), XlsxError> {
     let fmts = Formats::new();
     let mut workbook = Workbook::new();
@@ -1849,9 +1857,12 @@ pub fn write_multi_diff_xlsx(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
     use crate::models::*;
 
+    #[cfg(feature = "local-scan")]
     fn minimal_report() -> AgentReport {
         AgentReport {
             scan_id: "test".into(),
@@ -1891,6 +1902,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local-scan")]
     #[test]
     fn write_report_creates_nonempty_file() {
         let tmp = std::env::temp_dir().join(format!("owlzops-test-{}.xlsx", uuid::Uuid::new_v4()));

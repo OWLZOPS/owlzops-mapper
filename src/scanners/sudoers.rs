@@ -124,13 +124,10 @@ where
                 for entry in entries.flatten() {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
-                    let has_disallowed_char = name.contains('.') || name.ends_with('~');
-                    let is_conf = entry
-                        .path()
-                        .extension()
-                        .map(|x| x == "conf")
-                        .unwrap_or(false);
-                    if has_disallowed_char && !is_conf {
+                    // R19‑13: sudo ignores files containing a dot or ending with ~.
+                    // This includes `.conf` files – they must be excluded.
+                    let ignored = name.contains('.') || name.ends_with('~');
+                    if ignored {
                         continue;
                     }
                     if entry.path().is_file() && !name.starts_with('.') && name != "README" {
@@ -167,14 +164,9 @@ where
                                 for entry in entries.flatten() {
                                     let name = entry.file_name();
                                     let name = name.to_string_lossy();
-                                    let has_disallowed_char =
-                                        name.contains('.') || name.ends_with('~');
-                                    let is_conf = entry
-                                        .path()
-                                        .extension()
-                                        .map(|x| x == "conf")
-                                        .unwrap_or(false);
-                                    if has_disallowed_char && !is_conf {
+                                    // R19‑13: same filter for included directories.
+                                    let ignored = name.contains('.') || name.ends_with('~');
+                                    if ignored {
                                         continue;
                                     }
                                     if entry.path().is_file()

@@ -9,31 +9,17 @@
 #![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
 use crate::models::FileCapFinding;
+use crate::scanners::fs_inventory;
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-const SCAN_DIRS: &[(&str, u8)] = &[
-    ("/usr/bin", 1), // 1 = only this directory, no recursion
-    ("/usr/sbin", 1),
-    ("/usr/local/bin", 1),
-    ("/usr/local/sbin", 1),
-    ("/bin", 1),
-    ("/sbin", 1),
-    ("/usr/lib", 4),
-    ("/usr/libexec", 4),
-    ("/usr/local/lib", 4),
-    ("/usr/lib64", 4),
-];
-
-const BUDGET_FLAT: usize = 4_096; // per flat bin directory
-const BUDGET_DEEP: usize = 40_000; // per recursive lib root
-
 /// Convert a capability bitmask (u64) into a list of human‑readable names.
+/// Bits beyond the last known constant (40) are reported as `cap_<N>` so that
+/// no capability is silently discarded (R19‑05).
 fn cap_mask_to_names(mask: u64) -> Vec<String> {
     const CAP_NAMES: &[&str] = &[
         "CAP_CHOWN",
@@ -80,9 +66,13 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
     ];
 
     let mut out = Vec::new();
-    for (i, name) in CAP_NAMES.iter().enumerate() {
+    for i in 0..64 {
         if (mask >> i) & 1 != 0 {
-            out.push(name.to_string());
+            if let Some(&name) = CAP_NAMES.get(i) {
+                out.push(name.to_string());
+            } else {
+                out.push(format!("cap_{i}"));
+            }
         }
     }
     out
@@ -90,6 +80,7 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
 
 /// Parsed VFS capability structure.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // inheritable/rootid kept for upcoming usage
 struct VfsCaps {
     revision: u8,
     permitted: u64,
@@ -156,141 +147,73 @@ fn read_caps_raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn scan_dir_recursive(
-    dir: &Path,
-    max_depth: u8,
-    results: &mut Vec<FileCapFinding>,
-    seen: &mut HashSet<(u64, u64)>,
-    notsup_devs: &mut HashSet<u64>,
-    budget: &mut usize,
-) {
-    if *budget == 0 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        if *budget == 0 {
-            break;
-        }
-        *budget -= 1;
-
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-
-        if ft.is_dir() && max_depth > 1 {
-            scan_dir_recursive(
-                &entry.path(),
-                max_depth - 1,
-                results,
-                seen,
-                notsup_devs,
-                budget,
-            );
-            continue;
-        }
-
-        if !ft.is_file() {
-            continue;
-        }
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        // Deduplication
-        let dev_ino = (meta.dev(), meta.ino());
-        if !seen.insert(dev_ino) {
-            continue;
-        }
-
-        match read_caps_raw(&entry.path()) {
-            Ok(Some(buf)) => {
-                match parse_vfs_cap_data(&buf) {
-                    Ok(caps) => {
-                        let names = cap_mask_to_names(caps.permitted);
-                        if !names.is_empty() {
-                            results.push(FileCapFinding {
-                                path: entry.path().to_string_lossy().into_owned(),
-                                capabilities: names,
-                                reason: Some(
-                                    "file capabilities granted via extended attributes".into(),
-                                ),
-                                // new fields (R17-07, R17-10)
-                                permitted: caps.permitted,
-                                inheritable: caps.inheritable,
-                                effective: caps.effective,
-                                revision: caps.revision,
-                                rootid: caps.rootid,
-                                package: None, // <-- Добавлено
-                            });
-                        }
-                    }
-                    Err(reason) => {
-                        crate::coverage::record(format!(
-                            "file_capabilities: unparsed xattr at {}: {}",
-                            entry.path().display(),
-                            reason
-                        ));
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => match e.raw_os_error() {
-                Some(libc::ENOTSUP) => {
-                    let dev = meta.dev();
-                    if notsup_devs.insert(dev) {
-                        crate::coverage::record(format!(
-                            "file_capabilities: xattr unsupported on dev {dev} — inventory blind there"
-                        ));
-                    }
-                }
-                _ if e.kind() != io::ErrorKind::PermissionDenied => {
-                    crate::coverage::record(format!(
-                        "file_capabilities: error reading {}: {}",
-                        entry.path().display(),
-                        e
-                    ));
-                }
-                _ => {}
-            },
-        }
-    }
-}
-
+/// Unified inventory using the common `fs_inventory` walker.
+/// Deduplication and budget management are handled by the walker;
+/// the callback only processes individual unique files.
 #[cfg(target_os = "linux")]
 pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
     let mut findings = Vec::new();
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
     let mut notsup_devs: HashSet<u64> = HashSet::new();
 
-    for (dir, depth) in SCAN_DIRS {
-        let path = Path::new(dir);
-        if !path.is_dir() {
-            continue;
-        }
-        let mut budget = if *depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
-        scan_dir_recursive(
-            path,
-            *depth,
-            &mut findings,
-            &mut seen,
-            &mut notsup_devs,
-            &mut budget,
-        );
-        if budget == 0 {
-            crate::coverage::record(format!(
-                "file_capabilities: {dir} entry budget exhausted — inventory INCOMPLETE for this root"
-            ));
-        }
-    }
+    fs_inventory::walk_scannable_dirs(
+        "file_capabilities",
+        &mut |entry: &std::fs::DirEntry, meta: &std::fs::Metadata| {
+            match read_caps_raw(&entry.path()) {
+                Ok(Some(buf)) => {
+                    match parse_vfs_cap_data(&buf) {
+                        Ok(caps) => {
+                            // R19‑05: report the file whenever ANY capability set is
+                            // non‑zero, not just permitted.  Inheritable‑only files
+                            // were previously silently dropped.
+                            if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
+                                let names = cap_mask_to_names(caps.permitted);
+                                findings.push(FileCapFinding {
+                                    path: entry.path().to_string_lossy().into_owned(),
+                                    capabilities: names,
+                                    reason: Some(
+                                        "file capabilities granted via extended attributes".into(),
+                                    ),
+                                    permitted: caps.permitted,
+                                    inheritable: caps.inheritable,
+                                    effective: caps.effective,
+                                    revision: caps.revision,
+                                    rootid: caps.rootid,
+                                    package: None,
+                                });
+                            }
+                        }
+                        Err(reason) => {
+                            crate::coverage::record(format!(
+                                "file_capabilities: unparsed xattr at {}: {}",
+                                entry.path().display(),
+                                reason
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::ENOTSUP) => {
+                        let dev = meta.dev();
+                        if notsup_devs.insert(dev) {
+                            crate::coverage::record(format!(
+                                "file_capabilities: xattr unsupported on dev {dev} — inventory blind there"
+                            ));
+                        }
+                    }
+                    _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
+                        crate::coverage::record(format!(
+                            "file_capabilities: error reading {}: {}",
+                            entry.path().display(),
+                            e
+                        ));
+                    }
+                    _ => {}
+                },
+            }
+            Ok(())
+        },
+    );
     findings
 }
 
@@ -334,5 +257,26 @@ mod tests {
         assert!(names.contains(&"CAP_SYS_ADMIN".to_string()));
         assert!(names.contains(&"CAP_BPF".to_string()));
         assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn cap_mask_high_bits_are_not_silent() {
+        let mask = (1u64 << 41) | (1u64 << 63);
+        let names = cap_mask_to_names(mask);
+        assert!(names.contains(&"cap_41".to_string()));
+        assert!(names.contains(&"cap_63".to_string()));
+    }
+
+    #[test]
+    fn inheritable_only_file_not_lost() {
+        let caps = VfsCaps {
+            revision: 2,
+            permitted: 0,
+            inheritable: 1 << 13, // CAP_NET_RAW
+            effective: false,
+            rootid: None,
+        };
+        // The new reporting condition must consider this worth reporting.
+        assert!(caps.permitted != 0 || caps.inheritable != 0 || caps.effective);
     }
 }

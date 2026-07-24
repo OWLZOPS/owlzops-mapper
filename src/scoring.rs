@@ -1851,8 +1851,11 @@ pub(crate) fn classify_cap_binary(
         }
     }
 
-    // Package DB unavailable – we could not verify, but no structural match
-    if *provenance_source == ProvenanceSource::Unavailable {
+    // Package DB unavailable or partial – we could not verify, but no structural match
+    if matches!(
+        *provenance_source,
+        ProvenanceSource::Unavailable | ProvenanceSource::PartialApk
+    ) {
         return (2, "package DB unattributable; no structural match");
     }
 
@@ -1886,15 +1889,15 @@ pub(crate) fn classify_setuid(
     .iter()
     .any(|d| f.path.starts_with(d));
 
+    // Treat PartialApk the same as Unavailable – DB is incomplete, cannot assert ownership.
     match (*provenance_source, in_system_dir, f.root_owner) {
-        // Package DB unavailable – use structural fallback with low weight
-        (ProvenanceSource::Unavailable, true, true) => {
+        (ProvenanceSource::Unavailable | ProvenanceSource::PartialApk, true, true) => {
             (2, "package DB unattributable; structural fallback")
         }
-        (ProvenanceSource::Unavailable, true, false) => {
+        (ProvenanceSource::Unavailable | ProvenanceSource::PartialApk, true, false) => {
             (10, "non-root setuid in system dir, DB unattributable")
         }
-        (ProvenanceSource::Unavailable, false, _) => {
+        (ProvenanceSource::Unavailable | ProvenanceSource::PartialApk, false, _) => {
             (14, "setuid outside system dirs, DB unattributable")
         }
         // DB available, file not in any package
