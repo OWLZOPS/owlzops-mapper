@@ -55,31 +55,7 @@ jobs:
                  masking:    .security.mount_masking}' audit_result.json
           fi
 
-          # -----------------------------------------------------------------
-          # check_ioc – reusable strict‑mode guard for any result JSON file.
-          # Known false positives on the GitHub runner:
-          #   suspicious_processes : provjobd* (Azure provisioning daemon)
-          #   library_injections   : networkd-dispat with source maps-rwx-provisional
-          # Any other IoC finding on any channel breaks the build.
-          # -----------------------------------------------------------------
-          check_ioc() {
-            local f="$1"
-            local unexp
-            unexp=$(jq -r '
-              ([.security.suspicious_processes[]?.name
-                 | select(test("^provjobd") | not)] | length)
-              + ([.security.library_injections[]?
-                 | select(.process != "networkd-dispat")] | length)
-              + ([.security.ghost_pids[]?]     | length)
-              + ([.security.reverse_shells[]?] | length)
-              + ([.security.mount_masking[]?]  | length)' "$f")
-            if [ "$unexp" -ne 0 ]; then
-              echo "::error::$unexp unexpected IoC finding(s) in $f — new false positive or real regression"
-              exit 1
-            fi
-          }
-
-          check_ioc audit_result.json
+          .github/scripts/check-ioc.sh audit_result.json
 
           jq -e '.scan_id != null'                  audit_result.json > /dev/null
           jq -e '.risk_score != null'               audit_result.json > /dev/null
@@ -101,7 +77,7 @@ jobs:
           set -e
           [ $DEEP_EXIT -le 3 ] || { echo "❌ deep run failed: $DEEP_EXIT"; cat deep_result.json; exit $DEEP_EXIT; }
           jq -e '.scan_id != null' deep_result.json > /dev/null
-          check_ioc deep_result.json
+          .github/scripts/check-ioc.sh deep_result.json
           echo "✅ deep audit completed"
 
       - name: Interrupt semantics (SIGINT)
