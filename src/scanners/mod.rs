@@ -9,6 +9,7 @@ mod dlp;
 pub mod docker;
 #[cfg(feature = "local-scan")]
 mod ebpf;
+#[cfg(feature = "local-scan")]
 mod file_capabilities;
 #[cfg(feature = "local-scan")]
 mod fs_inventory;
@@ -34,6 +35,7 @@ mod reverse_shell;
 pub mod security;
 #[cfg(feature = "local-scan")]
 pub mod self_integrity;
+#[cfg(feature = "local-scan")]
 #[cfg(feature = "local-scan")]
 mod setuid;
 #[cfg(feature = "local-scan")]

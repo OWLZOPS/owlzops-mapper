@@ -1859,6 +1859,7 @@ pub fn write_multi_diff_xlsx(
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
     use crate::models::*;
 
     #[cfg(feature = "local-scan")]
