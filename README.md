@@ -83,19 +83,18 @@ mv owlzops-mapper owlzops-agent-linux
 
 **R19 Audit Completion — Inventory Accuracy & CI Hardening**
 
-- **File capability mask now covers all 64 bits.**  
-  Capability bits beyond the 41st are no longer silently dropped; they are reported as `cap_<N>`. A file with *only* inheritable or effective capabilities (permitted = 0) is now correctly included in the inventory instead of being discarded (R19‑05).
-- **Unified filesystem walker.**  
-  `setuid` and `file_capabilities` scanners now share a single recursive traversal (`fs_inventory`). Duplicate hardlinks are deduplicated **before** consuming the per‑directory budget, eliminating non‑determinism and false “budget exhausted” warnings (R19‑06, R19‑14, R19‑15).
+- **File capability mask covers all 64 bits; inheritable‑only files are no longer lost.**  
+  Capability bits beyond the 41st are reported as `cap_<N>`. Inheritable‑only setcap entries (e.g., `cap_net_raw+i`) now appear in the inventory with `(inh)` suffix and are correctly classified instead of being suppressed (R19‑05, R19V12‑01).
+- **Unified filesystem walker — single pass.**  
+  `setuid` and `file_capabilities` scanners now share the same recursive traversal (`fs_inventory`), executing a **single pass** over every scanned directory. Per‑root budget is shared across subdirectories, and filesystem boundaries (`st_dev`) are not crossed (R19‑06, R19‑14, R19‑15, R19V12‑02/‑03/‑04).
 - **Sudoers parsing matches real `sudo` behaviour.**  
   Files with a `.` (including `.conf`) or ending with `~` inside `sudoers.d` are now correctly ignored, matching the behaviour of the real sudo parser (R19‑13).
 - **Honest provenance when the APK database is truncated.**  
   A new `PartialApk` provenance variant prevents files from being incorrectly flagged as “not owned by any package” when `/lib/apk/db/installed` was capped during reading (R19V5‑05).
 - **macOS orchestrator CI is fully linted.**  
-  All local‑only modules are now gated behind `#[cfg(feature = "local-scan")]`, allowing `cargo clippy --no-default-features` to pass cleanly. The macOS build is guarded against regressions.
+  All local‑only modules are gated behind `#[cfg(feature = "local-scan")]`, allowing `cargo clippy --no-default-features` to pass cleanly. The macOS build is guarded against regressions.
 - **Stronger CI guards.**  
-  Every job now has an explicit `timeout‑minutes`. The E2E interrupt test distinguishes a graceful shutdown from a plain signal death and catches the case where the scan finishes before SIGINT arrives.
-
+  Every job has an explicit `timeout‑minutes`. The E2E interrupt test distinguishes a graceful shutdown from a plain signal death and catches the case where the scan finishes before SIGINT arrives.
 ---
 
 ## Usage

@@ -1,19 +1,21 @@
-//! Unified filesystem inventory walk.
-//! Scans the standard binary/library directories once and invokes
-//! callbacks for each regular file, so that multiple scanners (setuid,
-//! file capabilities) can collect their findings in a single pass.
+//! Budget management (R19‑15 / R19V12‑02):
+//! - The entry budget is shared across the whole root: one allowance per
+//!   SCAN_DIRS entry, threaded by `&mut` through the recursion.
+//! - Hardlinks are deduplicated *before* consuming the budget, so duplicates
+//!   cannot trigger a false "budget exhausted" warning.
 //!
-//! Budget management (R19‑14 / R19‑15):
-//! - Hardlinks are deduplicated *before* consuming the budget, so
-//!   different readdir orders produce deterministic inventories.
-//! - An "entry budget exhausted" message is emitted only when a unique
-//!   file could not be processed because the per‑directory budget was
-//!   depleted – not when duplicates filled the remaining budget.
+//! Known limitation (R19‑14, partially open): among several hardlink aliases
+//! the one returned first by `readdir` wins. Since `provenance::lookup` is
+//! path-based, the finding's weight can differ between hosts or after the
+//! directory is modified. Emitting all aliases would fix this.
 
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+
+use crate::models::{FileCapFinding, SetuidFinding};
 
 pub(crate) const SCAN_DIRS: &[(&str, u8)] = &[
     ("/usr/bin", 1),
@@ -31,8 +33,6 @@ pub(crate) const SCAN_DIRS: &[(&str, u8)] = &[
 pub(crate) const BUDGET_FLAT: usize = 4_096;
 pub(crate) const BUDGET_DEEP: usize = 40_000;
 
-/// Walk the configured directories and call `on_file` for each unique
-/// regular file. The closure may capture local state by reference.
 pub(crate) fn walk_scannable_dirs<F>(scanner_name: &str, mut on_file: &mut F)
 where
     F: FnMut(&fs::DirEntry, &fs::Metadata) -> Result<(), ()>,
@@ -43,8 +43,29 @@ where
         if !path.is_dir() {
             continue;
         }
-        let budget = if depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
-        if let Err(()) = walk_recursive(path, depth, &mut seen, budget, &mut on_file) {
+        let mut budget = if depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
+        // Capture the device id of the root directory – we will not cross
+        // into mounted filesystems (R19V12‑04). If we cannot stat the root,
+        // the filesystem boundary check is disabled with a warning.
+        let root_dev = match path.metadata() {
+            Ok(m) => Some(m.dev()),
+            Err(e) => {
+                crate::coverage::record(format!(
+                    "{scanner_name}: cannot stat root {dir} ({}) — filesystem boundary check disabled",
+                    e.kind()
+                ));
+                None
+            }
+        };
+        if let Err(()) = walk_recursive(
+            path,
+            depth,
+            &mut seen,
+            &mut budget,
+            root_dev,
+            scanner_name,
+            &mut on_file,
+        ) {
             crate::coverage::record(format!(
                 "{scanner_name}: {dir} entry budget exhausted — inventory INCOMPLETE for this root"
             ));
@@ -52,18 +73,19 @@ where
     }
 }
 
-/// Recursive walk with dedup‑before‑budget semantics.
 fn walk_recursive<F>(
     dir: &Path,
     max_depth: u8,
     seen: &mut HashSet<(u64, u64)>,
-    mut budget: usize,
+    budget: &mut usize,
+    root_dev: Option<u64>,
+    scanner_name: &str,
     on_file: &mut F,
 ) -> Result<(), ()>
 where
     F: FnMut(&fs::DirEntry, &fs::Metadata) -> Result<(), ()>,
 {
-    if budget == 0 {
+    if *budget == 0 {
         return Err(());
     }
 
@@ -79,7 +101,25 @@ where
         };
 
         if ft.is_dir() && max_depth > 1 {
-            walk_recursive(&entry.path(), max_depth - 1, seen, budget, on_file)?;
+            // Do not cross filesystem boundary unless we couldn't determine it.
+            if let (Some(rd), Ok(meta)) = (root_dev, entry.metadata())
+                && meta.dev() != rd
+            {
+                crate::coverage::record(format!(
+                    "{scanner_name}: {} is on a different filesystem — not traversed",
+                    entry.path().display()
+                ));
+                continue;
+            }
+            walk_recursive(
+                &entry.path(),
+                max_depth - 1,
+                seen,
+                budget,
+                root_dev,
+                scanner_name,
+                on_file,
+            )?;
             continue;
         }
 
@@ -92,20 +132,94 @@ where
             Err(_) => continue,
         };
 
-        // Deduplication *before* spending the budget.
         let dev_ino = (meta.dev(), meta.ino());
         if !seen.insert(dev_ino) {
-            continue; // hardlink – do not count
+            continue;
         }
 
-        // Unique file – check budget.
-        if budget == 0 {
-            return Err(()); // genuine budget exhausted
+        if *budget == 0 {
+            return Err(());
         }
-        budget -= 1;
+        *budget -= 1;
 
         on_file(&entry, &meta)?;
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn gather_binary_inventory() -> (Vec<SetuidFinding>, Vec<FileCapFinding>) {
+    let mut setuid_findings = Vec::new();
+    let mut cap_findings = Vec::new();
+    let mut notsup_devs: HashSet<u64> = HashSet::new();
+
+    walk_scannable_dirs("binary_inventory", &mut |entry, meta| {
+        let mode = meta.permissions().mode();
+        let is_suid = mode & libc::S_ISUID != 0;
+        let is_sgid = mode & libc::S_ISGID != 0;
+        if is_suid || is_sgid {
+            setuid_findings.push(SetuidFinding {
+                path: entry.path().to_string_lossy().into_owned(),
+                setuid: is_suid,
+                setgid: is_sgid,
+                root_owner: meta.uid() == 0,
+                package: None,
+            });
+        }
+
+        match crate::scanners::file_capabilities::read_caps_raw(&entry.path()) {
+            Ok(Some(buf)) => match crate::scanners::file_capabilities::parse_vfs_cap_data(&buf) {
+                Ok(caps) => {
+                    if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
+                        let names = crate::scanners::file_capabilities::build_capability_names(
+                            caps.permitted,
+                            caps.inheritable,
+                        );
+                        cap_findings.push(FileCapFinding {
+                            path: entry.path().to_string_lossy().into_owned(),
+                            capabilities: names,
+                            reason: Some(
+                                "file capabilities granted via extended attributes".into(),
+                            ),
+                            permitted: caps.permitted,
+                            inheritable: caps.inheritable,
+                            effective: caps.effective,
+                            revision: caps.revision,
+                            rootid: caps.rootid,
+                            package: None,
+                        });
+                    }
+                }
+                Err(reason) => {
+                    crate::coverage::record(format!(
+                        "binary_inventory: unparsed xattr at {}: {reason}",
+                        entry.path().display()
+                    ));
+                }
+            },
+            Ok(None) => {}
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOTSUP) => {
+                    let dev = meta.dev();
+                    if notsup_devs.insert(dev) {
+                        crate::coverage::record(format!(
+                            "binary_inventory: xattr unsupported on dev {dev} — inventory blind there"
+                        ));
+                    }
+                }
+                _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
+                    crate::coverage::record(format!(
+                        "binary_inventory: error reading {}: {}",
+                        entry.path().display(),
+                        e
+                    ));
+                }
+                _ => {}
+            },
+        }
+        Ok(())
+    });
+
+    (setuid_findings, cap_findings)
 }

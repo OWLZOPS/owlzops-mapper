@@ -78,21 +78,35 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
     out
 }
 
+/// Build the human‑readable capability list from both permitted and inheritable masks.
+/// Inheritable‑only entries are tagged `(inh)` so they don't collapse
+/// `all()` checks on the permitted list and are visible to the operator.
+pub(crate) fn build_capability_names(permitted: u64, inheritable: u64) -> Vec<String> {
+    let mut names = cap_mask_to_names(permitted);
+    for n in cap_mask_to_names(inheritable) {
+        let tagged = format!("{n}(inh)");
+        if !names.contains(&tagged) {
+            names.push(tagged);
+        }
+    }
+    names
+}
+
 /// Parsed VFS capability structure.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // inheritable/rootid kept for upcoming usage
-struct VfsCaps {
-    revision: u8,
-    permitted: u64,
-    inheritable: u64,
-    effective: bool,
+pub(crate) struct VfsCaps {
+    pub(crate) revision: u8,
+    pub(crate) permitted: u64,
+    pub(crate) inheritable: u64,
+    pub(crate) effective: bool,
     /// v3 rootid (uid mapped to root in the user namespace where the caps are valid)
-    rootid: Option<u32>,
+    pub(crate) rootid: Option<u32>,
 }
 
 /// Parse a raw `security.capability` xattr value.  Returns an error string on
 /// unsupported revision or truncated data.
-fn parse_vfs_cap_data(bytes: &[u8]) -> Result<VfsCaps, &'static str> {
+pub(crate) fn parse_vfs_cap_data(bytes: &[u8]) -> Result<VfsCaps, &'static str> {
     if bytes.len() < 4 {
         return Err("xattr too short");
     }
@@ -122,7 +136,7 @@ fn parse_vfs_cap_data(bytes: &[u8]) -> Result<VfsCaps, &'static str> {
 /// Read the `security.capability` xattr of a file using `lgetxattr` (does NOT follow symlinks).
 /// Implements a retry loop for `ERANGE` (TOCTOU-safe) and handles `ENODATA`, `ENOENT`, `ENOTSUP`.
 #[cfg(target_os = "linux")]
-fn read_caps_raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_caps_raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let cpath = CString::new(path.as_os_str().as_bytes())?;
     let mut buf = vec![0u8; 64]; // v3 fits in 24 bytes; 64 covers everything
     loop {
@@ -151,6 +165,7 @@ fn read_caps_raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// Deduplication and budget management are handled by the walker;
 /// the callback only processes individual unique files.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // retained for backward compatibility; prefer gather_binary_inventory()
 pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
     let mut findings = Vec::new();
     let mut notsup_devs: HashSet<u64> = HashSet::new();
@@ -159,38 +174,33 @@ pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
         "file_capabilities",
         &mut |entry: &std::fs::DirEntry, meta: &std::fs::Metadata| {
             match read_caps_raw(&entry.path()) {
-                Ok(Some(buf)) => {
-                    match parse_vfs_cap_data(&buf) {
-                        Ok(caps) => {
-                            // R19‑05: report the file whenever ANY capability set is
-                            // non‑zero, not just permitted.  Inheritable‑only files
-                            // were previously silently dropped.
-                            if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
-                                let names = cap_mask_to_names(caps.permitted);
-                                findings.push(FileCapFinding {
-                                    path: entry.path().to_string_lossy().into_owned(),
-                                    capabilities: names,
-                                    reason: Some(
-                                        "file capabilities granted via extended attributes".into(),
-                                    ),
-                                    permitted: caps.permitted,
-                                    inheritable: caps.inheritable,
-                                    effective: caps.effective,
-                                    revision: caps.revision,
-                                    rootid: caps.rootid,
-                                    package: None,
-                                });
-                            }
-                        }
-                        Err(reason) => {
-                            crate::coverage::record(format!(
-                                "file_capabilities: unparsed xattr at {}: {}",
-                                entry.path().display(),
-                                reason
-                            ));
+                Ok(Some(buf)) => match parse_vfs_cap_data(&buf) {
+                    Ok(caps) => {
+                        if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
+                            let names = build_capability_names(caps.permitted, caps.inheritable);
+                            findings.push(FileCapFinding {
+                                path: entry.path().to_string_lossy().into_owned(),
+                                capabilities: names,
+                                reason: Some(
+                                    "file capabilities granted via extended attributes".into(),
+                                ),
+                                permitted: caps.permitted,
+                                inheritable: caps.inheritable,
+                                effective: caps.effective,
+                                revision: caps.revision,
+                                rootid: caps.rootid,
+                                package: None,
+                            });
                         }
                     }
-                }
+                    Err(reason) => {
+                        crate::coverage::record(format!(
+                            "file_capabilities: unparsed xattr at {}: {}",
+                            entry.path().display(),
+                            reason
+                        ));
+                    }
+                },
                 Ok(None) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::ENOTSUP) => {
@@ -268,15 +278,12 @@ mod tests {
     }
 
     #[test]
-    fn inheritable_only_file_not_lost() {
-        let caps = VfsCaps {
-            revision: 2,
-            permitted: 0,
-            inheritable: 1 << 13, // CAP_NET_RAW
-            effective: false,
-            rootid: None,
-        };
-        // The new reporting condition must consider this worth reporting.
-        assert!(caps.permitted != 0 || caps.inheritable != 0 || caps.effective);
+    fn inheritable_only_yields_non_empty_capability_list() {
+        let names = build_capability_names(0, 1 << 13); // CAP_NET_RAW
+        assert!(
+            !names.is_empty(),
+            "inheritable-only file must not report zero capabilities"
+        );
+        assert!(names.iter().any(|n| n.starts_with("CAP_NET_RAW")));
     }
 }

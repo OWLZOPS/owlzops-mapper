@@ -31,6 +31,7 @@ fn inspect_file(meta: &fs::Metadata, path: &Path) -> Option<SetuidFinding> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // retained for backward compatibility; prefer gather_binary_inventory()
 pub fn gather_setuid_files() -> Vec<SetuidFinding> {
     let mut findings = Vec::new();
 

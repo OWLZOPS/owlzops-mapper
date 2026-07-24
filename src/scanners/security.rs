@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
+use crate::scanners::fs_inventory;
+
 /// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
 /// unprivileged user. Shared with `scoring.rs` so the policy has exactly one
 /// source of truth and cannot drift.
@@ -484,11 +486,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     // --- Reverse-shell / C2 correlation (SEC-022) -------------------------
     let reverse_shells = crate::scanners::reverse_shell::scan_reverse_shells();
 
-    // --- File capabilities inventory (R16) --------------------------------
-    let mut file_capabilities = crate::scanners::file_capabilities::gather_file_capabilities();
-
-    // --- Setuid/setgid inventory (R17) ------------------------------------
-    let mut setuid_files = crate::scanners::setuid::gather_setuid_files();
+    // --- Binary inventory (setuid + file capabilities) — single pass (R19V12-03)
+    let (mut setuid_files, mut file_capabilities) = fs_inventory::gather_binary_inventory();
 
     // --- Resolve package provenance and attach to findings --------------------
     let candidates: HashSet<String> = file_capabilities
