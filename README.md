@@ -79,26 +79,22 @@ mv owlzops-mapper owlzops-agent-linux
 
 ---
 
-## Highlights v0.5.24
+## Highlights v0.5.25
 
-**R19 Audit Fixes — Graceful Degradation & Drift Detection**
+**R19 Audit Completion — Inventory Accuracy & CI Hardening**
 
-- **ProvenanceSource no longer lies when the DB is unreadable.**  
-  A present but unreadable package database (EACCES, restrictive mount) is now reported as `Unavailable` instead of `Dpkg` with an empty map, preventing false “unexpected” classifications for every system binary.
-- **Sudoers audit now emits coverage warnings on I/O errors.**  
-  Unreadable `/etc/sudoers` (e.g. mode 0440 without root) no longer silently produces an empty NOPASSWD list. The operator sees a coverage warning instead of a false-negative.
-- **Capped I/O in dpkg/apk backends + basename pre‑filter.**  
-  Both resolvers now respect the project‑wide capped‑I/O policy, closing an OOM vector and reducing allocation pressure by ~1000×.
-- **Structural capability baseline works on RPM/Arch hosts.**  
-  `classify_cap_binary` checks the known‑binary list before consulting the package database, so `ping`, `mtr`, `dumpcap` are recognised even when the DB is unavailable.
-- **Double‑stat eliminated in setuid scanner.**  
-  Halves the number of `stat` syscalls and closes a TOCTOU window.
-- **eBPF inventory completed.**  
-  Link objects (kprobe/tracepoint attachments) are now collected, `prog_tag` is extracted, and dropped objects are reported as coverage warnings. Pin‑scan is protected against symlink traversal and stack overflow.
-- **Two‑phase Ctrl‑C teardown.**  
-  A first Ctrl‑C gives in‑flight tasks a 10 s grace period to finish and clean up remote binaries; a second Ctrl‑C aborts immediately.
-- **Drift detection for setuid, capabilities, and eBPF.**  
-  Snapshot comparison now reports added/removed setuid files, file capabilities, and changes in eBPF inventory.
+- **File capability mask now covers all 64 bits.**  
+  Capability bits beyond the 41st are no longer silently dropped; they are reported as `cap_<N>`. A file with *only* inheritable or effective capabilities (permitted = 0) is now correctly included in the inventory instead of being discarded (R19‑05).
+- **Unified filesystem walker.**  
+  `setuid` and `file_capabilities` scanners now share a single recursive traversal (`fs_inventory`). Duplicate hardlinks are deduplicated **before** consuming the per‑directory budget, eliminating non‑determinism and false “budget exhausted” warnings (R19‑06, R19‑14, R19‑15).
+- **Sudoers parsing matches real `sudo` behaviour.**  
+  Files with a `.` (including `.conf`) or ending with `~` inside `sudoers.d` are now correctly ignored, matching the behaviour of the real sudo parser (R19‑13).
+- **Honest provenance when the APK database is truncated.**  
+  A new `PartialApk` provenance variant prevents files from being incorrectly flagged as “not owned by any package” when `/lib/apk/db/installed` was capped during reading (R19V5‑05).
+- **macOS orchestrator CI is fully linted.**  
+  All local‑only modules are now gated behind `#[cfg(feature = "local-scan")]`, allowing `cargo clippy --no-default-features` to pass cleanly. The macOS build is guarded against regressions.
+- **Stronger CI guards.**  
+  Every job now has an explicit `timeout‑minutes`. The E2E interrupt test distinguishes a graceful shutdown from a plain signal death and catches the case where the scan finishes before SIGINT arrives.
 
 ---
 
@@ -458,6 +454,27 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.24 (2026-07-24)
+
+**R19 Audit Fixes — Graceful Degradation & Drift Detection**
+
+- **ProvenanceSource no longer lies when the DB is unreadable.**  
+  A present but unreadable package database (EACCES, restrictive mount) is now reported as `Unavailable` instead of `Dpkg` with an empty map, preventing false “unexpected” classifications for every system binary.
+- **Sudoers audit now emits coverage warnings on I/O errors.**  
+  Unreadable `/etc/sudoers` (e.g. mode 0440 without root) no longer silently produces an empty NOPASSWD list. The operator sees a coverage warning instead of a false-negative.
+- **Capped I/O in dpkg/apk backends + basename pre‑filter.**  
+  Both resolvers now respect the project‑wide capped‑I/O policy, closing an OOM vector and reducing allocation pressure by ~1000×.
+- **Structural capability baseline works on RPM/Arch hosts.**  
+  `classify_cap_binary` checks the known‑binary list before consulting the package database, so `ping`, `mtr`, `dumpcap` are recognised even when the DB is unavailable.
+- **Double‑stat eliminated in setuid scanner.**  
+  Halves the number of `stat` syscalls and closes a TOCTOU window.
+- **eBPF inventory completed.**  
+  Link objects (kprobe/tracepoint attachments) are now collected, `prog_tag` is extracted, and dropped objects are reported as coverage warnings. Pin‑scan is protected against symlink traversal and stack overflow.
+- **Two‑phase Ctrl‑C teardown.**  
+  A first Ctrl‑C gives in‑flight tasks a 10 s grace period to finish and clean up remote binaries; a second Ctrl‑C aborts immediately.
+- **Drift detection for setuid, capabilities, and eBPF.**  
+  Snapshot comparison now reports added/removed setuid files, file capabilities, and changes in eBPF inventory.
+
 ### v0.5.23 (2026-07-22)
 
 **Provenance‑Resolved Suppression for File Capabilities & Setuid**
@@ -493,20 +510,6 @@ See [LICENSE](LICENSE) for details.
 - **Minor hardening:** Unified network decoders; XLSX formula injection guard now handles leading whitespace; semaphore acquisition correctly bails out when the scheduler is closed; `exe_provenance` is computed once per PID, not per memory region.
 
 ### v0.5.20 (2026-07-18)
-
-**Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
-
-- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
-- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
-- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
-- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts. The fleet orchestrator adds a grace budget to accommodate teardown.
-- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
-- **Coverage scope isolation:** Coverage warnings from concurrent local and remote scans are now tagged with the originating scan, preventing misleading attribution in fleet reports.
-- **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
-- **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
-- **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
-
-### v0.5.19 (2026-07-17)
 
 **Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
 
