@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "local-scan"), allow(dead_code, unused_imports))]
 //! Agentless Linux capability audit: parses CapInh/CapPrm/CapEff/CapBnd/CapAmb
 //! from /proc/<pid>/status and flags non-root processes holding critical
 //! kernel capabilities. std-only, zero-copy line parsing, no new crates.
