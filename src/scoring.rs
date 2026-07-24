@@ -1430,6 +1430,48 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── CAP-002 – ambient capabilities without NoNewPrivs (non-root) ──────
+    // Uses the typed reason to avoid brittle string comparison.
+    let ambient_findings: Vec<&crate::models::ProcCapFinding> = report
+        .security
+        .capability_audit
+        .iter()
+        .filter(|f| {
+            f.reason
+                .as_ref()
+                .is_some_and(|r| *r == crate::models::CapReason::AmbientCapsNoNewPrivs)
+        })
+        .collect();
+    if !ambient_findings.is_empty() {
+        let list = ambient_findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} (pid {}, euid {}): ambient [{}]",
+                    f.comm,
+                    f.pid,
+                    f.euid,
+                    crate::scanners::capabilities::decode_mask(f.ambient).join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "CAP-002",
+            title: "Ambient capabilities held with NoNewPrivs disabled".to_string(),
+            category: Category::Security,
+            weight: 12,
+            evidence: format!(
+                "{} non-root process(es) hold ambient capabilities while NoNewPrivs is off — \
+                 the set survives execve of a non-setuid binary: {}",
+                ambient_findings.len(),
+                list
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── Docker container security issues ────────────────
     let mut has_mem_limit_issue = false;
     let mut has_cpu_limit_issue = false;
