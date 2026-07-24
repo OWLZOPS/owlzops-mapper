@@ -285,6 +285,9 @@ pub enum ProvenanceSource {
     Dpkg,
     /// Alpine database was used.
     Apk,
+    /// Alpine database was used but the file was truncated at the read cap.
+    /// Attribution is partial – some files may be misreported as unpackaged.
+    PartialApk,
     /// No parseable database (RPM/pacman, or missing DB).
     #[default]
     Unavailable,

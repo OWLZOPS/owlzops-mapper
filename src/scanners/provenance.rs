@@ -53,8 +53,12 @@ pub fn resolve_batch(candidates: &HashSet<String>) -> ProvenanceIndex {
     }
     if Path::new("/lib/apk/db/installed").is_file() {
         return match resolve_apk(candidates) {
-            Some(map) => ProvenanceIndex {
-                source: ProvenanceSource::Apk,
+            Some((map, truncated)) => ProvenanceIndex {
+                source: if truncated {
+                    ProvenanceSource::PartialApk
+                } else {
+                    ProvenanceSource::Apk
+                },
                 map,
             },
             None => unavailable("apk DB present but unreadable"),
@@ -143,9 +147,9 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> Option<HashMap<String, String>>
 // APK backend (capped, basename-prefiltered, truncation-aware)
 // ---------------------------------------------------------------------------
 
-fn resolve_apk(candidates: &HashSet<String>) -> Option<HashMap<String, String>> {
+fn resolve_apk(candidates: &HashSet<String>) -> Option<(HashMap<String, String>, bool)> {
     if candidates.is_empty() {
-        return Some(HashMap::new());
+        return Some((HashMap::new(), false));
     }
 
     let (content, truncated) = match crate::safe_io::read_file_capped(
@@ -208,7 +212,7 @@ fn resolve_apk(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
         }
     }
 
-    Some(owned)
+    Some((owned, truncated))
 }
 
 // ---------------------------------------------------------------------------
