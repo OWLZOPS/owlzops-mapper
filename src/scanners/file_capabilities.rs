@@ -148,78 +148,72 @@ fn read_caps_raw(path: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 /// Unified inventory using the common `fs_inventory` walker.
+/// Deduplication and budget management are handled by the walker;
+/// the callback only processes individual unique files.
 #[cfg(target_os = "linux")]
 pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
     let mut findings = Vec::new();
     let mut notsup_devs: HashSet<u64> = HashSet::new();
 
-    fs_inventory::walk_scannable_dirs("file_capabilities", &mut |entry: &std::fs::DirEntry,
-                                                                 meta: &std::fs::Metadata,
-                                                                 seen: &mut HashSet<(
-        u64,
-        u64,
-    )>| {
-        // Deduplication
-        let dev_ino = (meta.dev(), meta.ino());
-        if !seen.insert(dev_ino) {
-            return Ok(());
-        }
-
-        match read_caps_raw(&entry.path()) {
-            Ok(Some(buf)) => {
-                match parse_vfs_cap_data(&buf) {
-                    Ok(caps) => {
-                        // R19‑05: report the file whenever ANY capability set is
-                        // non‑zero, not just permitted.  Inheritable‑only files
-                        // were previously silently dropped.
-                        if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
-                            let names = cap_mask_to_names(caps.permitted);
-                            findings.push(FileCapFinding {
-                                path: entry.path().to_string_lossy().into_owned(),
-                                capabilities: names,
-                                reason: Some(
-                                    "file capabilities granted via extended attributes".into(),
-                                ),
-                                permitted: caps.permitted,
-                                inheritable: caps.inheritable,
-                                effective: caps.effective,
-                                revision: caps.revision,
-                                rootid: caps.rootid,
-                                package: None,
-                            });
+    fs_inventory::walk_scannable_dirs(
+        "file_capabilities",
+        &mut |entry: &std::fs::DirEntry, meta: &std::fs::Metadata| {
+            match read_caps_raw(&entry.path()) {
+                Ok(Some(buf)) => {
+                    match parse_vfs_cap_data(&buf) {
+                        Ok(caps) => {
+                            // R19‑05: report the file whenever ANY capability set is
+                            // non‑zero, not just permitted.  Inheritable‑only files
+                            // were previously silently dropped.
+                            if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
+                                let names = cap_mask_to_names(caps.permitted);
+                                findings.push(FileCapFinding {
+                                    path: entry.path().to_string_lossy().into_owned(),
+                                    capabilities: names,
+                                    reason: Some(
+                                        "file capabilities granted via extended attributes".into(),
+                                    ),
+                                    permitted: caps.permitted,
+                                    inheritable: caps.inheritable,
+                                    effective: caps.effective,
+                                    revision: caps.revision,
+                                    rootid: caps.rootid,
+                                    package: None,
+                                });
+                            }
+                        }
+                        Err(reason) => {
+                            crate::coverage::record(format!(
+                                "file_capabilities: unparsed xattr at {}: {}",
+                                entry.path().display(),
+                                reason
+                            ));
                         }
                     }
-                    Err(reason) => {
+                }
+                Ok(None) => {}
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::ENOTSUP) => {
+                        let dev = meta.dev();
+                        if notsup_devs.insert(dev) {
+                            crate::coverage::record(format!(
+                                "file_capabilities: xattr unsupported on dev {dev} — inventory blind there"
+                            ));
+                        }
+                    }
+                    _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
                         crate::coverage::record(format!(
-                            "file_capabilities: unparsed xattr at {}: {}",
+                            "file_capabilities: error reading {}: {}",
                             entry.path().display(),
-                            reason
+                            e
                         ));
                     }
-                }
+                    _ => {}
+                },
             }
-            Ok(None) => {}
-            Err(e) => match e.raw_os_error() {
-                Some(libc::ENOTSUP) => {
-                    let dev = meta.dev();
-                    if notsup_devs.insert(dev) {
-                        crate::coverage::record(format!(
-                            "file_capabilities: xattr unsupported on dev {dev} — inventory blind there"
-                        ));
-                    }
-                }
-                _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
-                    crate::coverage::record(format!(
-                        "file_capabilities: error reading {}: {}",
-                        entry.path().display(),
-                        e
-                    ));
-                }
-                _ => {}
-            },
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
     findings
 }
 

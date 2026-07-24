@@ -36,17 +36,15 @@ pub fn gather_setuid_files() -> Vec<SetuidFinding> {
 
     // Use the unified filesystem walker; deduplication and budget
     // tracking are handled inside `fs_inventory`.
-    fs_inventory::walk_scannable_dirs("setuid", &mut |entry: &std::fs::DirEntry,
-                                                      meta: &std::fs::Metadata,
-                                                      _seen: &mut std::collections::HashSet<(
-        u64,
-        u64,
-    )>| {
-        if let Some(finding) = inspect_file(meta, &entry.path()) {
-            findings.push(finding);
-        }
-        Ok(())
-    });
+    fs_inventory::walk_scannable_dirs(
+        "setuid",
+        &mut |entry: &std::fs::DirEntry, meta: &std::fs::Metadata| {
+            if let Some(finding) = inspect_file(meta, &entry.path()) {
+                findings.push(finding);
+            }
+            Ok(())
+        },
+    );
     findings
 }
 
