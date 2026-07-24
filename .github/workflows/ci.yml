@@ -18,6 +18,7 @@ jobs:
   test-native:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30   # R19V11-05: guard against hung test runs
     env:
       CC: gcc
       CXX: g++
@@ -70,6 +71,7 @@ jobs:
   build-macos-orchestrator:
     name: Build macOS orchestrator
     runs-on: macos-latest
+    timeout-minutes: 20   # R19V11-05
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -82,8 +84,6 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
-      # R19V11-01: tests do not depend on the dead-code audit and must run now —
-      # this is the only verification of the published macOS artifact beyond compilation.
       - name: Run tests (orchestrator config)
         run: cargo test --locked --no-default-features
 
@@ -93,6 +93,7 @@ jobs:
   test-containers:
     name: Test in ${{ matrix.container }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30   # R19V11-05
     container: ${{ matrix.container }}
     strategy:
       fail-fast: false
@@ -150,6 +151,7 @@ jobs:
   test-opensuse:
     name: Test in openSUSE Tumbleweed
     runs-on: ubuntu-latest
+    timeout-minutes: 30   # R19V11-05
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:

@@ -97,17 +97,28 @@ jobs:
       - name: Interrupt semantics (SIGINT)
         run: |
           set +e
-          ./target/debug/owlzops-mapper audit --deep --format json --output interrupted.json &
+          # R19V11-04: distinguish graceful shutdown (exit 130 + specific log line)
+          # from plain death by signal (also 128+2=130).
+          ./target/debug/owlzops-mapper audit --deep --format json \
+            --output interrupted.json 2> interrupt.log &
           PID=$!
           sleep 3
-          kill -INT $PID
-          wait $PID
-          CODE=$?
-          set -e
 
-          [ "$CODE" -eq 130 ] || { echo "::error::expected exit 130 on SIGINT, got $CODE"; exit 1; }
-          if [ -s interrupted.json ]; then
-            echo "::error::interrupted run published a report — partial state must never be emitted"
+          # If the scan already finished, we cannot test the interrupt path.
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "::error::scan finished before SIGINT — interrupt path untested (increase workload)"
             exit 1
           fi
+
+          kill -INT "$PID"
+          wait "$PID"; CODE=$?
+          set -e
+
+          [ "$CODE" -eq 130 ] || { echo "::error::expected exit 130 on SIGINT, got $CODE"; cat interrupt.log; exit 1; }
+          # The graceful handler prints this exact line; death by default
+          # disposition would not.
+          grep -q "Local scan interrupted — no report emitted" interrupt.log \
+            || { echo "::error::process died from SIGINT instead of the graceful path"; cat interrupt.log; exit 1; }
+          [ ! -s interrupted.json ] \
+            || { echo "::error::interrupted run published a report"; exit 1; }
           echo "✅ interrupt contract holds"
