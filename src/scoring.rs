@@ -395,7 +395,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .security
                 .capability_audit
                 .iter()
-                .find(|c| c.pid == pid)
+                .find(|c| c.pid == pid && !c.critical_caps.is_empty())
             else {
                 continue;
             };
@@ -2761,5 +2761,39 @@ mod tests {
             classify_cap_binary(&fc, &ProvenanceSource::Unavailable).0,
             8
         );
+    }
+
+    #[test]
+    fn ephemeral_port_with_ambient_only_does_not_fire_sec015() {
+        use crate::models::{CapReason, PortInfo, ProcCapFinding};
+        let mut r = minimal_report();
+        r.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            port: "4444".into(),
+            process: "x".into(),
+            bind_address: "0.0.0.0".into(),
+            pid: Some(1337),
+            exe_path: Some("/tmp/x".into()),
+        }];
+        r.security.capability_audit = vec![ProcCapFinding {
+            pid: 1337,
+            comm: "x".into(),
+            euid: 1000,
+            effective: 0x400,
+            permitted: 0x400,
+            inheritable: 0x400,
+            bounding: 0x1ff_ffff_ffff,
+            ambient: 0x400,
+            no_new_privs: Some(false),
+            seccomp: Some(0),
+            critical_caps: vec![],
+            reason: Some(CapReason::AmbientCapsNoNewPrivs),
+        }];
+        let ids: Vec<_> = evaluate(&r).into_iter().map(|f| f.id).collect();
+        assert!(
+            !ids.iter().any(|id| *id == "SEC-015" || *id == "SEC-017"),
+            "ambient-only entry must not complete the ephemeral-exec capability correlation"
+        );
+        assert!(ids.contains(&"CAP-002"));
     }
 }
