@@ -520,7 +520,16 @@ pub struct SuspiciousProcess {
     pub self_attributed: Option<String>,
 }
 
-// Process Capability Audit Models
+// ── Process Capability Audit Models ──────────────────────────────────────
+
+/// Typed reason for a process capability finding.
+/// Replaces the brittle string literal used previously (R20‑03).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapReason {
+    /// Ambient capabilities held without NoNewPrivs (CAP-002).
+    AmbientCapsNoNewPrivs,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ProcCapFinding {
@@ -540,11 +549,9 @@ pub struct ProcCapFinding {
     #[serde(default)]
     pub seccomp: Option<u8>,
     pub critical_caps: Vec<String>,
-    /// Set to "ambient_caps_no_new_privs" when a non-root process holds
-    /// ambient capabilities with NoNewPrivs disabled – a strong signal of
-    /// misconfiguration or preparation for privilege escalation.
+    /// Reason for this finding (e.g. AmbientCapsNoNewPrivs).
     #[serde(default)]
-    pub reason: Option<String>,
+    pub reason: Option<CapReason>,
 }
 
 // Bind‑mount / overlay masking (SEC‑021)

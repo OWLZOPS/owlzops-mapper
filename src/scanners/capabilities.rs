@@ -6,7 +6,7 @@
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::models::{ProcCapFinding, SuspiciousProcess};
+use crate::models::{CapReason, ProcCapFinding, SuspiciousProcess};
 use crate::{coverage, safe_io};
 
 // ── Capability bit numbers (include/uapi/linux/capability.h) ────────────
@@ -485,7 +485,11 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         }
 
         if st.euid == 0 {
-            continue; // root: full capability masks are the default — flagging is noise
+            // root: full Prm/Eff/Bnd masks are the default, flagging them is noise.
+            // CapAmb is also zero by default for root, and ambient does not grant
+            // anything beyond what root already has – the signal appears only after
+            // a uid change. (R20‑04)
+            continue;
         }
 
         // Possession, not acquisition potential: bounding excluded on purpose.
@@ -508,7 +512,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         // CAP-002: ambient caps without NoNewPrivs on a non-root process.
         // A strong signal of misconfiguration or preparation for privilege escalation.
         let reason = if st.caps.ambient != 0 && st.no_new_privs != Some(true) {
-            Some("ambient_caps_no_new_privs".to_string())
+            Some(CapReason::AmbientCapsNoNewPrivs)
         } else {
             None
         };
@@ -721,10 +725,7 @@ NoNewPrivs:\t0\nSeccomp:\t0\n",
         );
         let (findings, _) = audit_host_processes(tmp.path());
         assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].reason.as_deref(),
-            Some("ambient_caps_no_new_privs")
-        );
+        assert_eq!(findings[0].reason, Some(CapReason::AmbientCapsNoNewPrivs));
     }
 
     #[test]
@@ -742,8 +743,8 @@ Seccomp:\t0\n",
         let (findings, _) = audit_host_processes(tmp.path());
         assert_eq!(findings.len(), 1);
         assert_eq!(
-            findings[0].reason.as_deref(),
-            Some("ambient_caps_no_new_privs"),
+            findings[0].reason,
+            Some(CapReason::AmbientCapsNoNewPrivs),
             "missing NoNewPrivs line implies no protection"
         );
     }

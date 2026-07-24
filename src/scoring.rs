@@ -395,7 +395,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .security
                 .capability_audit
                 .iter()
-                .find(|c| c.pid == pid)
+                .find(|c| c.pid == pid && !c.critical_caps.is_empty())
             else {
                 continue;
             };
@@ -1365,40 +1365,39 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Non-root processes with critical kernel capabilities ──
-    if !report.security.capability_audit.is_empty() {
-        let n = report.security.capability_audit.len();
-        let nnp_open = report
-            .security
-            .capability_audit
+    // ── Non-root processes with critical kernel capabilities (CAP-001) ──
+    let cap_findings: Vec<&crate::models::ProcCapFinding> = report
+        .security
+        .capability_audit
+        .iter()
+        .filter(|f| !f.critical_caps.is_empty())
+        .collect();
+    if !cap_findings.is_empty() {
+        let n = cap_findings.len();
+        let nnp_open = cap_findings
             .iter()
             .filter(|f| f.no_new_privs == Some(false))
             .count();
 
         let ports = &report.network.listening_ports;
-        let (listening, exposed) =
-            report
-                .security
-                .capability_audit
-                .iter()
-                .fold((0usize, 0usize), |(l, e), f| {
-                    let pid = Some(f.pid);
-                    let mut on_net = false;
-                    let mut global = false;
-                    for p in ports {
-                        if p.pid == pid {
-                            on_net = true;
-                            if crate::utils::is_wildcard_bind(&p.bind_address) {
-                                global = true;
-                                break;
-                            }
-                        }
+        let (listening, exposed) = cap_findings.iter().fold((0usize, 0usize), |(l, e), f| {
+            let pid = Some(f.pid);
+            let mut on_net = false;
+            let mut global = false;
+            for p in ports {
+                if p.pid == pid {
+                    on_net = true;
+                    if crate::utils::is_wildcard_bind(&p.bind_address) {
+                        global = true;
+                        break;
                     }
-                    (l + on_net as usize, e + global as usize)
-                });
+                }
+            }
+            (l + on_net as usize, e + global as usize)
+        });
 
         let mut evidence = format!(
-            "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW or ambient capability sets"
+            "{n} non-root process(es) with SYS_ADMIN/SYS_PTRACE/DAC_OVERRIDE/NET_RAW capability sets"
         );
         if nnp_open > 0 {
             evidence.push_str(&format!(
@@ -1425,6 +1424,48 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             category: Category::Security,
             weight,
             evidence,
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    // ── CAP-002 – ambient capabilities without NoNewPrivs (non-root) ──────
+    // Uses the typed reason to avoid brittle string comparison.
+    let ambient_findings: Vec<&crate::models::ProcCapFinding> = report
+        .security
+        .capability_audit
+        .iter()
+        .filter(|f| {
+            f.reason
+                .as_ref()
+                .is_some_and(|r| *r == crate::models::CapReason::AmbientCapsNoNewPrivs)
+        })
+        .collect();
+    if !ambient_findings.is_empty() {
+        let list = ambient_findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} (pid {}, euid {}): ambient [{}]",
+                    f.comm,
+                    f.pid,
+                    f.euid,
+                    crate::scanners::capabilities::decode_mask(f.ambient).join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        findings.push(Finding {
+            id: "CAP-002",
+            title: "Ambient capabilities held with NoNewPrivs disabled".to_string(),
+            category: Category::Security,
+            weight: 12,
+            evidence: format!(
+                "{} non-root process(es) hold ambient capabilities while NoNewPrivs is off — \
+                 the set survives execve of a non-setuid binary: {}",
+                ambient_findings.len(),
+                list
+            ),
             suppressed: None,
             cis_ref: None,
         });
@@ -2720,5 +2761,39 @@ mod tests {
             classify_cap_binary(&fc, &ProvenanceSource::Unavailable).0,
             8
         );
+    }
+
+    #[test]
+    fn ephemeral_port_with_ambient_only_does_not_fire_sec015() {
+        use crate::models::{CapReason, PortInfo, ProcCapFinding};
+        let mut r = minimal_report();
+        r.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            port: "4444".into(),
+            process: "x".into(),
+            bind_address: "0.0.0.0".into(),
+            pid: Some(1337),
+            exe_path: Some("/tmp/x".into()),
+        }];
+        r.security.capability_audit = vec![ProcCapFinding {
+            pid: 1337,
+            comm: "x".into(),
+            euid: 1000,
+            effective: 0x400,
+            permitted: 0x400,
+            inheritable: 0x400,
+            bounding: 0x1ff_ffff_ffff,
+            ambient: 0x400,
+            no_new_privs: Some(false),
+            seccomp: Some(0),
+            critical_caps: vec![],
+            reason: Some(CapReason::AmbientCapsNoNewPrivs),
+        }];
+        let ids: Vec<_> = evaluate(&r).into_iter().map(|f| f.id).collect();
+        assert!(
+            !ids.iter().any(|id| *id == "SEC-015" || *id == "SEC-017"),
+            "ambient-only entry must not complete the ephemeral-exec capability correlation"
+        );
+        assert!(ids.contains(&"CAP-002"));
     }
 }
