@@ -1,6 +1,7 @@
 use std::io::{self, Read};
 
 /// Read a file into a String, capping at `max_bytes`. Returns (content, truncated).
+#[cfg(feature = "local-scan")]
 pub fn read_file_capped(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
@@ -18,6 +19,7 @@ pub fn read_file_capped(path: &str, max_bytes: usize) -> io::Result<(String, boo
 }
 
 /// Read a file into raw bytes, capping at `max_bytes`. Returns (bytes, truncated).
+#[cfg(feature = "local-scan")]
 pub fn read_file_bytes_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
@@ -46,7 +48,9 @@ pub fn read_reader_capped<R: Read>(mut reader: R, max_bytes: usize) -> (Vec<u8>,
     (buf, truncated)
 }
 
+#[cfg(feature = "local-scan")]
 pub const CAP_PROC_NET: usize = 16 * 1024 * 1024;
+#[cfg(feature = "local-scan")]
 pub const CAP_PROC_ENVIRON: usize = 256 * 1024;
 pub const CAP_CHILD_STDOUT: usize = 32 * 1024 * 1024;
 

@@ -13,6 +13,7 @@ mod self_identity;
 mod ssh_engine;
 mod ui;
 mod utils;
+#[cfg(feature = "local-scan")]
 mod verdict_cache;
 
 use crate::utils::host_budget_secs;

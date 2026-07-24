@@ -1,5 +1,6 @@
 #[cfg(feature = "local-scan")]
 mod access;
+#[cfg(feature = "local-scan")]
 pub mod capabilities;
 #[cfg(feature = "local-scan")]
 mod deep;

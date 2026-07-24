@@ -4,6 +4,7 @@ use crate::ui;
 use std::path::Path;
 use tracing::warn;
 
+#[cfg(feature = "local-scan")]
 pub fn output_single(
     report: &AgentReport,
     format: &OutputFormat,

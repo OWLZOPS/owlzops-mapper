@@ -797,6 +797,7 @@ pub struct DeepMemoryAnalysis {
     pub image_header: bool, // MZ / ELF / PE in the first bytes of RWX region
 }
 
+#[cfg(feature = "local-scan")]
 impl DeepMemoryAnalysis {
     pub fn inconclusive() -> Self {
         Self {

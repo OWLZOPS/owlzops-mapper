@@ -44,6 +44,7 @@ pub fn validate_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "local-scan")]
 pub fn is_local_host(host: &str) -> bool {
     let host_lower = host.to_lowercase();
     if host_lower == "localhost" || host_lower == "127.0.0.1" || host_lower == "::1" {
