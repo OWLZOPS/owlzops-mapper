@@ -1857,6 +1857,7 @@ pub fn write_multi_diff_xlsx(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
     use crate::models::*;
 
@@ -1899,6 +1900,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "local-scan")]
     #[test]
     fn write_report_creates_nonempty_file() {
         let tmp = std::env::temp_dir().join(format!("owlzops-test-{}.xlsx", uuid::Uuid::new_v4()));

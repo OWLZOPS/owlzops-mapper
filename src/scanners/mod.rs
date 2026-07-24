@@ -31,6 +31,7 @@ mod reverse_shell;
 pub mod security;
 #[cfg(feature = "local-scan")]
 pub mod self_integrity;
+#[cfg(feature = "local-scan")]
 mod setuid;
 #[cfg(feature = "local-scan")]
 pub mod storage;
