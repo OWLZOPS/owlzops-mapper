@@ -95,6 +95,24 @@ jobs:
 
       - name: Deep forensic run (smoke)
         run: |
+          # Re-define check_ioc (same as in the shallow step)
+          check_ioc() {
+            local f="$1"
+            local unexp
+            unexp=$(jq -r '
+              ([.security.suspicious_processes[]?.name
+                 | select(test("^provjobd") | not)] | length)
+              + ([.security.library_injections[]?
+                 | select(.process != "networkd-dispat")] | length)
+              + ([.security.ghost_pids[]?]     | length)
+              + ([.security.reverse_shells[]?] | length)
+              + ([.security.mount_masking[]?]  | length)' "$f")
+            if [ "$unexp" -ne 0 ]; then
+              echo "::error::$unexp unexpected IoC finding(s) in $f — new false positive or real regression"
+              exit 1
+            fi
+          }
+
           set +e
           sudo ./target/debug/owlzops-mapper audit --deep --format json > deep_result.json
           DEEP_EXIT=$?
