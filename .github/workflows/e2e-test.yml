@@ -55,14 +55,18 @@ jobs:
                  masking:    .security.mount_masking}' audit_result.json
           fi
 
-          # `provjobd` (with optional numeric suffix) is the only known false
-          # positive on the GitHub runner. Any new suspicious process must
-          # break the build.
+          # provjobd (with optional numeric suffix) is the only known false
+          # positive on the GitHub runner.  All other IoC channels must be
+          # empty — any new finding on any channel breaks the build.
           UNEXPECTED=$(jq -r '
-            [.security.suspicious_processes[]?.name]
-            | map(select(test("^provjobd") | not)) | length' audit_result.json)
+            ([.security.suspicious_processes[]?.name]
+               | map(select(test("^provjobd") | not)) | length)
+            + ([.security.library_injections[]?] | length)
+            + ([.security.ghost_pids[]?]         | length)
+            + ([.security.reverse_shells[]?]     | length)
+            + ([.security.mount_masking[]?]      | length)' audit_result.json)
           if [ "$UNEXPECTED" -ne 0 ]; then
-            echo "::error::$UNEXPECTED unexpected suspicious process(es) — new false positive or real regression"
+            echo "::error::$UNEXPECTED unexpected IoC finding(s) — new false positive or real regression"
             exit 1
           fi
 

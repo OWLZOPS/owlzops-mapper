@@ -77,10 +77,15 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # action HEAD as of 2026-06-28
         with:
           toolchain: stable
-          # components: clippy  -- deferred: --no-default-features dead-code audit planned for v0.5.25
+          # clippy deferred: dead-code audit under --no-default-features → v0.5.25
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      # R19V11-01: tests do not depend on the dead-code audit and must run now —
+      # this is the only verification of the published macOS artifact beyond compilation.
+      - name: Run tests (orchestrator config)
+        run: cargo test --locked --no-default-features
 
       - name: Build orchestrator (remote-only)
         run: cargo build --release --no-default-features
