@@ -301,11 +301,21 @@ pub fn gather_ebpf_inventory() -> EbpfInventory {
         ));
     }
 
+    // Collect unique, sorted program tags for drift comparison (R19V‑10).
+    let mut tags: Vec<String> = programs
+        .iter()
+        .map(|p| p.prog_tag.clone())
+        .filter(|t| !t.is_empty())
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+
     EbpfInventory {
         programs,
         maps,
         pins,
         links,
+        prog_tags: tags,
     }
 }
 

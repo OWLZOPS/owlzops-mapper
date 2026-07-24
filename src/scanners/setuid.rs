@@ -6,16 +6,15 @@
 use crate::models::SetuidFinding;
 use crate::scanners::fs_inventory;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+/// Inspect a file for setuid/setgid bits, reusing the shared `fs_inventory::inspect_file`
+/// for setuid detection (R19V13‑04).
 fn inspect_file(meta: &fs::Metadata, path: &Path) -> Option<SetuidFinding> {
-    let mode = meta.permissions().mode();
-
-    #[allow(clippy::unnecessary_cast)]
-    let is_suid = mode & libc::S_ISUID as u32 != 0;
-    #[allow(clippy::unnecessary_cast)]
-    let is_sgid = mode & libc::S_ISGID as u32 != 0;
+    // Shared helper for setuid – avoids duplicating the mode-mask logic.
+    let is_suid = fs_inventory::inspect_file(meta);
+    let is_sgid = meta.mode() & 0o2000 != 0; // S_ISGID
 
     if !is_suid && !is_sgid {
         return None;
@@ -43,7 +42,7 @@ pub fn gather_setuid_files() -> Vec<SetuidFinding> {
             if let Some(finding) = inspect_file(meta, &entry.path()) {
                 findings.push(finding);
             }
-            Ok(())
+            // Callback now returns nothing (R19V14‑02/03).
         },
     );
     findings
@@ -55,16 +54,15 @@ pub fn gather_setuid_files() -> Vec<SetuidFinding> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unnecessary_cast)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn inspect_file_suid() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let mut perms = tmp.as_file().metadata().unwrap().permissions();
-        let mode = perms.mode();
-        perms.set_mode(mode | libc::S_ISUID as u32);
+        perms.set_mode(0o4755); // setuid + rwxr-xr-x
         tmp.as_file().set_permissions(perms).unwrap();
         let meta = tmp.as_file().metadata().unwrap();
         let f = inspect_file(&meta, tmp.path()).unwrap();
@@ -77,5 +75,17 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let meta = tmp.as_file().metadata().unwrap();
         assert!(inspect_file(&meta, tmp.path()).is_none());
+    }
+
+    #[test]
+    fn inspect_file_sgid() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut perms = tmp.as_file().metadata().unwrap().permissions();
+        perms.set_mode(0o2755); // setgid
+        tmp.as_file().set_permissions(perms).unwrap();
+        let meta = tmp.as_file().metadata().unwrap();
+        let f = inspect_file(&meta, tmp.path()).unwrap();
+        assert!(f.setgid);
+        assert!(!f.setuid);
     }
 }

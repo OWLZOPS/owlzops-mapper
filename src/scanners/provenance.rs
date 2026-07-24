@@ -1,4 +1,4 @@
-//! Package provenance resolver for dpkg and apk.
+//! Package provenance resolver for dpkg, apk, and rpm.
 //!
 //! Given a set of file paths (candidates) returns which installed package owns
 //! each file.  Candidates must be in **canonical** form (see
@@ -9,10 +9,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use crate::models::ProvenanceSource;
 
 const MAX_LIST_BYTES: usize = 8 * 1024 * 1024; // largest real .list ≈ 2 MB
+/// Batch size for rpm queries – one `rpm -qf` invocation per chunk.
+const RPM_CHUNK_SIZE: usize = 100;
 
 /// The result of a batch resolution together with the database that produced it.
 pub struct ProvenanceIndex {
@@ -42,6 +45,7 @@ pub fn resolve_batch(candidates: &HashSet<String>) -> ProvenanceIndex {
         }
     };
 
+    // 1. dpkg
     if Path::new("/var/lib/dpkg/info").is_dir() {
         return match resolve_dpkg(candidates) {
             Some(map) => ProvenanceIndex {
@@ -51,6 +55,8 @@ pub fn resolve_batch(candidates: &HashSet<String>) -> ProvenanceIndex {
             None => unavailable("dpkg DB present but not a single .list was readable"),
         };
     }
+
+    // 2. apk
     if Path::new("/lib/apk/db/installed").is_file() {
         return match resolve_apk(candidates) {
             Some((map, truncated)) => ProvenanceIndex {
@@ -64,6 +70,15 @@ pub fn resolve_batch(candidates: &HashSet<String>) -> ProvenanceIndex {
             None => unavailable("apk DB present but unreadable"),
         };
     }
+
+    // 3. rpm (querying the rpm tool, no DB parsing)
+    if let Some(map) = resolve_rpm(candidates) {
+        return ProvenanceIndex {
+            source: ProvenanceSource::Rpm,
+            map,
+        };
+    }
+
     unavailable("no parseable package DB (rpm/pacman)")
 }
 
@@ -216,13 +231,75 @@ fn resolve_apk(candidates: &HashSet<String>) -> Option<(HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
-// RPM backend (honest degradation)
+// RPM backend (uses external `rpm` tool with batching)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-fn resolve_rpm(_candidates: &HashSet<String>) -> HashMap<String, String> {
-    crate::coverage::record("provenance: RPM backend skipped (no BDB/SQLite parser)");
-    HashMap::new()
+/// Resolve file ownership via `rpm -qf`.
+/// Returns None if `rpm` is not available or fails entirely.
+fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> {
+    if candidates.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    // Check for rpm binary
+    let rpm_bin = if Path::new("/usr/bin/rpm").exists() {
+        "/usr/bin/rpm"
+    } else if Path::new("/bin/rpm").exists() {
+        "/bin/rpm"
+    } else {
+        crate::coverage::record("provenance: RPM backend skipped (rpm binary not found)");
+        return None;
+    };
+
+    let mut owned = HashMap::new();
+    let candidate_vec: Vec<&String> = candidates.iter().collect();
+
+    // Batch candidates into chunks of RPM_CHUNK_SIZE to avoid argument limits
+    for chunk in candidate_vec.chunks(RPM_CHUNK_SIZE) {
+        let paths: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let output = match Command::new(rpm_bin)
+            .args(["-qf", "--queryformat", "%{NAME}\n", "--"])
+            .args(&paths)
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                crate::coverage::record(format!("provenance: failed to execute rpm: {e}"));
+                return None;
+            }
+        };
+
+        // rpm prints package names to stdout, errors (like "file ... is not owned by any package") to stderr
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+
+        if lines.len() != paths.len() {
+            // Safety net: if rpm output is misaligned, we skip this chunk to avoid incorrect assignments
+            crate::coverage::record(format!(
+                "provenance: rpm output line count mismatch (got {}, expected {}) — skipping chunk",
+                lines.len(),
+                paths.len()
+            ));
+            continue;
+        }
+
+        // Zip paths and lines: each line corresponds to the path at the same index
+        for (i, line) in lines.iter().enumerate() {
+            let pkg = line.trim();
+            if pkg.is_empty() || pkg.starts_with("file ") {
+                // "file <path> is not owned by any package" – skip
+                continue;
+            }
+            owned.insert(paths[i].to_string(), pkg.to_string());
+        }
+    }
+
+    if owned.is_empty() {
+        // rpm worked but found nothing – still a valid (empty) resolution
+        Some(HashMap::new())
+    } else {
+        Some(owned)
+    }
 }
 
 // ---------------------------------------------------------------------------

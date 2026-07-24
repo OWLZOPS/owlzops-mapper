@@ -286,9 +286,10 @@ pub enum ProvenanceSource {
     /// Alpine database was used.
     Apk,
     /// Alpine database was used but the file was truncated at the read cap.
-    /// Attribution is partial – some files may be misreported as unpackaged.
     PartialApk,
-    /// No parseable database (RPM/pacman, or missing DB).
+    /// RPM database was queried via rpm tool.
+    Rpm,
+    /// No parseable database (pacman, or missing DB).
     #[default]
     Unavailable,
 }
@@ -781,6 +782,10 @@ pub struct EbpfInventory {
     pub pins: Vec<BpfPinInfo>,
     #[serde(default)]
     pub links: Vec<BpfLinkInfo>,
+    /// Stable set of program tags (from fdinfo prog_tag) for drift detection.
+    /// Sorted for reproducibility. Empty on legacy snapshots.
+    #[serde(default)]
+    pub prog_tags: Vec<String>,
 }
 
 // ── Deep Forensics (Pointer Resolution & Memory Analysis) ──

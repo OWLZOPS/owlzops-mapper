@@ -221,7 +221,7 @@ pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
                     _ => {}
                 },
             }
-            Ok(())
+            // No Ok(()) – callback signature changed to `FnMut`, return is void.
         },
     );
     findings
