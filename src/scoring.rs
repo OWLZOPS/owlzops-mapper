@@ -1839,11 +1839,15 @@ pub(crate) fn classify_cap_binary(
         .unwrap_or("");
     for (name, allowed) in KNOWN_CAP_BINARIES {
         if basename == *name {
-            return if fc
-                .capabilities
-                .iter()
-                .all(|c| allowed.contains(&c.as_str()))
-            {
+            // build_capability_names tags inheritable bits with "(inh)";
+            // the baseline describes the set of capabilities, not the
+            // specific masks, so strip the tag before comparing (otherwise
+            // dumpcap with +eip triggers a false positive).
+            let within_baseline = fc.capabilities.iter().all(|c| {
+                let bare = c.strip_suffix("(inh)").unwrap_or(c);
+                allowed.contains(&bare)
+            });
+            return if within_baseline {
                 (0, "known binary with expected capabilities")
             } else {
                 (8, "known binary carrying capabilities beyond its baseline")
@@ -2682,6 +2686,39 @@ mod tests {
         assert_eq!(
             f.weight, 15,
             "PRIVESC-marker entry must be treated as NOPASSWD: ALL"
+        );
+    }
+
+    #[test]
+    fn known_binary_with_inheritable_flag_is_not_flagged() {
+        let fc = FileCapFinding {
+            path: "/usr/bin/dumpcap".into(),
+            capabilities: vec![
+                "CAP_NET_ADMIN".into(),
+                "CAP_NET_RAW".into(),
+                "CAP_NET_ADMIN(inh)".into(),
+                "CAP_NET_RAW(inh)".into(),
+            ],
+            package: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_cap_binary(&fc, &ProvenanceSource::Unavailable).0,
+            0
+        );
+    }
+
+    #[test]
+    fn inheritable_only_escalation_still_fires() {
+        let fc = FileCapFinding {
+            path: "/usr/bin/ping".into(),
+            capabilities: vec!["CAP_SYS_ADMIN(inh)".into()],
+            package: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_cap_binary(&fc, &ProvenanceSource::Unavailable).0,
+            8
         );
     }
 }
