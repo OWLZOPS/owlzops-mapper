@@ -979,10 +979,10 @@ mod tests {
     #[test]
     fn lone_dropper_rwx_still_alarms() {
         let maps = "\
-0000400000-0000401000 r-xp 00000000 08:01 100 /home/u/.cache/x
+0000400000-0000401000 r-xp 00000000 08:01 100 /tmp/.x/dropper
 74f000000000-74f000010000 rwxp 00000000 00:00 0 [anon:.bss]
 ";
-        let f = scan_with(maps, Some("/home/u/.cache/x"));
+        let f = scan_with(maps, Some("/tmp/.x/dropper"));
         assert_eq!(
             src_of(&f, "74f000000000-74f000010000"),
             Some("maps-anon-rwx"),
