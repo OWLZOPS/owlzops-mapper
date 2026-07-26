@@ -301,6 +301,15 @@ pub fn gather_ebpf_inventory() -> EbpfInventory {
         ));
     }
 
+    // Pin type/id are unknown in pure‑VFS mode — make this potolok visible.
+    if !pins.is_empty() {
+        crate::coverage::record(format!(
+            "ebpf: type/id of {} pin(s) in /sys/fs/bpf unknown — \
+             requires BPF_OBJ_GET outside pure-VFS mode; pin path recorded (Raw Truth)",
+            pins.len()
+        ));
+    }
+
     // Collect unique, sorted program tags for drift comparison (R19V‑10).
     let mut tags: Vec<String> = programs
         .iter()

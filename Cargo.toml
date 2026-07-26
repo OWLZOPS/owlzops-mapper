@@ -40,8 +40,8 @@ hmac = "0.13"
 data-encoding = "2"
 subtle = "2"
 
-# io‑uring is Linux‑only
-[target.'cfg(target_os = "linux")'.dependencies]
+# io‑uring is Linux‑only and fully stubbed on musl — restrict dependency cfg accordingly
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 io-uring = "0.7.13"
 
 [dev-dependencies]
