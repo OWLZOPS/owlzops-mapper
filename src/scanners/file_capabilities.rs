@@ -172,56 +172,55 @@ pub fn gather_file_capabilities() -> Vec<FileCapFinding> {
 
     fs_inventory::walk_scannable_dirs(
         "file_capabilities",
-        &mut |entry: &std::fs::DirEntry, meta: &std::fs::Metadata| {
-            match read_caps_raw(&entry.path()) {
-                Ok(Some(buf)) => match parse_vfs_cap_data(&buf) {
-                    Ok(caps) => {
-                        if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
-                            let names = build_capability_names(caps.permitted, caps.inheritable);
-                            findings.push(FileCapFinding {
-                                path: entry.path().to_string_lossy().into_owned(),
-                                capabilities: names,
-                                reason: Some(
-                                    "file capabilities granted via extended attributes".into(),
-                                ),
-                                permitted: caps.permitted,
-                                inheritable: caps.inheritable,
-                                effective: caps.effective,
-                                revision: caps.revision,
-                                rootid: caps.rootid,
-                                package: None,
-                            });
-                        }
+        &mut |entry: &std::fs::DirEntry, meta: &std::fs::Metadata| match read_caps_raw(
+            &entry.path(),
+        ) {
+            Ok(Some(buf)) => match parse_vfs_cap_data(&buf) {
+                Ok(caps) => {
+                    if caps.permitted != 0 || caps.inheritable != 0 || caps.effective {
+                        let names = build_capability_names(caps.permitted, caps.inheritable);
+                        findings.push(FileCapFinding {
+                            path: entry.path().to_string_lossy().into_owned(),
+                            capabilities: names,
+                            reason: Some(
+                                "file capabilities granted via extended attributes".into(),
+                            ),
+                            permitted: caps.permitted,
+                            inheritable: caps.inheritable,
+                            effective: caps.effective,
+                            revision: caps.revision,
+                            rootid: caps.rootid,
+                            package: None,
+                        });
                     }
-                    Err(reason) => {
+                }
+                Err(reason) => {
+                    crate::coverage::record(format!(
+                        "file_capabilities: unparsed xattr at {}: {}",
+                        entry.path().display(),
+                        reason
+                    ));
+                }
+            },
+            Ok(None) => {}
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOTSUP) => {
+                    let dev = meta.dev();
+                    if notsup_devs.insert(dev) {
                         crate::coverage::record(format!(
-                            "file_capabilities: unparsed xattr at {}: {}",
-                            entry.path().display(),
-                            reason
+                            "file_capabilities: xattr unsupported on dev {dev} — inventory blind there"
                         ));
                     }
-                },
-                Ok(None) => {}
-                Err(e) => match e.raw_os_error() {
-                    Some(libc::ENOTSUP) => {
-                        let dev = meta.dev();
-                        if notsup_devs.insert(dev) {
-                            crate::coverage::record(format!(
-                                "file_capabilities: xattr unsupported on dev {dev} — inventory blind there"
-                            ));
-                        }
-                    }
-                    _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
-                        crate::coverage::record(format!(
-                            "file_capabilities: error reading {}: {}",
-                            entry.path().display(),
-                            e
-                        ));
-                    }
-                    _ => {}
-                },
-            }
-            // No Ok(()) – callback signature changed to `FnMut`, return is void.
+                }
+                _ if e.kind() != std::io::ErrorKind::PermissionDenied => {
+                    crate::coverage::record(format!(
+                        "file_capabilities: error reading {}: {}",
+                        entry.path().display(),
+                        e
+                    ));
+                }
+                _ => {}
+            },
         },
     );
     findings

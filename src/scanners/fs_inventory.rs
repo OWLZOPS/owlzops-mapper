@@ -1,17 +1,23 @@
+//! Unified filesystem inventory traversal logic.
+//! Both the setuid and file_capabilities scanners use the same
+//! directory list, budget constants, and deduplication, and can
+//! optionally be combined into a single pass via `gather_binary_inventory`.
+//!
 //! Budget management (R19‑15 / R19V12‑02):
 //! - The entry budget is shared across the whole root: one allowance per
-//!   SCAN_DIRS entry, threaded by `&mut` through the recursion.
+//!   SCAN_DIRS entry, threaded by `&mut` through the recursion — not a fresh
+//!   allowance per directory.
 //! - Hardlinks are deduplicated *before* consuming the budget, so duplicates
 //!   cannot trigger a false "budget exhausted" warning.
 //!
 //! Known limitation (R19‑14, partially open): among several hardlink aliases
-//! the one returned first by `readdir` wins. Since `provenance::lookup` is
-//! path-based, the finding's weight can differ between hosts or after the
-//! directory is modified. Emitting all aliases would fix this.
+//! of the same inode, the one returned first by `readdir` wins. Since
+//! `provenance::lookup` is path-based, a finding's weight can differ between
+//! hosts or after the directory is modified. Emitting all aliases would fix it.
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use crate::models::{FileCapFinding, SetuidFinding};
@@ -32,15 +38,13 @@ pub(crate) const SCAN_DIRS: &[(&str, u8)] = &[
 pub(crate) const BUDGET_FLAT: usize = 4_096;
 pub(crate) const BUDGET_DEEP: usize = 40_000;
 
-/// Shared setuid predicate — avoids duplication between binary inventory
-/// and the stand-alone `setuid` module (R19V13‑04).
-pub(crate) fn inspect_file(meta: &fs::Metadata) -> bool {
-    meta.permissions().mode() & 0o4000 != 0
-}
-
-pub(crate) fn walk_scannable_dirs<F>(scanner_name: &str, mut on_file: &mut F)
+/// Walk the standard binary/library roots once, invoking `on_file` for each
+/// unique regular file. The callback does not return a value: traversal-control
+/// (the per-root entry budget) is handled internally, so the callback cannot be
+/// confused with the budget signal (R19V14-02). `on_file` is taken by `&mut F`
+/// and passed straight down — no `&mut &mut F` indirection (R19V14-03).
+pub(crate) fn walk_scannable_dirs<F>(scanner_name: &str, on_file: &mut F)
 where
-    // Callback no longer returns a Result (R19V14‑02/03).
     F: FnMut(&fs::DirEntry, &fs::Metadata),
 {
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
@@ -50,6 +54,9 @@ where
             continue;
         }
         let mut budget = if depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
+        // Capture the device id of the root directory – we will not cross
+        // into mounted filesystems (R19V12‑04). If we cannot stat the root,
+        // the filesystem boundary check is disabled with a warning.
         let root_dev = match path.metadata() {
             Ok(m) => Some(m.dev()),
             Err(e) => {
@@ -67,7 +74,7 @@ where
             &mut budget,
             root_dev,
             scanner_name,
-            &mut on_file,
+            on_file,
         ) {
             crate::coverage::record(format!(
                 "{scanner_name}: {dir} entry budget exhausted — inventory INCOMPLETE for this root"
@@ -76,6 +83,8 @@ where
     }
 }
 
+/// `Err(())` is the *budget-exhausted* signal and nothing else; it is distinct
+/// from anything the callback might want to report (the callback is infallible).
 fn walk_recursive<F>(
     dir: &Path,
     max_depth: u8,
@@ -104,6 +113,7 @@ where
         };
 
         if ft.is_dir() && max_depth > 1 {
+            // Do not cross filesystem boundary unless we couldn't determine it.
             if let (Some(rd), Ok(meta)) = (root_dev, entry.metadata())
                 && meta.dev() != rd
             {
@@ -144,8 +154,6 @@ where
         }
         *budget -= 1;
 
-        // Callback returns nothing; budget exhaustion is only signalled
-        // by the walker's own counter (R19V14‑02/03).
         on_file(&entry, &meta);
     }
 
@@ -159,18 +167,9 @@ pub(crate) fn gather_binary_inventory() -> (Vec<SetuidFinding>, Vec<FileCapFindi
     let mut notsup_devs: HashSet<u64> = HashSet::new();
 
     walk_scannable_dirs("binary_inventory", &mut |entry, meta| {
-        let mode = meta.permissions().mode();
-        // Use the shared helper (R19V13‑04)
-        let is_suid = inspect_file(meta);
-        let is_sgid = mode & libc::S_ISGID != 0;
-        if is_suid || is_sgid {
-            setuid_findings.push(SetuidFinding {
-                path: entry.path().to_string_lossy().into_owned(),
-                setuid: is_suid,
-                setgid: is_sgid,
-                root_owner: meta.uid() == 0,
-                package: None,
-            });
+        // Single source of truth for the setuid/setgid predicate (R19V13-04).
+        if let Some(finding) = crate::scanners::setuid::inspect_file(meta, &entry.path()) {
+            setuid_findings.push(finding);
         }
 
         match crate::scanners::file_capabilities::read_caps_raw(&entry.path()) {
@@ -223,7 +222,6 @@ pub(crate) fn gather_binary_inventory() -> (Vec<SetuidFinding>, Vec<FileCapFindi
                 _ => {}
             },
         }
-        // The callback is now infallible; nothing to return.
     });
 
     (setuid_findings, cap_findings)
