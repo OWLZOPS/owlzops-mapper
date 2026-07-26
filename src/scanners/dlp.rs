@@ -34,6 +34,11 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
     // Reusable buffer for constructing /proc/<pid>/... paths
     let mut path_buf = String::with_capacity(64);
 
+    // Count how many *processes* had unreadable /proc/<pid>/environ or cmdline
+    // due to EACCES (typically non‑root scan).  One aggregate coverage line
+    // is emitted at the end to avoid flooding the operator with per‑PID noise.
+    let mut denied = 0usize;
+
     for entry in entries.flatten() {
         let Ok(file_name) = entry.file_name().into_string() else {
             continue;
@@ -41,6 +46,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         let Ok(pid) = file_name.parse::<u32>() else {
             continue;
         };
+
+        // Per‑PID flag – raised once if either environ or cmdline is EACCES.
+        let mut pid_denied = false;
 
         // Process name
         path_buf.clear();
@@ -61,73 +69,99 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         // 1. Environment Variables
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/environ", pid);
-        if let Ok((env_data, truncated)) =
-            safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON)
-        {
-            if truncated {
-                coverage::record(format!("{} truncated", path_buf));
-            }
-            for chunk in env_data.split(|&b| b == 0) {
-                let Ok(env_var) = std::str::from_utf8(chunk) else {
-                    continue;
-                };
-                let Some((key, _value)) = env_var.split_once('=') else {
-                    continue;
-                };
+        match safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
+            Ok((env_data, truncated)) => {
+                if truncated {
+                    coverage::record(format!("{} truncated", path_buf));
+                }
+                for chunk in env_data.split(|&b| b == 0) {
+                    let Ok(env_var) = std::str::from_utf8(chunk) else {
+                        continue;
+                    };
+                    let Some((key, _value)) = env_var.split_once('=') else {
+                        continue;
+                    };
 
-                if SENSITIVE_KEYS
-                    .iter()
-                    .any(|&sk| key.eq_ignore_ascii_case(sk))
-                {
-                    leaks.push(SecretLeak {
-                        pid,
-                        process: process_name.clone(),
-                        source: "environ".to_string(),
-                        matched_key: key.to_string(),
-                    });
+                    if SENSITIVE_KEYS
+                        .iter()
+                        .any(|&sk| key.eq_ignore_ascii_case(sk))
+                    {
+                        leaks.push(SecretLeak {
+                            pid,
+                            process: process_name.clone(),
+                            source: "environ".to_string(),
+                            matched_key: key.to_string(),
+                        });
+                    }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                pid_denied = true;
+            }
+            Err(_) => {}
         }
 
         // 2. Command Line Arguments
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/cmdline", pid);
-        if let Ok((cmd_data, truncated)) =
-            safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON)
-        {
-            if truncated {
-                coverage::record(format!("{} truncated", path_buf));
-            }
-            for chunk in cmd_data.split(|&b| b == 0) {
-                let Ok(arg) = std::str::from_utf8(chunk) else {
-                    continue;
-                };
+        match safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
+            Ok((cmd_data, truncated)) => {
+                if truncated {
+                    coverage::record(format!("{} truncated", path_buf));
+                }
+                for chunk in cmd_data.split(|&b| b == 0) {
+                    let Ok(arg) = std::str::from_utf8(chunk) else {
+                        continue;
+                    };
 
-                for &flag in SENSITIVE_FLAGS {
-                    if starts_with_icase(arg, flag) {
+                    for &flag in SENSITIVE_FLAGS {
+                        if starts_with_icase(arg, flag) {
+                            leaks.push(SecretLeak {
+                                pid,
+                                process: process_name.clone(),
+                                source: "cmdline".to_string(),
+                                matched_key: flag.to_string(),
+                            });
+                        }
+                    }
+
+                    // Cover `mysql -pSECRET` (without equals sign)
+                    if (process_name == "mysql" || process_name == "mysqldump")
+                        && let Some(pwd) = arg.strip_prefix("-p")
+                        && !pwd.is_empty()
+                    {
                         leaks.push(SecretLeak {
                             pid,
                             process: process_name.clone(),
                             source: "cmdline".to_string(),
-                            matched_key: flag.to_string(),
+                            matched_key: "mysql-password".to_string(),
                         });
                     }
                 }
-
-                // Cover `mysql -pSECRET` (without equals sign)
-                if (process_name == "mysql" || process_name == "mysqldump")
-                    && let Some(pwd) = arg.strip_prefix("-p")
-                    && !pwd.is_empty()
-                {
-                    leaks.push(SecretLeak {
-                        pid,
-                        process: process_name.clone(),
-                        source: "cmdline".to_string(),
-                        matched_key: "mysql-password".to_string(),
-                    });
-                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                pid_denied = true;
+            }
+            Err(_) => {}
         }
+
+        if pid_denied {
+            denied += 1;
+        }
+    }
+
+    // Aggregate coverage: if any /proc/<pid>/environ or cmdline was denied,
+    // warn the operator that secret hygiene is incomplete (mirrors proc_net).
+    if denied > 0 {
+        let hint = if !crate::is_running_as_root() {
+            " — run as root for full coverage"
+        } else {
+            ""
+        };
+        coverage::record(format!(
+            "dlp: {denied} process(es) with unreadable /proc/<pid>/environ|cmdline{hint}; \
+             secret hygiene INCOMPLETE"
+        ));
     }
 
     leaks

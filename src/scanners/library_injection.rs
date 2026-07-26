@@ -399,10 +399,17 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         let mut pid_hits = 0usize;
 
         // --- 1. ENVIRON SCAN ---
-        if let Ok((data, _)) = safe_io::read_file_bytes_capped(
+        if let Ok((data, truncated)) = safe_io::read_file_bytes_capped(
             &format!("{proc_root}/{pid}/environ"),
             safe_io::CAP_PROC_ENVIRON,
         ) {
+            if truncated {
+                coverage::record(format!(
+                    "library_injection: /proc/{pid}/environ truncated at {} B — \
+                     LD_* variables beyond limit NOT scanned",
+                    safe_io::CAP_PROC_ENVIRON
+                ));
+            }
             for chunk in data.split(|&b| b == 0).filter(|c| !c.is_empty()) {
                 let Ok(kv) = std::str::from_utf8(chunk) else {
                     continue;
@@ -436,9 +443,15 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
 
         // --- 2. MAPS SCAN ---
         if findings.len() < MAX_FINDINGS {
-            if let Ok((content, _)) =
+            if let Ok((content, truncated)) =
                 safe_io::read_file_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
             {
+                if truncated {
+                    coverage::record(format!(
+                        "library_injection: /proc/{pid}/maps truncated at {CAP_PROC_MAPS} B — \
+                         VMAs beyond limit NOT scanned (mmap-spam evasion possible)"
+                    ));
+                }
                 let exe_path = fs::read_link(format!("{proc_root}/{pid}/exe"))
                     .map(|p| p.to_string_lossy().to_string())
                     .ok();

@@ -528,7 +528,17 @@ pub async fn run_remote_scan_russh(
                 ChannelMsg::Data { ref data } => {
                     let room = safe_io::CAP_CHILD_STDOUT.saturating_sub(stdout.len());
                     if room > 0 {
-                        stdout.extend_from_slice(&data[..data.len().min(room)]);
+                        let take = data.len().min(room);
+                        stdout.extend_from_slice(&data[..take]);
+                        // If this chunk didn't fit entirely, mark truncated
+                        if data.len() > room && !stdout_truncated {
+                            stdout_truncated = true;
+                            tracing::warn!(
+                                host = %hostname,
+                                "remote stdout exceeded cap ({} bytes), truncating",
+                                safe_io::CAP_CHILD_STDOUT
+                            );
+                        }
                     } else if !stdout_truncated {
                         stdout_truncated = true;
                         tracing::warn!(
@@ -541,7 +551,16 @@ pub async fn run_remote_scan_russh(
                 ChannelMsg::ExtendedData { ref data, ext: 1 } => {
                     let room = CAP_REMOTE_STDERR.saturating_sub(stderr.len());
                     if room > 0 {
-                        stderr.extend_from_slice(&data[..data.len().min(room)]);
+                        let take = data.len().min(room);
+                        stderr.extend_from_slice(&data[..take]);
+                        if data.len() > room && !stderr_truncated {
+                            stderr_truncated = true;
+                            tracing::warn!(
+                                host = %hostname,
+                                "remote stderr exceeded cap ({} bytes), truncating",
+                                CAP_REMOTE_STDERR
+                            );
+                        }
                     } else if !stderr_truncated {
                         stderr_truncated = true;
                         tracing::warn!(
