@@ -604,23 +604,61 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // --- security.ebpf_inventory (R19-10) ---
-    let ebpf_snapshot = |inv: &crate::models::EbpfInventory| {
+    // --- security.ebpf_inventory (R19-10 / R21-01) ---
+    // Programs are keyed by their stable prog_tag: replacing one program with
+    // another (identical count, different code) changes the tag set but not the
+    // count, so a count-only snapshot would miss it — exactly the post-compromise
+    // signal this field was collected for. A newly-appeared tag is Degraded (a
+    // new tracing program after the baseline), a vanished tag is Improved.
+    let before_tags: HashSet<&str> = before
+        .security
+        .ebpf_inventory
+        .prog_tags
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let after_tags: HashSet<&str> = after
+        .security
+        .ebpf_inventory
+        .prog_tags
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for added in after_tags.difference(&before_tags) {
+        changes.push(Change {
+            field: "security.ebpf_inventory.prog".into(),
+            before: None,
+            after: Some(format!("new BPF program tag {added}")),
+            severity: Severity::Degraded,
+        });
+    }
+    for removed in before_tags.difference(&after_tags) {
+        changes.push(Change {
+            field: "security.ebpf_inventory.prog".into(),
+            before: Some(format!("BPF program tag {removed} gone")),
+            after: None,
+            severity: Severity::Improved,
+        });
+    }
+
+    // Maps / links / pins have no stable identifier, so cardinality is all we
+    // can diff there. Programs are intentionally excluded here — they are keyed
+    // by tag above.
+    let ebpf_counts = |inv: &crate::models::EbpfInventory| {
         format!(
-            "progs:{} maps:{} links:{} pins:{}",
-            inv.programs.len(),
+            "maps:{} links:{} pins:{}",
             inv.maps.len(),
             inv.links.len(),
             inv.pins.len()
         )
     };
-    let before_ebpf = ebpf_snapshot(&before.security.ebpf_inventory);
-    let after_ebpf = ebpf_snapshot(&after.security.ebpf_inventory);
-    if before_ebpf != after_ebpf {
+    let before_counts = ebpf_counts(&before.security.ebpf_inventory);
+    let after_counts = ebpf_counts(&after.security.ebpf_inventory);
+    if before_counts != after_counts {
         changes.push(Change {
             field: "security.ebpf_inventory".into(),
-            before: Some(before_ebpf),
-            after: Some(after_ebpf),
+            before: Some(before_counts),
+            after: Some(after_counts),
             severity: Severity::Changed,
         });
     }
@@ -977,6 +1015,49 @@ mod tests {
         assert!(
             !diff.changes.iter().any(|c| c.field.contains("exposure")),
             "Should not report escalation when config is unchanged"
+        );
+    }
+
+    #[test]
+    fn ebpf_program_swap_is_detected_by_tag_not_count() {
+        // One program unloaded, another loaded: identical count, different tag.
+        // A count-only snapshot would report no drift; the tag set must catch it.
+        let mut before = test_report();
+        before.security.ebpf_inventory.prog_tags = vec!["a04f5eef06a7f555".into()];
+
+        let mut after = test_report();
+        after.security.ebpf_inventory.prog_tags = vec!["deadbeefcafe0001".into()];
+
+        let diff = compare_reports(&before, &after);
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.field == "security.ebpf_inventory.prog"),
+            "swapping one BPF program for another must surface in drift even at equal count"
+        );
+        // The vanished tag is Improved, the new tag is Degraded — both present.
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.field == "security.ebpf_inventory.prog"
+                    && c.severity == Severity::Degraded),
+            "a newly-appeared program tag must be Degraded"
+        );
+    }
+
+    #[test]
+    fn ebpf_no_drift_when_tag_set_is_stable() {
+        let mut before = test_report();
+        before.security.ebpf_inventory.prog_tags =
+            vec!["a04f5eef06a7f555".into(), "beef00001111c0de".into()];
+        let after = before.clone();
+        let diff = compare_reports(&before, &after);
+        assert!(
+            !diff
+                .changes
+                .iter()
+                .any(|c| c.field.starts_with("security.ebpf_inventory")),
+            "identical tag sets and counts must produce no eBPF drift"
         );
     }
 }
