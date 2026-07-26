@@ -34,7 +34,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
     // Reusable buffer for constructing /proc/<pid>/... paths
     let mut path_buf = String::with_capacity(64);
 
-    // Count how many processes had unreadable /proc/<pid>/environ or cmdline
+    // Count how many *processes* had unreadable /proc/<pid>/environ or cmdline
     // due to EACCES (typically non‑root scan).  One aggregate coverage line
     // is emitted at the end to avoid flooding the operator with per‑PID noise.
     let mut denied = 0usize;
@@ -46,6 +46,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         let Ok(pid) = file_name.parse::<u32>() else {
             continue;
         };
+
+        // Per‑PID flag – raised once if either environ or cmdline is EACCES.
+        let mut pid_denied = false;
 
         // Process name
         path_buf.clear();
@@ -93,7 +96,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                denied += 1;
+                pid_denied = true;
             }
             Err(_) => {}
         }
@@ -137,9 +140,13 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                denied += 1;
+                pid_denied = true;
             }
             Err(_) => {}
+        }
+
+        if pid_denied {
+            denied += 1;
         }
     }
 

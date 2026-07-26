@@ -301,7 +301,7 @@ pub fn gather_ebpf_inventory() -> EbpfInventory {
         ));
     }
 
-    // Pin type/id are unknown in pure‑VFS mode — make this potolok visible.
+    // Pin type/id are unknown in pure‑VFS mode — make this ceiling visible.
     if !pins.is_empty() {
         crate::coverage::record(format!(
             "ebpf: type/id of {} pin(s) in /sys/fs/bpf unknown — \
