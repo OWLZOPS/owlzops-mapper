@@ -16,6 +16,76 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 
 // ---------------------------------------------------------------------------
+// Theme & Icons
+// ---------------------------------------------------------------------------
+
+pub struct Theme {
+    pub is_tty: bool,
+    pub owl: &'static str,
+    pub spy: &'static str,
+    pub shield: &'static str,
+    pub sec_cat: &'static str,
+    pub rel_cat: &'static str,
+    pub hyg_cat: &'static str,
+    pub sec_item: &'static str,
+    pub alert: &'static str,
+    pub warn: &'static str,
+    pub warn_sm: &'static str,
+    pub ghost: &'static str,
+    pub dna: &'static str,
+    pub mag: &'static str,
+    pub hint: &'static str,
+    pub color_reset: &'static str,
+}
+
+impl Theme {
+    pub fn new() -> Self {
+        use std::io::IsTerminal;
+        let is_tty = std::io::stdout().is_terminal();
+
+        if is_tty {
+            Self {
+                is_tty,
+                owl: "\u{1F989}  ",
+                spy: "\u{1F50D}  ",
+                shield: "\u{1F512}  ",
+                sec_cat: "\u{1F6E1} ",
+                rel_cat: "\u{2699} ",
+                hyg_cat: "\u{1F9F9} ",
+                sec_item: "\u{1F6E1}  ",
+                alert: "\u{1F6A8} ",        // 🚨
+                warn: "\u{26A0}\u{FE0F}  ", // ⚠️ (with emoji presentation selector)
+                warn_sm: "\u{26A0} ",       // ⚠ (text presentation)
+                ghost: "\u{1F47B} ",        // 👻
+                dna: "\u{1F9EC} ",          // 🧬
+                mag: "\u{1F50D} ",          // 🔍
+                hint: "\u{1F4A1} ",         // 💡
+                color_reset: "\x1b[0m",
+            }
+        } else {
+            Self {
+                is_tty,
+                owl: "",
+                spy: "",
+                shield: "",
+                sec_cat: "",
+                rel_cat: "",
+                hyg_cat: "",
+                sec_item: "[i] ",
+                alert: "[!] ",
+                warn: "[!] ",
+                warn_sm: "[!] ",
+                ghost: "[!] ",
+                dna: "[!] ",
+                mag: "[*] ",
+                hint: "[*] ",
+                color_reset: "",
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sanitisation helper
 // ---------------------------------------------------------------------------
 
@@ -61,7 +131,9 @@ fn create_dynamic_table() -> Table {
 // ---------------------------------------------------------------------------
 
 pub fn render_dashboard(report: &AgentReport, verbose: bool) {
-    render_header(report);
+    let theme = Theme::new();
+
+    render_header(report, &theme);
     render_system_overview(report);
     render_top_memory(report);
     render_databases(report);
@@ -74,13 +146,14 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_packages(report);
     render_docker(report);
     render_capability_audit(report);
-    render_mount_masking(report);
-    render_reverse_shells(report);
-    render_library_injections(report, verbose);
-    render_ghost_pids(report);
+
+    render_mount_masking(report, &theme);
+    render_reverse_shells(report, &theme);
+    render_library_injections(report, verbose, &theme);
+    render_ghost_pids(report, &theme);
 
     if !report.coverage_warnings.is_empty() {
-        println!("\n⚠ Coverage Warnings (incomplete data):");
+        println!("\n{}Coverage Warnings (incomplete data):", theme.warn_sm);
         for w in &report.coverage_warnings {
             println!("   - {}", sanitize_terminal(w));
         }
@@ -90,6 +163,8 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
 }
 
 pub fn render_multi_host_summary(reports: &[AgentReport]) {
+    let theme = Theme::new();
+
     if reports.is_empty() {
         println!("No reports to display.");
         return;
@@ -140,7 +215,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
         ]);
     }
 
-    println!("\u{1F989} Owlzops Multi‑Host Audit Summary\n");
+    println!("{}Owlzops Multi‑Host Audit Summary\n", theme.owl);
     println!("{t}\n");
 }
 
@@ -148,16 +223,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
 // Private render helpers
 // ---------------------------------------------------------------------------
 
-fn render_header(report: &AgentReport) {
-    use std::io::IsTerminal;
-    let is_tty = std::io::stdout().is_terminal();
-
-    let (icon_owl, icon_spy, icon_shield, color_reset) = if is_tty {
-        ("\u{1F989}  ", "\u{1F50D}  ", "\u{1F512}  ", "\x1b[0m")
-    } else {
-        ("", "", "", "")
-    };
-
+fn render_header(report: &AgentReport, theme: &Theme) {
     // Always compute the score locally to avoid depending on a possibly
     // stale `risk_score` from an older remote agent.
     let scored = crate::scoring::score(crate::scoring::evaluate(report));
@@ -171,7 +237,7 @@ fn render_header(report: &AgentReport) {
         "Critical"
     };
 
-    let risk_color = if is_tty {
+    let risk_color = if theme.is_tty {
         if risk_score >= 70 {
             "\x1b[1;31m"
         } else if risk_score >= 40 {
@@ -183,11 +249,14 @@ fn render_header(report: &AgentReport) {
         ""
     };
 
-    println!("{}Owlzops Mapper v{}", icon_owl, report.version);
-    println!("{}Scan completed in {:.2}s", icon_spy, report.duration_secs);
+    println!("{}Owlzops Mapper v{}", theme.owl, report.version);
+    println!(
+        "{}Scan completed in {:.2}s",
+        theme.spy, report.duration_secs
+    );
     println!(
         "{}Risk Score: {}{}/100{}  ({}) \n",
-        icon_shield, risk_color, risk_score, color_reset, risk_label
+        theme.shield, risk_color, risk_score, theme.color_reset, risk_label
     );
 
     println!(
@@ -204,24 +273,18 @@ fn render_header(report: &AgentReport) {
     if !active_findings.is_empty() {
         println!("\nRisk Breakdown:");
 
-        let (icon_sec, icon_rel, icon_hyg) = if is_tty {
-            ("\u{1F6E1} ", "\u{2699} ", "\u{1F9F9} ")
-        } else {
-            ("", "", "")
-        };
-
         let categories = [
             (
                 crate::scoring::Category::Security,
-                format!("{}Security Findings", icon_sec),
+                format!("{}Security Findings", theme.sec_cat),
             ),
             (
                 crate::scoring::Category::Reliability,
-                format!("{}Reliability Findings", icon_rel),
+                format!("{}Reliability Findings", theme.rel_cat),
             ),
             (
                 crate::scoring::Category::Hygiene,
-                format!("{}Hygiene Findings", icon_hyg),
+                format!("{}Hygiene Findings", theme.hyg_cat),
             ),
         ];
 
@@ -1310,7 +1373,7 @@ fn render_capability_audit(report: &AgentReport) {
 
 // ── SEC-021: Bind‑Mount Masking ───────────────────────────────────────────
 
-fn render_mount_masking(report: &AgentReport) {
+fn render_mount_masking(report: &AgentReport, theme: &Theme) {
     if report.security.mount_masking.is_empty() {
         return;
     }
@@ -1333,13 +1396,13 @@ fn render_mount_masking(report: &AgentReport) {
             Cell::new(sanitize_terminal(&m.reason)),
         ]);
     }
-    println!("⚠ Bind‑Mount Masking Detected (SEC‑021):");
+    println!("{}Bind‑Mount Masking Detected (SEC‑021):", theme.warn_sm);
     println!("{t}\n");
 }
 
 // ── SEC-022: Reverse Shells / C2 ──────────────────────────────────────────
 
-fn render_reverse_shells(report: &AgentReport) {
+fn render_reverse_shells(report: &AgentReport, theme: &Theme) {
     if report.security.reverse_shells.is_empty() {
         return;
     }
@@ -1367,7 +1430,7 @@ fn render_reverse_shells(report: &AgentReport) {
             Cell::new(fd),
         ]);
     }
-    println!("🚨 Reverse Shell / C2 Connections (SEC‑022):");
+    println!("{}Reverse Shell / C2 Connections (SEC‑022):", theme.alert);
     println!("{t}\n");
 }
 
@@ -1392,7 +1455,7 @@ fn origin_label(o: &Origin) -> &'static str {
 
 // ── SEC-023 / SEC-026 / SEC-027 / SEC-028 / SEC-029: Library Injection & Memory Anomalies ─────
 
-fn render_library_injections(report: &AgentReport, verbose: bool) {
+fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme) {
     let inj = &report.security.library_injections;
     if inj.is_empty() {
         return;
@@ -1423,7 +1486,10 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                 Cell::new(if l.is_deleted { "yes" } else { "no" }),
             ]);
         }
-        println!("🧬 Userspace Rootkit / Library Injection (SEC‑023):");
+        println!(
+            "{}Userspace Rootkit / Library Injection (SEC‑023):",
+            theme.dna
+        );
         println!("{t}\n");
     }
 
@@ -1480,7 +1546,10 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                     Cell::new(sanitize_terminal(&l.object_path)),
                 ]);
             }
-            println!("⚠️  Anomalous Executable Memory (SEC‑026) — verbose:");
+            println!(
+                "{}Anomalous Executable Memory (SEC‑026) — verbose:",
+                theme.warn
+            );
             println!("{t}\n");
         } else {
             struct Row {
@@ -1620,7 +1689,10 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                 }
                 t.add_row(cells);
             }
-            println!("⚠️  Anomalous Executable Memory (SEC‑026 / SEC-028):");
+            println!(
+                "{}Anomalous Executable Memory (SEC‑026 / SEC-028):",
+                theme.warn
+            );
             println!("{t}");
             if rows.len() > CAP {
                 println!(
@@ -1634,7 +1706,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
                 let deep_requested = std::env::args().any(|arg| arg == "--deep");
                 if !deep_requested {
                     println!(
-                        "\n    \x1b[1;36m💡 HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n"
+                        "\n    \x1b[1;36m{}HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n",
+                        theme.hint
                     );
                 } else {
                     println!();
@@ -1654,7 +1727,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             .collect();
 
         if !traced.is_empty() {
-            println!("  🔍 Pointer resolution trace (deep forensics):");
+            println!("  {}Pointer resolution trace (deep forensics):", theme.mag);
             for l in traced.iter().take(5) {
                 let d = l.deep_forensics.as_ref().unwrap();
                 println!(
@@ -1693,7 +1766,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         .collect();
     if !jit_advisories.is_empty() {
         println!(
-            "🛡  JIT writable-code advisory (SEC‑027): {} suppressed finding(s) with verified runtime topology.\n",
+            "{}JIT writable-code advisory (SEC‑027): {} suppressed finding(s) with verified runtime topology.\n",
+            theme.sec_item,
             jit_advisories.len()
         );
     }
@@ -1709,7 +1783,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
         .collect();
     if !prov_trust.is_empty() {
         println!(
-            "🛡  Provisional Trust (SEC‑029): {} region(s) in allowlisted binaries (JIT shape unverified).\n",
+            "{}Provisional Trust (SEC‑029): {} region(s) in allowlisted binaries (JIT shape unverified).\n",
+            theme.sec_item,
             prov_trust.len()
         );
     }
@@ -1729,13 +1804,15 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
 
         if !suppressed.is_empty() {
             println!(
-                "🛡  Files with expected capabilities (SEC‑034): {} suppressed finding(s).\n",
+                "{}Files with expected capabilities (SEC‑034): {} suppressed finding(s).\n",
+                theme.sec_item,
                 suppressed.len()
             );
         }
         if !active.is_empty() {
             println!(
-                "🛡  Unexpected file capabilities (SEC‑036): {} active finding(s) — review required.\n",
+                "{}Unexpected file capabilities (SEC‑036): {} active finding(s) — review required.\n",
+                theme.sec_item,
                 active.len()
             );
         }
@@ -1751,13 +1828,15 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
 
         if !suppressed_su.is_empty() {
             println!(
-                "🛡  Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).\n",
+                "{}Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).\n",
+                theme.sec_item,
                 suppressed_su.len()
             );
         }
         if !active_su.is_empty() {
             println!(
-                "🛡  Unexpected setuid/setgid files (SEC‑037): {} active finding(s) — review required.\n",
+                "{}Unexpected setuid/setgid files (SEC‑037): {} active finding(s) — review required.\n",
+                theme.sec_item,
                 active_su.len()
             );
         }
@@ -1768,7 +1847,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let ebpf_total = ebpf.programs.len() + ebpf.maps.len() + ebpf.links.len() + ebpf.pins.len();
     if ebpf_total > 0 {
         println!(
-            "🛡  eBPF inventory (SEC‑035): {} program(s), {} map(s), {} link(s), {} pin(s).\n",
+            "{}eBPF inventory (SEC‑035): {} program(s), {} map(s), {} link(s), {} pin(s).\n",
+            theme.sec_item,
             ebpf.programs.len(),
             ebpf.maps.len(),
             ebpf.links.len(),
@@ -1781,8 +1861,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let tamper = taint.flags.iter().filter(|f| f.security_relevant).count();
     if tamper > 0 {
         println!(
-            "🛡  Kernel taint (SEC‑038): {} module-integrity flag(s) set (tainted={}) — review required.\n",
-            tamper, taint.raw
+            "{}Kernel taint (SEC‑038): {} module-integrity flag(s) set (tainted={}) — review required.\n",
+            theme.sec_item, tamper, taint.raw
         );
     }
 
@@ -1790,7 +1870,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let conf = &report.security.confinement;
     if conf.selinux_permissive || !conf.complain_profiles.is_empty() {
         println!(
-            "🛡  MAC downgrade (SEC‑039): selinux_permissive={}, {} AppArmor profile(s) in complain mode.\n",
+            "{}MAC downgrade (SEC‑039): selinux_permissive={}, {} AppArmor profile(s) in complain mode.\n",
+            theme.sec_item,
             conf.selinux_permissive,
             conf.complain_profiles.len()
         );
@@ -1800,7 +1881,8 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let hidden = &report.security.kernel_modules.hidden_candidates;
     if !hidden.is_empty() {
         println!(
-            "🚨 HIDDEN KERNEL MODULE (SEC‑040): {} module(s) scrubbed from /proc/modules but live in sysfs/kallsyms — {}",
+            "{}HIDDEN KERNEL MODULE (SEC‑040): {} module(s) scrubbed from /proc/modules but live in sysfs/kallsyms — {}",
+            theme.alert,
             hidden.len(),
             hidden
                 .iter()
@@ -1824,7 +1906,7 @@ fn region_kind(source: &str) -> (&'static str, u8) {
 
 // ── SEC-024/025: True Ghost PID / LKM Rootkit ─────────────────────────────
 
-fn render_ghost_pids(report: &AgentReport) {
+fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
     if report.security.ghost_pids.is_empty() {
         return;
     }
@@ -1860,7 +1942,10 @@ fn render_ghost_pids(report: &AgentReport) {
                 Cell::new(if g.holds_socket { "yes" } else { "no" }),
             ]);
         }
-        println!("👻 Hidden Process Detected (LKM Rootkit) (SEC‑024):");
+        println!(
+            "{}Hidden Process Detected (LKM Rootkit) (SEC‑024):",
+            theme.ghost
+        );
         println!("{t}\n");
     }
 
@@ -1889,7 +1974,10 @@ fn render_ghost_pids(report: &AgentReport) {
                 Cell::new(if g.holds_socket { "yes" } else { "no" }),
             ]);
         }
-        println!("👻 Suspicious PID Visibility Mismatch (downgraded) (SEC‑025):");
+        println!(
+            "{}Suspicious PID Visibility Mismatch (downgraded) (SEC‑025):",
+            theme.ghost
+        );
         println!("{t}\n");
     }
 }
