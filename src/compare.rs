@@ -663,6 +663,61 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
+    // --- security.kernel_modules (SEC-040 drift) ---
+    let before_mods: HashSet<&str> = before
+        .security
+        .kernel_modules
+        .proc_modules
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let after_mods: HashSet<&str> = after
+        .security
+        .kernel_modules
+        .proc_modules
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for added in after_mods.difference(&before_mods) {
+        changes.push(Change {
+            field: "security.kernel_modules".into(),
+            before: None,
+            after: Some(format!("module {added} loaded")),
+            severity: Severity::Degraded,
+        });
+    }
+    for removed in before_mods.difference(&after_mods) {
+        changes.push(Change {
+            field: "security.kernel_modules".into(),
+            before: Some(format!("module {removed} unloaded")),
+            after: None,
+            severity: Severity::Improved,
+        });
+    }
+    // A newly-appeared hidden candidate is the strongest post-baseline signal.
+    let before_hidden: HashSet<&str> = before
+        .security
+        .kernel_modules
+        .hidden_candidates
+        .iter()
+        .map(|h| h.name.as_str())
+        .collect();
+    let after_hidden: HashSet<&str> = after
+        .security
+        .kernel_modules
+        .hidden_candidates
+        .iter()
+        .map(|h| h.name.as_str())
+        .collect();
+    for added in after_hidden.difference(&before_hidden) {
+        changes.push(Change {
+            field: "security.kernel_modules.hidden".into(),
+            before: None,
+            after: Some(format!("hidden module {added} appeared")),
+            severity: Severity::Degraded,
+        });
+    }
+
     // Deterministic sort: Degraded first, then Changed, then Improved;
     // within same severity, stable order by field/before/after
     changes.sort_unstable_by(|a, b| {

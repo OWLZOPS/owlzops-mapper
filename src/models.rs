@@ -337,6 +337,17 @@ pub struct SecurityInfo {
     /// “file not owned by any package” from “could not check”.
     #[serde(default)]
     pub provenance_source: ProvenanceSource,
+
+    // ── NEW FIELDS (SEC-038/039/040) ──
+    /// Decoded kernel taint mask (SEC-038).
+    #[serde(default)]
+    pub kernel_taint: KernelTaint,
+    /// LSM confinement state and downgrades (SEC-039).
+    #[serde(default)]
+    pub confinement: ConfinementReport,
+    /// Kernel module inventory + hidden-module reconciliation (SEC-040).
+    #[serde(default)]
+    pub kernel_modules: KernelModuleInventory,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -866,4 +877,83 @@ pub enum PointerKind {
     JitCluster,
     LibData,
     Unmapped,
+}
+
+// ── NEW STRUCTURES (SEC-038/039/040) ──────────────────────────────────────
+
+// ── Kernel taint (SEC-038) ────────────────────────────────────────────────
+
+/// Decoded /proc/sys/kernel/tainted. `raw == 0` ⇒ clean kernel.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct KernelTaint {
+    pub raw: u64,
+    #[serde(default)]
+    pub flags: Vec<TaintFlag>,
+    /// True when the file was unreadable/unparseable — taint state UNKNOWN
+    /// (distinct from a genuinely clean `raw == 0`).
+    #[serde(default)]
+    pub unavailable: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct TaintFlag {
+    pub bit: u8,
+    pub code: char,   // kernel letter, e.g. 'E'
+    pub name: String, // human description
+    /// True only for module-integrity bits that scoring escalates.
+    #[serde(default)]
+    pub security_relevant: bool,
+}
+
+// ── LSM confinement (SEC-039) ─────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ConfinementReport {
+    /// Active LSMs from /sys/kernel/security/lsm.
+    #[serde(default)]
+    pub lsms: Vec<String>,
+    /// SELinux loaded AND permissive (/sys/fs/selinux/enforce == 0).
+    #[serde(default)]
+    pub selinux_permissive: bool,
+    /// AppArmor profiles in complain mode (defined but not enforced).
+    #[serde(default)]
+    pub complain_profiles: Vec<ComplainProc>,
+    /// True when per-process attr/current could not be fully read (non-root).
+    #[serde(default)]
+    pub attr_read_incomplete: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ComplainProc {
+    pub pid: u32,
+    pub comm: String,
+    pub profile: String,
+}
+
+// ── Kernel module integrity (SEC-040) ─────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct KernelModuleInventory {
+    /// Module names from /proc/modules (canonical loadable list = lsmod).
+    #[serde(default)]
+    pub proc_modules: Vec<String>,
+    /// Live loadable modules from /sys/module/*/initstate == "live".
+    /// Built-ins (no initstate) are excluded — they would otherwise be FPs.
+    #[serde(default)]
+    pub sysfs_modules: Vec<String>,
+    /// In sysfs(live)/kallsyms but ABSENT from /proc/modules ⇒ Diamorphine-class.
+    #[serde(default)]
+    pub hidden_candidates: Vec<HiddenModule>,
+    /// False when /proc/kallsyms was empty/unreadable (kptr_restrict / no
+    /// CONFIG_KALLSYMS) — the kallsyms leg was skipped.
+    #[serde(default)]
+    pub kallsyms_checked: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct HiddenModule {
+    pub name: String,
+    /// Interfaces that still expose it: "sysfs", "kallsyms".
+    #[serde(default)]
+    pub seen_in: Vec<String>,
 }

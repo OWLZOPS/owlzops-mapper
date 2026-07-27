@@ -1207,6 +1207,94 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-038 – Kernel taint: unsigned / force-loaded module (LKM lead) ──
+    {
+        let taint = &report.security.kernel_taint;
+        let tamper: Vec<String> = taint
+            .flags
+            .iter()
+            .filter(|f| f.security_relevant)
+            .map(|f| format!("{} ({})", f.name, f.code))
+            .collect();
+        if !tamper.is_empty() {
+            findings.push(Finding {
+                id: "SEC-038",
+                title: "Kernel tainted by unsigned or force-loaded module".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!(
+                    "/proc/sys/kernel/tainted = {}: {}. A module bypassing signature \
+                     verification is a common LKM-rootkit footprint — visible even if the \
+                     module unlinks itself from /proc/modules.",
+                    taint.raw,
+                    tamper.join(", ")
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-039 – LSM confinement downgrade (MAC not enforcing) ────────────
+    {
+        let c = &report.security.confinement;
+        let mut reasons: Vec<String> = Vec::new();
+        if c.selinux_permissive {
+            reasons.push("SELinux loaded but running permissive (not enforcing)".to_string());
+        }
+        if !c.complain_profiles.is_empty() {
+            let list = c
+                .complain_profiles
+                .iter()
+                .map(|p| format!("{} (pid {}, profile {})", p.comm, p.pid, p.profile))
+                .collect::<Vec<_>>()
+                .join("; ");
+            reasons.push(format!(
+                "{} AppArmor profile(s) in complain mode — defined but NOT enforced: {}",
+                c.complain_profiles.len(),
+                list
+            ));
+        }
+        if !reasons.is_empty() {
+            findings.push(Finding {
+                id: "SEC-039",
+                title: "Mandatory Access Control downgraded (LSM not enforcing)".to_string(),
+                category: Category::Security,
+                weight: 15,
+                evidence: reasons.join(" | "),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-040 – Hidden kernel module (Diamorphine-class LKM rootkit) ─────
+    {
+        let inv = &report.security.kernel_modules;
+        if !inv.hidden_candidates.is_empty() {
+            let list = inv
+                .hidden_candidates
+                .iter()
+                .map(|h| format!("{} (seen in {})", h.name, h.seen_in.join("+")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-040",
+                title: "ACTIVE COMPROMISE: kernel module hidden from /proc/modules".to_string(),
+                category: Category::Security,
+                weight: 55,
+                evidence: format!(
+                    "{} module(s) live in sysfs/kallsyms but scrubbed from /proc/modules \
+                     (module_list unlink — Diamorphine-class LKM rootkit): {}",
+                    inv.hidden_candidates.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
@@ -1804,9 +1892,12 @@ impl CriticalFlags {
         // SEC-026 is excluded: suspicious memory mappings (anon/rwx) are not
         // confirmed active compromise, but may indicate JIT or driver activity.
         // SEC-028 is included: deep-confirmed unattributed payload = live IoC.
-        const IOC_IDS: [&str; 11] = [
+        // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
+        // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
+        // modules are excluded upstream, so FP is near-zero.
+        const IOC_IDS: [&str; 12] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "SEC-028", "DOCK-010",
+            "SEC-024", "SEC-028", "SEC-040", "DOCK-010",
         ];
         let count_sysctl = findings
             .iter()
