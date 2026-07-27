@@ -1187,4 +1187,101 @@ mod tests {
             "identical tag sets and counts must produce no eBPF drift"
         );
     }
+
+    #[test]
+    fn apparmor_enforce_to_complain_is_drift() {
+        // A profile enforcing at baseline (absent from the complain list) that is
+        // now in complain mode must surface as Degraded — the weighted signal that
+        // point-in-time SEC-039 deliberately defers to drift.
+        let before = test_report(); // named was enforcing → no complain entries
+        let mut after = test_report();
+        after.security.confinement.complain_profiles = vec![ComplainProc {
+            pid: 2655657,
+            comm: "named".into(),
+            profile: "named".into(),
+        }];
+
+        let diff = compare_reports(&before, &after);
+        let change = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "security.confinement.apparmor")
+            .expect("enforce→complain regression not detected");
+        assert_eq!(change.severity, Severity::Degraded);
+        assert!(change.after.as_deref().unwrap().contains("named"));
+
+        // Symmetry: complain→enforce is Improved; a stable complain set is silent.
+        assert!(
+            compare_reports(&after, &before)
+                .changes
+                .iter()
+                .any(|c| c.field == "security.confinement.apparmor"
+                    && c.severity == Severity::Improved),
+            "complain→enforce must be Improved"
+        );
+        assert!(
+            !compare_reports(&after, &after)
+                .changes
+                .iter()
+                .any(|c| c.field.starts_with("security.confinement")),
+            "identical complain set must produce no drift"
+        );
+    }
+
+    #[test]
+    fn kernel_taint_bit_appearing_is_drift() {
+        // A taint bit set in `after` but not `before` means a module loaded AFTER
+        // the baseline — Degraded even for bits (E/O) that are benign as steady
+        // state. An always-tainted box (stable value) must not drift.
+        let mut before = test_report();
+        before.security.kernel_taint = KernelTaint {
+            raw: 1 << 12, // O — out-of-tree driver already present at baseline
+            flags: vec![TaintFlag {
+                bit: 12,
+                code: 'O',
+                name: "out-of-tree module loaded".into(),
+                security_relevant: false,
+            }],
+            unavailable: false,
+        };
+        let mut after = test_report();
+        after.security.kernel_taint = KernelTaint {
+            raw: (1 << 12) | (1 << 13), // E newly appeared (unsigned module loaded)
+            flags: vec![
+                TaintFlag {
+                    bit: 12,
+                    code: 'O',
+                    name: "out-of-tree module loaded".into(),
+                    security_relevant: false,
+                },
+                TaintFlag {
+                    bit: 13,
+                    code: 'E',
+                    name: "unsigned module loaded".into(),
+                    security_relevant: true,
+                },
+            ],
+            unavailable: false,
+        };
+
+        let diff = compare_reports(&before, &after);
+        let change = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "security.kernel_taint")
+            .expect("newly-set taint bit not detected");
+        assert_eq!(change.severity, Severity::Degraded);
+        // Only the NEW bit (E) is reported, not the pre-existing O.
+        assert!(change.after.as_deref().unwrap().contains("unsigned module"));
+        assert!(!change.after.as_deref().unwrap().contains("out-of-tree"));
+
+        // Stable taint value (nvidia always-tainted) → no drift.
+        assert!(
+            !compare_reports(&after, &after)
+                .changes
+                .iter()
+                .any(|c| c.field == "security.kernel_taint"),
+            "unchanged taint value must produce no drift"
+        );
+    }
 }
