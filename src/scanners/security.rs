@@ -550,6 +550,10 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         ebpf_inventory: crate::scanners::ebpf::gather_ebpf_inventory(),
         setuid_files,
         provenance_source,
+        // ── NEW (SEC-038/039/040) ──
+        kernel_taint: crate::scanners::kernel_taint::gather_kernel_taint(),
+        confinement: crate::scanners::confinement::gather_confinement(),
+        kernel_modules: crate::scanners::kernel_modules::gather_kernel_modules(),
     }
 }
 

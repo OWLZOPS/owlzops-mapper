@@ -41,3 +41,11 @@ mod setuid;
 pub mod storage;
 #[cfg(feature = "local-scan")]
 mod sudoers;
+
+// ── NEW SCANNERS (SEC-038/039/040) ──
+#[cfg(feature = "local-scan")]
+mod confinement;
+#[cfg(feature = "local-scan")]
+mod kernel_modules;
+#[cfg(feature = "local-scan")]
+mod kernel_taint;
