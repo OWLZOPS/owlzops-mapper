@@ -1856,25 +1856,42 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         );
     }
 
-    // SEC‑038 – Kernel taint (unsigned / force-loaded module)
-    let taint = &report.security.kernel_taint;
-    let tamper = taint.flags.iter().filter(|f| f.security_relevant).count();
-    if tamper > 0 {
-        println!(
-            "{}Kernel taint (SEC‑038): {} module-integrity flag(s) set (tainted={}) — review required.\n",
-            theme.sec_item, tamper, taint.raw
-        );
+    // SEC‑038 – Kernel taint (tiered)
+    {
+        let taint = &report.security.kernel_taint;
+        let has = |c: char| taint.flags.iter().any(|f| f.code == c);
+        let forced = has('F') || has('R') || has('N');
+        let unsigned_or_oot = has('E') || has('O');
+        let hidden = !report.security.kernel_modules.hidden_candidates.is_empty();
+        if forced || (unsigned_or_oot && hidden) {
+            println!(
+                "{}Kernel taint (SEC‑038): module tampering (tainted={}) — REVIEW REQUIRED.\n",
+                theme.alert, taint.raw
+            );
+        } else if unsigned_or_oot {
+            println!(
+                "{}Kernel taint (SEC‑038): unsigned/out-of-tree module (tainted={}) — informational (third-party driver).\n",
+                theme.sec_item, taint.raw
+            );
+        }
     }
 
-    // SEC‑039 – LSM confinement downgrade
-    let conf = &report.security.confinement;
-    if conf.selinux_permissive || !conf.complain_profiles.is_empty() {
-        println!(
-            "{}MAC downgrade (SEC‑039): selinux_permissive={}, {} AppArmor profile(s) in complain mode.\n",
-            theme.sec_item,
-            conf.selinux_permissive,
-            conf.complain_profiles.len()
-        );
+    // SEC‑039 – LSM confinement (tiered)
+    {
+        let c = &report.security.confinement;
+        if c.selinux_permissive {
+            println!(
+                "{}SELinux permissive mode (SEC‑039): REVIEW REQUIRED.\n",
+                theme.alert
+            );
+        }
+        if !c.complain_profiles.is_empty() {
+            println!(
+                "{}AppArmor complain mode (SEC‑039): {} profile(s) not enforcing — informational (often an intentional baseline).\n",
+                theme.sec_item,
+                c.complain_profiles.len()
+            );
+        }
     }
 
     // SEC‑040 – Hidden kernel module (Diamorphine-class)
