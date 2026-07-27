@@ -18,10 +18,13 @@ const CAP_KALLSYMS: usize = 32 * 1024 * 1024;
 
 /// Bracketed kallsyms tags that are NOT loadable modules.
 const PSEUDO_MODULES: &[&str] = &[
-    "bpf", "ftrace", "kernel",   // built-in
-    "vdso",     // userspace helper
-    "vsyscall", // legacy vDSO
-    "vvar",     // vDSO data
+    "bpf",
+    "ftrace",
+    "kernel",            // built-in
+    "vdso",              // userspace helper
+    "vsyscall",          // legacy vDSO
+    "vvar",              // vDSO data
+    "__builtin__ftrace", // kernel synthetic ftrace module (not a loadable module)
 ];
 
 /// First whitespace token of each /proc/modules line is the module name.
