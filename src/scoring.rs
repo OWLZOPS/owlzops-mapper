@@ -49,6 +49,31 @@ pub struct Finding {
     pub cis_ref: Option<&'static str>,
 }
 
+/// Escalation-risk weight for an ambient capability set held with NoNewPrivs off.
+/// Ambient caps survive execve of a *non-setuid* binary, so only escalation-
+/// PRIMITIVE caps make that dangerous. Benign caps (mlock, clock, low-port bind,
+/// nice, RTC wake) are informational. NET_RAW is moderate. Everything else —
+/// including unknown/future caps — is treated as dangerous (fail-safe: a new
+/// dangerous cap must never be silently suppressed). Bit positions per <linux/capability.h>.
+fn ambient_escalation_weight(ambient: u64) -> u8 {
+    // Non-escalation caps, safe to hold ambiently.
+    const BENIGN: u64 = (1 << 10)   // CAP_NET_BIND_SERVICE (bind <1024)
+        | (1 << 14)   // CAP_IPC_LOCK   (mlock / large pages — DB memlock)
+        | (1 << 15)   // CAP_IPC_OWNER
+        | (1 << 23)   // CAP_SYS_NICE
+        | (1 << 25)   // CAP_SYS_TIME   (set clock)
+        | (1 << 35); // CAP_WAKE_ALARM
+    const MODERATE: u64 = 1 << 13; // CAP_NET_RAW
+
+    if ambient & !BENIGN & !MODERATE != 0 {
+        12 // at least one escalation-primitive cap
+    } else if ambient & MODERATE != 0 {
+        5 // NET_RAW only
+    } else {
+        0 // benign caps only
+    }
+}
+
 /// Evaluate a full agent report into a list of findings.
 /// This is a pure function – no side effects.
 pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
@@ -1207,41 +1232,93 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-038 – Kernel taint: unsigned / force-loaded module (LKM lead) ──
+    // ── SEC-038 – Kernel taint tiered by module-integrity signal ───────────
+    // Unsigned/out-of-tree modules are ubiquitous on workstations & dev boxes
+    // (nvidia/dkms/vbox) → informational on their own. They become a weighted
+    // lead only when CORRELATED with an actually-hidden module (SEC-040), or as
+    // drift (compare.rs). Force-load/-unload/test-module are rare and weighted low.
     {
         let taint = &report.security.kernel_taint;
-        let tamper: Vec<String> = taint
+        let has = |c: char| taint.flags.iter().any(|f| f.code == c);
+
+        let forced = has('F') || has('R') || has('N'); // insmod -f / rmmod -f / test module
+        let unsigned_or_oot = has('E') || has('O'); // unsigned / out-of-tree
+        let hidden = !report.security.kernel_modules.hidden_candidates.is_empty();
+
+        let flags_str = taint
             .flags
             .iter()
-            .filter(|f| f.security_relevant)
+            .filter(|f| f.security_relevant || f.code == 'O')
             .map(|f| format!("{} ({})", f.name, f.code))
-            .collect();
-        if !tamper.is_empty() {
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if forced || (unsigned_or_oot && hidden) {
+            let (weight, note) = if unsigned_or_oot && hidden {
+                (
+                    25,
+                    " CORRELATED with a module hidden from /proc/modules (SEC-040) — strong LKM-rootkit signal.",
+                )
+            } else {
+                (
+                    10,
+                    " Force-loaded/-unloaded or test module — unusual on a server.",
+                )
+            };
             findings.push(Finding {
                 id: "SEC-038",
-                title: "Kernel tainted by unsigned or force-loaded module".to_string(),
+                title: "Kernel taint indicates module tampering".to_string(),
                 category: Category::Security,
-                weight: 25,
+                weight,
                 evidence: format!(
-                    "/proc/sys/kernel/tainted = {}: {}. A module bypassing signature \
-                     verification is a common LKM-rootkit footprint — visible even if the \
-                     module unlinks itself from /proc/modules.",
-                    taint.raw,
-                    tamper.join(", ")
+                    "/proc/sys/kernel/tainted = {}: {}.{}",
+                    taint.raw, flags_str, note
                 ),
                 suppressed: None,
+                cis_ref: None,
+            });
+        } else if unsigned_or_oot {
+            findings.push(Finding {
+                id: "SEC-038",
+                title: "Kernel tainted by unsigned/out-of-tree module (informational)".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!("/proc/sys/kernel/tainted = {}: {}", taint.raw, flags_str),
+                suppressed: Some(
+                    "Unsigned or out-of-tree modules are normal for third-party drivers \
+                     (nvidia, dkms, virtualbox). This escalates to a weighted finding only when \
+                     correlated with a hidden module (SEC-040) or when it appears as drift."
+                        .to_string(),
+                ),
                 cis_ref: None,
             });
         }
     }
 
-    // ── SEC-039 – LSM confinement downgrade (MAC not enforcing) ────────────
+    // ── SEC-039 – LSM confinement state ────────────────────────────────────
     {
         let c = &report.security.confinement;
-        let mut reasons: Vec<String> = Vec::new();
+
+        // SELinux permissive is an unambiguous host-level downgrade → weighted.
         if c.selinux_permissive {
-            reasons.push("SELinux loaded but running permissive (not enforcing)".to_string());
+            findings.push(Finding {
+                id: "SEC-039",
+                title: "SELinux running in permissive mode (not enforcing)".to_string(),
+                category: Category::Security,
+                weight: 15,
+                evidence: "SELinux is loaded but in permissive mode — policy violations are \
+                           logged, not blocked."
+                    .to_string(),
+                suppressed: None,
+                cis_ref: None,
+            });
         }
+
+        // AppArmor complain mode is POINT-IN-TIME and cannot distinguish an
+        // intentional vendor baseline (e.g. BIND/named under a hosting panel whose
+        // stock profile is too strict) from a genuine enforce→complain regression.
+        // Informational here; the weighted signal is the enforce→complain DRIFT
+        // emitted by compare.rs.
         if !c.complain_profiles.is_empty() {
             let list = c
                 .complain_profiles
@@ -1249,20 +1326,22 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .map(|p| format!("{} (pid {}, profile {})", p.comm, p.pid, p.profile))
                 .collect::<Vec<_>>()
                 .join("; ");
-            reasons.push(format!(
-                "{} AppArmor profile(s) in complain mode — defined but NOT enforced: {}",
-                c.complain_profiles.len(),
-                list
-            ));
-        }
-        if !reasons.is_empty() {
             findings.push(Finding {
                 id: "SEC-039",
-                title: "Mandatory Access Control downgraded (LSM not enforcing)".to_string(),
+                title: "AppArmor profiles in complain mode (informational)".to_string(),
                 category: Category::Security,
-                weight: 15,
-                evidence: reasons.join(" | "),
-                suppressed: None,
+                weight: 0,
+                evidence: format!(
+                    "{} profile(s) defined but not enforcing: {}",
+                    c.complain_profiles.len(),
+                    list
+                ),
+                suppressed: Some(
+                    "Complain mode is frequently an intentional baseline for services whose \
+                     vendor profile is too strict (e.g. named/BIND under a control panel). A \
+                     regression from enforce→complain is surfaced as drift by `compare`."
+                        .to_string(),
+                ),
                 cis_ref: None,
             });
         }
@@ -1518,7 +1597,9 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── CAP-002 – ambient capabilities without NoNewPrivs (non-root) ──────
-    // Uses the typed reason to avoid brittle string comparison.
+    // Ambient caps survive execve of a non-setuid binary, but only escalation-
+    // PRIMITIVE caps make that dangerous. Tiered by ambient_escalation_weight():
+    // benign holders (e.g. mariadbd + CAP_IPC_LOCK for memlock) are informational.
     let ambient_findings: Vec<&crate::models::ProcCapFinding> = report
         .security
         .capability_audit
@@ -1530,33 +1611,74 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         })
         .collect();
     if !ambient_findings.is_empty() {
-        let list = ambient_findings
-            .iter()
-            .map(|f| {
-                format!(
-                    "{} (pid {}, euid {}): ambient [{}]",
-                    f.comm,
-                    f.pid,
-                    f.euid,
-                    crate::scanners::capabilities::decode_mask(f.ambient).join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        findings.push(Finding {
-            id: "CAP-002",
-            title: "Ambient capabilities held with NoNewPrivs disabled".to_string(),
-            category: Category::Security,
-            weight: 12,
-            evidence: format!(
-                "{} non-root process(es) hold ambient capabilities while NoNewPrivs is off — \
-                 the set survives execve of a non-setuid binary: {}",
-                ambient_findings.len(),
-                list
-            ),
-            suppressed: None,
-            cis_ref: None,
-        });
+        let describe = |f: &crate::models::ProcCapFinding| {
+            format!(
+                "{} (pid {}, euid {}): ambient [{}]",
+                f.comm,
+                f.pid,
+                f.euid,
+                crate::scanners::capabilities::decode_mask(f.ambient).join(", ")
+            )
+        };
+        let (active, benign): (Vec<_>, Vec<_>) = ambient_findings
+            .into_iter()
+            .partition(|f| ambient_escalation_weight(f.ambient) > 0);
+
+        // Weighted: at least one escalation-primitive cap held ambiently.
+        if !active.is_empty() {
+            let max_weight = active
+                .iter()
+                .map(|f| ambient_escalation_weight(f.ambient))
+                .max()
+                .unwrap_or(0);
+            let list = active
+                .iter()
+                .map(|&f| describe(f))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "CAP-002",
+                title: "Escalation-capable ambient capabilities with NoNewPrivs disabled"
+                    .to_string(),
+                category: Category::Security,
+                weight: max_weight,
+                evidence: format!(
+                    "{} non-root process(es) hold escalation-primitive ambient capabilities \
+                     while NoNewPrivs is off — the set survives execve of a non-setuid binary: {}",
+                    active.len(),
+                    list
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // Informational: only benign ambient caps (IPC_LOCK, SYS_TIME, …).
+        if !benign.is_empty() {
+            let list = benign
+                .iter()
+                .map(|&f| describe(f))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "CAP-002",
+                title: "Benign ambient capabilities (informational)".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} non-root process(es) hold only non-escalation ambient capabilities: {}",
+                    benign.len(),
+                    list
+                ),
+                suppressed: Some(
+                    "These ambient capabilities are not privilege-escalation primitives and are \
+                     commonly granted intentionally via systemd AmbientCapabilities (e.g. a \
+                     database holding CAP_IPC_LOCK for memory locking)."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
     }
 
     // ── Docker container security issues ────────────────
@@ -2886,5 +3008,160 @@ mod tests {
             "ambient-only entry must not complete the ephemeral-exec capability correlation"
         );
         assert!(ids.contains(&"CAP-002"));
+    }
+
+    #[test]
+    fn ambient_weight_tiers() {
+        assert_eq!(ambient_escalation_weight(1 << 14), 0); // CAP_IPC_LOCK (mariadbd)
+        assert_eq!(ambient_escalation_weight(1 << 25), 0); // CAP_SYS_TIME
+        assert_eq!(ambient_escalation_weight(1 << 10), 0); // CAP_NET_BIND_SERVICE
+        assert_eq!(ambient_escalation_weight(1 << 13), 5); // CAP_NET_RAW
+        assert_eq!(ambient_escalation_weight(1 << 21), 12); // CAP_SYS_ADMIN
+        assert_eq!(ambient_escalation_weight(1 << 19), 12); // CAP_SYS_PTRACE
+        assert_eq!(ambient_escalation_weight((1 << 14) | (1 << 21)), 12); // Mixed → max
+        assert_eq!(ambient_escalation_weight(1 << 40), 12); // Unknown/future cap → fail-safe dangerous
+    }
+
+    #[test]
+    fn cap002_ipc_lock_is_informational() {
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![ProcCapFinding {
+            pid: 1013,
+            comm: "mariadbd".into(),
+            euid: 108,
+            effective: 1 << 14,
+            permitted: 1 << 14,
+            inheritable: 0,
+            bounding: 0x1ff_ffff_ffff,
+            ambient: 1 << 14, // CAP_IPC_LOCK
+            no_new_privs: Some(false),
+            seccomp: Some(0),
+            critical_caps: vec![],
+            reason: Some(CapReason::AmbientCapsNoNewPrivs),
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-002")
+            .expect("CAP-002 present");
+        assert_eq!(f.weight, 0, "IPC_LOCK ambient must be informational");
+        assert!(f.suppressed.is_some());
+    }
+
+    #[test]
+    fn cap002_sys_admin_keeps_weight() {
+        let mut r = minimal_report();
+        r.security.capability_audit = vec![ProcCapFinding {
+            pid: 4242,
+            comm: "evil".into(),
+            euid: 1000,
+            effective: 1 << 21,
+            permitted: 1 << 21,
+            inheritable: 0,
+            bounding: 0x1ff_ffff_ffff,
+            ambient: 1 << 21, // CAP_SYS_ADMIN
+            no_new_privs: Some(false),
+            seccomp: Some(0),
+            critical_caps: vec![],
+            reason: Some(CapReason::AmbientCapsNoNewPrivs),
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "CAP-002" && f.suppressed.is_none())
+            .expect("weighted CAP-002");
+        assert_eq!(f.weight, 12);
+    }
+
+    #[test]
+    fn sec038_nvidia_unsigned_is_informational() {
+        let mut r = minimal_report();
+        r.security.kernel_taint = KernelTaint {
+            raw: 12288, // O + E, no hidden module
+            flags: vec![
+                TaintFlag {
+                    bit: 12,
+                    code: 'O',
+                    name: "out-of-tree module loaded".into(),
+                    security_relevant: false,
+                },
+                TaintFlag {
+                    bit: 13,
+                    code: 'E',
+                    name: "unsigned module loaded".into(),
+                    security_relevant: true,
+                },
+            ],
+            unavailable: false,
+        };
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-038")
+            .expect("SEC-038 present");
+        assert_eq!(f.weight, 0, "unsigned/OOT alone must be informational");
+        assert!(f.suppressed.is_some());
+    }
+
+    #[test]
+    fn sec038_unsigned_plus_hidden_module_escalates() {
+        let mut r = minimal_report();
+        r.security.kernel_taint = KernelTaint {
+            raw: 1 << 13,
+            flags: vec![TaintFlag {
+                bit: 13,
+                code: 'E',
+                name: "unsigned module loaded".into(),
+                security_relevant: true,
+            }],
+            unavailable: false,
+        };
+        r.security.kernel_modules = KernelModuleInventory {
+            proc_modules: vec!["ext4".into()],
+            sysfs_modules: vec!["ext4".into(), "diamorphine".into()],
+            hidden_candidates: vec![HiddenModule {
+                name: "diamorphine".into(),
+                seen_in: vec!["sysfs".into()],
+            }],
+            kallsyms_checked: true,
+        };
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-038" && f.suppressed.is_none())
+            .expect("weighted SEC-038");
+        assert_eq!(f.weight, 25);
+        assert!(f.evidence.contains("SEC-040"));
+    }
+
+    #[test]
+    fn sec039_complain_informational_permissive_weighted() {
+        // Complain only → informational.
+        let mut r = minimal_report();
+        r.security.confinement = ConfinementReport {
+            lsms: vec!["apparmor".into()],
+            selinux_permissive: false,
+            complain_profiles: vec![ComplainProc {
+                pid: 2655657,
+                comm: "named".into(),
+                profile: "named".into(),
+            }],
+            attr_read_incomplete: false,
+        };
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-039")
+            .expect("SEC-039 present");
+        assert_eq!(f.weight, 0, "point-in-time complain must be informational");
+
+        // SELinux permissive → weighted.
+        let mut r2 = minimal_report();
+        r2.security.confinement = ConfinementReport {
+            lsms: vec!["selinux".into()],
+            selinux_permissive: true,
+            complain_profiles: vec![],
+            attr_read_incomplete: false,
+        };
+        let f2 = evaluate(&r2)
+            .into_iter()
+            .find(|f| f.id == "SEC-039" && f.suppressed.is_none())
+            .expect("weighted SEC-039");
+        assert_eq!(f2.weight, 15);
     }
 }
