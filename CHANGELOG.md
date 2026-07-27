@@ -4,6 +4,7 @@
 - Close Raw Truth gaps in library_injection, DLP, eBPF pins, musl cfg
 - Add __builtin__ftrace to pseudo-module exclusion list
 - Add blank lines between kernel hardening info lines in terminal output
+- Tier CAP-002 ambient caps, SEC-038/039 point-in-time vs drift weights
 
 ## Build System
 
@@ -12,6 +13,7 @@
 ## Documentation
 
 - Update CHANGELOG for v0.5.25
+- Update CHANGELOG for v0.5.26
 
 ## Features
 
@@ -28,8 +30,10 @@
 ## Refactoring
 
 - **fs_inventory:** Unify setuid predicate, remove double-indirection, clarify budget docs
+- **ui:** Introduce tty-aware theme and unify unicode escapes
 
 ## Testing
 
 - **library_injection:** Make lone_dropper_rwx_still_alarms independent of environment
+- Add drift tests for AppArmor complain and kernel taint
 
