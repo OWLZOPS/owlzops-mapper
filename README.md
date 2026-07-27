@@ -91,6 +91,8 @@ mv owlzops-mapper owlzops-agent-linux
   Three‑source reconciliation (`/proc/modules`, `/sys/module/*/initstate`, `/proc/kallsyms`) flags modules live in sysfs/kallsyms but scrubbed from `/proc/modules` — the Diamorphine‑class `module_list`‑unlink signature. Built‑ins and pseudo‑modules (`bpf`, `ftrace`, `__builtin__ftrace`, `kernel`, `vdso`, `vsyscall`, `vvar`) are excluded to keep FP near zero. Qualifies as a live IoC (`exit‑3` in `CriticalFlags`).
 - **Drift detection for kernel modules.**  
   Snapshot comparison now reports module load/unload events and newly‑appeared hidden candidates — the strongest post‑baseline signal for kernel integrity.
+- **False‑positive recalibration.**  
+  Ambient capabilities are now tiered by escalation risk (benign `CAP_IPC_LOCK` → 0, dangerous `CAP_SYS_ADMIN` → 12). Kernel taint from third‑party drivers (NVIDIA, DKMS) is informational unless correlated with a hidden module. AppArmor complain mode is informational at scan time; the weighted signal lives in drift.
 - **UI consistency.**  
   Blank lines now separate informational lines (eBPF inventory, setuid summary, kernel taint, MAC downgrade) in the terminal output for consistent readability.
 
@@ -285,7 +287,7 @@ sudo ./owlzops-mapper snapshot --output-dir /var/lib/owlzops
 | `0` | No critical issues found | All hosts clean |
 | `1` | One or more critical findings (firewall disabled, SSH root login permitted, pending security updates, SSL certificate about to expire, failed services, missing backups, NTP not synced, sudo NOPASSWD entries, sysctl issues ≥ 3) | Any host has critical issues |
 | `2` | Not running as root, scan warnings present, **or fleet scan produced zero reports** | Any host not running as root, **or all remote hosts failed** |
-| `3` | **Active compromise detected** (IoC findings SEC‑015…SEC‑024, SEC‑028, DOCK‑010) | **Any host shows active compromise** |
+| `3` | **Active compromise detected** (IoC findings SEC‑015…SEC‑024, SEC‑028, SEC‑040, DOCK‑010) | **Any host shows active compromise** |
 
 > **Scoring version guard:** when comparing snapshots taken with different scoring engine versions, `risk_score` changes are marked as `~ Changed` rather than `↑ Improved` or `↓ Degraded`.
 
@@ -349,8 +351,12 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | **SEC‑025 – Downgraded PID visibility mismatch** | **+20** (no exit code escalation) |
 | **SEC‑028 – Unattributed executable payload in memory (deep forensics)** | **+60** |
 | **SEC‑029 – Provisional trust (allowlisted binary, memory unverified)** | **0** (auditable, no penalty) |
-| **DOCK‑010 – Container runtime capability tampering** | **+60** |
+| **SEC‑038 – Kernel tainted by unsigned/force‑loaded module** | **0 (informational, e.g. NVIDIA driver) / 10 (forced load/unload) / 25 (correlated with hidden module SEC‑040)** |
+| **SEC‑039 – AppArmor profiles in complain mode (informational)** | **0 (drift enforce→complain is reported as Degraded by `compare`)** |
+| **SEC‑039 – SELinux running permissive** | **+15** |
+| **SEC‑040 – Hidden kernel module (Diamorphine‑class LKM rootkit)** | **+55 (exit‑3)** |
 | **CAP‑001 (dynamic) – Non‑root with critical capabilities** | **+8 (loopback) / +20 (wildcard exposure)** |
+| **CAP‑002 – Ambient capabilities with NoNewPrivs disabled** | **0 (benign: IPC_LOCK, SYS_TIME, …) / 5 (NET_RAW) / 12 (escalation‑capable: SYS_ADMIN, SYS_PTRACE, …)** |
 
 ---
 
