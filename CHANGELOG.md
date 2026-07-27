@@ -1,52 +1,35 @@
 
 ## Bug Fixes
 
-- **ci:** Restore macOS tests, extend E2E IoC guard to all channels
-- **ci:** Allowlist known injection FP on GitHub runner
-- **scanners:** Report inheritable-only file caps; cover all 64 capability bits
-- **sudoers:** Ignore files containing '.' or ending with '~' in sudoers.d
-- **fs_inventory:** Deduplicate before budget, fix hardlink non-determinism
-- Gate local-only modules behind cfg(local-scan) for macOS orchestrator
-- Gate local-only symbols behind cfg(local-scan) via sed
-- Isolate local-only code behind cfg(local-scan) for clean macOS build
-- Isolate local-only code behind cfg(local-scan) for clean macOS build
-- Gate local-only modules behind cfg(local-scan)
-- **scanners:** Complete R19-05/06/14/15 — inheritable caps, shared budget, st_dev
-- **scoring:** Strip (inh) suffix before matching known capability baseline
-- **e2e:** Apply IoC allowlist to deep forensic result
-- **e2e:** Define check_ioc in deep forensic step to fix command-not-found
-- **e2e:** Deduplicate IoC check, exclude downgraded ghost_pids
-- **e2e:** Sync workflow with main, use shared IoC check script
-- Drop callback Result and unify setuid detection
-- **rpm:** Use run_with_timeout and correct parsing (R20-01, R20-02)
-- **scoring:** Exclude ambient-only entries from CAP-001 count (R20V-01)
-- **scoring:** Exclude ambient-only entries from ephemeral-port correlation (R20V2-01)
+- Close Raw Truth gaps in library_injection, DLP, eBPF pins, musl cfg
+- Add __builtin__ftrace to pseudo-module exclusion list
+- Add blank lines between kernel hardening info lines in terminal output
 
-## CI/CD
+## Build System
 
-- Add job timeouts, harden E2E interrupt test
-- Re-enable clippy for macOS orchestrator after dead-code cleanup
+- **deps:** Bump russh from 0.62.3 to 0.62.4 (#122)
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.24
-- Update CHANGELOG for v0.5.25
 - Update CHANGELOG for v0.5.25
 
 ## Features
 
-- **provenance:** Distinguish truncated APK database from complete
-- Implement RPM package provenance backend
-- Add prog_tags to eBPF inventory for stable drift detection (R19V-10)
-- Feat(scoring): add CAP-002 for ambient caps without NoNewPrivs (R20-03)
-chore: clarify comment on root euid skip (R20-04)
+- **compare:** Detect eBPF program swap by prog_tag, not count
+- SEC-038/039/040 kernel hardening scanners
+- Activate SEC-038/039/040 findings and UI rendering
 
 ## Miscellaneous
 
-- Start 0.5.25 development cycle
-- **release:** Bump version to v0.5.24
+- Tighten dlp denied counter, fix eng comment in ebpf
+- Ignore .idea directory
+- **release:** Bump version to 0.5.26
 
 ## Refactoring
 
-- **scanners:** Unify filesystem walk for setuid and file capabilities
+- **fs_inventory:** Unify setuid predicate, remove double-indirection, clarify budget docs
+
+## Testing
+
+- **library_injection:** Make lone_dropper_rwx_still_alarms independent of environment
 
