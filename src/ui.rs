@@ -1775,6 +1775,40 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
             ebpf.pins.len(),
         );
     }
+
+    // SEC‑038 – Kernel taint (unsigned / force-loaded module)
+    let taint = &report.security.kernel_taint;
+    let tamper = taint.flags.iter().filter(|f| f.security_relevant).count();
+    if tamper > 0 {
+        println!(
+            "🛡  Kernel taint (SEC‑038): {} module-integrity flag(s) set (tainted={}) — review required.",
+            tamper, taint.raw
+        );
+    }
+
+    // SEC‑039 – LSM confinement downgrade
+    let conf = &report.security.confinement;
+    if conf.selinux_permissive || !conf.complain_profiles.is_empty() {
+        println!(
+            "🛡  MAC downgrade (SEC‑039): selinux_permissive={}, {} AppArmor profile(s) in complain mode.",
+            conf.selinux_permissive,
+            conf.complain_profiles.len()
+        );
+    }
+
+    // SEC‑040 – Hidden kernel module (Diamorphine-class)
+    let hidden = &report.security.kernel_modules.hidden_candidates;
+    if !hidden.is_empty() {
+        println!(
+            "🚨 HIDDEN KERNEL MODULE (SEC‑040): {} module(s) scrubbed from /proc/modules but live in sysfs/kallsyms — {}",
+            hidden.len(),
+            hidden
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 }
 
 /// Short label + severity rank from the source string.
