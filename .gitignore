@@ -7,3 +7,4 @@
 # GPG private keys
 *.asc
 !gpg-public-key.asc
+.idea/
