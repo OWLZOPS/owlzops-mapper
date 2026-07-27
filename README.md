@@ -79,22 +79,21 @@ mv owlzops-mapper owlzops-agent-linux
 
 ---
 
-## Highlights v0.5.25
+## Highlights v0.5.26
 
-**R19 Audit Completion — Inventory Accuracy & CI Hardening**
+**Kernel Hardening Scanners — Taint, LSM Downgrade & Hidden Module Detection**
 
-- **File capability mask covers all 64 bits; inheritable‑only files are no longer lost.**  
-  Capability bits beyond the 41st are reported as `cap_<N>`. Inheritable‑only setcap entries (e.g., `cap_net_raw+i`) now appear in the inventory with `(inh)` suffix and are correctly classified instead of being suppressed (R19‑05, R19V12‑01).
-- **Unified filesystem walker — single pass.**  
-  `setuid` and `file_capabilities` scanners now share the same recursive traversal (`fs_inventory`), executing a **single pass** over every scanned directory. Per‑root budget is shared across subdirectories, and filesystem boundaries (`st_dev`) are not crossed (R19‑06, R19‑14, R19‑15, R19V12‑02/‑03/‑04).
-- **Sudoers parsing matches real `sudo` behaviour.**  
-  Files with a `.` (including `.conf`) or ending with `~` inside `sudoers.d` are now correctly ignored, matching the behaviour of the real sudo parser (R19‑13).
-- **Honest provenance when the APK database is truncated.**  
-  A new `PartialApk` provenance variant prevents files from being incorrectly flagged as “not owned by any package” when `/lib/apk/db/installed` was capped during reading (R19V5‑05).
-- **macOS orchestrator CI is fully linted.**  
-  All local‑only modules are gated behind `#[cfg(feature = "local-scan")]`, allowing `cargo clippy --no-default-features` to pass cleanly. The macOS build is guarded against regressions.
-- **Stronger CI guards.**  
-  Every job has an explicit `timeout‑minutes`. The E2E interrupt test distinguishes a graceful shutdown from a plain signal death and catches the case where the scan finishes before SIGINT arrives.
+- **Kernel taint check (SEC‑038).**  
+  Decodes `/proc/sys/kernel/tainted` and surfaces unsigned/force‑loaded modules as a low‑cost LKM‑rootkit lead. Bit‑accurate table matches the kernel's own `taint_flags[]` (bit 9 = `TAINT_WARN`, not bit 5).
+- **LSM confinement downgrade detection (SEC‑039).**  
+  Detects AppArmor profiles in `complain` mode and SELinux running globally `permissive` — near‑zero‑FP signals that a MAC baseline has regressed or been switched off. The `/proc` walk runs only when the matching LSM is actually loaded.
+- **Hidden kernel module detection (SEC‑040).**  
+  Three‑source reconciliation (`/proc/modules`, `/sys/module/*/initstate`, `/proc/kallsyms`) flags modules live in sysfs/kallsyms but scrubbed from `/proc/modules` — the Diamorphine‑class `module_list`‑unlink signature. Built‑ins and pseudo‑modules (`bpf`, `ftrace`, `__builtin__ftrace`, `kernel`, `vdso`, `vsyscall`, `vvar`) are excluded to keep FP near zero. Qualifies as a live IoC (`exit‑3` in `CriticalFlags`).
+- **Drift detection for kernel modules.**  
+  Snapshot comparison now reports module load/unload events and newly‑appeared hidden candidates — the strongest post‑baseline signal for kernel integrity.
+- **UI consistency.**  
+  Blank lines now separate informational lines (eBPF inventory, setuid summary, kernel taint, MAC downgrade) in the terminal output for consistent readability.
+
 ---
 
 ## Usage
@@ -453,6 +452,23 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.25 (2026-07-24)
+
+**R19 Audit Completion — Inventory Accuracy & CI Hardening**
+
+- **File capability mask covers all 64 bits; inheritable‑only files are no longer lost.**  
+  Capability bits beyond the 41st are reported as `cap_<N>`. Inheritable‑only setcap entries (e.g., `cap_net_raw+i`) now appear in the inventory with `(inh)` suffix and are correctly classified instead of being suppressed (R19‑05, R19V12‑01).
+- **Unified filesystem walker — single pass.**  
+  `setuid` and `file_capabilities` scanners now share the same recursive traversal (`fs_inventory`), executing a **single pass** over every scanned directory. Per‑root budget is shared across subdirectories, and filesystem boundaries (`st_dev`) are not crossed (R19‑06, R19‑14, R19‑15, R19V12‑02/‑03/‑04).
+- **Sudoers parsing matches real `sudo` behaviour.**  
+  Files with a `.` (including `.conf`) or ending with `~` inside `sudoers.d` are now correctly ignored, matching the behaviour of the real sudo parser (R19‑13).
+- **Honest provenance when the APK database is truncated.**  
+  A new `PartialApk` provenance variant prevents files from being incorrectly flagged as “not owned by any package” when `/lib/apk/db/installed` was capped during reading (R19V5‑05).
+- **macOS orchestrator CI is fully linted.**  
+  All local‑only modules are gated behind `#[cfg(feature = "local-scan")]`, allowing `cargo clippy --no-default-features` to pass cleanly. The macOS build is guarded against regressions.
+- **Stronger CI guards.**  
+  Every job has an explicit `timeout‑minutes`. The E2E interrupt test distinguishes a graceful shutdown from a plain signal death and catches the case where the scan finishes before SIGINT arrives.
+
 ### v0.5.24 (2026-07-24)
 
 **R19 Audit Fixes — Graceful Degradation & Drift Detection**
@@ -507,19 +523,5 @@ See [LICENSE](LICENSE) for details.
 - **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts.
 - **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
 - **Minor hardening:** Unified network decoders; XLSX formula injection guard now handles leading whitespace; semaphore acquisition correctly bails out when the scheduler is closed; `exe_provenance` is computed once per PID, not per memory region.
-
-### v0.5.20 (2026-07-18)
-
-**Structural JNI Trust — Netty/gRPC ghost inode reclassification & Transport Resilience**
-
-- **False‑positive elimination for Netty/gRPC:** Legitimate JNI libraries loaded via `NativeLibraryLoader` (which deletes the `.so` after `dlopen`) are no longer classified as `SEC‑023` (weight 60). Instead, they are recognised by five structural gates and routed to the new **SEC‑033** (weight 0, suppressed, visible in reports).
-- **Inode family analysis:** The scanner now builds segment families per `(dev, inode)` for deleted `.so` files, detecting the multi‑segment pattern produced by `ld.so` and distinguishing it from single‑shot `mmap` stagers. An `rwx` permission on *any* family segment poisons the whole inode.
-- **Ghost inode transparency:** The `SEC‑033` finding includes the path to the live inode via `/proc/<pid>/map_files/<region_addr>`, enabling forensic recovery and verification of the deleted library’s content.
-- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts. The fleet orchestrator adds a grace budget to accommodate teardown.
-- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
-- **Coverage scope isolation:** Coverage warnings from concurrent local and remote scans are now tagged with the originating scan, preventing misleading attribution in fleet reports.
-- **Legacy SSH removal:** The `snapshot` command now uses the pure‑Rust `russh` engine, eliminating the last dependency on the system `ssh`/`scp` binaries.
-- **Blocking I/O eliminated:** Local binary upload and SSH key loading have been moved to async I/O and blocking thread‑pools, avoiding stalls of the tokio runtime under high concurrency.
-- **Minor hardening:** XLSX formula injection guard now handles leading whitespace; duplicated network decoders have been unified; semaphore acquisition correctly bails out when the scheduler is closed.
 
 </details>
