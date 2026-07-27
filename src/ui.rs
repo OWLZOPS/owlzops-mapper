@@ -1768,7 +1768,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let ebpf_total = ebpf.programs.len() + ebpf.maps.len() + ebpf.links.len() + ebpf.pins.len();
     if ebpf_total > 0 {
         println!(
-            "🛡  eBPF inventory (SEC‑035): {} program(s), {} map(s), {} link(s), {} pin(s).",
+            "🛡  eBPF inventory (SEC‑035): {} program(s), {} map(s), {} link(s), {} pin(s).\n",
             ebpf.programs.len(),
             ebpf.maps.len(),
             ebpf.links.len(),
@@ -1781,7 +1781,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let tamper = taint.flags.iter().filter(|f| f.security_relevant).count();
     if tamper > 0 {
         println!(
-            "🛡  Kernel taint (SEC‑038): {} module-integrity flag(s) set (tainted={}) — review required.",
+            "🛡  Kernel taint (SEC‑038): {} module-integrity flag(s) set (tainted={}) — review required.\n",
             tamper, taint.raw
         );
     }
@@ -1790,7 +1790,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool) {
     let conf = &report.security.confinement;
     if conf.selinux_permissive || !conf.complain_profiles.is_empty() {
         println!(
-            "🛡  MAC downgrade (SEC‑039): selinux_permissive={}, {} AppArmor profile(s) in complain mode.",
+            "🛡  MAC downgrade (SEC‑039): selinux_permissive={}, {} AppArmor profile(s) in complain mode.\n",
             conf.selinux_permissive,
             conf.complain_profiles.len()
         );
