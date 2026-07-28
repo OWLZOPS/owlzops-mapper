@@ -102,7 +102,7 @@ fn scan_sysfs_live() -> BTreeSet<String> {
 
 #[cfg(target_os = "linux")]
 pub fn gather_kernel_modules() -> KernelModuleInventory {
-    let proc_modules = match safe_io::read_file_capped("/proc/modules", CAP_PROC_MODULES) {
+    let mut proc_modules = match safe_io::read_file_capped("/proc/modules", CAP_PROC_MODULES) {
         Ok((content, truncated)) => {
             if truncated {
                 coverage::record(
@@ -151,6 +151,27 @@ pub fn gather_kernel_modules() -> KernelModuleInventory {
                 (BTreeSet::new(), false)
             }
         };
+
+    // R22-02: second snapshot of /proc/modules after slow reads (kallsyms)
+    // to close the TOCTOU window where a module is legitimately loaded between
+    // the first /proc/modules read and the kallsyms scan.
+    // Union of both snapshots eliminates the false SEC-040 → exit-code-3.
+    if let Ok((proc_after_raw, truncated_after)) =
+        safe_io::read_file_capped("/proc/modules", CAP_PROC_MODULES)
+    {
+        if truncated_after {
+            coverage::record(
+                "kernel_modules: second /proc/modules snapshot truncated — race window partially closed"
+                    .to_string(),
+            );
+        }
+        proc_modules.extend(parse_proc_modules(&proc_after_raw));
+    } else {
+        coverage::record(
+            "kernel_modules: second /proc/modules read failed — relying on first snapshot only"
+                .to_string(),
+        );
+    }
 
     // Guard: if /proc/modules is empty but modules exist in other sources,
     // suppress the hidden check to avoid a flood of false positives.
@@ -236,5 +257,36 @@ mod tests {
                        ext4 987136 3 - Live 0x0000000000000000";
         let names = parse_proc_modules(content);
         assert!(names.contains("diamorphine") && names.contains("ext4"));
+    }
+
+    // R22-02 regression tests
+
+    #[test]
+    fn racing_insmod_between_reads_is_not_flagged() {
+        // Module absent in first /proc/modules snapshot,
+        // appears in second snapshot + sysfs/kallsyms — legitimate load, not rootkit.
+        let proc_before = set(&["ext4", "nvme"]);
+        let proc_after = set(&["ext4", "nvme", "e1000e"]);
+        let sysfs = set(&["ext4", "nvme", "e1000e"]);
+        let kall = set(&["e1000e"]);
+
+        let mut proc_union = proc_before;
+        proc_union.extend(proc_after);
+        assert!(
+            reconcile(&proc_union, &sysfs, &kall).is_empty(),
+            "module loaded during scan is a race, not Diamorphine"
+        );
+    }
+
+    #[test]
+    fn diamorphine_absent_from_both_reads_still_caught() {
+        // Real hidden module stays invisible across both /proc/modules snapshots.
+        let mut proc_union: BTreeSet<String> = set(&["ext4"]);
+        proc_union.extend(set(&["ext4"])); // second read also missing diamorphine
+        let sysfs = set(&["ext4", "diamorphine"]);
+        let kall = set(&["diamorphine"]);
+        let hidden = reconcile(&proc_union, &sysfs, &kall);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].name, "diamorphine");
     }
 }
