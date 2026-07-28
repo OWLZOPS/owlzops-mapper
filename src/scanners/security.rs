@@ -119,7 +119,13 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
         let Some(val) = parts.next() else { continue };
 
         // Directives inside Match blocks are conditional; ignore them.
+        // R22-04: record the presence of Match blocks so fallback misdetection
+        // risk is visible in coverage (fallback does not evaluate conditions).
         if key.eq_ignore_ascii_case("match") {
+            coverage::record(
+                "sshd_config_contains_match: fallback parser may misinterpret conditional directives"
+                    .to_string(),
+            );
             break;
         }
 
