@@ -2,6 +2,10 @@
 ## Bug Fixes
 
 - Used create_dynamic_table() for Security & Health Checks table
+- R22-02 SEC-040 race with dual /proc/modules snapshot
+- R22-01 self-integrity now checks IPv6 transport
+- R22-03 inheritable-only tagging in build_capability_names
+- R22-04 sshd fallback notes Match presence in coverage
 
 ## Build System
 
@@ -16,6 +20,7 @@
 
 - Update CHANGELOG for v0.5.26
 - Update risk score table with SEC-038/039/040 and tiered CAP-002 weights
+- Update CHANGELOG for v0.5.27
 
 ## Features
 
@@ -23,5 +28,6 @@
 
 ## Miscellaneous
 
+- **release:** Bump version to 0.5.27
 - **release:** Bump version to 0.5.27
 
