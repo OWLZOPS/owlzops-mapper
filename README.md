@@ -79,22 +79,20 @@ mv owlzops-mapper owlzops-agent-linux
 
 ---
 
-## Highlights v0.5.26
+## Highlights v0.5.27
 
-**Kernel Hardening Scanners — Taint, LSM Downgrade & Hidden Module Detection**
+**Ftrace/Kprobe Hook‑Surface Audit — Rootkit Detection via Syscall Hooking**
 
-- **Kernel taint check (SEC‑038).**  
-  Decodes `/proc/sys/kernel/tainted` and surfaces unsigned/force‑loaded modules as a low‑cost LKM‑rootkit lead. Bit‑accurate table matches the kernel's own `taint_flags[]` (bit 9 = `TAINT_WARN`, not bit 5).
-- **LSM confinement downgrade detection (SEC‑039).**  
-  Detects AppArmor profiles in `complain` mode and SELinux running globally `permissive` — near‑zero‑FP signals that a MAC baseline has regressed or been switched off. The `/proc` walk runs only when the matching LSM is actually loaded.
-- **Hidden kernel module detection (SEC‑040).**  
-  Three‑source reconciliation (`/proc/modules`, `/sys/module/*/initstate`, `/proc/kallsyms`) flags modules live in sysfs/kallsyms but scrubbed from `/proc/modules` — the Diamorphine‑class `module_list`‑unlink signature. Built‑ins and pseudo‑modules (`bpf`, `ftrace`, `__builtin__ftrace`, `kernel`, `vdso`, `vsyscall`, `vvar`) are excluded to keep FP near zero. Qualifies as a live IoC (`exit‑3` in `CriticalFlags`).
-- **Drift detection for kernel modules.**  
-  Snapshot comparison now reports module load/unload events and newly‑appeared hidden candidates — the strongest post‑baseline signal for kernel integrity.
-- **False‑positive recalibration.**  
-  Ambient capabilities are now tiered by escalation risk (benign `CAP_IPC_LOCK` → 0, dangerous `CAP_SYS_ADMIN` → 12). Kernel taint from third‑party drivers (NVIDIA, DKMS) is informational unless correlated with a hidden module. AppArmor complain mode is informational at scan time; the weighted signal lives in drift.
-- **UI consistency.**  
-  Blank lines now separate informational lines (eBPF inventory, setuid summary, kernel taint, MAC downgrade) in the terminal output for consistent readability.
+- **Ftrace hook attribution (SEC‑041).**  
+  Reads `/sys/kernel/tracing/enabled_functions` and classifies every ftrace callback on syscall entries. Legitimate sources (BPF fentry/Falco/Tetragon, kprobes, livepatch) are filtered out, leaving unattributed hooks as a high‑signal rootkit lead.
+- **Tiered scoring.**  
+  Callback in a hidden module (correlated with SEC‑040) → +55 (exit‑3 via SEC‑040). Callback in a visible module → +30 (verify EDR?). Unresolved callback under `kptr_restrict` → informational (weight 0), with drift detection still active.
+- **Live‑tracer awareness.**  
+  If any function tracer is active (`current_tracer ≠ nop`), attribution is suppressed and a coverage warning is emitted — we cannot distinguish a rootkit from intentional tracing.
+- **Drift detection.**  
+  New/disappeared syscall hooks are reported as `Degraded`/`Improved` in snapshot diffs, giving a weighted signal even when point‑in‑time findings are informational.
+- **UI‑fix: dynamic table width for Security & Health Checks.**  
+  The terminal table now adapts to content width, preventing misalignment from long lists (e.g. many failed services).
 
 ---
 
@@ -355,6 +353,9 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | **SEC‑039 – AppArmor profiles in complain mode (informational)** | **0 (drift enforce→complain is reported as Degraded by `compare`)** |
 | **SEC‑039 – SELinux running permissive** | **+15** |
 | **SEC‑040 – Hidden kernel module (Diamorphine‑class LKM rootkit)** | **+55 (exit‑3)** |
+| **SEC‑041 – Ftrace syscall hook by hidden module** | **+55 (exit‑3 via SEC‑040)** |
+| **SEC‑041 – Unexplained ftrace syscall hook (visible module)** | **+30 (verify EDR?)** |
+| **SEC‑041 – Unattributed ftrace syscall hook (kptr_restrict)** | **0 (informational, drift still detected)** |
 | **CAP‑001 (dynamic) – Non‑root with critical capabilities** | **+8 (loopback) / +20 (wildcard exposure)** |
 | **CAP‑002 – Ambient capabilities with NoNewPrivs disabled** | **0 (benign: IPC_LOCK, SYS_TIME, …) / 5 (NET_RAW) / 12 (escalation‑capable: SYS_ADMIN, SYS_PTRACE, …)** |
 
@@ -458,6 +459,23 @@ See [LICENSE](LICENSE) for details.
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
 
+### v0.5.26 (2026-07-27)
+
+**Kernel Hardening Scanners — Taint, LSM Downgrade & Hidden Module Detection**
+
+- **Kernel taint check (SEC‑038).**  
+  Decodes `/proc/sys/kernel/tainted` and surfaces unsigned/force‑loaded modules as a low‑cost LKM‑rootkit lead. Bit‑accurate table matches the kernel's own `taint_flags[]` (bit 9 = `TAINT_WARN`, not bit 5).
+- **LSM confinement downgrade detection (SEC‑039).**  
+  Detects AppArmor profiles in `complain` mode and SELinux running globally `permissive` — near‑zero‑FP signals that a MAC baseline has regressed or been switched off. The `/proc` walk runs only when the matching LSM is actually loaded.
+- **Hidden kernel module detection (SEC‑040).**  
+  Three‑source reconciliation (`/proc/modules`, `/sys/module/*/initstate`, `/proc/kallsyms`) flags modules live in sysfs/kallsyms but scrubbed from `/proc/modules` — the Diamorphine‑class `module_list`‑unlink signature. Built‑ins and pseudo‑modules (`bpf`, `ftrace`, `__builtin__ftrace`, `kernel`, `vdso`, `vsyscall`, `vvar`) are excluded to keep FP near zero. Qualifies as a live IoC (`exit‑3` in `CriticalFlags`).
+- **Drift detection for kernel modules.**  
+  Snapshot comparison now reports module load/unload events and newly‑appeared hidden candidates — the strongest post‑baseline signal for kernel integrity.
+- **False‑positive recalibration.**  
+  Ambient capabilities are now tiered by escalation risk (benign `CAP_IPC_LOCK` → 0, dangerous `CAP_SYS_ADMIN` → 12). Kernel taint from third‑party drivers (NVIDIA, DKMS) is informational unless correlated with a hidden module. AppArmor complain mode is informational at scan time; the weighted signal lives in drift.
+- **UI consistency.**  
+  Blank lines now separate informational lines (eBPF inventory, setuid summary, kernel taint, MAC downgrade) in the terminal output for consistent readability.
+
 ### v0.5.25 (2026-07-24)
 
 **R19 Audit Completion — Inventory Accuracy & CI Hardening**
@@ -518,16 +536,5 @@ See [LICENSE](LICENSE) for details.
 - **Graceful degradation** – If `map_files` is unreadable (EACCES, EPERM, ENOENT), the finding stays in SEC‑033 with `deep_forensics = None`. Remote SSH hosts cannot open `map_files` locally, so they remain in SEC‑033 by design.
 - **Scoring & UI** – Layer 2b now branches on the new `Origin` values. New display strings in the terminal UI and JSON reports.
 - **Increased `MAX_FINDINGS` from 64 → 128** – Prevents ghost‑eligible PIDs from being squeezed out by JIT‑advisory findings on machines with many Java processes.
-
-### v0.5.21 (2026-07-18)
-
-**macOS Orchestrator, False‑Positive Elimination & Transport Resilience**
-
-- **macOS orchestrator (Apple Silicon):** A native `aarch64-apple-darwin` build is now available. It runs any remote scan (single host, fleet, snapshot) from macOS without requiring local audit support. The install script automatically selects the correct build, and the CI pipeline compiles the orchestrator on every push.
-- **SEC‑026 false‑positive elimination:** Chrome V8 code‑cage (executable `[heap]` inside a JIT reservation) and heavy standalone applications (Telegram, AppImage) are now recognised by VMA‑topology and file‑text anchors, respectively. They are routed to **SEC‑029** (Provisional Trust, weight 0) instead of raising false alarms. All other detection remains intact — droppers and real heap‑spray still fire.
-- **Drain‑time coverage scoping:** Coverage warnings from concurrent local and remote scans are now tagged with the correct scope at drain time. A single sequential drain point after fleet tasks guarantees correct attribution even if `coverage::record()` is later added to the SSH engine.
-- **Safe teardown on timeout:** Binary cleanup and graceful SSH disconnect now execute **outside** the scan deadline, guaranteeing zero‑footprint even on slow or hung hosts.
-- **io_uring soundness:** Fixed a use‑after‑free hazard in the ghost‑PID scanner when a signal interrupts `submit_and_wait`. In the rare failure case, resources are leaked instead of risking memory corruption.
-- **Minor hardening:** Unified network decoders; XLSX formula injection guard now handles leading whitespace; semaphore acquisition correctly bails out when the scheduler is closed; `exe_provenance` is computed once per PID, not per memory region.
 
 </details>
