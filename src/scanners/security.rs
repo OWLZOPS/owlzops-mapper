@@ -62,28 +62,36 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
                         && let Some(_pattern) = std::path::Path::new(path_part).file_name()
                         && let Ok(entries) = std::fs::read_dir(parent)
                     {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if let Some(name) = path.file_name() {
-                                let name = name.to_string_lossy();
-                                if name.ends_with(".conf")
-                                    && !name.starts_with('.')
-                                    && let Ok((inc_contents, inc_trunc)) = safe_io::read_file_capped(
-                                        path.to_str().unwrap_or(""),
-                                        4 * 1024 * 1024,
-                                    )
-                                {
-                                    if inc_trunc {
-                                        coverage::record(format!(
-                                            "sshd config include {} truncated",
-                                            path.display()
-                                        ));
-                                    }
-                                    for l in inc_contents.lines() {
-                                        let l = l.trim();
-                                        if !l.is_empty() && !l.starts_with('#') {
-                                            config_lines.push(l.to_string());
-                                        }
+                        // R22-06: collect and sort paths to match sshd's lexicographic order
+                        let mut include_paths: Vec<PathBuf> = entries
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.file_name()
+                                    .map(|n| {
+                                        let n = n.to_string_lossy();
+                                        n.ends_with(".conf") && !n.starts_with('.')
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        include_paths.sort(); // sshd reads includes in alphabetical order
+
+                        for path in include_paths {
+                            if let Ok((inc_contents, inc_trunc)) = safe_io::read_file_capped(
+                                path.to_str().unwrap_or(""),
+                                4 * 1024 * 1024,
+                            ) {
+                                if inc_trunc {
+                                    coverage::record(format!(
+                                        "sshd config include {} truncated",
+                                        path.display()
+                                    ));
+                                }
+                                for l in inc_contents.lines() {
+                                    let l = l.trim();
+                                    if !l.is_empty() && !l.starts_with('#') {
+                                        config_lines.push(l.to_string());
                                     }
                                 }
                             }
