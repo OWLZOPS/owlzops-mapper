@@ -554,6 +554,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         kernel_taint: crate::scanners::kernel_taint::gather_kernel_taint(),
         confinement: crate::scanners::confinement::gather_confinement(),
         kernel_modules: crate::scanners::kernel_modules::gather_kernel_modules(),
+        // ── NEW (SEC-041) ──
+        ftrace_hooks: crate::scanners::ftrace::gather_ftrace_hooks(),
     }
 }
 

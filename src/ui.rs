@@ -542,10 +542,7 @@ fn render_security_health(report: &AgentReport) {
         .map(|f| f.evidence.as_str())
         .collect();
 
-    let mut t_risk = Table::new();
-    t_risk
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS);
+    let mut t_risk = create_dynamic_table();
     t_risk.set_header(vec![
         Cell::new("Security & Health Checks")
             .add_attribute(Attribute::Bold)
@@ -1890,6 +1887,32 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                 "{}AppArmor complain mode (SEC‑039): {} profile(s) not enforcing — informational (often an intentional baseline).\n",
                 theme.sec_item,
                 c.complain_profiles.len()
+            );
+        }
+    }
+
+    // SEC‑041 – ftrace/kprobe hook surface
+    {
+        let inv = &report.security.ftrace_hooks;
+        if !inv.live_tracer_active && !inv.unattributed_syscall_hooks.is_empty() {
+            let degraded = inv.attribution_degraded
+                && !inv
+                    .unattributed_syscall_hooks
+                    .iter()
+                    .any(|h| h.callback.starts_with("module:"));
+            let (prefix, tag) = if degraded {
+                (
+                    theme.sec_item,
+                    "attribution degraded (kptr_restrict) — informational",
+                )
+            } else {
+                (theme.alert, "REVIEW REQUIRED — possible ftrace rootkit")
+            };
+            println!(
+                "{}ftrace syscall hooks (SEC‑041): {} unexplained hook(s) — {}.\n",
+                prefix,
+                inv.unattributed_syscall_hooks.len(),
+                tag
             );
         }
     }

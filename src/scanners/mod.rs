@@ -46,6 +46,8 @@ mod sudoers;
 #[cfg(feature = "local-scan")]
 mod confinement;
 #[cfg(feature = "local-scan")]
+mod ftrace;
+#[cfg(feature = "local-scan")]
 mod kernel_modules;
 #[cfg(feature = "local-scan")]
 mod kernel_taint;

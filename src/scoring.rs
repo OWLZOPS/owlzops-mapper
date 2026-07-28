@@ -1374,6 +1374,97 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-041 – Unexplained ftrace hook on a syscall entry (rootkit) ─────
+    // Deliberately NOT an independent IoC: legit EDR modules hook syscalls via
+    // ftrace, and the genuinely-malicious case (callback in a HIDDEN module)
+    // already trips SEC-040 → exit-3. Here we add weight/detail via correlation.
+    {
+        let inv = &report.security.ftrace_hooks;
+        if !inv.live_tracer_active && !inv.unattributed_syscall_hooks.is_empty() {
+            let hidden: std::collections::HashSet<&str> = report
+                .security
+                .kernel_modules
+                .hidden_candidates
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect();
+            let describe = |hooks: &[&crate::models::FtraceHook]| {
+                hooks
+                    .iter()
+                    .map(|h| format!("{} (via {})", h.function, h.callback))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let all: Vec<&crate::models::FtraceHook> =
+                inv.unattributed_syscall_hooks.iter().collect();
+            let correlated: Vec<&crate::models::FtraceHook> = all
+                .iter()
+                .copied()
+                .filter(|h| {
+                    h.callback
+                        .strip_prefix("module:")
+                        .is_some_and(|m| hidden.contains(m))
+                })
+                .collect();
+            let module_backed = all
+                .iter()
+                .any(|h| h.callback.starts_with("module:") && !h.callback.contains("unresolved"));
+
+            if !correlated.is_empty() {
+                findings.push(Finding {
+                    id: "SEC-041",
+                    title: "ACTIVE COMPROMISE: syscall ftrace-hooked by a hidden module"
+                        .to_string(),
+                    category: Category::Security,
+                    weight: 55,
+                    evidence: format!(
+                        "{} syscall entry point(s) ftrace-hooked by a module hidden from \
+                         /proc/modules (SEC-040 correlated — ftrace-rootkit): {}",
+                        correlated.len(),
+                        describe(&correlated)
+                    ),
+                    suppressed: None,
+                    cis_ref: None,
+                });
+            } else if inv.attribution_degraded && !module_backed {
+                findings.push(Finding {
+                    id: "SEC-041",
+                    title: "Unattributed ftrace hooks on syscalls (attribution degraded)".to_string(),
+                    category: Category::Security,
+                    weight: 0,
+                    evidence: format!(
+                        "{} syscall entry point(s) carry an ftrace_ops whose callback could not \
+                         be resolved (kptr_restrict): {}",
+                        all.len(),
+                        describe(&all)
+                    ),
+                    suppressed: Some(
+                        "kptr_restrict hides the ftrace callback, so a legitimate BPF/kprobe source \
+                         cannot be ruled out. Lower kptr_restrict for attribution, or rely on drift \
+                         (a NEW hook between snapshots is weighted regardless)."
+                            .to_string(),
+                    ),
+                    cis_ref: None,
+                });
+            } else {
+                findings.push(Finding {
+                    id: "SEC-041",
+                    title: "Unexplained ftrace hook on a syscall entry point".to_string(),
+                    category: Category::Security,
+                    weight: 30,
+                    evidence: format!(
+                        "{} syscall entry point(s) ftrace-hooked with no BPF/kprobe/livepatch source \
+                         and no active tracer — verify the owning module (EDR?) or investigate: {}",
+                        all.len(),
+                        describe(&all)
+                    ),
+                    suppressed: None,
+                    cis_ref: None,
+                });
+            }
+        }
+    }
+
     // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
