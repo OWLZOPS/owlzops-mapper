@@ -79,16 +79,19 @@ fn cap_mask_to_names(mask: u64) -> Vec<String> {
 }
 
 /// Build the human‑readable capability list from both permitted and inheritable masks.
-/// Inheritable‑only entries are tagged `(inh)` so they don't collapse
-/// `all()` checks on the permitted list and are visible to the operator.
+/// Inheritable‑only entries (capabilities present in the inheritable set but
+/// *not* already in the permitted set) are tagged `(inh)`.  This avoids
+/// duplicating entries for capabilities that appear in both sets.
 pub(crate) fn build_capability_names(permitted: u64, inheritable: u64) -> Vec<String> {
     let mut names = cap_mask_to_names(permitted);
-    for n in cap_mask_to_names(inheritable) {
-        let tagged = format!("{n}(inh)");
-        if !names.contains(&tagged) {
-            names.push(tagged);
-        }
-    }
+    // R22-03: tag only *inheritable‑only* capabilities – docstring and
+    // consumer expectations now match (no spurious duplicates).
+    let inh_only = inheritable & !permitted;
+    names.extend(
+        cap_mask_to_names(inh_only)
+            .into_iter()
+            .map(|n| format!("{n}(inh)")),
+    );
     names
 }
 
@@ -284,5 +287,26 @@ mod tests {
             "inheritable-only file must not report zero capabilities"
         );
         assert!(names.iter().any(|n| n.starts_with("CAP_NET_RAW")));
+    }
+
+    // R22-03: ensure no duplicates when a capability appears in both sets
+    #[test]
+    fn permitted_and_inheritable_intersection_no_duplicates() {
+        // CAP_NET_RAW (bit 13) set in both permitted and inheritable
+        let names = build_capability_names(1 << 13, 1 << 13);
+        assert_eq!(names.len(), 1, "should not duplicate CAP_NET_RAW");
+        assert_eq!(
+            names[0], "CAP_NET_RAW",
+            "permitted cap should appear without (inh)"
+        );
+    }
+
+    #[test]
+    fn inheritable_only_is_tagged() {
+        // permitted has CAP_NET_RAW, inheritable has CAP_NET_ADMIN (bit 12) only
+        let names = build_capability_names(1 << 13, 1 << 12);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"CAP_NET_RAW".to_string()));
+        assert!(names.contains(&"CAP_NET_ADMIN(inh)".to_string()));
     }
 }

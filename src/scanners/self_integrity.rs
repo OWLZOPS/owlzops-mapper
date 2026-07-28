@@ -17,7 +17,7 @@
 //!
 //! Tier 3 – self‑evident invariants (expensive to fake):
 //!   • /proc/self/maps is non‑empty (we are a running process with mappings)
-//!   • If launched over SSH, /proc/net/tcp MUST contain at least one
+//!   • If launched over SSH, /proc/net/tcp (or tcp6) MUST contain at least one
 //!     ESTABLISHED connection (our own SSH session).  Zero false positives:
 //!     the invariant is guaranteed by the transport.
 //!
@@ -185,26 +185,41 @@ fn check_os_type(report: &mut IntegrityReport) {
     }
 }
 
+/// Scan a /proc/net/tcp{,6} table for any ESTABLISHED (st == "01") connection.
+fn any_established(v4: Option<&str>, v6: Option<&str>) -> Option<bool> {
+    let scan = |c: &str| {
+        c.lines()
+            .skip(1)
+            .any(|l| l.split_ascii_whitespace().nth(3) == Some("01"))
+    };
+    match (v4, v6) {
+        (None, None) => None, // both unreadable – skip check
+        (a, b) => Some(a.map(scan).unwrap_or(false) || b.map(scan).unwrap_or(false)),
+    }
+}
+
 fn check_ssh_transport_invariant(report: &mut IntegrityReport) {
     if std::env::var("SSH_CONNECTION").is_err() {
         return;
     }
 
-    let content = match fs::read_to_string("/proc/net/tcp") {
-        Ok(c) => c,
-        Err(_) => return,
+    // R22-01: read both families; an IPv6 session only appears in tcp6.
+    let v4 = fs::read_to_string("/proc/net/tcp").ok();
+    let v6 = fs::read_to_string("/proc/net/tcp6").ok();
+    let has_established = match any_established(v4.as_deref(), v6.as_deref()) {
+        None => {
+            // Both tables unavailable – skip the check, don't claim compromise.
+            return;
+        }
+        Some(v) => v,
     };
-
-    let has_established = content
-        .lines()
-        .skip(1)
-        .any(|line| line.split_ascii_whitespace().nth(3) == Some("01"));
 
     if !has_established {
         report.compromised = true;
         report.warnings.push(
-            "self-integrity CRITICAL: launched over SSH, but /proc/net/tcp shows \
-             no ESTABLISHED connections – network stack is being filtered by a rootkit"
+            "self-integrity CRITICAL: launched over SSH, but neither /proc/net/tcp \
+             nor /proc/net/tcp6 shows an ESTABLISHED connection – network stack is \
+             being filtered by a rootkit"
                 .to_string(),
         );
     }
@@ -212,6 +227,8 @@ fn check_ssh_transport_invariant(report: &mut IntegrityReport) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn proc_self_stat_pid_parsing() {
         let s = "1234 (bash) S 1 1234 ...";
@@ -227,5 +244,25 @@ mod tests {
         let lp = before2.find('(').unwrap();
         let pid_str2 = before2[..lp].trim();
         assert_eq!(pid_str2, "99");
+    }
+
+    // R22-01 transport invariant tests
+    #[test]
+    fn ipv6_only_ssh_session_is_not_a_false_rootkit() {
+        let v4 = "  sl local rem st\n  0: 00000000:0016 00000000:0000 0A rest...\n";
+        let v6 = "  sl local rem st\n  0: 0000:0016 dead:C1A2 01 rest...\n";
+        assert_eq!(any_established(Some(v4), Some(v6)), Some(true));
+    }
+
+    #[test]
+    fn no_established_in_either_family_is_flagged() {
+        let v4 = "  sl local rem st\n  0: 00000000:0016 00000000:0000 0A rest...\n";
+        let v6 = "  sl local rem st\n";
+        assert_eq!(any_established(Some(v4), Some(v6)), Some(false));
+    }
+
+    #[test]
+    fn both_unreadable_returns_none_skip() {
+        assert_eq!(any_established(None, None), None);
     }
 }
