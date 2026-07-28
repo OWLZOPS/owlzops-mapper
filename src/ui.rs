@@ -542,10 +542,7 @@ fn render_security_health(report: &AgentReport) {
         .map(|f| f.evidence.as_str())
         .collect();
 
-    let mut t_risk = Table::new();
-    t_risk
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS);
+    let mut t_risk = create_dynamic_table();
     t_risk.set_header(vec![
         Cell::new("Security & Health Checks")
             .add_attribute(Attribute::Bold)
