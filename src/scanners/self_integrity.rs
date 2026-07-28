@@ -29,7 +29,7 @@
 //! Out‑of‑band attestation (TPM, remote observer) is the only true anchor.
 
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 
 // ---------------------------------------------------------------------------
 // public interface
@@ -185,16 +185,27 @@ fn check_os_type(report: &mut IntegrityReport) {
     }
 }
 
-/// Scan a /proc/net/tcp{,6} table for any ESTABLISHED (st == "01") connection.
-fn any_established(v4: Option<&str>, v6: Option<&str>) -> Option<bool> {
-    let scan = |c: &str| {
-        c.lines()
-            .skip(1)
-            .any(|l| l.split_ascii_whitespace().nth(3) == Some("01"))
-    };
+/// Streaming check for any ESTABLISHED (st == "01") connection in a /proc/net table.
+/// Returns `Some(true)` on first match (early exit), `Some(false)` if scanned
+/// without finding any, or `None` if the file cannot be opened.
+fn family_has_established(path: &str) -> Option<bool> {
+    let f = fs::File::open(path).ok()?;
+    let reader = BufReader::new(f);
+    for line in reader.lines().skip(1).map_while(Result::ok) {
+        if line.split_ascii_whitespace().nth(3) == Some("01") {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Combine results from two families: returns `None` if both are unavailable,
+/// `Some(true)` if at least one family has an ESTABLISHED socket, `Some(false)`
+/// otherwise.
+fn combine_established(v4: Option<bool>, v6: Option<bool>) -> Option<bool> {
     match (v4, v6) {
-        (None, None) => None, // both unreadable – skip check
-        (a, b) => Some(a.map(scan).unwrap_or(false) || b.map(scan).unwrap_or(false)),
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(false) || b.unwrap_or(false)),
     }
 }
 
@@ -203,10 +214,10 @@ fn check_ssh_transport_invariant(report: &mut IntegrityReport) {
         return;
     }
 
-    // R22-01: read both families; an IPv6 session only appears in tcp6.
-    let v4 = fs::read_to_string("/proc/net/tcp").ok();
-    let v6 = fs::read_to_string("/proc/net/tcp6").ok();
-    let has_established = match any_established(v4.as_deref(), v6.as_deref()) {
+    // R22-01 / R22-05: streaming dual‑family check, no uncontrolled memory use
+    let v4 = family_has_established("/proc/net/tcp");
+    let v6 = family_has_established("/proc/net/tcp6");
+    let has_established = match combine_established(v4, v6) {
         None => {
             // Both tables unavailable – skip the check, don't claim compromise.
             return;
@@ -227,7 +238,18 @@ fn check_ssh_transport_invariant(report: &mut IntegrityReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Old string‑based `any_established` preserved for existing unit tests.
+    fn any_established(v4: Option<&str>, v6: Option<&str>) -> Option<bool> {
+        let scan = |c: &str| {
+            c.lines()
+                .skip(1)
+                .any(|l| l.split_ascii_whitespace().nth(3) == Some("01"))
+        };
+        match (v4, v6) {
+            (None, None) => None,
+            (a, b) => Some(a.map(scan).unwrap_or(false) || b.map(scan).unwrap_or(false)),
+        }
+    }
 
     #[test]
     fn proc_self_stat_pid_parsing() {
@@ -246,7 +268,6 @@ mod tests {
         assert_eq!(pid_str2, "99");
     }
 
-    // R22-01 transport invariant tests
     #[test]
     fn ipv6_only_ssh_session_is_not_a_false_rootkit() {
         let v4 = "  sl local rem st\n  0: 00000000:0016 00000000:0000 0A rest...\n";
