@@ -1894,6 +1894,32 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         }
     }
 
+    // SEC‑041 – ftrace/kprobe hook surface
+    {
+        let inv = &report.security.ftrace_hooks;
+        if !inv.live_tracer_active && !inv.unattributed_syscall_hooks.is_empty() {
+            let degraded = inv.attribution_degraded
+                && !inv
+                    .unattributed_syscall_hooks
+                    .iter()
+                    .any(|h| h.callback.starts_with("module:"));
+            let (prefix, tag) = if degraded {
+                (
+                    theme.sec_item,
+                    "attribution degraded (kptr_restrict) — informational",
+                )
+            } else {
+                (theme.alert, "REVIEW REQUIRED — possible ftrace rootkit")
+            };
+            println!(
+                "{}ftrace syscall hooks (SEC‑041): {} unexplained hook(s) — {}.\n",
+                prefix,
+                inv.unattributed_syscall_hooks.len(),
+                tag
+            );
+        }
+    }
+
     // SEC‑040 – Hidden kernel module (Diamorphine-class)
     let hidden = &report.security.kernel_modules.hidden_candidates;
     if !hidden.is_empty() {

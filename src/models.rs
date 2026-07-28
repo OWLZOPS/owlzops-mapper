@@ -348,6 +348,9 @@ pub struct SecurityInfo {
     /// Kernel module inventory + hidden-module reconciliation (SEC-040).
     #[serde(default)]
     pub kernel_modules: KernelModuleInventory,
+    /// ftrace/kprobe hook surface on syscall entries (SEC-041).
+    #[serde(default)]
+    pub ftrace_hooks: FtraceHookInventory,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -956,4 +959,44 @@ pub struct HiddenModule {
     /// Interfaces that still expose it: "sysfs", "kallsyms".
     #[serde(default)]
     pub seen_in: Vec<String>,
+}
+
+// ── ftrace/kprobe hook surface (SEC-041) ──────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct FtraceHookInventory {
+    /// Syscall-entry functions carrying an ftrace_ops with NO legitimate source
+    /// (not BPF/kprobe/livepatch, no live tracer). Non-empty ⇒ ftrace-rootkit lead.
+    #[serde(default)]
+    pub unattributed_syscall_hooks: Vec<FtraceHook>,
+    /// Kprobes on syscall functions (attributed observability; surfaced for context).
+    #[serde(default)]
+    pub syscall_kprobes: Vec<KprobeEntry>,
+    /// Count of syscall hooks we could attribute (BPF/kprobe/livepatch/tracer/builtin).
+    #[serde(default)]
+    pub attributed_hook_count: usize,
+    /// A live function tracer was running → attribution impossible → not flagged.
+    #[serde(default)]
+    pub live_tracer_active: bool,
+    /// kptr_restrict hid callback symbols → unattributed hooks are informational.
+    #[serde(default)]
+    pub attribution_degraded: bool,
+    /// tracefs was mounted & readable at all.
+    #[serde(default)]
+    pub tracefs_available: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct FtraceHook {
+    pub function: String,
+    pub ops_count: u32,
+    /// "module:<name>" (callback lives in a module) or "unresolved" (kptr_restrict).
+    pub callback: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct KprobeEntry {
+    pub kind: char, // 'p' kprobe / 'r' kretprobe
+    pub group_name: String,
+    pub symbol: String,
 }

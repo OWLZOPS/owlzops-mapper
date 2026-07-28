@@ -790,6 +790,42 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // --- security.ftrace_hooks (SEC-041 drift: a NEW syscall hook appeared) ---
+    // Hook function names are stable identifiers, so this fires even under
+    // kptr_restrict where the point-in-time finding is only informational.
+    {
+        let before_h: HashSet<&str> = before
+            .security
+            .ftrace_hooks
+            .unattributed_syscall_hooks
+            .iter()
+            .map(|h| h.function.as_str())
+            .collect();
+        let after_h: HashSet<&str> = after
+            .security
+            .ftrace_hooks
+            .unattributed_syscall_hooks
+            .iter()
+            .map(|h| h.function.as_str())
+            .collect();
+        for appeared in after_h.difference(&before_h) {
+            changes.push(Change {
+                field: "security.ftrace_hooks".into(),
+                before: None,
+                after: Some(format!("syscall {appeared} newly ftrace-hooked")),
+                severity: Severity::Degraded,
+            });
+        }
+        for gone in before_h.difference(&after_h) {
+            changes.push(Change {
+                field: "security.ftrace_hooks".into(),
+                before: Some(format!("syscall {gone} was ftrace-hooked")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // Deterministic sort: Degraded first, then Changed, then Improved;
     // within same severity, stable order by field/before/after
     changes.sort_unstable_by(|a, b| {
