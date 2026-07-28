@@ -199,7 +199,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     // Sysctl issues – handle ip_forward with context
     for issue in &report.security.sysctl_issues {
         if issue.starts_with("net.ipv4.ip_forward=") {
-            let suppressed = if report.topology.docker_active
+            let suppressed = if report.topology.runtime_active
                 || report.host.native_services.iter().any(|s| s == "kubelet")
             {
                 Some("expected on Docker/kubelet host".to_string())
@@ -2352,7 +2352,7 @@ mod tests {
         r.host.backup_tools = vec!["restic".to_string()];
         r.host.ntp_synchronized = true;
         r.security.sysctl_issues = vec!["net.ipv4.ip_forward=1 (expected 0)".to_string()];
-        r.topology.docker_active = true;
+        r.topology.runtime_active = true;
 
         let findings = evaluate(&r);
         assert!(findings.iter().any(|f| f.suppressed.is_some()));

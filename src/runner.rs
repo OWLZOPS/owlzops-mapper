@@ -117,7 +117,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             network_task,
             storage_task,
             security_task,
-            tokio::spawn(crate::scanners::docker::gather_docker_topology()),
+            tokio::spawn(crate::scanners::runtime::gather_runtime_topology()),
             packages_task,
         );
 
