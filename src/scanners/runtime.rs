@@ -1,3 +1,4 @@
+use crate::coverage;
 use crate::models::{ContainerInfo, DanglingImageInfo, TopologyInfo};
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
@@ -10,10 +11,38 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::warn;
 
+// ── Runtime socket identification ───────────────────────────────────────
+
+/// Container-runtime control sockets. Mounting ANY of these into a container is
+/// a full host-takeover primitive (it grants the ability to start a privileged
+/// container on the host), not merely a "sensitive path". containerd/CRI-O are
+/// included even though we cannot *scan* them (gRPC): classification is
+/// independent of whether we can talk to the runtime.
+const RUNTIME_SOCKET_PATHS: &[&str] = &[
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+    "/var/run/containerd/containerd.sock",
+    "/run/crio/crio.sock",
+    "/var/run/crio/crio.sock",
+];
+
+fn is_runtime_socket(source: &str) -> bool {
+    RUNTIME_SOCKET_PATHS.contains(&source)
+        // Rootless Podman lives under a per-UID runtime dir:
+        // /run/user/<uid>/podman/podman.sock
+        || source.ends_with("/podman/podman.sock")
+}
+
 /// Classify a host-side bind-mount source into a sensitive-mount label, if any.
 /// `writable`: from inspect Mount.rw (defaults to true = conservative when unknown).
 fn classify_mount(source: &str, writable: bool) -> Option<String> {
-    if source == "/var/run/docker.sock" || source == "/run/docker.sock" {
+    // The label is kept as the historical wire constant `DOCKER_SOCKET` so that
+    // scoring.rs, existing snapshots and drift comparisons stay stable. It means
+    // "container runtime control socket", regardless of which runtime.
+    if is_runtime_socket(source) {
         return Some("DOCKER_SOCKET".to_string());
     }
     if source == "/" {
@@ -28,10 +57,20 @@ fn classify_mount(source: &str, writable: bool) -> Option<String> {
         "/var/run",
         "/run",
         "/var/lib/docker",
+        "/var/lib/containers", // Podman / CRI-O rootful image + layer store
+        "/var/lib/containerd",
     ];
+    // Zero-alloc prefix test. Rootless Podman/Buildah store lives under $HOME,
+    // so no absolute prefix works — we scan for the distinctive path component.
     let hit = SENSITIVE
         .iter()
-        .find(|p| source == **p || source.starts_with(&format!("{p}/")))?;
+        .copied()
+        .find(|p| source == *p || source.strip_prefix(p).is_some_and(|r| r.starts_with('/')))
+        .or_else(|| {
+            source
+                .contains("/.local/share/containers")
+                .then_some("~/.local/share/containers")
+        })?;
     if writable {
         Some(format!("{hit} (rw)"))
     } else {
@@ -43,23 +82,71 @@ fn classify_mount(source: &str, writable: bool) -> Option<String> {
 /// Supports Docker and Podman (both speak the Docker Engine API).
 /// Containerd/CRI‑O sockets are deliberately skipped – they require gRPC.
 pub async fn gather_runtime_topology() -> TopologyInfo {
-    let endpoints = [
-        ("Docker", "/var/run/docker.sock"),
-        ("Podman", "/run/podman/podman.sock"),
+    let mut endpoints: Vec<(&str, String)> = vec![
+        ("Docker", "/var/run/docker.sock".to_string()),
+        ("Podman", "/run/podman/podman.sock".to_string()),
     ];
+    // Rootless Podman: socket lives in a per-UID runtime dir. Enumerate instead
+    // of guessing the UID (XDG_RUNTIME_DIR is cleared by sudo's env_reset).
+    if let Ok(entries) = fs::read_dir("/run/user") {
+        for e in entries.flatten() {
+            let p = e.path().join("podman/podman.sock");
+            if p.exists()
+                && let Some(s) = p.to_str()
+            {
+                endpoints.push(("Podman (rootless)", s.to_string()));
+            }
+        }
+    }
 
     let mut active_client = None;
     let mut runtime_name = String::new();
+    let mut also_live: Vec<&str> = Vec::new();
 
-    for (name, path) in endpoints {
-        if std::path::Path::new(path).exists()
-            && let Ok(client) = Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
-            && client.ping().await.is_ok()
-        {
-            active_client = Some(client);
-            runtime_name = name.to_string();
-            break;
+    for (name, path) in &endpoints {
+        if !std::path::Path::new(path).exists() {
+            continue; // socket absent → runtime genuinely not installed, not a gap
         }
+        let client = match Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION) {
+            Ok(c) => c,
+            Err(e) => {
+                coverage::record(format!(
+                    "runtime: {name} socket {path} present but unusable ({e}) — \
+                     container audit (DOCK-*) SKIPPED for this runtime"
+                ));
+                continue;
+            }
+        };
+        // Explicit deadline: bollard's own 120 s would stall the whole host scan
+        // on a wedged daemon, and we now probe more than one endpoint.
+        match tokio::time::timeout(Duration::from_secs(5), client.ping()).await {
+            Ok(Ok(_)) => {
+                if active_client.is_none() {
+                    runtime_name = name.to_string();
+                    active_client = Some(client);
+                } else {
+                    also_live.push(name);
+                }
+            }
+            Ok(Err(e)) => coverage::record(format!(
+                "runtime: {name} socket {path} exists but ping failed ({e}) — likely \
+                 EACCES (non-root scan) or dead daemon; container audit SKIPPED"
+            )),
+            Err(_) => coverage::record(format!(
+                "runtime: {name} ping on {path} timed out after 5s — daemon wedged; \
+                 container audit SKIPPED"
+            )),
+        }
+    }
+
+    // Raw Truth: a second live runtime is real state, not noise.
+    if !also_live.is_empty() {
+        coverage::record(format!(
+            "runtime: {} additional live runtime(s) NOT audited ({}) — only {runtime_name} \
+             was scanned; containers under the others are absent from this report",
+            also_live.len(),
+            also_live.join(", ")
+        ));
     }
 
     let docker = match active_client {
@@ -385,5 +472,65 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
         containers: container_list,
         images_reclaimable_mb,
         build_cache_reclaimable_mb,
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn podman_socket_is_a_takeover_primitive_not_a_sensitive_path() {
+        for p in [
+            "/run/podman/podman.sock",
+            "/run/user/1000/podman/podman.sock",
+            "/run/containerd/containerd.sock",
+            "/var/run/crio/crio.sock",
+        ] {
+            assert_eq!(
+                classify_mount(p, true).as_deref(),
+                Some("DOCKER_SOCKET"),
+                "{p} must classify as a runtime control socket"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_socket_classification_unchanged() {
+        assert_eq!(
+            classify_mount("/var/run/docker.sock", true).as_deref(),
+            Some("DOCKER_SOCKET")
+        );
+        assert_eq!(
+            classify_mount("/run/docker.sock", false).as_deref(),
+            Some("DOCKER_SOCKET")
+        );
+        assert_eq!(classify_mount("/", true).as_deref(), Some("HOST_ROOT"));
+    }
+
+    #[test]
+    fn podman_and_containerd_stores_are_sensitive() {
+        assert_eq!(
+            classify_mount("/var/lib/containers/storage", true).as_deref(),
+            Some("/var/lib/containers (rw)")
+        );
+        assert_eq!(
+            classify_mount("/var/lib/containerd", false).as_deref(),
+            Some("/var/lib/containerd (ro)")
+        );
+        assert_eq!(
+            classify_mount("/home/dev/.local/share/containers/storage", true).as_deref(),
+            Some("~/.local/share/containers (rw)")
+        );
+    }
+
+    #[test]
+    fn prefix_match_does_not_overreach() {
+        assert!(classify_mount("/etcetera", true).is_none());
+        assert!(classify_mount("/var/lib/dockerfiles", true).is_none());
+        assert_eq!(
+            classify_mount("/etc/passwd", false).as_deref(),
+            Some("/etc (ro)")
+        );
     }
 }
