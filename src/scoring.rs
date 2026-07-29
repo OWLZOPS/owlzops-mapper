@@ -1890,11 +1890,17 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_socket_or_root {
         findings.push(Finding {
             id: "DOCK-005",
-            title: "Container mounts Docker socket or host root".to_string(),
+            title: "Container mounts runtime control socket or host root".to_string(),
             category: Category::Security,
             weight: 15,
-            evidence: "A container bind-mounts /var/run/docker.sock or / (host takeover primitive)"
-                .to_string(),
+            evidence: format!(
+                "A container bind-mounts the {} control socket or / (host takeover primitive)",
+                if report.topology.runtime_name.is_empty() {
+                    "container runtime"
+                } else {
+                    &report.topology.runtime_name
+                }
+            ),
             suppressed: None,
             cis_ref: Some("CIS 5.31"),
         });
@@ -1934,7 +1940,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = oom_names.join(", ");
         findings.push(Finding {
             id: "DOCK-007",
-            title: "Docker containers killed by OOM".to_string(),
+            title: "Containers killed by OOM".to_string(),
             category: Category::Reliability,
             weight: RISK_CONTAINER_OOM,
             evidence: format!("OOMKilled: {}", list),

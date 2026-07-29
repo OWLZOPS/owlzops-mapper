@@ -553,7 +553,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // ── security.setuid_files (privilege-surface drift, R22-03) ─────────────
+    // ── security.setuid_files (privilege-surface drift, R22-07) ─────────────
     {
         let suid_bits = |setuid: bool, setgid: bool| -> &'static str {
             match (setuid, setgid) {
@@ -603,7 +603,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // ── security.file_capabilities (capability-surface drift, R22-03) ──────
+    // ── security.file_capabilities (capability-surface drift, R22-07) ──────
     {
         let label = |p: u64, i: u64| -> String {
             let names = crate::scanners::file_capabilities::build_capability_names(p, i);
