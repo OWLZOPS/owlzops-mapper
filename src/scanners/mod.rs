@@ -7,7 +7,6 @@ mod deep;
 mod dlp;
 #[cfg(feature = "local-scan")]
 mod ebpf;
-#[cfg(feature = "local-scan")]
 pub mod file_capabilities;
 #[cfg(feature = "local-scan")]
 mod fs_inventory;
