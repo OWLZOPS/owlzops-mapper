@@ -1,6 +1,6 @@
 use crate::models::{
-    AgentReport, Change, DiffReport, HostDiffStatus, MultiHostDiff, PortInfo, Severity,
-    SnapshotMeta,
+    AgentReport, Change, DiffReport, FileCapFinding, HostDiffStatus, MultiHostDiff, PortInfo,
+    SetuidFinding, Severity, SnapshotMeta,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -12,6 +12,20 @@ fn sev_rank(s: &Severity) -> u8 {
         Severity::Changed => 1,
         Severity::Improved => 2,
     }
+}
+
+/// Index setuid files by path for drift comparison.
+fn index_setuid_files(v: &[SetuidFinding]) -> HashMap<&str, (bool, bool)> {
+    v.iter()
+        .map(|f| (f.path.as_str(), (f.setuid, f.setgid)))
+        .collect()
+}
+
+/// Index file capabilities by path for drift comparison.
+fn index_file_caps(v: &[FileCapFinding]) -> HashMap<&str, (u64, u64, bool)> {
+    v.iter()
+        .map(|f| (f.path.as_str(), (f.permitted, f.inheritable, f.effective)))
+        .collect()
 }
 
 /// Compare two AgentReports and produce a DiffReport
@@ -539,77 +553,107 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // --- security.setuid_files (R19-10) ---
-    let before_suid: HashSet<&str> = before
-        .security
-        .setuid_files
-        .iter()
-        .map(|f| f.path.as_str())
-        .collect();
-    let after_suid: HashSet<&str> = after
-        .security
-        .setuid_files
-        .iter()
-        .map(|f| f.path.as_str())
-        .collect();
-    for added in after_suid.difference(&before_suid) {
-        changes.push(Change {
-            field: "security.setuid_files".into(),
-            before: None,
-            after: Some((*added).to_string()),
-            severity: Severity::Degraded,
-        });
-    }
-    for removed in before_suid.difference(&after_suid) {
-        changes.push(Change {
-            field: "security.setuid_files".into(),
-            before: Some((*removed).to_string()),
-            after: None,
-            severity: Severity::Improved,
-        });
+    // ── security.setuid_files (privilege-surface drift, R22-03) ─────────────
+    {
+        let suid_bits = |setuid: bool, setgid: bool| -> &'static str {
+            match (setuid, setgid) {
+                (true, true) => "setuid+setgid",
+                (true, false) => "setuid",
+                (false, true) => "setgid",
+                (false, false) => "no-bits",
+            }
+        };
+
+        let before_su = index_setuid_files(&before.security.setuid_files);
+        let after_su = index_setuid_files(&after.security.setuid_files);
+
+        for (path, &(suid, sgid)) in &after_su {
+            match before_su.get(path) {
+                None => changes.push(Change {
+                    field: "security.setuid_files".into(),
+                    before: None,
+                    after: Some(format!("{path} newly {}", suid_bits(suid, sgid))),
+                    severity: Severity::Degraded,
+                }),
+                Some(&(b_suid, b_sgid)) if (b_suid, b_sgid) != (suid, sgid) => {
+                    let gained = (suid && !b_suid) || (sgid && !b_sgid);
+                    changes.push(Change {
+                        field: "security.setuid_files".into(),
+                        before: Some(format!("{path} was {}", suid_bits(b_suid, b_sgid))),
+                        after: Some(format!("now {}", suid_bits(suid, sgid))),
+                        severity: if gained {
+                            Severity::Degraded
+                        } else {
+                            Severity::Improved
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+        for (path, &(suid, sgid)) in &before_su {
+            if !after_su.contains_key(path) {
+                changes.push(Change {
+                    field: "security.setuid_files".into(),
+                    before: Some(format!("{path} was {}", suid_bits(suid, sgid))),
+                    after: None,
+                    severity: Severity::Improved,
+                });
+            }
+        }
     }
 
-    // --- security.file_capabilities (R19-10) ---
-    let cap_key = |f: &crate::models::FileCapFinding| {
-        let mut caps = f.capabilities.clone();
-        caps.sort();
-        format!("{}:[{}]", f.path, caps.join(","))
-    };
-    let before_caps: HashSet<String> = before
-        .security
-        .file_capabilities
-        .iter()
-        .map(cap_key)
-        .collect();
-    let after_caps: HashSet<String> = after
-        .security
-        .file_capabilities
-        .iter()
-        .map(cap_key)
-        .collect();
-    for added in after_caps.difference(&before_caps) {
-        changes.push(Change {
-            field: "security.file_capabilities".into(),
-            before: None,
-            after: Some(added.clone()),
-            severity: Severity::Degraded,
-        });
-    }
-    for removed in before_caps.difference(&after_caps) {
-        changes.push(Change {
-            field: "security.file_capabilities".into(),
-            before: Some(removed.clone()),
-            after: None,
-            severity: Severity::Improved,
-        });
+    // ── security.file_capabilities (capability-surface drift, R22-03) ──────
+    {
+        let label = |p: u64, i: u64| -> String {
+            let names = crate::scanners::file_capabilities::build_capability_names(p, i);
+            if names.is_empty() {
+                "none".into()
+            } else {
+                names.join(", ")
+            }
+        };
+
+        let before_c = index_file_caps(&before.security.file_capabilities);
+        let after_c = index_file_caps(&after.security.file_capabilities);
+
+        for (path, &(p, i, e)) in &after_c {
+            match before_c.get(path) {
+                None => changes.push(Change {
+                    field: "security.file_capabilities".into(),
+                    before: None,
+                    after: Some(format!("{path} gained caps: {}", label(p, i))),
+                    severity: Severity::Degraded,
+                }),
+                Some(&(bp, bi, be)) if (bp, bi, be) != (p, i, e) => {
+                    let escalated = (p & !bp) != 0 || (i & !bi) != 0 || (e && !be);
+                    changes.push(Change {
+                        field: "security.file_capabilities".into(),
+                        before: Some(format!("{path}: {}", label(bp, bi))),
+                        after: Some(label(p, i)),
+                        severity: if escalated {
+                            Severity::Degraded
+                        } else {
+                            Severity::Improved
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+        for (path, &(p, i, _)) in &before_c {
+            if !after_c.contains_key(path) {
+                changes.push(Change {
+                    field: "security.file_capabilities".into(),
+                    before: Some(format!("{path} had caps: {}", label(p, i))),
+                    after: None,
+                    severity: Severity::Improved,
+                });
+            }
+        }
     }
 
     // --- security.ebpf_inventory (R19-10 / R21-01) ---
-    // Programs are keyed by their stable prog_tag: replacing one program with
-    // another (identical count, different code) changes the tag set but not the
-    // count, so a count-only snapshot would miss it — exactly the post-compromise
-    // signal this field was collected for. A newly-appeared tag is Degraded (a
-    // new tracing program after the baseline), a vanished tag is Improved.
     let before_tags: HashSet<&str> = before
         .security
         .ebpf_inventory
@@ -694,7 +738,6 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             severity: Severity::Improved,
         });
     }
-    // A newly-appeared hidden candidate is the strongest post-baseline signal.
     let before_hidden: HashSet<&str> = before
         .security
         .kernel_modules
@@ -718,15 +761,12 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // --- security.kernel_taint (SEC-038 drift: kernel tainted post-baseline) ---
+    // --- security.kernel_taint (SEC-038 drift) ---
     {
         let before_bits = before.security.kernel_taint.raw;
         let after_bits = after.security.kernel_taint.raw;
         let newly_set = after_bits & !before_bits;
         if newly_set != 0 {
-            // A taint bit appearing between snapshots ⇒ a module was loaded AFTER
-            // the baseline — weighted even for bits that are benign as steady state
-            // (a stable nvidia box is always-tainted, so no drift → no noise).
             let names: Vec<String> = after
                 .security
                 .kernel_taint
@@ -744,7 +784,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // --- security.confinement (SEC-039 drift: enforce→complain / →permissive) ---
+    // --- security.confinement (SEC-039 drift) ---
     {
         let before_c: HashSet<&str> = before
             .security
@@ -790,9 +830,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // --- security.ftrace_hooks (SEC-041 drift: a NEW syscall hook appeared) ---
-    // Hook function names are stable identifiers, so this fires even under
-    // kptr_restrict where the point-in-time finding is only informational.
+    // --- security.ftrace_hooks (SEC-041 drift) ---
     {
         let before_h: HashSet<&str> = before
             .security
@@ -1318,6 +1356,91 @@ mod tests {
                 .iter()
                 .any(|c| c.field == "security.kernel_taint"),
             "unchanged taint value must produce no drift"
+        );
+    }
+
+    // ── new setuid/file_capabilities drift tests ───────────────────────────
+
+    #[test]
+    fn setuid_binary_appearing_is_drift() {
+        let before = test_report();
+        let mut after = test_report();
+        after.security.setuid_files = vec![SetuidFinding {
+            path: "/usr/local/bin/backdoor".into(),
+            setuid: true,
+            setgid: false,
+            root_owner: true,
+            package: None,
+        }];
+        let diff = compare_reports(&before, &after);
+        let c = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "security.setuid_files")
+            .expect("new setuid binary must surface as drift");
+        assert_eq!(c.severity, Severity::Degraded);
+        assert!(
+            c.after
+                .as_deref()
+                .unwrap()
+                .contains("/usr/local/bin/backdoor")
+        );
+
+        assert!(
+            !compare_reports(&after, &after)
+                .changes
+                .iter()
+                .any(|c| c.field == "security.setuid_files"),
+            "identical setuid inventory must produce no drift"
+        );
+    }
+
+    #[test]
+    fn file_cap_escalation_on_existing_binary_is_drift() {
+        let mk = |perm: u64, names: Vec<String>| FileCapFinding {
+            path: "/usr/bin/node".into(),
+            capabilities: names,
+            reason: None,
+            permitted: perm,
+            inheritable: 0,
+            effective: true,
+            revision: 2,
+            rootid: None,
+            package: None,
+        };
+        let mut before = test_report();
+        before.security.file_capabilities = vec![mk(1 << 10, vec!["CAP_NET_BIND_SERVICE".into()])];
+        let mut after = test_report();
+        after.security.file_capabilities = vec![mk(
+            (1 << 10) | (1 << 39),
+            vec!["CAP_NET_BIND_SERVICE".into(), "CAP_BPF".into()],
+        )];
+
+        let diff = compare_reports(&before, &after);
+        let c = diff
+            .changes
+            .iter()
+            .find(|c| c.field == "security.file_capabilities")
+            .expect("capability escalation must surface as drift");
+        assert_eq!(c.severity, Severity::Degraded);
+        assert!(c.after.as_deref().unwrap().contains("CAP_BPF"));
+
+        // De-escalation (cap removed) → Improved; identical → no drift.
+        assert!(
+            compare_reports(&after, &before)
+                .changes
+                .iter()
+                .any(
+                    |c| c.field == "security.file_capabilities" && c.severity == Severity::Improved
+                ),
+            "removing a capability must be Improved"
+        );
+        assert!(
+            !compare_reports(&after, &after)
+                .changes
+                .iter()
+                .any(|c| c.field == "security.file_capabilities"),
+            "identical cap inventory must produce no drift"
         );
     }
 }
