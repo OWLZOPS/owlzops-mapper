@@ -29,6 +29,9 @@ pub(crate) const SCAN_DIRS: &[(&str, u8)] = &[
     ("/usr/local/sbin", 1),
     ("/bin", 1),
     ("/sbin", 1),
+    // NixOS keeps every setuid/capability wrapper here; the FHS bin dirs are
+    // empty stubs there. Absent on FHS hosts → skipped at zero cost.
+    ("/run/wrappers/bin", 1),
     ("/usr/lib", 4),
     ("/usr/libexec", 4),
     ("/usr/local/lib", 4),
@@ -48,11 +51,13 @@ where
     F: FnMut(&fs::DirEntry, &fs::Metadata),
 {
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut roots_scanned = 0usize;
     for &(dir, depth) in SCAN_DIRS {
         let path = Path::new(dir);
         if !path.is_dir() {
             continue;
         }
+        roots_scanned += 1;
         let mut budget = if depth > 1 { BUDGET_DEEP } else { BUDGET_FLAT };
         // Capture the device id of the root directory – we will not cross
         // into mounted filesystems (R19V12‑04). If we cannot stat the root,
@@ -80,6 +85,15 @@ where
                 "{scanner_name}: {dir} entry budget exhausted — inventory INCOMPLETE for this root"
             ));
         }
+    }
+
+    // Raw Truth: "no setuid files" and "nowhere to look" must not look alike.
+    if roots_scanned == 0 {
+        crate::coverage::record(format!(
+            "{scanner_name}: none of the standard binary roots exist (non-FHS layout, \
+             e.g. NixOS, or a minimal container) — setuid/capability inventory is EMPTY \
+             BY ABSENCE OF SCAN TARGETS, not by absence of findings"
+        ));
     }
 }
 
@@ -225,4 +239,17 @@ pub(crate) fn gather_binary_inventory() -> (Vec<SetuidFinding>, Vec<FileCapFindi
     });
 
     (setuid_findings, cap_findings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nixos_wrapper_dir_is_in_scan_roots() {
+        assert!(
+            SCAN_DIRS.iter().any(|(d, _)| *d == "/run/wrappers/bin"),
+            "NixOS setuid surface lives in /run/wrappers/bin"
+        );
+    }
 }
