@@ -7,6 +7,7 @@ use bollard::volume::ListVolumesOptions;
 use std::collections::HashMap;
 use std::default::Default;
 use std::fs;
+use std::path::Path;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::warn;
@@ -34,6 +35,22 @@ fn is_runtime_socket(source: &str) -> bool {
         // Rootless Podman lives under a per-UID runtime dir:
         // /run/user/<uid>/podman/podman.sock
         || source.ends_with("/podman/podman.sock")
+}
+
+/// Distinguish "socket absent" (not a gap) from "socket inaccessible"
+/// (a coverage gap — the audit is blind there).
+fn socket_reachable(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            coverage::record(format!(
+                "runtime: cannot stat {} (EACCES) — container audit blind there",
+                path.display()
+            ));
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Classify a host-side bind-mount source into a sensitive-mount label, if any.
@@ -94,23 +111,10 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
     if let Ok(entries) = fs::read_dir("/run/user") {
         for e in entries.flatten() {
             let p = e.path().join("podman/podman.sock");
-            // R22-11: /run/user/<uid> is 0700, so Path::exists() returns false
-            // on EACCES and we silently skip another user's rootless runtime.
-            // Use fs::metadata to tell "absent" from "inaccessible".
-            match fs::metadata(&p) {
-                Ok(_) => {
-                    if let Some(s) = p.to_str() {
-                        endpoints.push(("Podman (rootless)", s.to_string()));
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    coverage::record(format!(
-                        "runtime: cannot stat {} (EACCES — non-root scan of another \
-                         user's runtime dir); rootless Podman there is NOT audited",
-                        p.display()
-                    ));
-                }
-                Err(_) => {} // genuinely absent — not a gap
+            if socket_reachable(&p)
+                && let Some(s) = p.to_str()
+            {
+                endpoints.push(("Podman (rootless)", s.to_string()));
             }
         }
     }
@@ -122,8 +126,8 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
     let mut also_live: Vec<String> = Vec::new();
 
     for (name, path) in &endpoints {
-        if !std::path::Path::new(path).exists() {
-            continue; // socket absent → runtime genuinely not installed, not a gap
+        if !socket_reachable(Path::new(path)) {
+            continue; // socket absent or unreachable → not a gap
         }
         let client = match Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION) {
             Ok(c) => c,
