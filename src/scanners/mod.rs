@@ -6,8 +6,6 @@ mod deep;
 #[cfg(feature = "local-scan")]
 mod dlp;
 #[cfg(feature = "local-scan")]
-pub mod docker;
-#[cfg(feature = "local-scan")]
 mod ebpf;
 #[cfg(feature = "local-scan")]
 mod file_capabilities;
@@ -31,6 +29,8 @@ mod proc_net;
 mod provenance;
 #[cfg(feature = "local-scan")]
 mod reverse_shell;
+#[cfg(feature = "local-scan")]
+pub mod runtime;
 #[cfg(feature = "local-scan")]
 pub mod security;
 #[cfg(feature = "local-scan")]

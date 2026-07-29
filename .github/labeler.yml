@@ -9,7 +9,7 @@ security:
 
 docker:
   - changed-files:
-      - any-glob-to-any-file: 'src/scanners/docker.rs'
+      - any-glob-to-any-file: 'src/scanners/runtime.rs'
 
 reporting:
   - changed-files:

@@ -144,7 +144,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_shell_users(report);
     render_system_internals(report);
     render_packages(report);
-    render_docker(report);
+    render_runtime(report);
     render_capability_audit(report);
 
     render_mount_masking(report, &theme);
@@ -1158,10 +1158,12 @@ fn truncate_docker_mounts(mounts: &[String], max_width: usize) -> String {
         .join("\n")
 }
 
-fn render_docker(report: &AgentReport) {
-    if !report.topology.docker_active {
+fn render_runtime(report: &AgentReport) {
+    if !report.topology.runtime_active {
         return;
     }
+
+    let runtime = &report.topology.runtime_name;
     let total_img_gb = report.topology.total_images_size_mb as f64 / 1024.0;
     let reclaimable_gb = report.topology.images_reclaimable_mb as f64 / 1024.0;
     let build_cache_gb = report.topology.build_cache_reclaimable_mb as f64 / 1024.0;
@@ -1171,7 +1173,7 @@ fn render_docker(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_dock_sum.set_header(vec![
-        Cell::new("Docker Storage Summary")
+        Cell::new(format!("{} Storage Summary", runtime))
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
         Cell::new("Value").add_attribute(Attribute::Bold),
@@ -1218,7 +1220,7 @@ fn render_docker(report: &AgentReport) {
         "Dangling Volumes",
         &report.topology.dangling_volumes_count.to_string(),
     ]);
-    println!("Docker Images & Volumes:");
+    println!("{} Images & Volumes:", runtime);
     println!("{t_dock_sum}\n");
 
     if !report.topology.dangling_images.is_empty() {
@@ -1242,7 +1244,7 @@ fn render_docker(report: &AgentReport) {
         }
         println!("Top Dangling Images:");
         println!(
-            "\x1b[1;31m[!] WARNING: Before running `docker image prune`, ensure these images are truly unused and you have required backups!\x1b[0m"
+            "\x1b[1;31m[!] WARNING: Before running image prune, ensure these images are truly unused and you have required backups!\x1b[0m"
         );
         println!("{t_dang}\n");
     }
@@ -1302,7 +1304,7 @@ fn render_docker(report: &AgentReport) {
                 mounts_cell,
             ]);
         }
-        println!("Docker Containers & Data Persistency:");
+        println!("{} Containers & Data Persistency:", runtime);
         println!("{t_docker}\n");
     }
 }

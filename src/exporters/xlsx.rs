@@ -1158,7 +1158,7 @@ fn write_docker_section(
     report: &AgentReport,
     standalone: bool,
 ) -> Result<(), XlsxError> {
-    if !report.topology.docker_active {
+    if !report.topology.runtime_active {
         return Ok(());
     }
     if !standalone {
@@ -1166,7 +1166,7 @@ fn write_docker_section(
     }
     w.write_kv_row(
         "Docker Active",
-        &report.topology.docker_active.to_string(),
+        &report.topology.runtime_active.to_string(),
         None,
     )?;
     w.write_kv_row(

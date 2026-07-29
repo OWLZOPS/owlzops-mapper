@@ -203,7 +203,9 @@ pub struct DiskInfo {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TopologyInfo {
-    pub docker_active: bool,
+    pub runtime_active: bool,
+    #[serde(default)]
+    pub runtime_name: String,
     pub images_count: usize,
     pub dangling_images_count: usize,
     pub total_images_size_mb: u64,
