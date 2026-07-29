@@ -415,6 +415,7 @@ const INSTALL_ROOTS: &[&str] = &[
     "/usr/lib/",
     "/usr/share/",
     "/var/lib/flatpak/",
+    "/nix/store/", // NixOS / Nix – content-addressed, read-only system prefix
 ];
 
 /// System binary paths — territory of the package manager (root-owned).
@@ -661,5 +662,13 @@ mod tests {
         assert_eq!(canon_path("/usr/bin/su"), "/usr/bin/su"); // idempotent
         assert_eq!(canon_path("/opt/app"), "/opt/app");
         assert_eq!(canon_path("/home/user"), "/home/user");
+    }
+
+    #[test]
+    fn nix_store_paths_are_recognised_as_system_installs() {
+        assert!(
+            is_standard_install_path("/nix/store/0m0a1zw-coreutils-9.5/bin/ls"),
+            "NixOS system binaries must not be treated as non-standard"
+        );
     }
 }
