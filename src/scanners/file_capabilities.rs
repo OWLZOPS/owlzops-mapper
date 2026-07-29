@@ -9,6 +9,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
 use crate::models::FileCapFinding;
+#[cfg(feature = "local-scan")]
 use crate::scanners::fs_inventory;
 use std::collections::HashSet;
 use std::ffi::CString;
