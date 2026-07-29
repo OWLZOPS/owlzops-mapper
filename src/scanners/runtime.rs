@@ -79,8 +79,11 @@ fn classify_mount(source: &str, writable: bool) -> Option<String> {
 }
 
 /// Detect active container runtime by probing well‑known Unix sockets.
-/// Supports Docker and Podman (both speak the Docker Engine API).
-/// Containerd/CRI‑O sockets are deliberately skipped – they require gRPC.
+/// Supports Docker and Podman, rootful and rootless (all speak the Docker
+/// Engine API); rootless sockets are enumerated from /run/user/<uid>/.
+/// containerd/CRI‑O are not *scanned* (gRPC), but ARE classified as takeover
+/// primitives when bind‑mounted — see `is_runtime_socket`.
+/// Only the first live runtime is audited; any others are recorded in coverage.
 pub async fn gather_runtime_topology() -> TopologyInfo {
     let mut endpoints: Vec<(&str, String)> = vec![
         ("Docker", "/var/run/docker.sock".to_string()),
@@ -91,17 +94,32 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
     if let Ok(entries) = fs::read_dir("/run/user") {
         for e in entries.flatten() {
             let p = e.path().join("podman/podman.sock");
-            if p.exists()
-                && let Some(s) = p.to_str()
-            {
-                endpoints.push(("Podman (rootless)", s.to_string()));
+            // R22-11: /run/user/<uid> is 0700, so Path::exists() returns false
+            // on EACCES and we silently skip another user's rootless runtime.
+            // Use fs::metadata to tell "absent" from "inaccessible".
+            match fs::metadata(&p) {
+                Ok(_) => {
+                    if let Some(s) = p.to_str() {
+                        endpoints.push(("Podman (rootless)", s.to_string()));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    coverage::record(format!(
+                        "runtime: cannot stat {} (EACCES — non-root scan of another \
+                         user's runtime dir); rootless Podman there is NOT audited",
+                        p.display()
+                    ));
+                }
+                Err(_) => {} // genuinely absent — not a gap
             }
         }
     }
 
     let mut active_client = None;
     let mut runtime_name = String::new();
-    let mut also_live: Vec<&str> = Vec::new();
+    // R22-12: include socket path so the operator knows *which* additional
+    // runtime was skipped.
+    let mut also_live: Vec<String> = Vec::new();
 
     for (name, path) in &endpoints {
         if !std::path::Path::new(path).exists() {
@@ -125,7 +143,7 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                     runtime_name = name.to_string();
                     active_client = Some(client);
                 } else {
-                    also_live.push(name);
+                    also_live.push(format!("{name} @ {path}"));
                 }
             }
             Ok(Err(e)) => coverage::record(format!(

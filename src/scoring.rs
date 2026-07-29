@@ -1953,7 +1953,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = loop_names.join(", ");
         findings.push(Finding {
             id: "DOCK-008",
-            title: "Docker containers in restart loop".to_string(),
+            title: "Containers in restart loop".to_string(),
             category: Category::Reliability,
             weight: RISK_CONTAINER_RESTART_LOOP,
             evidence: format!(
@@ -1969,7 +1969,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = unhealthy_names.join(", ");
         findings.push(Finding {
             id: "DOCK-009",
-            title: "Unhealthy Docker containers (failing healthcheck)".to_string(),
+            title: "Unhealthy containers (failing healthcheck)".to_string(),
             category: Category::Reliability,
             weight: RISK_CONTAINER_UNHEALTHY,
             evidence: format!("unhealthy: {}", list),
