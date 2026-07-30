@@ -47,8 +47,10 @@ mod confinement;
 #[cfg(feature = "local-scan")]
 mod ftrace;
 #[cfg(feature = "local-scan")]
+pub mod kernel_facts;
+#[cfg(feature = "local-scan")]
 mod kernel_modules;
 #[cfg(feature = "local-scan")]
-mod kernel_taint;
+pub mod kernel_taint;
 #[cfg(feature = "local-scan")]
 pub mod preload;

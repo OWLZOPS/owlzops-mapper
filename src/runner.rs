@@ -194,6 +194,13 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         // ── SEC-042: system-wide LD_PRELOAD ──
         report.security.preload_injections = crate::scanners::preload::scan_ld_preload();
 
+        // ── SEC-044: kernel security facts ──
+        let (core_pattern, modules_disabled, lockdown) =
+            crate::scanners::kernel_facts::gather_kernel_facts();
+        report.security.core_pattern = core_pattern;
+        report.security.modules_disabled = modules_disabled;
+        report.security.lockdown = lockdown;
+
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
         info!(

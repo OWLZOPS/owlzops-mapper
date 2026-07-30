@@ -358,6 +358,14 @@ pub struct SecurityInfo {
     /// Entries found in /etc/ld.so.preload (system-wide library injection).
     #[serde(default)]
     pub preload_injections: Vec<PreloadFinding>,
+
+    // ── SEC-044: kernel security facts (core_pattern, modules_disabled, lockdown) ─
+    #[serde(default)]
+    pub core_pattern: String,
+    #[serde(default)]
+    pub modules_disabled: Option<bool>, // None = unreadable
+    #[serde(default)]
+    pub lockdown: Option<String>, // None = not available
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
