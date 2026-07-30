@@ -570,6 +570,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         kernel_modules: crate::scanners::kernel_modules::gather_kernel_modules(),
         // ── NEW (SEC-041) ──
         ftrace_hooks: crate::scanners::ftrace::gather_ftrace_hooks(),
+        // ── SEC-042: will be populated by runner / main after scan ──
+        preload_injections: Vec::new(),
     }
 }
 

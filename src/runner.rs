@@ -190,6 +190,10 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             scoring_version: crate::scoring::SCORING_VERSION,
             self_integrity: None,
         };
+
+        // ── SEC-042: system-wide LD_PRELOAD ──
+        report.security.preload_injections = crate::scanners::preload::scan_ld_preload();
+
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
         info!(

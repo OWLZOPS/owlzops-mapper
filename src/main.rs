@@ -255,12 +255,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     let integrity = scanners::self_integrity::run_self_integrity_check();
 
                     // R19V5-04: race‑free cancellation of the local scan.
-                    // If the user presses Ctrl‑C during this scan we must
-                    //   - not publish a half‑finished report (indistinguishable
-                    //     from real findings),
-                    //   - signal all registered helper processes,
-                    //   - set the `interrupted` flag to return exit code 130
-                    //     after the writer has drained.
                     let mut local_report = tokio::select! {
                         r = run_local_scan_async(&a) => r,
                         _ = shutdown_notify.notified() => {
@@ -277,6 +271,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             break;
                         }
                     };
+
+                    // ── SEC-042: system-wide LD_PRELOAD ──
+                    local_report.security.preload_injections = scanners::preload::scan_ld_preload();
 
                     local_report.self_integrity = Some(SelfIntegrityReport {
                         compromised: integrity.compromised,
@@ -502,8 +499,6 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     }
 
                     // R15-01: single sequential drain point after all fleet tasks complete.
-                    // No concurrent record() calls exist here, so drain-time tagging
-                    // is correct by construction.
                     for warning in crate::coverage::drain_scoped("fleet-orchestrator") {
                         warn!("{warning}");
                     }
@@ -617,6 +612,10 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         return 130;
                     }
                 };
+
+                // ── SEC-042: system-wide LD_PRELOAD ──
+                report.security.preload_injections = scanners::preload::scan_ld_preload();
+
                 report.self_integrity = Some(SelfIntegrityReport {
                     compromised: integrity.compromised,
                     warnings: integrity.warnings,
