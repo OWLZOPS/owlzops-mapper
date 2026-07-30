@@ -112,6 +112,33 @@ pub fn is_volatile_exec_path(path: &str) -> bool {
         || path.starts_with("/memfd:")
 }
 
+/// Home-relative depth: /home/u → 0, /home/u/Downloads → 1, /home/u/a/b → 2.
+/// Covers /root and Fedora Atomic's /var/home/<user>.
+fn home_relative_depth(dir: &str) -> Option<usize> {
+    for base in ["/home/", "/var/home/"] {
+        if let Some(rest) = dir.strip_prefix(base) {
+            // skip(1) drops the username component itself
+            return Some(rest.split('/').filter(|s| !s.is_empty()).skip(1).count());
+        }
+    }
+    if dir == "/root" {
+        return Some(0);
+    }
+    dir.strip_prefix("/root/")
+        .map(|r| r.split('/').filter(|s| !s.is_empty()).count())
+}
+
+/// A directory holding many UNRELATED things: its entry count says nothing about
+/// any particular binary inside it, so it may never vouch for one.
+fn is_container_dir(dir: &str) -> bool {
+    INSTALL_ROOTS
+        .iter()
+        .map(|r| r.trim_end_matches('/'))
+        .any(|r| dir == r || dir.ends_with(r))
+        || matches!(dir, "/" | "/home" | "/var/home" | "/root")
+        || home_relative_depth(dir).is_some_and(|d| d <= 1)
+}
+
 // ---------------------------------------------------------------------------
 // Usrmerge-aware canonical path
 // ---------------------------------------------------------------------------
@@ -483,10 +510,10 @@ fn populated_tree_within(exe: &str) -> bool {
         .ancestors()
         .skip(1) // skip the binary itself → start with its parent directory
         .take(MAX_UPWARD_DEPTH)
-        .take_while(|dir| {
-            let d = dir.to_string_lossy();
-            INSTALL_ROOTS.iter().any(|r| d.contains(*r)) // stop once we leave the install root
-        })
+        // R22-18: stop at the first directory that cannot vouch. Previously the
+        // boundary was INSTALL_ROOTS membership, which made the whole heuristic
+        // inert outside the allowlist.
+        .take_while(|dir| !is_container_dir(&dir.to_string_lossy()))
         .any(|dir| {
             std::fs::read_dir(dir)
                 .map(|rd| rd.take(INSTALL_TREE_MIN_FILES + 1).count() >= INSTALL_TREE_MIN_FILES)
@@ -541,7 +568,15 @@ pub fn exe_provenance(exe: &str, pid: u32) -> ExeProvenance {
         return ExeProvenance::NestedUserInstall;
     }
 
-    if !INSTALL_ROOTS.iter().any(|r| exe.contains(*r)) || !populated_tree_within(exe) {
+    // R22-18: volatile locations can never be an install tree, whatever the
+    // shape — an attacker fabricates one with `mkdir -p /tmp/x/bin` for free.
+    if is_volatile_exec_path(exe) {
+        return ExeProvenance::LoneDropped;
+    }
+
+    // Structure alone decides now; `is_container_dir` makes this safe to stand
+    // without the allowlist gate.
+    if !populated_tree_within(exe) {
         return ExeProvenance::LoneDropped;
     }
 
@@ -584,13 +619,6 @@ pub fn classify_listeners(ports: &[crate::models::PortInfo]) -> ListenerTiers {
             // User-writable tree: path does NOT clear; parentage needed later.
             // For now — provisional trust.
             (true, ExeProvenance::NestedUserInstall) => t.provisional.push(label),
-            // R22-17: a loopback-only listener from a non-volatile user path
-            // (e.g. JetBrains Toolbox, Discord, extracted tarball) is ordinary
-            // desktop software — stay VISIBLE as provisional but do not carry
-            // SEC-013's -20. /tmp, /var/tmp, /dev/shm and memfd keep full weight.
-            (true, ExeProvenance::LoneDropped) if !is_volatile_exec_path(exe) => {
-                t.provisional.push(label)
-            }
             // Lone/deleted binary OR exposed to the world → keep alert.
             _ => t.suspicious.push(label),
         }
@@ -751,23 +779,36 @@ mod tests {
     }
 
     #[test]
-    fn loopback_user_install_outside_allowlist_is_provisional_not_suspicious() {
-        let ports = vec![PortInfo {
-            port: "40083".into(),
-            protocol: "tcp".into(),
-            bind_address: "::ffff:127.0.0.1".into(),
-            exe_path: Some(
-                "/home/u/Downloads/jetbrains-toolbox-3.6.2/bin/jetbrains-toolbox".into(),
-            ),
-            process: "jetbrains-toolbox".into(),
-            pid: None,
-        }];
-        let t = classify_listeners(&ports);
-        assert!(
-            t.suspicious.is_empty(),
-            "loopback desktop app must not cost -20"
-        );
-        assert_eq!(t.provisional.len(), 1);
+    fn shared_user_dirs_cannot_vouch_for_a_binary() {
+        for d in [
+            "/home/u",
+            "/home/u/Downloads",
+            "/home/u/.cache",
+            "/home/u/.local/share",
+            "/opt",
+            "/usr/share",
+            "/root",
+            "/",
+        ] {
+            assert!(is_container_dir(d), "{d} must never vouch");
+        }
+        for d in [
+            "/home/u/Downloads/jetbrains-toolbox-3.6.2",
+            "/home/u/Downloads/jetbrains-toolbox-3.6.2/bin",
+            "/opt/app/bin",
+        ] {
+            assert!(!is_container_dir(d), "{d} is a dedicated app subtree");
+        }
+    }
+
+    #[test]
+    fn home_relative_depth_counts_below_the_user_dir() {
+        assert_eq!(home_relative_depth("/home/u"), Some(0));
+        assert_eq!(home_relative_depth("/home/u/Downloads"), Some(1));
+        assert_eq!(home_relative_depth("/home/u/Downloads/app/bin"), Some(3));
+        assert_eq!(home_relative_depth("/var/home/u/apps"), Some(1));
+        assert_eq!(home_relative_depth("/root"), Some(0));
+        assert_eq!(home_relative_depth("/opt/app"), None);
     }
 
     #[test]
