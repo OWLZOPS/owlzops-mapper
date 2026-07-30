@@ -1,33 +1,32 @@
 
 ## Bug Fixes
 
-- Used create_dynamic_table() for Security & Health Checks table
-- R22-02 SEC-040 race with dual /proc/modules snapshot
-- R22-01 self-integrity now checks IPv6 transport
-- R22-03 inheritable-only tagging in build_capability_names
-- R22-04 sshd fallback notes Match presence in coverage
-
-## Build System
-
-- **deps:** Bump tokio from 1.52.3 to 1.53.1 (#127)
-- **deps:** Bump taiki-e/install-action from 2.84.0 to 2.85.2 (#129)
-- **deps:** Bump clap from 4.6.3 to 4.6.4 (#131)
-- **deps:** Bump libc from 0.2.186 to 0.2.189 (#128)
-- **deps:** Bump serde from 1.0.228 to 1.0.229 (#132)
-- **deps:** Bump actions/labeler from 6.2.0 to 7.0.0
+- Make file_capabilities module available without local-scan feature
+- Gate fs_inventory import behind local-scan feature
+- Universal runtime classification (R22-08,R22-09,R22-10)
+- Close remaining runtime classification gaps (R22-11, R22-12)
+- Recognize /nix/store as system install root (NixOS)
+- NixOS support in provenance and listener classification (R22-15, R22-16)
+- Structural provenance for user-space installs (R22-18)
+- Home-base coverage, volatile precedence, and structural tests (R22-19, R22-20, R22-21)
+- Close /run blind spot and unify volatile path definitions (R22-22)
+- Exclude /run/wrappers from volatile/ephemeral classification (R22-23)
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.26
-- Update risk score table with SEC-038/039/040 and tiered CAP-002 weights
 - Update CHANGELOG for v0.5.27
 
 ## Features
 
-- SEC-041 ftrace/kprobe hook-surface audit with attribution
+- Universal container runtime detection (Docker + Podman)
+- Drift detection for setuid files and file capabilities
 
 ## Miscellaneous
 
-- **release:** Bump version to 0.5.27
-- **release:** Bump version to 0.5.27
+- **release:** Bump version to 0.5.28
+
+## Refactoring
+
+- Unify socket existence checks via socket_reachable helper (R22-13)
+- Extract classify_listeners for shadow-IT tiering
 
