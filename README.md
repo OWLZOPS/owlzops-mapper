@@ -79,20 +79,24 @@ mv owlzops-mapper owlzops-agent-linux
 
 ---
 
-## Highlights v0.5.27
+## Highlights v0.5.28
 
-**Ftrace/Kprobe Hook‑Surface Audit — Rootkit Detection via Syscall Hooking**
+**R22 Audit — False Positives Eliminated, Listener Tiering & Universal Runtime Detection**
 
-- **Ftrace hook attribution (SEC‑041).**  
-  Reads `/sys/kernel/tracing/enabled_functions` and classifies every ftrace callback on syscall entries. Legitimate sources (BPF fentry/Falco/Tetragon, kprobes, livepatch) are filtered out, leaving unattributed hooks as a high‑signal rootkit lead.
-- **Tiered scoring.**  
-  Callback in a hidden module (correlated with SEC‑040) → +55 (exit‑3 via SEC‑040). Callback in a visible module → +30 (verify EDR?). Unresolved callback under `kptr_restrict` → informational (weight 0), with drift detection still active.
-- **Live‑tracer awareness.**  
-  If any function tracer is active (`current_tracer ≠ nop`), attribution is suppressed and a coverage warning is emitted — we cannot distinguish a rootkit from intentional tracing.
-- **Drift detection.**  
-  New/disappeared syscall hooks are reported as `Degraded`/`Improved` in snapshot diffs, giving a weighted signal even when point‑in‑time findings are informational.
-- **UI‑fix: dynamic table width for Security & Health Checks.**  
-  The terminal table now adapts to content width, preventing misalignment from long lists (e.g. many failed services).
+- **Listener tiering rebuilt (SEC‑013/030/031).**  
+  Shadow‑IT classification now uses a single, shared function (`classify_listeners`) for both scoring and UI, eliminating a long‑standing source of potential divergence. Loopback‑only listeners from non‑volatile user paths (JetBrains Toolbox, extracted tarballs) are now correctly classified as *provisional* (weight 0) instead of *suspicious* (weight 20). Volatile locations (`/tmp`, `/var/tmp`, `/dev/shm`, `/memfd:`, `/run`) keep full weight.
+- **Structural provenance for user‑space installs.**  
+  The `populated_tree_within` heuristic now works outside the old allowlist, recognising unpacked application trees (e.g. `~/Downloads/jetbrains-toolbox-*/bin/…`) as legitimate installs while still flagging lone binaries in shared directories. This replaces the earlier tier‑level workaround with a proper structural fix.
+- **Universal container runtime detection (Docker + Podman).**  
+  The mapper probes both `/var/run/docker.sock` and `/run/podman/podman.sock` (including rootless Podman), and displays the active runtime name in all tables. Podman/CRI‑O control sockets are now recognised as full host‑takeover primitives (DOCK‑005), not just generic sensitive paths. Dead‑socket resilience is improved with explicit health‑check timeouts and coverage records.
+- **Blind spots closed: `/run`, `/var/home`, `/root`, `/nix/store`.**  
+  `/run/user/<uid>` (tmpfs, user‑writable without root) and Fedora Atomic’s `/var/home` are now correctly classified as user‑space, fixing a silent false‑negative in SEC‑013/015 and library injection. `/nix/store` paths are recognised as system installs, preventing trust downgrades on NixOS. `/root` binaries are now included in ephemeral detection.
+- **NixOS & non‑FHS coverage.**  
+  `/run/wrappers/bin` is added to the setuid/capability scan roots, and a coverage record is emitted when no standard binary roots exist, so an empty inventory is never mistaken for a clean result. `/run/wrappers/` is explicitly excluded from volatile classification to avoid contradicting the scan policy.
+- **Self‑integrity & sshd‑fallback hardening.**  
+  The SSH transport invariant check now streams `/proc/net/tcp{,6}` instead of reading whole files, and reads both IPv4 and IPv6 tables. The sshd fallback parser sorts glob‑includes alphabetically and records `Match`‑block presence in coverage.
+- **Container scoring texts are now runtime‑neutral.**  
+  DOCK‑005/007/008/009 no longer hardcode “Docker”, using the actual runtime name instead.
 
 ---
 
@@ -331,11 +335,11 @@ Colour legend: **green** < 40, **yellow** 40–69, **red** ≥ 70.
 | Docker: privileged containers | +10 |
 | Docker: dangerous capabilities | +10 |
 | Root login with password (combo) | +5 |
-| Container mounts Docker socket or host root | +15 |
+| Container mounts runtime control socket or host root | +15 |
 | Container mounts sensitive host path (writable) | +10 |
-| Docker: containers killed by OOM | +10 |
-| Docker: containers in restart loop | +5 |
-| Docker: unhealthy containers (failing healthcheck) | +10 |
+| Containers killed by OOM | +10 |
+| Containers in restart loop | +5 |
+| Unhealthy containers (failing healthcheck) | +10 |
 | **SEC‑015 – Privileged non‑root implant on network** | **+60** |
 | **SEC‑016 – Known malicious process (by name)** | **+60** |
 | **SEC‑017 – Fileless malware (deleted executable / memfd)** | **+60** |
@@ -458,6 +462,21 @@ See [LICENSE](LICENSE) for details.
 
 <details>
 <summary>Click to expand changelog (last 5 versions)</summary>
+
+### v0.5.27 (2026-07-28)
+
+**Ftrace/Kprobe Hook‑Surface Audit — Rootkit Detection via Syscall Hooking**
+
+- **Ftrace hook attribution (SEC‑041).**  
+  Reads `/sys/kernel/tracing/enabled_functions` and classifies every ftrace callback on syscall entries. Legitimate sources (BPF fentry/Falco/Tetragon, kprobes, livepatch) are filtered out, leaving unattributed hooks as a high‑signal rootkit lead.
+- **Tiered scoring.**  
+  Callback in a hidden module (correlated with SEC‑040) → +55 (exit‑3 via SEC‑040). Callback in a visible module → +30 (verify EDR?). Unresolved callback under `kptr_restrict` → informational (weight 0), with drift detection still active.
+- **Live‑tracer awareness.**  
+  If any function tracer is active (`current_tracer ≠ nop`), attribution is suppressed and a coverage warning is emitted — we cannot distinguish a rootkit from intentional tracing.
+- **Drift detection.**  
+  New/disappeared syscall hooks are reported as `Degraded`/`Improved` in snapshot diffs, giving a weighted signal even when point‑in‑time findings are informational.
+- **UI‑fix: dynamic table width for Security & Health Checks.**  
+  The terminal table now adapts to content width, preventing misalignment from long lists (e.g. many failed services).
 
 ### v0.5.26 (2026-07-27)
 
