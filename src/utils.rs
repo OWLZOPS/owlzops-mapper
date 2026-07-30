@@ -106,6 +106,10 @@ pub fn is_ephemeral_exec_path(path: &str) -> bool {
     path.starts_with("/tmp/")
         || path.starts_with("/var/tmp/")
         || path.starts_with("/dev/shm/")
+        // R22-22: /run is tmpfs and /run/user/<uid> is user-writable without
+        // root — a session-lifetime implant location. library_injection already
+        // treats /run as volatile for .so; exe must agree.
+        || path.starts_with("/run/")
         || HOME_BASES.iter().any(|b| path.starts_with(b))
         || path.starts_with("/memfd:")
 }
@@ -117,6 +121,7 @@ pub fn is_volatile_exec_path(path: &str) -> bool {
     path.starts_with("/tmp/")
         || path.starts_with("/var/tmp/")
         || path.starts_with("/dev/shm/")
+        || path.starts_with("/run/")
         || path.starts_with("/memfd:")
 }
 
@@ -887,5 +892,14 @@ mod tests {
             "/home/u/.cache/systemd-update",
             count
         ));
+    }
+
+    #[test]
+    fn run_tmpfs_is_volatile_and_reaches_classification() {
+        // /run/user/<uid> is user-writable tmpfs — a session-lifetime implant home.
+        assert!(is_ephemeral_exec_path("/run/user/1000/.x/implant"));
+        assert!(is_volatile_exec_path("/run/user/1000/.x/implant"));
+        // Boundary: /runtime-foo must NOT match.
+        assert!(!is_volatile_exec_path("/runtime-foo/bin/app"));
     }
 }
