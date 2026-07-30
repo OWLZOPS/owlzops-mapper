@@ -366,6 +366,10 @@ pub struct SecurityInfo {
     pub modules_disabled: Option<bool>, // None = unreadable
     #[serde(default)]
     pub lockdown: Option<String>, // None = not available
+
+    // ── SEC-043: ExecStart provenance for systemd units and cron ─
+    #[serde(default)]
+    pub exec_start_injections: Vec<ExecStartFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1014,6 +1018,28 @@ pub struct KprobeEntry {
     pub kind: char, // 'p' kprobe / 'r' kretprobe
     pub group_name: String,
     pub symbol: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEC-043: ExecStart provenance for systemd units and cron
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// An executable path found in an ExecStart directive of a systemd unit or cron job,
+/// flagged because it resides on an ephemeral/writable filesystem or lacks package ownership.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExecStartFinding {
+    /// "systemd:<unit>" or "cron:/etc/crontab" etc.
+    pub source: String,
+    /// Name of the unit or cron file
+    pub unit_name: String,
+    /// The executable path extracted (first token after stripping prefixes)
+    pub exec_path: String,
+    /// True if the path is on a volatile filesystem
+    pub volatile: bool,
+    /// Package that owns the file, if any
+    pub package: Option<String>,
+    /// Human-readable reason for flagging
+    pub reason: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
