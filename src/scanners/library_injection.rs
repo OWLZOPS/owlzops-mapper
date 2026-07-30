@@ -11,6 +11,9 @@ use crate::models::LibraryInjectionFinding;
 use crate::safe_io;
 use crate::verdict_cache::{Verdict, VerdictCache};
 
+// R22-22: single definition of "volatile" for both .so and exe paths.
+use crate::utils::is_volatile_exec_path as is_volatile_lib_path;
+
 /// Configuration for the memory scanner, passed down from CLI args.
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
@@ -66,17 +69,6 @@ const VENDOR_ROOTS: &[&str] = &[
     "/opt/google/chrome/",
 ];
 const VENDOR_ANCHOR_MIN_SO: usize = 3;
-
-/// Volatile paths where a loaded .so is genuinely suspicious.
-/// Differs from is_ephemeral_exec_path by NOT including /home,
-/// because user software (IDEs, VSCode) legitimately loads .so from /home.
-fn is_volatile_lib_path(p: &str) -> bool {
-    p.starts_with("/tmp/")
-        || p.starts_with("/var/tmp/")
-        || p.starts_with("/dev/shm/")
-        || p.starts_with("/run/")
-        || p.starts_with("/memfd:")
-}
 
 // ── REGION TIERING ─────────────────────────────────────────
 
