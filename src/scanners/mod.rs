@@ -50,4 +50,5 @@ mod ftrace;
 mod kernel_modules;
 #[cfg(feature = "local-scan")]
 mod kernel_taint;
+#[cfg(feature = "local-scan")]
 pub mod preload;
