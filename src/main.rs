@@ -282,6 +282,10 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     local_report.security.modules_disabled = modules_disabled;
                     local_report.security.lockdown = lockdown;
 
+                    // ── SEC-043: ExecStart provenance ──
+                    local_report.security.exec_start_injections =
+                        scanners::exec_provenance::scan_exec_provenance();
+
                     local_report.self_integrity = Some(SelfIntegrityReport {
                         compromised: integrity.compromised,
                         warnings: integrity.warnings,
@@ -629,6 +633,10 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 report.security.core_pattern = core_pattern;
                 report.security.modules_disabled = modules_disabled;
                 report.security.lockdown = lockdown;
+
+                // ── SEC-043: ExecStart provenance ──
+                report.security.exec_start_injections =
+                    scanners::exec_provenance::scan_exec_provenance();
 
                 report.self_integrity = Some(SelfIntegrityReport {
                     compromised: integrity.compromised,

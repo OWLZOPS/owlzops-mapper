@@ -576,6 +576,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         core_pattern: String::new(),
         modules_disabled: None,
         lockdown: None,
+        // ── SEC-043: will be populated by runner / main after scan ──
+        exec_start_injections: Vec::new(),
     }
 }
 
