@@ -87,6 +87,14 @@ pub fn is_loopback_bind(addr: &str) -> bool {
         || addr.strip_prefix("::ffff:").is_some_and(v4_loopback)
 }
 
+// ── User‑space path predicates (shared by shadow‑IT and injection scanners) ──
+
+/// Canonical home bases. `/var/home` is the physical location on Fedora
+/// Atomic (Silverblue/Kinoite/Bluefin); /home is a symlink there, and
+/// `/proc/<pid>/exe` reports the canonical path. Every predicate that
+/// reasons about "user‑writable space" must consult this list — R22‑19.
+pub(crate) const HOME_BASES: &[&str] = &["/home/", "/var/home/", "/root/"];
+
 /// Executables served from writable/ephemeral locations — a shared signal
 /// for shadow-IT (SEC-013), IoC (SEC-015) and ambiguous-malware corroboration.
 ///
@@ -98,13 +106,13 @@ pub fn is_ephemeral_exec_path(path: &str) -> bool {
     path.starts_with("/tmp/")
         || path.starts_with("/var/tmp/")
         || path.starts_with("/dev/shm/")
-        || path.starts_with("/home/")
+        || HOME_BASES.iter().any(|b| path.starts_with(b))
         || path.starts_with("/memfd:")
 }
 
 /// Volatile system locations: no legitimate long-lived install lives here.
-/// Narrower than `is_ephemeral_exec_path` — omits `/home`, where extracting a
-/// tarball into ~/Downloads or ~/Applications is ordinary, not a dropper signature.
+/// Narrower than `is_ephemeral_exec_path` — omits home bases, where extracting
+/// a tarball into ~/Downloads or ~/Applications is ordinary, not a dropper signature.
 pub fn is_volatile_exec_path(path: &str) -> bool {
     path.starts_with("/tmp/")
         || path.starts_with("/var/tmp/")
@@ -115,17 +123,22 @@ pub fn is_volatile_exec_path(path: &str) -> bool {
 /// Home-relative depth: /home/u → 0, /home/u/Downloads → 1, /home/u/a/b → 2.
 /// Covers /root and Fedora Atomic's /var/home/<user>.
 fn home_relative_depth(dir: &str) -> Option<usize> {
-    for base in ["/home/", "/var/home/"] {
-        if let Some(rest) = dir.strip_prefix(base) {
+    // The first two HOME_BASES are /home/ and /var/home/; /root/ is handled
+    // separately because its structure is flat (no username component to skip).
+    for base in HOME_BASES {
+        if *base == "/root/" {
+            if dir == "/root" {
+                return Some(0);
+            }
+            if let Some(rest) = dir.strip_prefix("/root/") {
+                return Some(rest.split('/').filter(|s| !s.is_empty()).count());
+            }
+        } else if let Some(rest) = dir.strip_prefix(base) {
             // skip(1) drops the username component itself
             return Some(rest.split('/').filter(|s| !s.is_empty()).skip(1).count());
         }
     }
-    if dir == "/root" {
-        return Some(0);
-    }
-    dir.strip_prefix("/root/")
-        .map(|r| r.split('/').filter(|s| !s.is_empty()).count())
+    None
 }
 
 /// A directory holding many UNRELATED things: its entry count says nothing about
@@ -502,10 +515,13 @@ pub fn in_foreign_mnt_ns(pid: u32) -> bool {
     matches!((p, host), (Some(a), Some(b)) if a != b)
 }
 
-/// Walk ancestors (up to MAX_UPWARD_DEPTH) and return true if any directory
-/// contains at least INSTALL_TREE_MIN_FILES entries — indicating a populated
-/// install tree rather than a sparse dropper location.
-fn populated_tree_within(exe: &str) -> bool {
+/// Testable core of `populated_tree_within`. Takes a directory-entry-count
+/// provider so the ancestor walk and boundary logic can be verified without
+/// touching the filesystem.
+fn populated_tree_within_with<F>(exe: &str, count_entries: F) -> bool
+where
+    F: Fn(&std::path::Path) -> Option<usize>,
+{
     std::path::Path::new(exe)
         .ancestors()
         .skip(1) // skip the binary itself → start with its parent directory
@@ -514,11 +530,18 @@ fn populated_tree_within(exe: &str) -> bool {
         // boundary was INSTALL_ROOTS membership, which made the whole heuristic
         // inert outside the allowlist.
         .take_while(|dir| !is_container_dir(&dir.to_string_lossy()))
-        .any(|dir| {
-            std::fs::read_dir(dir)
-                .map(|rd| rd.take(INSTALL_TREE_MIN_FILES + 1).count() >= INSTALL_TREE_MIN_FILES)
-                .unwrap_or(false)
-        })
+        .any(|dir| count_entries(dir).is_some_and(|n| n >= INSTALL_TREE_MIN_FILES))
+}
+
+/// Walk ancestors (up to MAX_UPWARD_DEPTH) and return true if any directory
+/// contains at least INSTALL_TREE_MIN_FILES entries — indicating a populated
+/// install tree rather than a sparse dropper location.
+fn populated_tree_within(exe: &str) -> bool {
+    populated_tree_within_with(exe, |dir| {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.take(INSTALL_TREE_MIN_FILES + 1).count())
+            .ok()
+    })
 }
 
 pub fn exe_provenance(exe: &str, pid: u32) -> ExeProvenance {
@@ -564,14 +587,16 @@ pub fn exe_provenance(exe: &str, pid: u32) -> ExeProvenance {
         };
     }
 
-    if RUNTIME_MANAGER_ROOTS.iter().any(|r| exe.contains(r)) {
-        return ExeProvenance::NestedUserInstall;
-    }
-
-    // R22-18: volatile locations can never be an install tree, whatever the
-    // shape — an attacker fabricates one with `mkdir -p /tmp/x/bin` for free.
+    // R22-18/20: volatile locations can never host an install tree, whatever
+    // the shape — an attacker fabricates one for free. MUST precede the
+    // runtime-manager check, which matches by substring and would otherwise
+    // vouch for /tmp/.nvm/payload.
     if is_volatile_exec_path(exe) {
         return ExeProvenance::LoneDropped;
+    }
+
+    if RUNTIME_MANAGER_ROOTS.iter().any(|r| exe.contains(r)) {
+        return ExeProvenance::NestedUserInstall;
     }
 
     // Structure alone decides now; `is_container_dir` makes this safe to stand
@@ -630,6 +655,7 @@ pub fn classify_listeners(ports: &[crate::models::PortInfo]) -> ListenerTiers {
 mod tests {
     use super::*;
     use crate::models::PortInfo;
+    use std::collections::HashMap;
 
     #[test]
     fn run_child_with_timeout_large_stdout_does_not_deadlock() {
@@ -779,6 +805,18 @@ mod tests {
     }
 
     #[test]
+    fn atomic_var_home_is_user_space() {
+        // Fedora Silverblue: /home is a symlink, /proc/<pid>/exe canonicalises
+        // to /var/home. Both must be treated as user-writable.
+        assert!(is_ephemeral_exec_path("/var/home/u/.cache/implant"));
+        assert!(is_ephemeral_exec_path("/root/x/payload"));
+        assert!(
+            !is_volatile_exec_path("/var/home/u/.cache/implant"),
+            "user space, not volatile"
+        );
+    }
+
+    #[test]
     fn shared_user_dirs_cannot_vouch_for_a_binary() {
         for d in [
             "/home/u",
@@ -822,5 +860,32 @@ mod tests {
             pid: None,
         }];
         assert_eq!(classify_listeners(&ports).suspicious.len(), 1);
+    }
+
+    #[test]
+    fn toolbox_subtree_vouches_shared_dir_does_not() {
+        let fs: HashMap<&str, usize> = HashMap::from([
+            ("/home/u/Downloads", 40),
+            ("/home/u/Downloads/jetbrains-toolbox-3.6.2/bin", 24),
+            ("/home/u/Downloads/jetbrains-toolbox-3.6.2", 3),
+            ("/home/u/.cache", 120),
+        ]);
+        let count = |p: &std::path::Path| fs.get(p.to_string_lossy().as_ref()).copied();
+
+        // Real app subtree → vouched, even though it lives under a shared dir.
+        assert!(populated_tree_within_with(
+            "/home/u/Downloads/jetbrains-toolbox-3.6.2/bin/jetbrains-toolbox",
+            count
+        ));
+        // Lone dropper in the same shared dir → the 40 siblings must NOT vouch.
+        assert!(!populated_tree_within_with(
+            "/home/u/Downloads/payload",
+            count
+        ));
+        // ~/.cache has 120 entries and still must not vouch.
+        assert!(!populated_tree_within_with(
+            "/home/u/.cache/systemd-update",
+            count
+        ));
     }
 }
