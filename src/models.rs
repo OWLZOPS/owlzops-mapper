@@ -353,6 +353,11 @@ pub struct SecurityInfo {
     /// ftrace/kprobe hook surface on syscall entries (SEC-041).
     #[serde(default)]
     pub ftrace_hooks: FtraceHookInventory,
+
+    // ── SEC-042: system-wide LD_PRELOAD via /etc/ld.so.preload ─────────
+    /// Entries found in /etc/ld.so.preload (system-wide library injection).
+    #[serde(default)]
+    pub preload_injections: Vec<PreloadFinding>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1001,4 +1006,27 @@ pub struct KprobeEntry {
     pub kind: char, // 'p' kprobe / 'r' kretprobe
     pub group_name: String,
     pub symbol: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEC-042: System-wide LD_PRELOAD (/etc/ld.so.preload)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// An entry found in /etc/ld.so.preload – a system-wide library that is
+/// injected into every dynamically-linked process without a trace in per-process
+/// environment or (if non-volatile) /proc/pid/maps.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PreloadFinding {
+    /// Path to the preloaded shared object (as written in the file).
+    pub path: String,
+    /// True when the path resides on a volatile filesystem (tmpfs, devtmpfs, …).
+    /// Non-volatile + unpackaged → strong IoC.
+    pub volatile: bool,
+    /// Resolved package name, if the file belongs to a known package.
+    /// `None` if not from a package or provenance unavailable.
+    pub package: Option<String>,
+    /// Number of processes that have this object mapped (cross-referenced from
+    /// /proc/<pid>/maps). Large numbers → systemic preload.
+    #[serde(default)]
+    pub mapped_by_pids: Option<usize>,
 }
