@@ -572,6 +572,10 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         ftrace_hooks: crate::scanners::ftrace::gather_ftrace_hooks(),
         // ── SEC-042: will be populated by runner / main after scan ──
         preload_injections: Vec::new(),
+        // ── SEC-044: will be populated by runner / main after scan ──
+        core_pattern: String::new(),
+        modules_disabled: None,
+        lockdown: None,
     }
 }
 
