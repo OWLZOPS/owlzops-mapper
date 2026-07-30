@@ -517,6 +517,16 @@ pub fn exe_provenance(exe: &str, pid: u32) -> ExeProvenance {
         };
     }
 
+    // NixOS / Nix: /nix/store/<hash>-<pkg>/bin/<name> is root-owned,
+    // read-only, content-addressed. Treat as installed.
+    if exe.starts_with("/nix/store/") {
+        return if root_owned {
+            ExeProvenance::InstalledApp
+        } else {
+            ExeProvenance::LoneDropped // should never happen
+        };
+    }
+
     if RUNTIME_MANAGER_ROOTS.iter().any(|r| exe.contains(r)) {
         return ExeProvenance::NestedUserInstall;
     }
@@ -530,6 +540,41 @@ pub fn exe_provenance(exe: &str, pid: u32) -> ExeProvenance {
     } else {
         ExeProvenance::NestedUserInstall
     }
+}
+
+/// Tiered shadow-IT listener classification. Single source of truth for both
+/// scoring (SEC-013/030/031) and terminal rendering — they must never disagree.
+#[derive(Default)]
+pub struct ListenerTiers {
+    pub suspicious: Vec<String>,  // SEC-013, weight 20
+    pub devtool: Vec<String>,     // SEC-030, advisory
+    pub provisional: Vec<String>, // SEC-031, provisional
+}
+
+pub fn classify_listeners(ports: &[crate::models::PortInfo]) -> ListenerTiers {
+    let mut t = ListenerTiers::default();
+    for port in ports {
+        let Some(exe) = port.exe_path.as_deref() else {
+            continue;
+        };
+        if !is_ephemeral_exec_path(exe) {
+            continue;
+        }
+        let label = format!(
+            "{}/{} on {} ({})",
+            port.port, port.protocol, port.bind_address, exe
+        );
+        let prov = port
+            .pid
+            .map(|p| exe_provenance(exe, p))
+            .unwrap_or(ExeProvenance::LoneDropped);
+        match (is_loopback_bind(&port.bind_address), prov) {
+            (true, ExeProvenance::InstalledApp) => t.devtool.push(label),
+            (true, ExeProvenance::NestedUserInstall) => t.provisional.push(label),
+            _ => t.suspicious.push(label),
+        }
+    }
+    t
 }
 
 #[cfg(test)]
