@@ -102,6 +102,16 @@ pub fn is_ephemeral_exec_path(path: &str) -> bool {
         || path.starts_with("/memfd:")
 }
 
+/// Volatile system locations: no legitimate long-lived install lives here.
+/// Narrower than `is_ephemeral_exec_path` — omits `/home`, where extracting a
+/// tarball into ~/Downloads or ~/Applications is ordinary, not a dropper signature.
+pub fn is_volatile_exec_path(path: &str) -> bool {
+    path.starts_with("/tmp/")
+        || path.starts_with("/var/tmp/")
+        || path.starts_with("/dev/shm/")
+        || path.starts_with("/memfd:")
+}
+
 // ---------------------------------------------------------------------------
 // Usrmerge-aware canonical path
 // ---------------------------------------------------------------------------
@@ -569,8 +579,19 @@ pub fn classify_listeners(ports: &[crate::models::PortInfo]) -> ListenerTiers {
             .map(|p| exe_provenance(exe, p))
             .unwrap_or(ExeProvenance::LoneDropped);
         match (is_loopback_bind(&port.bind_address), prov) {
+            // Root-owned tree: path alone is sufficient (need root to place binary).
             (true, ExeProvenance::InstalledApp) => t.devtool.push(label),
+            // User-writable tree: path does NOT clear; parentage needed later.
+            // For now — provisional trust.
             (true, ExeProvenance::NestedUserInstall) => t.provisional.push(label),
+            // R22-17: a loopback-only listener from a non-volatile user path
+            // (e.g. JetBrains Toolbox, Discord, extracted tarball) is ordinary
+            // desktop software — stay VISIBLE as provisional but do not carry
+            // SEC-013's -20. /tmp, /var/tmp, /dev/shm and memfd keep full weight.
+            (true, ExeProvenance::LoneDropped) if !is_volatile_exec_path(exe) => {
+                t.provisional.push(label)
+            }
+            // Lone/deleted binary OR exposed to the world → keep alert.
             _ => t.suspicious.push(label),
         }
     }
@@ -580,6 +601,7 @@ pub fn classify_listeners(ports: &[crate::models::PortInfo]) -> ListenerTiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::PortInfo;
 
     #[test]
     fn run_child_with_timeout_large_stdout_does_not_deadlock() {
@@ -715,5 +737,49 @@ mod tests {
             is_standard_install_path("/nix/store/0m0a1zw-coreutils-9.5/bin/ls"),
             "NixOS system binaries must not be treated as non-standard"
         );
+    }
+
+    #[test]
+    fn volatile_paths_are_narrower_than_ephemeral() {
+        assert!(is_ephemeral_exec_path("/home/u/Downloads/app-1.2/bin/app"));
+        assert!(!is_volatile_exec_path("/home/u/Downloads/app-1.2/bin/app"));
+
+        for p in ["/tmp/x", "/var/tmp/x", "/dev/shm/x", "/memfd:x"] {
+            assert!(is_volatile_exec_path(p), "{p} must stay volatile");
+        }
+        assert!(!is_volatile_exec_path("/usr/bin/nginx"));
+    }
+
+    #[test]
+    fn loopback_user_install_outside_allowlist_is_provisional_not_suspicious() {
+        let ports = vec![PortInfo {
+            port: "40083".into(),
+            protocol: "tcp".into(),
+            bind_address: "::ffff:127.0.0.1".into(),
+            exe_path: Some(
+                "/home/u/Downloads/jetbrains-toolbox-3.6.2/bin/jetbrains-toolbox".into(),
+            ),
+            process: "jetbrains-toolbox".into(),
+            pid: None,
+        }];
+        let t = classify_listeners(&ports);
+        assert!(
+            t.suspicious.is_empty(),
+            "loopback desktop app must not cost -20"
+        );
+        assert_eq!(t.provisional.len(), 1);
+    }
+
+    #[test]
+    fn loopback_volatile_path_keeps_full_weight() {
+        let ports = vec![PortInfo {
+            port: "4444".into(),
+            protocol: "tcp".into(),
+            bind_address: "127.0.0.1".into(),
+            exe_path: Some("/dev/shm/.hidden/implant".into()),
+            process: "implant".into(),
+            pid: None,
+        }];
+        assert_eq!(classify_listeners(&ports).suspicious.len(), 1);
     }
 }

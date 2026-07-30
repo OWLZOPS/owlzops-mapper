@@ -734,39 +734,10 @@ fn render_security_health(report: &AgentReport) {
     }
 
     // ── Shadow IT & Suspicious Listeners ───────────────────────────────
-    let mut shadow_it_ports = Vec::new();
-    let mut devtool_ports = Vec::new();
-    let mut prov_ports = Vec::new();
+    let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
-    for port in &report.network.listening_ports {
-        if let Some(exe) = &port.exe_path
-            && crate::utils::is_ephemeral_exec_path(exe)
-        {
-            let loopback = crate::utils::is_loopback_bind(&port.bind_address);
-            let label = format!(
-                "{}/{} on {} ({})",
-                port.port, port.protocol, port.bind_address, exe
-            );
-
-            let prov = port
-                .pid
-                .map(|p| crate::utils::exe_provenance(exe, p))
-                .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
-
-            match (loopback, prov) {
-                // Root-owned tree: path alone is sufficient (need root to place binary).
-                (true, crate::utils::ExeProvenance::InstalledApp) => devtool_ports.push(label),
-                // User-writable tree: path does NOT clear; parentage needed later.
-                // For now — provisional trust.
-                (true, crate::utils::ExeProvenance::NestedUserInstall) => prov_ports.push(label),
-                // Lone/deleted binary OR exposed to the world → keep alert.
-                _ => shadow_it_ports.push(label),
-            }
-        }
-    }
-
-    if !shadow_it_ports.is_empty() {
-        let shadow_cell = Cell::new(format!("{} listener(s)", shadow_it_ports.len()))
+    if !tiers.suspicious.is_empty() {
+        let shadow_cell = Cell::new(format!("{} listener(s)", tiers.suspicious.len()))
             .fg(Color::Red)
             .add_attribute(Attribute::Bold);
         t_risk.add_row(vec![
@@ -775,15 +746,18 @@ fn render_security_health(report: &AgentReport) {
         ]);
     }
 
-    if !devtool_ports.is_empty() {
+    if !tiers.devtool.is_empty() {
         let dev_cell =
-            Cell::new(format!("{} loopback IPC port(s)", devtool_ports.len())).fg(Color::Green);
+            Cell::new(format!("{} loopback IPC port(s)", tiers.devtool.len())).fg(Color::Green);
         t_risk.add_row(vec![Cell::new("Developer Tools (IPC)"), dev_cell]);
     }
 
-    if !prov_ports.is_empty() {
-        let prov_cell =
-            Cell::new(format!("{} user-space IPC port(s)", prov_ports.len())).fg(Color::Yellow);
+    if !tiers.provisional.is_empty() {
+        let prov_cell = Cell::new(format!(
+            "{} user-space IPC port(s)",
+            tiers.provisional.len()
+        ))
+        .fg(Color::Yellow);
         t_risk.add_row(vec![Cell::new("User Tools (Provisional)"), prov_cell]);
     }
 

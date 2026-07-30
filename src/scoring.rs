@@ -309,44 +309,9 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── Shadow IT & Suspicious Listeners — tiered by exposure × provenance ──
-    let mut suspicious_listeners = Vec::new(); // SEC-013 Warning (-20)
-    let mut devtool_listeners = Vec::new(); // SEC-030 Advisory (0)
-    let mut provisional_listeners = Vec::new(); // SEC-031 Provisional (0)
+    let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
-    for port in &report.network.listening_ports {
-        let Some(exe) = port.exe_path.as_deref() else {
-            continue;
-        };
-
-        if !crate::utils::is_ephemeral_exec_path(exe) {
-            continue; // packaged/system path → normal service
-        }
-
-        let loopback = crate::utils::is_loopback_bind(&port.bind_address);
-        let label = format!(
-            "{}/{} on {} ({})",
-            port.port, port.protocol, port.bind_address, exe
-        );
-
-        let prov = port
-            .pid
-            .map(|p| crate::utils::exe_provenance(exe, p))
-            .unwrap_or(crate::utils::ExeProvenance::LoneDropped);
-
-        match (loopback, prov) {
-            // Root-owned tree: path alone is sufficient (need root to place binary).
-            (true, crate::utils::ExeProvenance::InstalledApp) => devtool_listeners.push(label),
-            // User-writable tree: path does NOT clear; parentage needed later.
-            // For now — provisional trust.
-            (true, crate::utils::ExeProvenance::NestedUserInstall) => {
-                provisional_listeners.push(label)
-            }
-            // Lone/deleted binary OR exposed to the world → keep alert.
-            _ => suspicious_listeners.push(label),
-        }
-    }
-
-    if !suspicious_listeners.is_empty() {
+    if !tiers.suspicious.is_empty() {
         findings.push(Finding {
             id: "SEC-013",
             title: "Suspicious process listening on network port (Shadow IT)".to_string(),
@@ -354,16 +319,15 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 20,
             evidence: format!(
                 "{} suspicious listener(s): {}",
-                suspicious_listeners.len(),
-                suspicious_listeners.join(", ")
+                tiers.suspicious.len(),
+                tiers.suspicious.join(", ")
             ),
             suppressed: None,
             cis_ref: None,
         });
     }
 
-    // Loopback IPC of installed applications — honest informational state.
-    if !devtool_listeners.is_empty() {
+    if !tiers.devtool.is_empty() {
         findings.push(Finding {
             id: "SEC-030",
             title: "Developer tool listening on loopback (IPC) — informational".to_string(),
@@ -371,8 +335,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 0,
             evidence: format!(
                 "{} loopback-only listener(s) from root-owned installed applications: {}",
-                devtool_listeners.len(),
-                devtool_listeners.join(", ")
+                tiers.devtool.len(),
+                tiers.devtool.join(", ")
             ),
             suppressed: Some(
                 "Loopback-only bind from a populated ROOT-OWNED install tree.".to_string(),
@@ -381,8 +345,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Loopback IPC from user-writable directory (e.g. JetBrains Cache) — Provisional Trust.
-    if !provisional_listeners.is_empty() {
+    if !tiers.provisional.is_empty() {
         findings.push(Finding {
             id: "SEC-031",
             title: "User-space tool listening on loopback (IPC) — PROVISIONAL".to_string(),
@@ -390,8 +353,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             weight: 0,
             evidence: format!(
                 "{} loopback-only listener(s) nested under user-writable install tree (parentage unverified): {}",
-                provisional_listeners.len(),
-                provisional_listeners.join(", ")
+                tiers.provisional.len(),
+                tiers.provisional.join(", ")
             ),
             suppressed: Some(
                 "Loopback-only bind from a user-writable directory. Trust is PROVISIONAL until parentage is verified.".to_string(),
