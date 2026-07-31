@@ -103,6 +103,17 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::scanners::packages::gather_packages_info(want_refresh_packages)
         });
 
+        // SEC-042/043/044 – blocking I/O, depend only on `deep`.
+        // Spawn here to run in parallel with other scanners and be included
+        // in duration_secs (fixes R22-34: timer stopped before these ran).
+        let persistence_task = tokio::task::spawn_blocking(move || {
+            (
+                crate::scanners::preload::scan_ld_preload(),
+                crate::scanners::kernel_facts::gather_kernel_facts(),
+                crate::scanners::exec_provenance::scan_exec_provenance(deep),
+            )
+        });
+
         let (
             host_res,
             dbs_res,
@@ -111,6 +122,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             security_res,
             topology_info,
             packages_res,
+            persistence_res,
         ) = tokio::join!(
             host_task,
             dbs_task,
@@ -119,6 +131,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             security_task,
             tokio::spawn(crate::scanners::runtime::gather_runtime_topology()),
             packages_task,
+            persistence_task,
         );
 
         let mut scan_warnings = Vec::new();
@@ -165,6 +178,13 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
+        let (preload, kernel_facts, exec_start) = persistence_res.unwrap_or_else(|e| {
+            warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");
+            scan_warnings
+                .push("persistence scanner panicked — SEC-042/043/044 NOT verified".to_string());
+            (Vec::new(), (String::new(), None, None), Vec::new())
+        });
+
         // Drain coverage after all scanners finished – scope is attached here,
         // not in the scanners, because they run on arbitrary blocking threads.
         let coverage_warnings = crate::coverage::drain_scoped(&scan_id);
@@ -191,19 +211,13 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             self_integrity: None,
         };
 
-        // ── SEC-042: system-wide LD_PRELOAD ──
-        report.security.preload_injections = crate::scanners::preload::scan_ld_preload();
-
-        // ── SEC-044: kernel security facts ──
-        let (core_pattern, modules_disabled, lockdown) =
-            crate::scanners::kernel_facts::gather_kernel_facts();
+        // SEC-042/043/044 results (already computed in persistence_task)
+        report.security.preload_injections = preload;
+        let (core_pattern, modules_disabled, lockdown) = kernel_facts;
         report.security.core_pattern = core_pattern;
         report.security.modules_disabled = modules_disabled;
         report.security.lockdown = lockdown;
-
-        // ── SEC-043: ExecStart provenance ──
-        report.security.exec_start_injections =
-            crate::scanners::exec_provenance::scan_exec_provenance();
+        report.security.exec_start_injections = exec_start;
 
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 

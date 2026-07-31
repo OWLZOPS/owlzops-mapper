@@ -14,15 +14,31 @@ use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+/// Return `true` if the unit path already resides in a vendor-controlled
+/// systemd directory.  For those units the owning package is known from the
+/// directory hierarchy (rule R22-30) and does **not** need an `rpm -qf` call.
+fn unit_path_is_vendor_dir(path: &str) -> bool {
+    let canon = crate::utils::canon_path(path);
+    canon.starts_with("/usr/lib/systemd/system/") || canon.starts_with("/usr/lib/systemd/user/")
+    // On Fedora /lib/systemd/system is a symlink to /usr/lib/systemd/system,
+    // so canonicalization already resolves it.  No extra prefix is required.
+}
+
 /// Scan all systemd unit directories and cron files, returning any suspicious exec paths.
-pub fn scan_exec_provenance() -> Vec<ExecStartFinding> {
+///
+/// When `deep` is false, only unit-file authorship is resolved; the provenance
+/// of the target executable (`SEC-045` unpackaged target) is skipped, saving
+/// ~350 `rpm -qf` spawns.  Deep mode performs full resolution for inventory.
+pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
     let mut findings: Vec<ExecStartFinding> = Vec::new();
     let mut candidate_set: HashSet<String> = HashSet::new();
 
-    // Helper – push a finding and record its canonical path for batch resolution
+    // Helper – push a finding and (when deep) record its canonical path for batch resolution
     let mut push_candidate = |finding: ExecStartFinding| {
-        let canon = crate::utils::canon_path(&finding.exec_path).into_owned();
-        candidate_set.insert(canon);
+        if deep {
+            let canon = crate::utils::canon_path(&finding.exec_path).into_owned();
+            candidate_set.insert(canon);
+        }
         findings.push(finding);
     };
 
@@ -63,17 +79,20 @@ pub fn scan_exec_provenance() -> Vec<ExecStartFinding> {
     // Cron jobs
     scan_cron_files(&mut push_candidate);
 
-    // Add unit paths as candidates for authorship resolution
+    // Add unit paths as candidates for authorship resolution.
+    // Units already inside the vendor directory are skipped: their package
+    // ownership is implied by the directory (R22-30), saving ~400 rpm calls.
     for f in &findings {
-        if !f.unit_path.is_empty() {
+        if !f.unit_path.is_empty() && !unit_path_is_vendor_dir(&f.unit_path) {
             candidate_set.insert(crate::utils::canon_path(&f.unit_path).into_owned());
         }
     }
 
-    // Resolve package ownership for both targets and unit files in one batch
+    // Resolve package ownership for the collected candidates in one batch
     if !candidate_set.is_empty() {
         let prov = crate::scanners::provenance::resolve_batch(&candidate_set);
         for f in &mut findings {
+            // target executable – resolved only when deep is true (insertion skipped above)
             f.package = prov.lookup(crate::utils::canon_path(&f.exec_path).as_ref());
             if !f.unit_path.is_empty() {
                 f.unit_package = prov.lookup(crate::utils::canon_path(&f.unit_path).as_ref());
