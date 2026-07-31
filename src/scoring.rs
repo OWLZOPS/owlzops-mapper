@@ -1,4 +1,7 @@
-use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin, ProvenanceSource};
+use crate::coverage;
+use crate::models::{
+    AgentReport, CronSeverity, ExecWritability, InjectionClass, Origin, ProvenanceSource,
+};
 /// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
 /// unprivileged user. Shared with `security.rs` so the policy has exactly one
 /// source of truth and cannot drift.
@@ -1466,27 +1469,89 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-043 – ExecStart provenance ─────────────────────────────────────
-    for f in &report.security.exec_start_injections {
-        let is_ioc = f.volatile
-            || (f.package.is_none()
-                && report.security.provenance_source != ProvenanceSource::Unavailable);
-        if is_ioc {
+    // ── SEC-043 / SEC-045 / SEC-046 – ExecStart provenance ──────────────
+    {
+        let inj = &report.security.exec_start_injections;
+        let pick = |p: &dyn Fn(&crate::models::ExecStartFinding) -> bool| -> Vec<String> {
+            inj.iter()
+                .filter(|f| p(f))
+                .map(|f| format!("{} → {}", f.source, f.exec_path))
+                .collect()
+        };
+
+        // Volatile target — the most severe IoC.
+        let volatile = pick(&|f| f.volatile);
+        if !volatile.is_empty() {
             findings.push(Finding {
                 id: "SEC-043",
-                title: "Suspicious ExecStart or cron command path".to_string(),
+                title: "ACTIVE COMPROMISE: unit/cron executes from a volatile filesystem".into(),
                 category: Category::Security,
-                weight: 20,
+                weight: 55,
                 evidence: format!(
-                    "{} in {} (volatile: {}, package: {:?})",
-                    f.exec_path,
-                    f.source,
-                    f.volatile,
-                    f.package.as_deref()
+                    "{} persistence entr(ies) whose target lives on tmpfs — no legitimate \
+                     service is installed there: {}",
+                    volatile.len(),
+                    volatile.join("; ")
                 ),
                 suppressed: None,
                 cis_ref: None,
             });
+        }
+
+        // Non-root writable target — privilege escalation surface.
+        let weak = pick(&|f| !f.volatile && f.writability == ExecWritability::NonRootWritable);
+        if !weak.is_empty() {
+            findings.push(Finding {
+                id: "SEC-046",
+                title: "Root-executed unit/cron target is writable by a non-root principal".into(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!(
+                    "{} entr(ies) where the executable or its parent directory is non-root-owned \
+                     or group/other-writable — anyone with that access controls what root runs: {}",
+                    weak.len(),
+                    weak.join("; ")
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // Unpackaged but root-only — informational, weight 0.
+        let unpackaged = pick(&|f| {
+            !f.volatile && f.writability == ExecWritability::RootOnly && f.package.is_none()
+        });
+        if !unpackaged.is_empty() {
+            findings.push(Finding {
+                id: "SEC-045",
+                title: "Unit/cron targets with no package owner (inventory)".into(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} root-owned target(s) unresolved: {}",
+                    unpackaged.len(),
+                    unpackaged.join("; ")
+                ),
+                suppressed: Some(
+                    "Root-owned, non-writable and outside any volatile filesystem: only root \
+                     could have placed these. Package databases miss locally built software, \
+                     vendor packages and alternatives symlinks, so absence of an owner is not \
+                     evidence. A target that BECOMES unpackaged between snapshots is surfaced \
+                     as drift by `compare`."
+                        .into(),
+                ),
+                cis_ref: None,
+            });
+        }
+
+        // Unknown writability — coverage only.
+        let unknown = pick(&|f| f.writability == ExecWritability::Unknown);
+        if !unknown.is_empty() {
+            coverage::record(format!(
+                "exec_provenance: {} target(s) could not be stat'ed (EACCES) — writability \
+                 UNVERIFIED, not assumed safe",
+                unknown.len()
+            ));
         }
     }
 
@@ -1494,6 +1559,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if report.security.core_pattern.starts_with('|')
         && !report.security.core_pattern.contains("systemd-coredump")
         && !report.security.core_pattern.contains("abrt-hook-ccpp")
+        && !report.security.core_pattern.contains("apport")
+    // Ubuntu default crash handle
     {
         findings.push(Finding {
             id: "SEC-044",
@@ -2173,9 +2240,9 @@ impl CriticalFlags {
         // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
         // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
         // modules are excluded upstream, so FP is near-zero.
-        const IOC_IDS: [&str; 13] = [
+        const IOC_IDS: [&str; 14] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042",
+            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043",
         ];
         let count_sysctl = findings
             .iter()
