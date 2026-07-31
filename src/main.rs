@@ -272,19 +272,8 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         }
                     };
 
-                    // ── SEC-042: system-wide LD_PRELOAD ──
-                    local_report.security.preload_injections = scanners::preload::scan_ld_preload();
-
-                    // ── SEC-044: kernel security facts ──
-                    let (core_pattern, modules_disabled, lockdown) =
-                        scanners::kernel_facts::gather_kernel_facts();
-                    local_report.security.core_pattern = core_pattern;
-                    local_report.security.modules_disabled = modules_disabled;
-                    local_report.security.lockdown = lockdown;
-
-                    // ── SEC-043: ExecStart provenance ──
-                    local_report.security.exec_start_injections =
-                        scanners::exec_provenance::scan_exec_provenance();
+                    // (SEC-042/043/044 scanners run inside run_local_scan_async —
+                    //  no duplication here.)
 
                     local_report.self_integrity = Some(SelfIntegrityReport {
                         compromised: integrity.compromised,
@@ -624,19 +613,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     }
                 };
 
-                // ── SEC-042: system-wide LD_PRELOAD ──
-                report.security.preload_injections = scanners::preload::scan_ld_preload();
-
-                // ── SEC-044: kernel security facts ──
-                let (core_pattern, modules_disabled, lockdown) =
-                    scanners::kernel_facts::gather_kernel_facts();
-                report.security.core_pattern = core_pattern;
-                report.security.modules_disabled = modules_disabled;
-                report.security.lockdown = lockdown;
-
-                // ── SEC-043: ExecStart provenance ──
-                report.security.exec_start_injections =
-                    scanners::exec_provenance::scan_exec_provenance();
+                // (SEC-042/043/044 are handled by run_local_scan_async)
 
                 report.self_integrity = Some(SelfIntegrityReport {
                     compromised: integrity.compromised,

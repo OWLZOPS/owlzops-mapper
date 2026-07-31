@@ -1,3 +1,4 @@
+use crate::coverage;
 use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin, ProvenanceSource};
 /// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
 /// unprivileged user. Shared with `security.rs` so the policy has exactly one
@@ -829,20 +830,48 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    /// A single non-writable anonymous exec page is a trampoline/thunk slot
+    /// (libffi closures, PLT stubs), not a payload: 4 KiB is the mmap granule, and
+    /// r-x without w means the mapping already went through a W→X transition, which
+    /// is disciplined-JIT behaviour. Route to provisional instead of weighting it.
+    const TRAMPOLINE_MAX_BYTES: u64 = 4096;
+
+    fn is_trampoline_page(f: &crate::models::LibraryInjectionFinding) -> bool {
+        if !f.source.starts_with("maps-anon-rx") && !f.source.contains("r-xp") {
+            return false;
+        }
+        if let Some(region) = &f.region_addr
+            && let Some((start, end)) = region.split_once('-')
+            && let (Ok(s), Ok(e)) = (
+                usize::from_str_radix(start, 16),
+                usize::from_str_radix(end, 16),
+            )
+        {
+            return e - s == TRAMPOLINE_MAX_BYTES as usize;
+        }
+        false
+    }
+
     let mut classic_injections = Vec::new();
     let mut deep_critical = Vec::new();
     let mut memory_anomalies = Vec::new();
     let mut jit_advisories = Vec::new();
-    let mut trusted_unverified = Vec::new();
+    let mut provisional_regions = Vec::new(); // formerly trusted_unverified, now includes trampolines
     let mut unlink_ghosts = Vec::new();
 
     for finding in &report.security.library_injections {
         match mem_bucket(finding, report) {
             MemBucket::Classic => classic_injections.push(finding),
             MemBucket::DeepCritical => deep_critical.push(finding),
-            MemBucket::Anomaly => memory_anomalies.push(finding),
+            MemBucket::Anomaly => {
+                if is_trampoline_page(finding) {
+                    provisional_regions.push(finding); // trampoline → informational
+                } else {
+                    memory_anomalies.push(finding);
+                }
+            }
             MemBucket::Advisory => jit_advisories.push(finding),
-            MemBucket::TrustedUnverified => trusted_unverified.push(finding),
+            MemBucket::TrustedUnverified => provisional_regions.push(finding),
             MemBucket::UnlinkGhost => unlink_ghosts.push(finding),
         }
     }
@@ -904,7 +933,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-026 – Memory anomalies
+    // SEC-026 – Memory anomalies (now excludes trampoline pages)
     if !memory_anomalies.is_empty() {
         let mut by_process: std::collections::HashMap<String, (usize, Option<String>)> =
             std::collections::HashMap::new();
@@ -950,10 +979,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-029 – Trusted but unverified
-    if !trusted_unverified.is_empty() {
+    // SEC-029 – Provisional trust (includes trampolines, trusted unverified, etc.)
+    if !provisional_regions.is_empty() {
         let mut by_proc = std::collections::HashMap::new();
-        for f in &trusted_unverified {
+        for f in &provisional_regions {
             *by_proc
                 .entry(format!("{} (pid {})", f.process, f.pid))
                 .or_insert(0usize) += 1;
@@ -966,18 +995,17 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-029",
-            title: "Trusted-path executable memory — UNVERIFIED (no JIT signature)".to_string(),
+            title: "Provisional memory regions (trampolines, unverified, etc.)".to_string(),
             category: Category::Security,
             weight: 0,
             evidence: format!(
-                "{} region(s) in allowlisted binaries; no malice indicators (entropy < 7.0, no image \
-                 header) but JIT shape not yet attributed — provisional trust, add a runtime signature: {}",
-                trusted_unverified.len(),
+                "{} region(s) in allowlisted or low-risk patterns (e.g. single-page r-x trampolines): {}",
+                provisional_regions.len(),
                 list
             ),
             suppressed: Some(
-                "Trusted binary path; no malice indicators observed at the executed tier \
-                 (deep forensics, when run, found none). Trust is PROVISIONAL, not verified."
+                "These regions match known benign patterns (trampoline pages, unverified JIT). \
+                 Trust is PROVISIONAL; a new region between snapshots is surfaced as drift."
                     .to_string(),
             ),
             cis_ref: None,
@@ -1428,6 +1456,221 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-042 – System-wide LD_PRELOAD (/etc/ld.so.preload) ──────────────
+    for f in &report.security.preload_injections {
+        let is_ioc = f.volatile
+            || (f.package.is_none()
+                && report.security.provenance_source != ProvenanceSource::Unavailable);
+        if is_ioc {
+            findings.push(Finding {
+                id: "SEC-042",
+                title: "System-wide LD_PRELOAD injected".to_string(),
+                category: Category::Security,
+                weight: 60,
+                evidence: format!(
+                    "{} (volatile: {}, package: {:?})",
+                    f.path,
+                    f.volatile,
+                    f.package.as_deref()
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        } else if f.package.is_none()
+            && report.security.provenance_source == ProvenanceSource::Unavailable
+        {
+            findings.push(Finding {
+                id: "SEC-042",
+                title: "System-wide LD_PRELOAD injected (ownership unverifiable)".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} (provenance unavailable — cannot verify library origin)",
+                    f.path
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
+    {
+        use crate::models::ExecWritability as W;
+        let inj = &report.security.exec_start_injections;
+
+        // Helper: collect evidence strings for findings matching a predicate
+        let sel = |p: &dyn Fn(&crate::models::ExecStartFinding) -> bool| -> Vec<String> {
+            inj.iter()
+                .filter(|f| p(f))
+                .map(|f| format!("{} → {}", f.source, f.exec_path))
+                .collect()
+        };
+
+        // Tier 1 — live rogue payload on tmpfs, declared by an unpackaged unit
+        let live_rogue =
+            sel(&|f| f.volatile && f.writability != W::Missing && f.unit_package.is_none());
+        if !live_rogue.is_empty() {
+            findings.push(Finding {
+                id: "SEC-043",
+                title: "ACTIVE COMPROMISE: unpackaged unit executes a live target on tmpfs".into(),
+                category: Category::Security,
+                weight: 55,
+                evidence: format!(
+                    "{} entr(ies) where an unpackaged unit/cron file points at an EXISTING \
+                     executable on a volatile filesystem: {}",
+                    live_rogue.len(),
+                    live_rogue.join("; ")
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // Tier 2 — live vendor unit on tmpfs (e.g. LXD agent, cloud-init)
+        let live_vendor =
+            sel(&|f| f.volatile && f.writability != W::Missing && f.unit_package.is_some());
+        if !live_vendor.is_empty() {
+            findings.push(Finding {
+                id: "SEC-047",
+                title: "Vendor unit executes from a runtime-provisioned path".into(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} entr(ies): {}",
+                    live_vendor.len(),
+                    live_vendor.join("; ")
+                ),
+                suppressed: Some(
+                    "The unit file belongs to an installed package and the target is placed on \
+                     tmpfs by the runtime by design (LXD/Incus agent, cloud-init, dracut). \
+                     A change of unit provenance is surfaced as drift by `compare`."
+                        .into(),
+                ),
+                cis_ref: None,
+            });
+        }
+
+        // Tier 3 — volatile target that does not exist (dormant)
+        let dormant: Vec<&crate::models::ExecStartFinding> = inj
+            .iter()
+            .filter(|f| f.volatile && f.writability == W::Missing)
+            .collect();
+        if !dormant.is_empty() {
+            let rogue = dormant.iter().any(|f| f.unit_package.is_none());
+            let list = dormant
+                .iter()
+                .map(|f| format!("{} → {}", f.source, f.exec_path))
+                .collect::<Vec<_>>()
+                .join("; ");
+            findings.push(Finding {
+                id: "SEC-048",
+                title: "Unit references a volatile path that does not exist".into(),
+                category: Category::Security,
+                weight: if rogue { 20 } else { 0 },
+                evidence: format!("{} dormant entr(ies): {}", dormant.len(), list),
+                suppressed: (!rogue).then(|| {
+                    "All declaring units are package-owned: this is the standard \
+                     runtime-provisioned agent pattern on a host where that runtime is not \
+                     active (e.g. lxd-agent.service on a VM not managed by LXD). Nothing is \
+                     executing — the target is absent."
+                        .into()
+                }),
+                cis_ref: None,
+            });
+        }
+
+        // Privilege — weighted regardless of packaging
+        let weak = sel(&|f| !f.volatile && f.writability == W::NonRootWritable);
+        if !weak.is_empty() {
+            findings.push(Finding {
+                id: "SEC-046",
+                title: "Root-executed unit/cron target is writable by a non-root principal".into(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!(
+                    "{} entr(ies) where the executable or its parent directory is non-root-owned \
+                     or group/other-writable — anyone with that access controls what root runs: {}",
+                    weak.len(),
+                    weak.join("; ")
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // Unknown writability — coverage only
+        let unknown = inj.iter().filter(|f| f.writability == W::Unknown).count();
+        if unknown > 0 {
+            coverage::record(format!(
+                "exec_provenance: {unknown} target(s) could not be stat'ed (EACCES) — \
+                 writability UNVERIFIED, not assumed safe"
+            ));
+        }
+
+        // Inventory: unpackaged but root-only
+        let unpackaged =
+            sel(&|f| !f.volatile && f.writability == W::RootOnly && f.package.is_none());
+        if !unpackaged.is_empty() {
+            findings.push(Finding {
+                id: "SEC-045",
+                title: "Unit/cron targets with no package owner (inventory)".into(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} root-owned target(s) unresolved: {}",
+                    unpackaged.len(),
+                    unpackaged.join("; ")
+                ),
+                suppressed: Some(
+                    "Root-owned, non-writable and outside any volatile filesystem: only root \
+                     could have placed these. Package databases miss locally built software, \
+                     vendor packages and alternatives symlinks, so absence of an owner is not \
+                     evidence. A target that BECOMES unpackaged between snapshots is surfaced \
+                     as drift by `compare`."
+                        .into(),
+                ),
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-044 – Kernel security facts (core_pattern, lockdown) ──────────
+    if report.security.core_pattern.starts_with('|')
+        && !report.security.core_pattern.contains("systemd-coredump")
+        && !report.security.core_pattern.contains("abrt-hook-ccpp")
+        && !report.security.core_pattern.contains("apport")
+    // Ubuntu default crash handle
+    {
+        findings.push(Finding {
+            id: "SEC-044",
+            title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
+            category: Category::Security,
+            weight: 25,
+            evidence: format!("core_pattern = {}", report.security.core_pattern),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    if let Some(ref lock) = report.security.lockdown
+        && lock == "none"
+    {
+        findings.push(Finding {
+            id: "SEC-044",
+            title: "Kernel lockdown is inactive".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: "lockdown = none".to_string(),
+            suppressed: Some(
+                "Kernel lockdown is not enabled. Consider setting lockdown=integrity \
+                 in kernel command line to restrict userspace access to kernel memory."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
     // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
@@ -1651,9 +1894,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── CAP-002 – ambient capabilities without NoNewPrivs (non-root) ──────
-    // Ambient caps survive execve of a non-setuid binary, but only escalation-
-    // PRIMITIVE caps make that dangerous. Tiered by ambient_escalation_weight():
-    // benign holders (e.g. mariadbd + CAP_IPC_LOCK for memlock) are informational.
     let ambient_findings: Vec<&crate::models::ProcCapFinding> = report
         .security
         .capability_audit
@@ -2077,9 +2317,9 @@ impl CriticalFlags {
         // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
         // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
         // modules are excluded upstream, so FP is near-zero.
-        const IOC_IDS: [&str; 12] = [
+        const IOC_IDS: [&str; 14] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "SEC-028", "SEC-040", "DOCK-010",
+            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043",
         ];
         let count_sysctl = findings
             .iter()

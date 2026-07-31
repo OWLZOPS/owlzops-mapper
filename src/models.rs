@@ -1021,6 +1021,31 @@ pub struct KprobeEntry {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SEC-043 – writability classification (no DB, stat(2) only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What a non-root principal can do to this exec target. Derived from stat(2)
+/// alone — no package database — so it behaves identically on Debian, Fedora,
+/// Alpine, Arch and NixOS, and inside containers where no DB exists at all.
+/// This is the WEIGHTED signal for SEC-043; package ownership is inventory,
+/// not privilege, and must never carry weight on its own (R22-29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecWritability {
+    /// Root-owned, not group/other-writable, parent likewise.
+    #[default]
+    RootOnly,
+    /// The file or its parent directory is writable by a non-root principal —
+    /// whoever that is can replace the bytes root executes.
+    NonRootWritable,
+    /// Path does not exist: a stale unit, or a payload dropped just-in-time.
+    Missing,
+    /// Could not stat (EACCES on a parent). Explicitly unknown — never
+    /// silently folded into RootOnly.
+    Unknown,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SEC-043: ExecStart provenance for systemd units and cron
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1032,14 +1057,24 @@ pub struct ExecStartFinding {
     pub source: String,
     /// Name of the unit or cron file
     pub unit_name: String,
+    /// Absolute path of the unit/cron file that declared this entry.
+    #[serde(default)]
+    pub unit_path: String,
+    /// Package owning the unit file itself — the AUTHORSHIP signal. A vendor
+    /// unit pointing at a runtime-provisioned path (lxd-agent → /run/lxd_agent,
+    /// cloud-init, dracut) is distro intent; an attacker's entry is unpackaged.
+    /// Distinct from `package`, which describes the target and is inventory only.
+    #[serde(default)]
+    pub unit_package: Option<String>,
     /// The executable path extracted (first token after stripping prefixes)
     pub exec_path: String,
     /// True if the path is on a volatile filesystem
     pub volatile: bool,
+    /// What a non-root user can do to this file (stat-based, no DB).
+    #[serde(default)]
+    pub writability: ExecWritability,
     /// Package that owns the file, if any
     pub package: Option<String>,
-    /// Human-readable reason for flagging
-    pub reason: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
