@@ -1057,6 +1057,15 @@ pub struct ExecStartFinding {
     pub source: String,
     /// Name of the unit or cron file
     pub unit_name: String,
+    /// Absolute path of the unit/cron file that declared this entry.
+    #[serde(default)]
+    pub unit_path: String,
+    /// Package owning the unit file itself — the AUTHORSHIP signal. A vendor
+    /// unit pointing at a runtime-provisioned path (lxd-agent → /run/lxd_agent,
+    /// cloud-init, dracut) is distro intent; an attacker's entry is unpackaged.
+    /// Distinct from `package`, which describes the target and is inventory only.
+    #[serde(default)]
+    pub unit_package: Option<String>,
     /// The executable path extracted (first token after stripping prefixes)
     pub exec_path: String,
     /// True if the path is on a volatile filesystem
@@ -1066,8 +1075,6 @@ pub struct ExecStartFinding {
     pub writability: ExecWritability,
     /// Package that owns the file, if any
     pub package: Option<String>,
-    /// Human-readable reason for flagging
-    pub reason: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
