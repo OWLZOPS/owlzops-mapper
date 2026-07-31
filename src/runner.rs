@@ -203,7 +203,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
 
         // ── SEC-043: ExecStart provenance ──
         report.security.exec_start_injections =
-            crate::scanners::exec_provenance::scan_exec_provenance();
+            crate::scanners::exec_provenance::scan_exec_provenance(args.deep);
 
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
