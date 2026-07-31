@@ -1,6 +1,6 @@
 use crate::models::{
-    AgentReport, Change, DiffReport, FileCapFinding, HostDiffStatus, MultiHostDiff, PortInfo,
-    SetuidFinding, Severity, SnapshotMeta,
+    AgentReport, Change, DiffReport, ExecStartFinding, ExecWritability, FileCapFinding,
+    HostDiffStatus, MultiHostDiff, PortInfo, SetuidFinding, Severity, SnapshotMeta,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -861,6 +861,114 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                 after: None,
                 severity: Severity::Improved,
             });
+        }
+    }
+
+    // ── security.exec_start_injections (SEC‑043/045/046/047/048 drift) ─────
+    // Keyed on (unit_path, exec_path). Steady-state informational signals
+    // (SEC-045 unpackaged, SEC-047 vendor runtime) BECOME weighted when they
+    // appear, vanish, or change between snapshots.
+    {
+        type ExecKey<'a> = (&'a str, &'a str); // (unit_path, exec_path)
+        let before_exec: HashMap<ExecKey<'_>, &ExecStartFinding> = before
+            .security
+            .exec_start_injections
+            .iter()
+            .map(|f| ((f.unit_path.as_str(), f.exec_path.as_str()), f))
+            .collect();
+        let after_exec: HashMap<ExecKey<'_>, &ExecStartFinding> = after
+            .security
+            .exec_start_injections
+            .iter()
+            .map(|f| ((f.unit_path.as_str(), f.exec_path.as_str()), f))
+            .collect();
+
+        // New entries (appeared since baseline)
+        for (key, f) in &after_exec {
+            if !before_exec.contains_key(key) {
+                let desc = format!(
+                    "{} → {} (volatile:{}, writability:{:?}, unit_pkg:{:?})",
+                    f.unit_path, f.exec_path, f.volatile, f.writability, f.unit_package
+                );
+                changes.push(Change {
+                    field: "security.exec_start_injections".into(),
+                    before: None,
+                    after: Some(desc),
+                    severity: Severity::Degraded,
+                });
+            }
+        }
+
+        // Removed entries (vanished since baseline)
+        for (key, f) in &before_exec {
+            if !after_exec.contains_key(key) {
+                let desc = format!(
+                    "{} → {} (was volatile:{}, writability:{:?}, unit_pkg:{:?})",
+                    f.unit_path, f.exec_path, f.volatile, f.writability, f.unit_package
+                );
+                changes.push(Change {
+                    field: "security.exec_start_injections".into(),
+                    before: Some(desc),
+                    after: None,
+                    severity: Severity::Improved,
+                });
+            }
+        }
+
+        // Changed entries (unit_package lost/gained, target appeared, volatility changed)
+        for (key, b) in &before_exec {
+            if let Some(a) = after_exec.get(key) {
+                // Unit lost its package owner
+                if b.unit_package.is_some() && a.unit_package.is_none() {
+                    changes.push(Change {
+                        field: "security.exec_start_injections".into(),
+                        before: Some(format!(
+                            "{} → {} (unit_pkg={:?})",
+                            b.unit_path, b.exec_path, b.unit_package
+                        )),
+                        after: Some(format!("unit_pkg lost (was {:?})", b.unit_package)),
+                        severity: Severity::Degraded,
+                    });
+                }
+                // Target appeared (was Missing, now exists)
+                if b.writability == ExecWritability::Missing
+                    && a.writability != ExecWritability::Missing
+                {
+                    changes.push(Change {
+                        field: "security.exec_start_injections".into(),
+                        before: Some(format!(
+                            "{} → {} (target was Missing)",
+                            b.unit_path, b.exec_path
+                        )),
+                        after: Some(format!("target now {:?}", a.writability)),
+                        severity: Severity::Degraded,
+                    });
+                }
+                // Volatility appeared
+                if !b.volatile && a.volatile {
+                    changes.push(Change {
+                        field: "security.exec_start_injections".into(),
+                        before: Some(format!(
+                            "{} → {} (was non-volatile)",
+                            b.unit_path, b.exec_path
+                        )),
+                        after: Some("now volatile".to_string()),
+                        severity: Severity::Degraded,
+                    });
+                }
+                // Target package owner changed
+                if b.package != a.package {
+                    changes.push(Change {
+                        field: "security.exec_start_injections".into(),
+                        before: Some(format!(
+                            "{} → {} (pkg={:?})",
+                            b.unit_path, b.exec_path, b.package
+                        )),
+                        after: Some(format!("pkg={:?}", a.package)),
+                        severity: Severity::Changed,
+                    });
+                }
+            }
         }
     }
 
