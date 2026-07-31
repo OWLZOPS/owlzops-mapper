@@ -1428,6 +1428,102 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-042 – System-wide LD_PRELOAD (/etc/ld.so.preload) ──────────────
+    for f in &report.security.preload_injections {
+        let is_ioc = f.volatile
+            || (f.package.is_none()
+                && report.security.provenance_source != ProvenanceSource::Unavailable);
+        if is_ioc {
+            findings.push(Finding {
+                id: "SEC-042",
+                title: "System-wide LD_PRELOAD injected".to_string(),
+                category: Category::Security,
+                weight: 60,
+                evidence: format!(
+                    "{} (volatile: {}, package: {:?})",
+                    f.path,
+                    f.volatile,
+                    f.package.as_deref()
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        } else if f.package.is_none()
+            && report.security.provenance_source == ProvenanceSource::Unavailable
+        {
+            findings.push(Finding {
+                id: "SEC-042",
+                title: "System-wide LD_PRELOAD injected (ownership unverifiable)".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} (provenance unavailable — cannot verify library origin)",
+                    f.path
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-043 – ExecStart provenance ─────────────────────────────────────
+    for f in &report.security.exec_start_injections {
+        let is_ioc = f.volatile
+            || (f.package.is_none()
+                && report.security.provenance_source != ProvenanceSource::Unavailable);
+        if is_ioc {
+            findings.push(Finding {
+                id: "SEC-043",
+                title: "Suspicious ExecStart or cron command path".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} in {} (volatile: {}, package: {:?})",
+                    f.exec_path,
+                    f.source,
+                    f.volatile,
+                    f.package.as_deref()
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
+    // ── SEC-044 – Kernel security facts (core_pattern, lockdown) ──────────
+    if report.security.core_pattern.starts_with('|')
+        && !report.security.core_pattern.contains("systemd-coredump")
+        && !report.security.core_pattern.contains("abrt-hook-ccpp")
+    {
+        findings.push(Finding {
+            id: "SEC-044",
+            title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
+            category: Category::Security,
+            weight: 25,
+            evidence: format!("core_pattern = {}", report.security.core_pattern),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    if let Some(ref lock) = report.security.lockdown
+        && lock == "none"
+    {
+        findings.push(Finding {
+            id: "SEC-044",
+            title: "Kernel lockdown is inactive".to_string(),
+            category: Category::Security,
+            weight: 0,
+            evidence: "lockdown = none".to_string(),
+            suppressed: Some(
+                "Kernel lockdown is not enabled. Consider setting lockdown=integrity \
+                 in kernel command line to restrict userspace access to kernel memory."
+                    .to_string(),
+            ),
+            cis_ref: None,
+        });
+    }
+
     // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
@@ -2077,9 +2173,9 @@ impl CriticalFlags {
         // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
         // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
         // modules are excluded upstream, so FP is near-zero.
-        const IOC_IDS: [&str; 12] = [
+        const IOC_IDS: [&str; 13] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "SEC-028", "SEC-040", "DOCK-010",
+            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042",
         ];
         let count_sysctl = findings
             .iter()

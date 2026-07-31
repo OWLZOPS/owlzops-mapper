@@ -10,12 +10,13 @@
 use crate::coverage;
 use crate::models::PreloadFinding;
 use crate::safe_io;
+use std::collections::HashSet;
 
 /// Scan `/etc/ld.so.preload` and return any entries found.
 ///
 /// Each entry becomes a `PreloadFinding`. Volatility is checked via
 /// `is_volatile_exec_path`, and package ownership is resolved through the
-/// existing provenance infrastructure.
+/// existing batch provenance infrastructure.
 ///
 /// # Coverage
 /// - If the file is absent (ENOENT) the scan is considered clear — no finding
@@ -46,6 +47,7 @@ pub fn scan_ld_preload() -> Vec<PreloadFinding> {
     }
 
     let mut findings = Vec::new();
+    let mut candidates: HashSet<String> = HashSet::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -54,31 +56,27 @@ pub fn scan_ld_preload() -> Vec<PreloadFinding> {
         }
 
         let volatile = crate::utils::is_volatile_exec_path(trimmed);
-        let package = lookup_package_owner(trimmed);
+        candidates.insert(crate::utils::canon_path(trimmed).into_owned());
 
         findings.push(PreloadFinding {
             path: trimmed.to_string(),
             volatile,
-            package,
-            mapped_by_pids: None, // filled later by the correlation step
+            package: None, // filled later by batch resolution
+            mapped_by_pids: None,
         });
     }
 
+    // Batch-resolve package ownership – same pattern as SEC-043 (exec_provenance).
+    if !candidates.is_empty() {
+        let prov = crate::scanners::provenance::resolve_batch(&candidates);
+        for f in &mut findings {
+            f.package = prov.lookup(crate::utils::canon_path(&f.path).as_ref());
+        }
+    }
+
     if findings.is_empty() && !truncated {
-        // Explicitly record that the file was present but benign.
         coverage::record("ld.so.preload exists but contains no active entries".to_string());
     }
 
     findings
-}
-
-/// Resolve the package that owns the given file path.
-///
-/// This calls into the existing provenance logic (dpkg, rpm, apk, etc.) and
-/// returns `Some(package_name)` if the file is tracked, or `None` otherwise.
-fn lookup_package_owner(_path: &str) -> Option<String> {
-    // TODO: integrate with the actual package ownership lookup (e.g.,
-    // crate::provenance::resolve_package(path)).
-    // For now, return None – the scanner will still flag the finding.
-    None
 }
