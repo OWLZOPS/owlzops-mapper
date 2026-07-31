@@ -50,6 +50,19 @@ pub struct Finding {
     pub cis_ref: Option<&'static str>,
 }
 
+/// Vendor unit hierarchy. systemd.unit(5) reserves these directories for units
+/// installed by the package manager; the administrator's own units live in
+/// /etc/systemd/system. This is the DB‑FREE authorship signal: unlike the package
+/// database — which already demonstrated false negatives on /usr/lib and
+/// /usr/libexec paths — a vendor unit is ALWAYS in a vendor directory, so this
+/// check cannot miss. /etc/systemd/system is deliberately excluded: it is exactly
+/// where a dropped unit would live, so those fall back to the DB check alone.
+pub(crate) fn unit_is_vendor_shipped(f: &crate::models::ExecStartFinding) -> bool {
+    f.unit_package.is_some()
+        || f.unit_path.starts_with("/usr/lib/systemd/system/")
+        || f.unit_path.starts_with("/lib/systemd/system/")
+}
+
 /// Escalation-risk weight for an ambient capability set held with NoNewPrivs off.
 /// Ambient caps survive execve of a *non-setuid* binary, so only escalation-
 /// PRIMITIVE caps make that dangerous. Benign caps (mlock, clock, low-port bind,
@@ -847,7 +860,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 usize::from_str_radix(end, 16),
             )
         {
-            return e - s == TRAMPOLINE_MAX_BYTES as usize;
+            return e.checked_sub(s) == Some(TRAMPOLINE_MAX_BYTES as usize);
         }
         false
     }
@@ -1507,9 +1520,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .collect()
         };
 
-        // Tier 1 — live rogue payload on tmpfs, declared by an unpackaged unit
-        let live_rogue =
-            sel(&|f| f.volatile && f.writability != W::Missing && f.unit_package.is_none());
+        // Tier 1 — live rogue payload on tmpfs, declared by a non‑vendor unit.
+        // Unknown writability is excluded: an EACCES target is not provably present.
+        let live_rogue = sel(&|f| {
+            f.volatile
+                && matches!(f.writability, W::RootOnly | W::NonRootWritable)
+                && !unit_is_vendor_shipped(f)
+        });
         if !live_rogue.is_empty() {
             findings.push(Finding {
                 id: "SEC-043",
@@ -1528,8 +1545,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
 
         // Tier 2 — live vendor unit on tmpfs (e.g. LXD agent, cloud-init)
-        let live_vendor =
-            sel(&|f| f.volatile && f.writability != W::Missing && f.unit_package.is_some());
+        let live_vendor = sel(&|f| {
+            f.volatile
+                && matches!(f.writability, W::RootOnly | W::NonRootWritable)
+                && unit_is_vendor_shipped(f)
+        });
         if !live_vendor.is_empty() {
             findings.push(Finding {
                 id: "SEC-047",
@@ -1557,9 +1577,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .filter(|f| f.volatile && f.writability == W::Missing)
             .collect();
         if !dormant.is_empty() {
-            let rogue = dormant.iter().any(|f| f.unit_package.is_none());
+            let rogue = dormant.iter().any(|f| !unit_is_vendor_shipped(f));
             let list = dormant
                 .iter()
+                .filter(|f| !rogue || !unit_is_vendor_shipped(f))
                 .map(|f| format!("{} → {}", f.source, f.exec_path))
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -3463,5 +3484,28 @@ mod tests {
             .find(|f| f.id == "SEC-039" && f.suppressed.is_none())
             .expect("weighted SEC-039");
         assert_eq!(f2.weight, 15);
+    }
+
+    // ── R22-30: vendor directory authorship ────────────────────────
+    #[test]
+    fn unit_is_vendor_shipped_by_directory() {
+        use super::unit_is_vendor_shipped;
+
+        // A vendor unit whose package DB entry was missed must still be
+        // recognised as shipped by its location.
+        let f = ExecStartFinding {
+            unit_path: "/usr/lib/systemd/system/lxd-agent.service".into(),
+            unit_package: None, // resolver missed it
+            ..Default::default()
+        };
+        assert!(unit_is_vendor_shipped(&f));
+
+        // A unit dropped in the admin hierarchy is never vouched for by location.
+        let d = ExecStartFinding {
+            unit_path: "/etc/systemd/system/update.service".into(),
+            unit_package: None,
+            ..Default::default()
+        };
+        assert!(!unit_is_vendor_shipped(&d));
     }
 }

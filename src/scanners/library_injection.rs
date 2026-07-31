@@ -271,6 +271,7 @@ fn is_inside_jit_cluster(addr_lo: u64, clusters: &[ExecCluster]) -> bool {
 
 const TRAMP_MAX_BYTES: u64 = 4 * 4096;
 const TRAMP_POOL_MIN: usize = 8;
+const PAGE_SIZE: u64 = 4096; // single page – trampoline / thunk
 
 fn region_size(addr: &str) -> Option<u64> {
     let (lo, hi) = addr.split_once('-')?;
@@ -685,7 +686,16 @@ fn scan_maps(
                 format!("{} (rwx file-backed)", path.unwrap_or("unknown")),
             ),
             ExecTier::AnonRwx => ("maps-anon-rwx", "anonymous executable (rwxp)".to_string()),
-            ExecTier::AnonRx => ("maps-anon-rx", "anonymous executable (r-xp)".to_string()),
+            ExecTier::AnonRx => {
+                // Single-page anonymous r‑x → libffi/GObject trampoline,
+                // label explicitly so scoring can route it to provisional.
+                let src = if region_size(addr) == Some(PAGE_SIZE) {
+                    "maps-anon-rx-trampoline"
+                } else {
+                    "maps-anon-rx"
+                };
+                (src, "anonymous executable (r-xp)".to_string())
+            }
             _ => continue,
         };
 
