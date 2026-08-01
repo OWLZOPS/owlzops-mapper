@@ -188,7 +188,7 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
     let unit_path_s = unit_path.to_string_lossy().into_owned();
 
     let (content, truncated) =
-        match safe_io::read_file_capped(unit_path.to_str().unwrap_or(""), 64 * 1024) {
+        match safe_io::read_file_capped_regular(unit_path.to_str().unwrap_or(""), 64 * 1024) {
             Ok(t) => t,
             Err(_) => return,
         };
@@ -252,7 +252,7 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
 /// Scan crontabs (system and user) and check commands for suspicious paths.
 fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
     // System crontab file
-    if let Ok((content, _)) = safe_io::read_file_capped("/etc/crontab", 64 * 1024) {
+    if let Ok((content, _)) = safe_io::read_file_capped_regular("/etc/crontab", 64 * 1024) {
         for line in content.lines() {
             check_cron_line(line, "cron:/etc/crontab", "/etc/crontab", push);
         }
@@ -264,7 +264,7 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
             let path = entry.path();
             let path_s = path.to_string_lossy().into_owned();
             if let Ok((content, _)) =
-                safe_io::read_file_capped(path.to_str().unwrap_or(""), 64 * 1024)
+                safe_io::read_file_capped_regular(path.to_str().unwrap_or(""), 64 * 1024)
             {
                 let source = format!(
                     "cron.d:{}",

@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Read a file into a String, capping at `max_bytes`. Returns (content, truncated).
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
@@ -46,6 +47,48 @@ pub fn read_reader_capped<R: Read>(mut reader: R, max_bytes: usize) -> (Vec<u8>,
         let _ = io::copy(&mut reader, &mut io::sink());
     }
     (buf, truncated)
+}
+
+// ── R23-10: safe open for host-controlled paths (FIFO/device resistant) ──
+
+/// Like `read_file_capped`, but opens the file with `O_NONBLOCK | O_NOCTTY`
+/// and verifies that the resulting file descriptor is a regular file.
+///
+/// Paths under scanner control (`/etc/ld.so.preload`, unit files, cron files)
+/// are writable by root.  An attacker can replace any of them with a FIFO or
+/// device node; `File::open` on a FIFO blocks until a writer appears, hanging
+/// the scanner forever.  `O_NONBLOCK` makes the open non‑blocking, and the
+/// subsequent `fstat` check ensures we only read regular files.  Other errors
+/// (e.g. `ENOENT`, `EACCES`) are returned normally so the caller can decide
+/// whether to record a coverage warning.
+///
+/// This function MUST be used for every scanner path that lives on a host‑
+/// controlled filesystem (i.e. not `/proc`, `/sys`, or `/dev`).
+pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+
+    if !f.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file (FIFO or device on a scanner path)",
+        ));
+    }
+
+    let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let read = f
+        .by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)?;
+    let truncated = read > max_bytes;
+    if truncated {
+        buf.truncate(max_bytes);
+    }
+    let text = String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, truncated))
 }
 
 #[cfg(feature = "local-scan")]

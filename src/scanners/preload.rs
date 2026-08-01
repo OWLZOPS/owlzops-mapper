@@ -27,7 +27,7 @@ pub fn scan_ld_preload() -> Vec<PreloadFinding> {
     let mut candidates: HashSet<String> = HashSet::new();
 
     let (content, truncated) =
-        match crate::safe_io::read_file_capped("/etc/ld.so.preload", 64 * 1024) {
+        match crate::safe_io::read_file_capped_regular("/etc/ld.so.preload", 64 * 1024) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No preload file → nothing injected, nothing to verify.
