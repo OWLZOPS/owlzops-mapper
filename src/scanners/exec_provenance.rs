@@ -196,6 +196,14 @@ fn assess_writability(path: &str) -> ExecWritability {
     }
 }
 
+/// Return `true` if `path` is a symlink pointing to /dev/null — a masked
+/// systemd unit.  These are intentionally disabled and contain no directives.
+fn is_masked_symlink(path: &Path) -> bool {
+    std::fs::read_link(path)
+        .map(|target| target == Path::new("/dev/null"))
+        .unwrap_or(false)
+}
+
 /// Returns true if the unit file does not set `User=` to a non-root account.
 /// The last `User=` line wins (systemd behaviour). Fail-closed: absent or
 /// root/0 → true.
@@ -235,6 +243,11 @@ fn split_directive(line: &str) -> Option<(&str, &str)> {
 
 /// Extract paths from Exec* directives in a service/drop-in file and check them.
 fn scan_service_file(unit_path: &Path, scope: UnitScope, push: &mut dyn FnMut(ExecStartFinding)) {
+    // Masked units (symlink to /dev/null) are intentionally disabled, nothing to scan.
+    if is_masked_symlink(unit_path) {
+        return;
+    }
+
     let unit_path_s = unit_path.to_string_lossy().into_owned();
 
     let Some(path_str) = unit_path.to_str() else {
@@ -326,7 +339,10 @@ fn scan_service_file(unit_path: &Path, scope: UnitScope, push: &mut dyn FnMut(Ex
 /// Scan crontabs (system and user) and check commands for suspicious paths.
 fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
     // System crontab file
-    if let Ok((content, _)) = safe_io::read_file_capped_regular("/etc/crontab", 64 * 1024) {
+    let crontab = Path::new("/etc/crontab");
+    if !is_masked_symlink(crontab)
+        && let Ok((content, _)) = safe_io::read_file_capped_regular("/etc/crontab", 64 * 1024)
+    {
         for line in content.lines() {
             check_cron_line(line, "cron:/etc/crontab", "/etc/crontab", push);
         }
@@ -336,6 +352,10 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
     if let Ok(entries) = std::fs::read_dir("/etc/cron.d") {
         for entry in entries.flatten() {
             let path = entry.path();
+            if is_masked_symlink(&path) {
+                continue; // masked, nothing to scan
+            }
+
             let path_s = path.to_string_lossy().into_owned();
 
             // R23-18: cron ignores files that don't match [A-Za-z0-9_-].
@@ -364,7 +384,9 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
         }
     }
 
-    // TODO: user crontabs via `crontab -l`? For now, skip to avoid complexity.
+    // TODO: user crontabs from /var/spool/cron/crontabs/<user> — can be read
+    // directly without spawning, and the username is the file name (identity known).
+    // Deferred to avoid scope creep; currently only system crontabs are covered.
 }
 
 /// R23-18: cron ignores files in /etc/cron.d that contain characters beyond
