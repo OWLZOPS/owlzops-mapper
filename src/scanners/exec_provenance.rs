@@ -161,27 +161,39 @@ fn assess_writability(path: &str) -> ExecWritability {
 /// Returns true if the unit file does not set `User=` to a non-root account.
 /// The last `User=` line wins (systemd behaviour). Fail-closed: absent or
 /// root/0 → true.
+///
+/// R23-15: normalise whitespace around `=` — systemd's conf-parser strips
+/// both sides, so `User = app` is a valid assignment.
 fn unit_runs_as_root(content: &str) -> bool {
     content
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("User="))
-        .next_back() // last assignment wins
+        .filter_map(|l| split_directive(l.trim()).filter(|(k, _)| *k == "User"))
+        .map(|(_, v)| v)
+        .next_back()
         .is_none_or(|u| {
             let u = u.trim().trim_matches('"');
             u.is_empty() || u == "root" || u == "0"
         })
 }
 
-// R23-04: all Exec* directives understood by systemd.
+// ── R23-04 / R23-15: all Exec* directives understood by systemd, without '=' ─
 const EXEC_DIRECTIVES: &[&str] = &[
-    "ExecStart=",
-    "ExecStartPre=",
-    "ExecStartPost=",
-    "ExecReload=",
-    "ExecStop=",
-    "ExecStopPost=",
-    "ExecCondition=",
+    "ExecStart",
+    "ExecStartPre",
+    "ExecStartPost",
+    "ExecReload",
+    "ExecStop",
+    "ExecStopPost",
+    "ExecCondition",
 ];
+
+/// Split a line by the FIRST '=', trim both sides.  This mirrors systemd's
+/// conf-parser which strips whitespace around the delimiter, so
+/// `ExecStart = /tmp/x` is a valid assignment (R23-15).
+fn split_directive(line: &str) -> Option<(&str, &str)> {
+    let (k, v) = line.split_once('=')?;
+    Some((k.trim_end(), v.trim_start()))
+}
 
 /// Extract paths from Exec* directives in a service/drop-in file and check them.
 fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
@@ -223,7 +235,10 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
             continue;
         }
 
-        if let Some(rest) = EXEC_DIRECTIVES.iter().find_map(|d| trimmed.strip_prefix(d)) {
+        let Some((key, rest)) = split_directive(trimmed) else {
+            continue;
+        };
+        if EXEC_DIRECTIVES.contains(&key) {
             // R23-05: systemd allows optional prefixes '-', '@', '+', '!', ':'
             // and quoted paths.  Strip prefixes, then remove surrounding quotes.
             let args = rest
@@ -411,5 +426,16 @@ mod tests {
         let mut got = Vec::new();
         scan_service_file(&unit, &mut |f| got.push(f.exec_path));
         assert_eq!(got, vec!["/dev/shm/impl".to_string()]);
+    }
+
+    #[test]
+    fn whitespace_around_equals_is_not_a_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("evil.service");
+        std::fs::write(&unit, "[Service]\nUser = app\nExecStart = -/dev/shm/impl\n").unwrap();
+
+        let mut got = Vec::new();
+        scan_service_file(&unit, &mut |f| got.push((f.exec_path, f.runs_as_root)));
+        assert_eq!(got, vec![("/dev/shm/impl".to_string(), false)]);
     }
 }
