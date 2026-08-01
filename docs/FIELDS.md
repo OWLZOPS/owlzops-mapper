@@ -118,11 +118,12 @@ An array of objects, one per detected database engine.
 
 ---
 
-## `topology` (Docker)
+## `topology` (Docker / Podman)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `docker_active` | boolean | Docker daemon reachable |
+| `runtime_active` | boolean | Container runtime reachable |
+| `runtime_name` | string | Name of the container runtime (e.g. "Docker") |
 | `images_count` | integer | Total number of images |
 | `dangling_images_count` | integer | Images without tags |
 | `total_images_size_mb` | integer | Real disk size of all images in MB |
@@ -226,6 +227,8 @@ An array of objects, one per detected database engine.
 | `library_injections[].object_path` | string | The offending .so or LD_* value |
 | `library_injections[].source` | string | Where it was observed: `"LD_PRELOAD"`, `"LD_LIBRARY_PATH"`, or `"maps"` |
 | `library_injections[].is_deleted` | boolean | Whether the mapped object is marked `(deleted)` (stronger IoC) |
+| `library_injections[].region_addr` | string \| null | VMA start‑end address (`"7f3c0000‑7f3d0000"`) |
+| `library_injections[].deep_forensics` | object \| null | Deep memory forensics payload (only with `--deep`) |
 | `ghost_pids` | array of objects | PIDs hidden from `/proc` listing by an LKM rootkit (SEC‑024/025) |
 | `ghost_pids[].pid` | integer | The hidden PID |
 | `ghost_pids[].state` | string \| null | Process state (`"R"`, `"S"`, `"D"`, `"Z"`, …) if readable |
@@ -233,6 +236,101 @@ An array of objects, one per detected database engine.
 | `ghost_pids[].confirmed_via` | string | How existence was confirmed: `"stat-path"`, `"kill"`, or `"stat-path+kill"` |
 | `ghost_pids[].confirmed_ioc` | boolean | `true` if this is a hard IoC (meets all criteria); `false` if downgraded |
 | `ghost_pids[].holds_socket` | boolean | Whether the hidden PID also owns a network socket (corroboration) |
+| `file_capabilities` | array of objects | Files with persistent capabilities (setcap) |
+| `file_capabilities[].path` | string | Absolute path of the file |
+| `file_capabilities[].capabilities` | array of strings | Human‑readable capability names |
+| `file_capabilities[].reason` | string \| null | Why this file was flagged |
+| `file_capabilities[].permitted` | integer | Permitted capability mask (raw) |
+| `file_capabilities[].inheritable` | integer | Inheritable capability mask (raw) |
+| `file_capabilities[].effective` | boolean | Effective bit |
+| `file_capabilities[].revision` | integer | Capability revision |
+| `file_capabilities[].rootid` | integer \| null | Root user namespace ID |
+| `file_capabilities[].package` | string \| null | Owning package, if resolved |
+| `ebpf_inventory` | object | Loaded eBPF programs, maps, and pinned objects |
+| `ebpf_inventory.programs` | array of objects | Loaded BPF programs |
+| `ebpf_inventory.programs[].prog_id` | integer | Program ID |
+| `ebpf_inventory.programs[].prog_type` | string | Program type |
+| `ebpf_inventory.programs[].prog_name` | string \| null | Program name |
+| `ebpf_inventory.programs[].prog_tag` | string | Program tag |
+| `ebpf_inventory.programs[].pid` | integer | PID of the process that loaded the program |
+| `ebpf_inventory.programs[].comm` | string | Comm of the process |
+| `ebpf_inventory.maps` | array of objects | Loaded BPF maps |
+| `ebpf_inventory.maps[].map_id` | integer | Map ID |
+| `ebpf_inventory.maps[].map_type` | string | Map type |
+| `ebpf_inventory.maps[].pid` | integer | PID of the process that created the map |
+| `ebpf_inventory.maps[].comm` | string | Comm of the process |
+| `ebpf_inventory.links` | array of objects | Active BPF links |
+| `ebpf_inventory.links[].link_id` | integer | Link ID |
+| `ebpf_inventory.links[].prog_id` | integer | Program ID |
+| `ebpf_inventory.links[].attach_type` | string | Attach type |
+| `ebpf_inventory.links[].pid` | integer | PID of the process that created the link |
+| `ebpf_inventory.links[].comm` | string | Comm of the process |
+| `ebpf_inventory.pins` | array of objects | Pinned BPF objects in /sys/fs/bpf |
+| `ebpf_inventory.pins[].path` | string | Path in /sys/fs/bpf |
+| `ebpf_inventory.pins[].obj_type` | string | `"prog"`, `"map"`, or `"link"` |
+| `ebpf_inventory.pins[].obj_id` | integer | Object ID |
+| `ebpf_inventory.prog_tags` | array of strings | Stable set of program tags for drift detection |
+| `setuid_files` | array of objects | Setuid/setgid files found in common binary directories |
+| `setuid_files[].path` | string | Absolute path |
+| `setuid_files[].setuid` | boolean | Has setuid bit |
+| `setuid_files[].setgid` | boolean | Has setgid bit |
+| `setuid_files[].root_owner` | boolean | File is owned by root |
+| `setuid_files[].package` | string \| null | Owning package, if resolved |
+| `provenance_source` | string | Which package database was used for attribution: `"dpkg"`, `"apk"`, `"rpm"`, or `"unavailable"` |
+| `kernel_taint` | object | Decoded /proc/sys/kernel/tainted |
+| `kernel_taint.raw` | integer | Raw taint value |
+| `kernel_taint.flags` | array of objects | Decoded taint flags |
+| `kernel_taint.flags[].bit` | integer | Bit position |
+| `kernel_taint.flags[].code` | string | Kernel letter (e.g. `"E"`) |
+| `kernel_taint.flags[].name` | string | Human description |
+| `kernel_taint.flags[].security_relevant` | boolean | Whether the flag is security‑relevant |
+| `kernel_taint.unavailable` | boolean | True if the file was unreadable |
+| `confinement` | object | LSM confinement state |
+| `confinement.lsms` | array of strings | Active LSMs |
+| `confinement.selinux_permissive` | boolean | SELinux is loaded but in permissive mode |
+| `confinement.complain_profiles` | array of objects | AppArmor profiles in complain mode |
+| `confinement.complain_profiles[].pid` | integer | PID |
+| `confinement.complain_profiles[].comm` | string | Process comm |
+| `confinement.complain_profiles[].profile` | string | Profile name |
+| `confinement.attr_read_incomplete` | boolean | True when per‑process attr/current could not be fully read (non‑root) |
+| `kernel_modules` | object | Kernel module inventory |
+| `kernel_modules.proc_modules` | array of strings | Module names from /proc/modules |
+| `kernel_modules.sysfs_modules` | array of strings | Live loadable modules from /sys/module |
+| `kernel_modules.hidden_candidates` | array of objects | Modules live in sysfs/kallsyms but absent from /proc/modules |
+| `kernel_modules.hidden_candidates[].name` | string | Module name |
+| `kernel_modules.hidden_candidates[].seen_in` | array of strings | Interfaces that still expose it (e.g. `"sysfs"`, `"kallsyms"`) |
+| `kernel_modules.kallsyms_checked` | boolean | False when /proc/kallsyms was empty/unreadable |
+| `ftrace_hooks` | object | ftrace/kprobe hook surface |
+| `ftrace_hooks.unattributed_syscall_hooks` | array of objects | Syscall‑entry functions with an ftrace_ops from no legitimate source |
+| `ftrace_hooks.unattributed_syscall_hooks[].function` | string | Function name |
+| `ftrace_hooks.unattributed_syscall_hooks[].ops_count` | integer | Number of ftrace_ops on the function |
+| `ftrace_hooks.unattributed_syscall_hooks[].callback` | string | `"module:<name>"` or `"unresolved"` |
+| `ftrace_hooks.syscall_kprobes` | array of objects | Kprobes on syscall functions |
+| `ftrace_hooks.syscall_kprobes[].kind` | string | `"p"` (kprobe) or `"r"` (kretprobe) |
+| `ftrace_hooks.syscall_kprobes[].group_name` | string | Kprobe group name |
+| `ftrace_hooks.syscall_kprobes[].symbol` | string | Symbol name |
+| `ftrace_hooks.attributed_hook_count` | integer | Number of syscall hooks attributed to a known source |
+| `ftrace_hooks.live_tracer_active` | boolean | A live function tracer was running |
+| `ftrace_hooks.attribution_degraded` | boolean | kptr_restrict hid callback symbols |
+| `ftrace_hooks.tracefs_available` | boolean | tracefs was mounted & readable |
+| `preload_injections` | array of objects | Entries found in /etc/ld.so.preload (SEC‑042/049/050) |
+| `preload_injections[].path` | string | Path to the preloaded shared object |
+| `preload_injections[].volatile` | boolean | True when the path resides on a volatile filesystem |
+| `preload_injections[].package` | string \| null | Resolved package name, if the file belongs to a known package |
+| `preload_injections[].mapped_by_pids` | integer \| null | Number of processes that have this object mapped; `null` = unknown |
+| `exec_start_injections` | array of objects | ExecStart provenance for systemd units and cron (SEC‑043/045/046/047/048) |
+| `exec_start_injections[].source` | string | `"systemd:<unit>"` or `"cron:/etc/crontab"` etc. |
+| `exec_start_injections[].unit_name` | string | Name of the unit or cron file |
+| `exec_start_injections[].unit_path` | string | Absolute path of the unit/cron file that declared this entry |
+| `exec_start_injections[].unit_package` | string \| null | Package owning the unit file itself |
+| `exec_start_injections[].exec_path` | string | The executable path extracted (first token after stripping prefixes) |
+| `exec_start_injections[].volatile` | boolean | True if the path is on a volatile filesystem |
+| `exec_start_injections[].writability` | string | `"root_only"`, `"non_root_writable"`, `"missing"`, or `"unknown"` |
+| `exec_start_injections[].package` | string \| null | Package that owns the file, if any (only with `--deep`) |
+| `exec_start_injections[].runs_as_root` | boolean | True when the unit does NOT set `User=` (i.e. runs as root). Defaults to `true` for legacy snapshots. |
+| `core_pattern` | string \| null | `/proc/sys/kernel/core_pattern`; `null` = unreadable (SEC‑044) |
+| `modules_disabled` | boolean \| null | `/proc/sys/kernel/modules_disabled`; `null` = unreadable (SEC‑044) |
+| `lockdown` | string \| null | Kernel lockdown state; `null` = unavailable (SEC‑044) |
 
 ---
 

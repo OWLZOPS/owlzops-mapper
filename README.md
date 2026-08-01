@@ -308,23 +308,25 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 
 **Active compromise (IoC)** — these escalate to exit code 3
 
-| Finding | Penalty |
-| --- | --- |
-| **SEC-015** – Privileged non-root implant on network | **+60** |
-| **SEC-016** – Known malicious process (by name) | **+60** |
-| **SEC-017** – Fileless malware (deleted executable / memfd) | **+60** |
-| **SEC-019** – Fileless malware with critical kernel caps | **+60** |
-| **SEC-020** – Kernel-thread masquerading process | **+60** |
-| **SEC-021** – Bind-mount / overlay masking | **+60** |
-| **SEC-022** – Reverse shell / C2 connection | **+60** |
-| **SEC-023** – Userspace rootkit / library injection | **+60** |
-| **SEC-024** – True Ghost PID (LKM rootkit) | **+60** |
-| **SEC-028** – Unattributed executable payload in memory (`--deep`) | **+60** |
-| **SEC-040** – Hidden kernel module (Diamorphine-class LKM rootkit) | **+55** |
-| **SEC-041** – Ftrace syscall hook by hidden module | **+55** (via SEC-040) |
-| **SEC-018** – Suspicious cron job (persistence) | +20 |
-| **SEC-025** – Downgraded PID visibility mismatch | +20 (no exit-code escalation) |
-
+| Finding                                                                    | Penalty                           |
+|----------------------------------------------------------------------------|-----------------------------------|
+| **SEC-015** – Privileged non-root implant on network                       | **+60**                           |
+| **SEC-016** – Known malicious process (by name)                            | **+60**                           |
+| **SEC-017** – Fileless malware (deleted executable / memfd)                | **+60**                           |
+| **SEC-019** – Fileless malware with critical kernel caps                   | **+60**                           |
+| **SEC-020** – Kernel-thread masquerading process                           | **+60**                           |
+| **SEC-021** – Bind-mount / overlay masking                                 | **+60**                           |
+| **SEC-022** – Reverse shell / C2 connection                                | **+60**                           |
+| **SEC-023** – Userspace rootkit / library injection                        | **+60**                           |
+| **SEC-024** – True Ghost PID (LKM rootkit)                                 | **+60**                           |
+| **SEC-028** – Unattributed executable payload in memory (`--deep`)         | **+60**                           |
+| **SEC-040** – Hidden kernel module (Diamorphine-class LKM rootkit)         | **+55**                           |
+| **SEC-041** – Ftrace syscall hook by hidden module                         | **+55** (via SEC-040)             |
+| **SEC-018** – Suspicious cron job (persistence)                            | **+20**                           |
+| **SEC-025** – Downgraded PID visibility mismatch                           | **+20** (no exit-code escalation) |
+| **SEC‑042** - System‑wide LD_PRELOAD injected (volatile or corroborated)   | **+55 or +60**                    |
+| **SEC‑049** - System‑wide LD_PRELOAD present (ownership unverifiable)      | **+20**                           |
+| **SEC‑050** - System‑wide LD_PRELOAD injected (unpackaged, not yet mapped) | **+30**                           |
 **Kernel & confinement**
 
 | Finding | Penalty |
