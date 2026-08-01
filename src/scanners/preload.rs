@@ -29,6 +29,10 @@ pub fn scan_ld_preload() -> Vec<PreloadFinding> {
     let (content, truncated) =
         match crate::safe_io::read_file_capped("/etc/ld.so.preload", 64 * 1024) {
             Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No preload file → nothing injected, nothing to verify.
+                return findings;
+            }
             Err(e) => {
                 coverage::record(format!(
                     "/etc/ld.so.preload unreadable ({e}); SEC-042 NOT verified"
