@@ -225,8 +225,14 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
     // TODO: user crontabs via `crontab -l`? For now, skip to avoid complexity.
 }
 
+// Shorthand schedules recognized by vixie/cronie.
+const CRON_SHORTHANDS: &[&str] = &[
+    "reboot", "yearly", "annually", "monthly", "weekly", "daily", "midnight", "hourly",
+];
+
 /// Check a cron line: ignore comments, empty lines, and environment assignments.
-/// Extract the command part (6th field onwards) and check its first token.
+/// Handles both system crontab format (`/etc/crontab`, `/etc/cron.d/*`) with a
+/// mandatory `user` field, and shorthand `@reboot user command`.
 fn check_cron_line(
     line: &str,
     source: &str,
@@ -237,19 +243,32 @@ fn check_cron_line(
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return;
     }
-    // Cron lines: minute hour day month day-of-week command
+
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 6 {
+    let Some(&first) = parts.first() else { return };
+
+    // SHELL=/bin/sh, MAILTO="" – not schedules.
+    if first.contains('=') {
         return;
     }
-    // The command starts at index 5
-    let first_token = parts[5];
-    if first_token.starts_with('@') {
-        // @reboot, etc. – skip for now
+
+    // R23-01: /etc/crontab and /etc/cron.d/* use the SYSTEM format:
+    // <schedule> <user> <command>. The user field is required.
+    let cmd_idx = match first.strip_prefix('@') {
+        Some(tag) => {
+            if !CRON_SHORTHANDS.contains(&tag) {
+                return;
+            }
+            2 // @reboot | user | command
+        }
+        None => 6, // 5 schedule fields | user | command
+    };
+
+    let Some(&first_token) = parts.get(cmd_idx) else {
         return;
-    }
+    };
     if !first_token.starts_with('/') {
-        return;
+        return; // `cd / && ...`, relative commands – out of scope
     }
 
     let resolved = std::fs::canonicalize(first_token)
@@ -268,4 +287,45 @@ fn check_cron_line(
         writability,
         package: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_crontab_command_is_after_user_field() {
+        let mut got = Vec::new();
+        let mut push = |f: ExecStartFinding| got.push(f.exec_path);
+
+        check_cron_line(
+            "* * * * * root /dev/shm/impl --quiet",
+            "cron:/etc/crontab",
+            "/etc/crontab",
+            &mut push,
+        );
+        check_cron_line(
+            "@reboot root /tmp/persist.sh",
+            "cron.d:x",
+            "/etc/cron.d/x",
+            &mut push,
+        );
+        check_cron_line(
+            "SHELL=/bin/sh",
+            "cron:/etc/crontab",
+            "/etc/crontab",
+            &mut push,
+        );
+        check_cron_line(
+            "17 * * * * root cd / && run-parts /etc/cron.hourly",
+            "c",
+            "c",
+            &mut push,
+        );
+
+        assert_eq!(
+            got,
+            vec!["/dev/shm/impl".to_string(), "/tmp/persist.sh".to_string()]
+        );
+    }
 }
