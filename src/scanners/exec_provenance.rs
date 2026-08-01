@@ -365,6 +365,11 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
                 .to_string_lossy()
                 .into_owned();
             if !cron_d_is_active(&name) {
+                // R23-22: skip must be visible – cron does not execute these.
+                coverage::record(format!(
+                    "/etc/cron.d/{name} skipped: name outside [A-Za-z0-9_-] — \
+                     cron does not execute it (backup/save file)"
+                ));
                 continue;
             }
 
