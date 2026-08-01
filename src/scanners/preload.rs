@@ -24,19 +24,27 @@ pub(crate) fn parse_preload_entries(content: &str) -> Vec<&str> {
 
 /// Count how many processes have each preload path mapped in /proc/<pid>/maps.
 ///
-/// Returns `None` when `/proc` is unreadable — the count is UNKNOWN, not zero.
-/// Returns `Some(map)` with zero counts for entries not found.  Paths are
-/// canonicalised before matching because the kernel prints the resolved path
-/// in `/proc/<pid>/maps`.
+/// Returns `None` when `/proc` is unreadable or no maps could be read at all —
+/// the count is UNKNOWN, not zero.
+/// Returns `Some(map)` with zero counts for entries not found.
+/// Paths are resolved (canonicalized) before matching because the kernel
+/// prints the fully resolved path in maps.
 fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
     if paths.is_empty() {
         return Some(HashMap::new());
     }
 
-    // Build a mapping from canonical path → original path
+    // Build a mapping from resolved path → original path.
+    // R23‑21: try full canonicalization first (handles symlinks), fall back
+    // to usrmerge-aware canon_path if the file no longer exists.
     let canon: Vec<(String, String)> = paths
         .iter()
-        .map(|p| (crate::utils::canon_path(p).into_owned(), p.clone()))
+        .map(|p| {
+            let resolved = std::fs::canonicalize(p)
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| crate::utils::canon_path(p).into_owned());
+            (resolved, p.clone())
+        })
         .collect();
 
     let mut counts: HashMap<String, usize> = paths.iter().cloned().map(|p| (p, 0)).collect();
@@ -47,6 +55,9 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
         return None;
     };
 
+    let mut read_ok = 0usize;
+    let mut denied = 0usize;
+
     for entry in procs.flatten() {
         let file_name = entry.file_name();
         let Some(pid_str) = file_name.to_str() else {
@@ -55,10 +66,18 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
         let Ok(pid) = pid_str.parse::<u32>() else {
             continue;
         };
-        let Ok((maps, _)) =
-            crate::safe_io::read_file_capped(&format!("/proc/{pid}/maps"), 1024 * 1024)
-        else {
-            continue;
+
+        let maps = match crate::safe_io::read_file_capped(&format!("/proc/{pid}/maps"), 1024 * 1024)
+        {
+            Ok((m, _)) => {
+                read_ok += 1;
+                m
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied += 1;
+                continue;
+            }
+            Err(_) => continue,
         };
 
         // Exact match on the path field (last column), not substring.
@@ -71,6 +90,21 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
                 *counts.entry(orig.clone()).or_insert(0) += 1;
             }
         }
+    }
+
+    if denied > 0 {
+        let hint = if crate::is_running_as_root() {
+            ""
+        } else {
+            " — run as root for full coverage"
+        };
+        coverage::record(format!(
+            "ld.so.preload corroboration: {denied} /proc/<pid>/maps unreadable{hint}"
+        ));
+    }
+    if read_ok == 0 {
+        // No observations at all — cannot assert zero (R23‑20).
+        return None;
     }
     Some(counts)
 }

@@ -1542,6 +1542,18 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .collect()
         };
 
+        // R23-23: keep evidence strings readable and JSON compact.
+        fn evidence_list(items: &[String], limit: usize) -> String {
+            if items.len() <= limit {
+                return items.join("; ");
+            }
+            format!(
+                "{}; +{} more",
+                items[..limit].join("; "),
+                items.len() - limit
+            )
+        }
+
         // Tier 1 — live rogue payload on tmpfs, declared by a non‑vendor unit.
         // Unknown writability is excluded: an EACCES target is not provably present.
         let live_rogue = sel(&|f| {
@@ -1559,7 +1571,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     "{} entr(ies) where an unpackaged unit/cron file points at an EXISTING \
                      executable on a volatile filesystem: {}",
                     live_rogue.len(),
-                    live_rogue.join("; ")
+                    evidence_list(&live_rogue, 10)
                 ),
                 suppressed: None,
                 cis_ref: None,
@@ -1581,7 +1593,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 evidence: format!(
                     "{} entr(ies): {}",
                     live_vendor.len(),
-                    live_vendor.join("; ")
+                    evidence_list(&live_vendor, 10)
                 ),
                 suppressed: Some(
                     "The unit file belongs to an installed package and the target is placed on \
@@ -1604,14 +1616,17 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .iter()
                 .filter(|f| !rogue || !unit_is_vendor_shipped(f))
                 .map(|f| format!("{} → {}", f.source, f.exec_path))
-                .collect::<Vec<_>>()
-                .join("; ");
+                .collect::<Vec<_>>();
             findings.push(Finding {
                 id: "SEC-048",
                 title: "Unit references a volatile path that does not exist".into(),
                 category: Category::Security,
                 weight: if rogue { 20 } else { 0 },
-                evidence: format!("{} dormant entr(ies): {}", dormant.len(), list),
+                evidence: format!(
+                    "{} dormant entr(ies): {}",
+                    dormant.len(),
+                    evidence_list(&list, 10)
+                ),
                 suppressed: (!rogue).then(|| {
                     "All declaring units are package-owned: this is the standard \
                      runtime-provisioned agent pattern on a host where that runtime is not \
@@ -1636,7 +1651,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     "{} entr(ies) where the executable or its parent directory is non-root-owned \
                      or group/other-writable — anyone with that access controls what root runs: {}",
                     weak.len(),
-                    weak.join("; ")
+                    evidence_list(&weak, 10)
                 ),
                 suppressed: None,
                 cis_ref: None,
@@ -1664,7 +1679,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 evidence: format!(
                     "{} root-owned target(s) unresolved: {}",
                     unpackaged.len(),
-                    unpackaged.join("; ")
+                    evidence_list(&unpackaged, 10)
                 ),
                 suppressed: Some(
                     "Root-owned, non-writable and outside any volatile filesystem: only root \
@@ -3567,5 +3582,31 @@ mod tests {
             !CriticalFlags::from_findings(&findings).compromised_host,
             "unverifiable ownership != active compromise"
         );
+    }
+
+    // R23-24: direct test that IoC IDs carry IoC-band weight
+    #[test]
+    fn every_ioc_branch_carries_ioc_weight() {
+        let mut r = minimal_report();
+        r.security.preload_injections = vec![PreloadFinding {
+            path: "/dev/shm/eb.so".into(),
+            volatile: true,
+            package: None,
+            mapped_by_pids: Some(3),
+        }];
+        r.security.exec_start_injections = vec![ExecStartFinding {
+            unit_path: "/etc/systemd/system/x.service".into(),
+            exec_path: "/dev/shm/x".into(),
+            volatile: true,
+            writability: ExecWritability::RootOnly,
+            runs_as_root: true,
+            ..Default::default()
+        }];
+
+        for f in evaluate(&r).iter().filter(|f| f.suppressed.is_none()) {
+            if ["SEC-042", "SEC-043"].contains(&f.id) {
+                assert!(f.weight >= 55, "{} emitted with weight {}", f.id, f.weight);
+            }
+        }
     }
 }
