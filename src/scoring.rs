@@ -1615,7 +1615,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
 
         // Privilege — weighted regardless of packaging
-        let weak = sel(&|f| !f.volatile && f.writability == W::NonRootWritable);
+        // R23-06: only flag when the unit actually runs as root.
+        let weak = sel(&|f| f.runs_as_root && !f.volatile && f.writability == W::NonRootWritable);
         if !weak.is_empty() {
             findings.push(Finding {
                 id: "SEC-046",
