@@ -24,6 +24,34 @@ fn unit_path_is_vendor_dir(path: &str) -> bool {
     // so canonicalization already resolves it.  No extra prefix is required.
 }
 
+// ── R23-16: Scope of the unit manager ──────────────────────────────────────
+
+/// Who executes the unit.  For the user manager `User=` does NOT apply, so
+/// identity is determined by the manager owner, not the file content.
+#[derive(Clone, Copy)]
+enum UnitScope {
+    /// systemd (PID 1): identity comes from `User=`, defaults to root.
+    System,
+    /// systemd --user: runs as the session owner.
+    UserManager { owner_is_root: bool },
+}
+
+/// Root directories for system units (PID 1).
+const SYSTEM_UNIT_DIRS: &[&str] = &[
+    "/etc/systemd/system",
+    "/run/systemd/system",
+    "/usr/lib/systemd/system",
+    "/usr/local/lib/systemd/system", // priority over /usr/lib, not vendor-owned
+];
+
+/// Root directories for user units (systemd --user).
+/// None of these are executed by root (except /root's own manager).
+const USER_UNIT_DIRS: &[&str] = &[
+    "/etc/systemd/user",
+    "/run/systemd/user",
+    "/usr/lib/systemd/user",
+];
+
 /// Scan all systemd unit directories and cron files, returning any suspicious exec paths.
 ///
 /// When `deep` is false, only unit-file authorship is resolved; the provenance
@@ -43,31 +71,20 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
     };
 
     // R23-04: full systemd search path — includes /usr/local/lib/systemd,
-    // drop-in directories (<unit>.d/*.conf), user units (/etc/systemd/user,
-    // /run/systemd/user, /usr/lib/systemd/user), and .socket units.
-    const UNIT_DIRS: &[&str] = &[
-        "/etc/systemd/system",
-        "/run/systemd/system",
-        "/usr/lib/systemd/system",
-        "/usr/local/lib/systemd/system", // priority over /usr/lib, not vendor-owned
-        "/etc/systemd/user",
-        "/run/systemd/user",
-        "/usr/lib/systemd/user",
-    ];
-
+    // drop-in directories (<unit>.d/*.conf), user units, and .socket units.
     fn is_unit_file(p: &Path) -> bool {
         p.extension()
             .is_some_and(|e| e == "service" || e == "socket")
     }
 
-    fn scan_unit_dir(dir: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
+    fn scan_unit_dir(dir: &Path, scope: UnitScope, push: &mut dyn FnMut(ExecStartFinding)) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if is_unit_file(&path) {
-                scan_service_file(&path, push);
+                scan_service_file(&path, scope, push);
                 continue;
             }
             // R23-04: drop-in directories <unit>.d/*.conf
@@ -77,15 +94,24 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
                 for d in dropins.flatten() {
                     let dp = d.path();
                     if dp.extension().is_some_and(|e| e == "conf") {
-                        scan_service_file(&dp, push);
+                        scan_service_file(&dp, scope, push);
                     }
                 }
             }
         }
     }
 
-    for dir in UNIT_DIRS {
-        scan_unit_dir(Path::new(dir), &mut push_candidate);
+    for dir in SYSTEM_UNIT_DIRS {
+        scan_unit_dir(Path::new(dir), UnitScope::System, &mut push_candidate);
+    }
+    for dir in USER_UNIT_DIRS {
+        scan_unit_dir(
+            Path::new(dir),
+            UnitScope::UserManager {
+                owner_is_root: false,
+            },
+            &mut push_candidate,
+        );
     }
 
     // User systemd units (non-root persistence):
@@ -95,14 +121,26 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
             for user_entry in users.flatten() {
                 let user_dir = user_entry.path().join(".config/systemd/user");
                 if user_dir.is_dir() {
-                    scan_unit_dir(&user_dir, &mut push_candidate);
+                    scan_unit_dir(
+                        &user_dir,
+                        UnitScope::UserManager {
+                            owner_is_root: false,
+                        },
+                        &mut push_candidate,
+                    );
                 }
             }
         }
     }
     let root_user_dir = Path::new("/root/.config/systemd/user");
     if root_user_dir.is_dir() {
-        scan_unit_dir(root_user_dir, &mut push_candidate);
+        scan_unit_dir(
+            root_user_dir,
+            UnitScope::UserManager {
+                owner_is_root: true,
+            },
+            &mut push_candidate,
+        );
     }
 
     // Cron jobs
@@ -196,7 +234,7 @@ fn split_directive(line: &str) -> Option<(&str, &str)> {
 }
 
 /// Extract paths from Exec* directives in a service/drop-in file and check them.
-fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
+fn scan_service_file(unit_path: &Path, scope: UnitScope, push: &mut dyn FnMut(ExecStartFinding)) {
     let unit_path_s = unit_path.to_string_lossy().into_owned();
 
     let Some(path_str) = unit_path.to_str() else {
@@ -226,8 +264,11 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
         .to_string_lossy()
         .to_string();
 
-    // R23-06: check if the unit runs as root (no non-root User=).
-    let runs_as_root = unit_runs_as_root(&content);
+    // R23-06 / R23-16: determine whether the unit runs as root.
+    let runs_as_root = match scope {
+        UnitScope::System => unit_runs_as_root(&content),
+        UnitScope::UserManager { owner_is_root } => owner_is_root,
+    };
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -269,7 +310,7 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
                     volatile,
                     writability,
                     package: None,
-                    runs_as_root, // R23-06
+                    runs_as_root, // R23-06 / R23-16
                 });
             }
         }
@@ -290,6 +331,17 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
         for entry in entries.flatten() {
             let path = entry.path();
             let path_s = path.to_string_lossy().into_owned();
+
+            // R23-18: cron ignores files that don't match [A-Za-z0-9_-].
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if !cron_d_is_active(&name) {
+                continue;
+            }
+
             let Some(path_str) = path.to_str() else {
                 coverage::record(format!(
                     "cron.d path is not valid UTF-8 ({}); skipping",
@@ -298,10 +350,7 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
                 continue;
             };
             if let Ok((content, _)) = safe_io::read_file_capped_regular(path_str, 64 * 1024) {
-                let source = format!(
-                    "cron.d:{}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                );
+                let source = format!("cron.d:{}", name);
                 for line in content.lines() {
                     check_cron_line(line, &source, &path_s, push);
                 }
@@ -310,6 +359,15 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
     }
 
     // TODO: user crontabs via `crontab -l`? For now, skip to avoid complexity.
+}
+
+/// R23-18: cron ignores files in /etc/cron.d that contain characters beyond
+/// [A-Za-z0-9_-] — editor backups, package manager save files, etc.
+fn cron_d_is_active(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 // Shorthand schedules recognized by vixie/cronie.
@@ -339,16 +397,15 @@ fn check_cron_line(
         return;
     }
 
-    // R23-01: /etc/crontab and /etc/cron.d/* use the SYSTEM format:
-    // <schedule> <user> <command>. The user field is required.
-    let cmd_idx = match first.strip_prefix('@') {
+    // R23-13: extract the user field as well as the command index.
+    let (cmd_idx, user_idx) = match first.strip_prefix('@') {
         Some(tag) => {
             if !CRON_SHORTHANDS.contains(&tag) {
                 return;
             }
-            2 // @reboot | user | command
+            (2, 1) // @reboot | user | command
         }
-        None => 6, // 5 schedule fields | user | command
+        None => (6, 5), // 5 schedule fields | user | command
     };
 
     let Some(&first_token) = parts.get(cmd_idx) else {
@@ -364,6 +421,11 @@ fn check_cron_line(
     let volatile = crate::utils::is_volatile_exec_path(&resolved);
     let writability = assess_writability(first_token);
 
+    // R23-13: real identity from the user field.
+    let runs_as_root = parts
+        .get(user_idx)
+        .is_none_or(|u| *u == "root" || *u == "0");
+
     push(ExecStartFinding {
         source: source.to_string(),
         unit_name: source.to_string(),
@@ -373,7 +435,7 @@ fn check_cron_line(
         volatile,
         writability,
         package: None,
-        runs_as_root: true, // cron entries always execute as the specified user, but for simplicity we assume root (fail‑closed)
+        runs_as_root,
     });
 }
 
@@ -418,13 +480,25 @@ mod tests {
     }
 
     #[test]
+    fn cron_identity_comes_from_the_user_field() {
+        let mut got = Vec::new();
+        let mut push = |f: ExecStartFinding| got.push((f.exec_path, f.runs_as_root));
+
+        check_cron_line("*/5 * * * * deploy /opt/app/sync.sh", "c", "c", &mut push);
+        check_cron_line("0 3 * * * root /usr/local/sbin/backup", "c", "c", &mut push);
+
+        assert!(!got[0].1, "User=deploy → SEC-046 not applicable");
+        assert!(got[1].1);
+    }
+
+    #[test]
     fn quoted_exec_start_is_not_a_bypass() {
         let dir = tempfile::tempdir().unwrap();
         let unit = dir.path().join("evil.service");
         std::fs::write(&unit, "[Service]\nExecStart=-:\"/dev/shm/impl\" --daemon\n").unwrap();
 
         let mut got = Vec::new();
-        scan_service_file(&unit, &mut |f| got.push(f.exec_path));
+        scan_service_file(&unit, UnitScope::System, &mut |f| got.push(f.exec_path));
         assert_eq!(got, vec!["/dev/shm/impl".to_string()]);
     }
 
@@ -435,7 +509,9 @@ mod tests {
         std::fs::write(&unit, "[Service]\nUser = app\nExecStart = -/dev/shm/impl\n").unwrap();
 
         let mut got = Vec::new();
-        scan_service_file(&unit, &mut |f| got.push((f.exec_path, f.runs_as_root)));
+        scan_service_file(&unit, UnitScope::System, &mut |f| {
+            got.push((f.exec_path, f.runs_as_root))
+        });
         assert_eq!(got, vec![("/dev/shm/impl".to_string(), false)]);
     }
 }
