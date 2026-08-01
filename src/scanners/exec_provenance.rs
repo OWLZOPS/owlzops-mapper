@@ -158,6 +158,20 @@ fn assess_writability(path: &str) -> ExecWritability {
     }
 }
 
+/// Returns true if the unit file does not set `User=` to a non-root account.
+/// The last `User=` line wins (systemd behaviour). Fail-closed: absent or
+/// root/0 → true.
+fn unit_runs_as_root(content: &str) -> bool {
+    content
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("User="))
+        .next_back() // last assignment wins
+        .is_none_or(|u| {
+            let u = u.trim().trim_matches('"');
+            u.is_empty() || u == "root" || u == "0"
+        })
+}
+
 // R23-04: all Exec* directives understood by systemd.
 const EXEC_DIRECTIVES: &[&str] = &[
     "ExecStart=",
@@ -187,6 +201,9 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+
+    // R23-06: check if the unit runs as root (no non-root User=).
+    let runs_as_root = unit_runs_as_root(&content);
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -225,6 +242,7 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
                     volatile,
                     writability,
                     package: None,
+                    runs_as_root, // R23-06
                 });
             }
         }
@@ -323,6 +341,7 @@ fn check_cron_line(
         volatile,
         writability,
         package: None,
+        runs_as_root: true, // cron entries always execute as the specified user, but for simplicity we assume root (fail‑closed)
     });
 }
 
