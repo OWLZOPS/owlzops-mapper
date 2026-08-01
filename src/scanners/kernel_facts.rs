@@ -6,10 +6,22 @@ use crate::coverage;
 use crate::safe_io;
 
 /// Gather kernel hardening facts: core_pattern, modules_disabled, lockdown state.
-pub fn gather_kernel_facts() -> (String, Option<bool>, Option<String>) {
-    let core_pattern = safe_io::read_file_capped("/proc/sys/kernel/core_pattern", 4096)
-        .map(|(s, _)| s.trim().to_string())
-        .unwrap_or_default();
+///
+/// core_pattern is now `Option<String>`: `None` means the file was unreadable
+/// (EACCES, missing `/proc`, etc.) and the core-dump handler hijack check
+/// **cannot** be performed.  An empty string (the previous sentinel) is
+/// indistinguishable from a genuinely empty pattern, which the kernel treats
+/// as "disabled" and is safe — coverage distinguishes the two (R23-07).
+pub fn gather_kernel_facts() -> (Option<String>, Option<bool>, Option<String>) {
+    let core_pattern = match safe_io::read_file_capped("/proc/sys/kernel/core_pattern", 4096) {
+        Ok((s, _)) => Some(s.trim().to_string()),
+        Err(e) => {
+            coverage::record(format!(
+                "core_pattern unreadable ({e}); core-dump handler hijack NOT verified"
+            ));
+            None
+        }
+    };
 
     let modules_disabled = safe_io::read_file_capped("/proc/sys/kernel/modules_disabled", 4096)
         .ok()

@@ -182,7 +182,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");
             scan_warnings
                 .push("persistence scanner panicked — SEC-042/043/044 NOT verified".to_string());
-            (Vec::new(), (String::new(), None, None), Vec::new())
+            (Vec::new(), (None, None, None), Vec::new())
         });
 
         // Drain coverage after all scanners finished – scope is attached here,

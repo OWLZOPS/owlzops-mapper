@@ -1671,21 +1671,30 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-044 – Kernel security facts (core_pattern, lockdown) ──────────
-    if report.security.core_pattern.starts_with('|')
-        && !report.security.core_pattern.contains("systemd-coredump")
-        && !report.security.core_pattern.contains("abrt-hook-ccpp")
-        && !report.security.core_pattern.contains("apport")
-    // Ubuntu default crash handle
+    // R23-07: core_pattern is now Option — None means unreadable (coverage).
+    // Only flag when a handler is piped and the handler binary is not a known
+    // trusted one OR resides on a volatile filesystem.
+    if let Some(cp) = report.security.core_pattern.as_deref()
+        && cp.starts_with('|')
     {
-        findings.push(Finding {
-            id: "SEC-044",
-            title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
-            category: Category::Security,
-            weight: 25,
-            evidence: format!("core_pattern = {}", report.security.core_pattern),
-            suppressed: None,
-            cis_ref: None,
-        });
+        let handler = cp.trim_start_matches('|').trim();
+        let bin = handler.split_whitespace().next().unwrap_or(handler);
+        let known_basenames = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
+        let basename = bin.rsplit('/').next().unwrap_or(bin);
+        let volatile = crate::utils::is_volatile_exec_path(bin);
+        let trusted = known_basenames.contains(&basename) && !volatile;
+
+        if !trusted {
+            findings.push(Finding {
+                id: "SEC-044",
+                title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!("core_pattern = {}", cp),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
     }
 
     if let Some(ref lock) = report.security.lockdown

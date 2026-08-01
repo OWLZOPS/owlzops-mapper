@@ -361,7 +361,7 @@ pub struct SecurityInfo {
 
     // ── SEC-044: kernel security facts (core_pattern, modules_disabled, lockdown) ─
     #[serde(default)]
-    pub core_pattern: String,
+    pub core_pattern: Option<String>,
     #[serde(default)]
     pub modules_disabled: Option<bool>, // None = unreadable
     #[serde(default)]
