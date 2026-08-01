@@ -1469,42 +1469,55 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-042 – System-wide LD_PRELOAD (/etc/ld.so.preload) ──────────────
+    // ── SEC-042 / SEC-049: System-wide LD_PRELOAD ──
     for f in &report.security.preload_injections {
-        let is_ioc = f.volatile
-            || (f.package.is_none()
-                && report.security.provenance_source != ProvenanceSource::Unavailable);
-        if is_ioc {
+        if f.volatile {
             findings.push(Finding {
                 id: "SEC-042",
-                title: "System-wide LD_PRELOAD injected".to_string(),
+                title: "System-wide LD_PRELOAD from volatile location (ACTIVE COMPROMISE)".into(),
                 category: Category::Security,
                 weight: 60,
                 evidence: format!(
-                    "{} (volatile: {}, package: {:?})",
-                    f.path,
-                    f.volatile,
-                    f.package.as_deref()
+                    "{} is injected via /etc/ld.so.preload and resides on a volatile filesystem",
+                    f.path
                 ),
-                suppressed: None,
                 cis_ref: None,
+                suppressed: None,
             });
         } else if f.package.is_none()
             && report.security.provenance_source == ProvenanceSource::Unavailable
         {
+            // R23-02: separate ID — CriticalFlags keys on ID, not weight.
+            // Same contract as SEC-024 (hard) / SEC-025 (downgraded).
             findings.push(Finding {
-                id: "SEC-042",
-                title: "System-wide LD_PRELOAD injected (ownership unverifiable)".to_string(),
+                id: "SEC-049",
+                title: "System-wide LD_PRELOAD present (ownership unverifiable)".into(),
                 category: Category::Security,
                 weight: 20,
                 evidence: format!(
-                    "{} (provenance unavailable — cannot verify library origin)",
+                    "{} is listed in /etc/ld.so.preload, but package database is unavailable — ownership cannot be verified",
                     f.path
                 ),
-                suppressed: None,
                 cis_ref: None,
+                suppressed: None,
+            });
+        } else if f.package.is_none()
+            && report.security.provenance_source != ProvenanceSource::Unavailable
+        {
+            findings.push(Finding {
+                id: "SEC-042",
+                title: "System-wide LD_PRELOAD injected (unpackaged object)".into(),
+                category: Category::Security,
+                weight: 30,
+                evidence: format!(
+                    "{} is injected via /etc/ld.so.preload and does NOT belong to any installed package",
+                    f.path
+                ),
+                cis_ref: None,
+                suppressed: None,
             });
         }
+        // packaged preload objects are not flagged (normal)
     }
 
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
@@ -3507,5 +3520,23 @@ mod tests {
             ..Default::default()
         };
         assert!(!unit_is_vendor_shipped(&d));
+    }
+
+    #[test]
+    fn sec049_unverifiable_preload_does_not_set_compromise() {
+        let mut r = minimal_report();
+        r.security.provenance_source = ProvenanceSource::Unavailable;
+        r.security.preload_injections = vec![PreloadFinding {
+            path: "/usr/lib/libsnoopy.so".into(),
+            volatile: false,
+            package: None,
+            mapped_by_pids: None,
+        }];
+        let findings = evaluate(&r);
+        assert!(findings.iter().any(|f| f.id == "SEC-049"));
+        assert!(
+            !CriticalFlags::from_findings(&findings).compromised_host,
+            "unverifiable ownership != active compromise"
+        );
     }
 }
