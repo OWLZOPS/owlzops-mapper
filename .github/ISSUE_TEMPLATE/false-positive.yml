@@ -1,0 +1,92 @@
+name: False positive
+description: The mapper flagged something that is legitimate on your host
+title: "[FP] "
+labels: ["false-positive"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        False positives are the main thing that erodes trust in a scanner, so these reports are genuinely useful — thank you.
+
+        **Do not paste anything sensitive.** Redact hostnames, IPs, usernames, container names and paths that identify your environment. A redacted report is still perfectly actionable.
+
+        If you think you've found a security vulnerability *in the tool itself*, stop here and email security@owlzops.com instead — see [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `owlzops-mapper --version`
+      placeholder: "0.5.28"
+    validations:
+      required: true
+
+  - type: input
+    id: finding
+    attributes:
+      label: Finding ID
+      description: The SEC / DOCK / CAP code that fired, or the finding text if there is no code
+      placeholder: "SEC-013"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and kernel, plus anything non-standard about the host
+      placeholder: |
+        OS:      Ubuntu 24.04
+        Kernel:  6.8.0-51-generic
+        Runtime: Docker 27.3 / Podman rootless / none
+        Notes:   NixOS, Fedora Atomic, Alpine, k3s node, LXC container, etc.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: What the mapper reported
+      description: The relevant table row or JSON finding object. Redact identifying values.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: legitimate
+    attributes:
+      label: Why this is legitimate
+      description: |
+        The important part. What is the flagged thing actually doing, and how do you know it's supposed to be there?
+        Package ownership, upstream docs, the service that owns it — whatever makes the case.
+      placeholder: |
+        This binary lives under ~/.local/share/JetBrains/... and is part of the Toolbox install.
+        It only listens on 127.0.0.1 and is owned by my user, not root.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Supporting evidence (optional)
+      description: |
+        Whatever helps identify the structural rule that should have suppressed this — package ownership, path,
+        listener bind address, capability set. Redact freely.
+      placeholder: |
+        $ dpkg -S /usr/bin/example
+        $ getcap /usr/bin/example
+        $ ss -lntp | grep 9001
+      render: shell
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I'm running an official release binary, not a modified or debug build
+          required: true
+        - label: I've redacted hostnames, IPs, usernames and anything else identifying
+          required: true
+        - label: This is a false positive, not a suspected vulnerability in the tool
+          required: true

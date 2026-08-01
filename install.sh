@@ -19,7 +19,16 @@ case "$OS" in
         esac
         ;;
     Darwin)
-        SUFFIX="macos-arm64"
+        case "$ARCH" in
+            arm64) SUFFIX="macos-arm64" ;;
+            *)
+                echo "Unsupported macOS architecture: $ARCH"
+                echo "  Only Apple Silicon (arm64) is published for macOS."
+                echo "  On an Intel Mac, run the Linux binary on the target host directly,"
+                echo "  or orchestrate remote scans from a Linux machine."
+                exit 1
+                ;;
+        esac
         ;;
     *)
         echo "Unsupported OS: $OS"
@@ -102,11 +111,18 @@ if [ "$OS" = "Darwin" ]; then
   other Linux servers, but local audit is
   NOT supported on macOS.
 
-  To scan remote hosts, download the Linux
-  agent binary and pass it with --local-binary:
+  To scan remote hosts you also need the Linux
+  agent. Extract it under a DIFFERENT name, or
+  it will overwrite the orchestrator you just
+  installed:
 
-  curl -sSL https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzops-mapper-linux-x86_64.tar.gz | tar xz
-  ./owlzops-mapper audit --host <host> --copy-binary --local-binary ./owlzops-mapper-linux-x86_64
+  curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzops-mapper-linux-x86_64.tar.gz \\
+    | tar xzO owlzops-mapper > owlzops-agent-linux
+  chmod +x owlzops-agent-linux
+
+  Then pass it with --local-binary:
+
+  ./owlzops-mapper audit --host <host> --copy-binary --local-binary ./owlzops-agent-linux
 
 ========================================
 EOF

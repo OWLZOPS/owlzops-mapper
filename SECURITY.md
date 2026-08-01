@@ -107,26 +107,69 @@ We ship fixes forward. If you're behind, upgrading is the fix.
 
 ## Verifying what you run
 
-Every release is published with:
+Every release publishes, for each target:
 
-- A **SHA256 checksum**, listed on the release page
-- A **GPG signature** over the artifact
-- An **SBOM** (software bill of materials) describing what went into the build
+| File | What it is |
+|---|---|
+| `owlzops-mapper-<target>.tar.gz` | The artifact |
+| `owlzops-mapper-<target>.tar.gz.sha256` | SHA256 checksum of the artifact |
+| `owlzops-mapper-<target>.tar.gz.asc` | GPG signature over the artifact |
+| `owlzops-mapper-<target>.tar.gz.sha256.asc` | GPG signature over the checksum file |
 
-Verify manually:
+`<target>` is one of `linux-x86_64`, `linux-arm64`, `macos-arm64`. An SBOM
+describing what went into the build is attached to the release as well.
 
-```bash
-# checksum
-sha256sum -c owlzops-mapper-<version>-<target>.sha256
+### Signing key
 
-# signature
-gpg --verify owlzops-mapper-<version>-<target>.asc owlzops-mapper-<version>-<target>
+```
+Fingerprint: 63C3 49F8 1ACB B992 9EF8  E73E B47B CE30 4E7C 265E
 ```
 
-The install script performs both checks automatically and refuses to install on
-mismatch. If you'd rather not pipe a script to a shell — a reasonable position —
-download the binary and the signature and verify by hand. The commands above are
-all it does.
+The key is in this repository as [`gpg-public-key.asc`](gpg-public-key.asc), but a
+key you fetch from the same place as the binary proves very little on its own.
+**Compare the fingerprint above against the key you imported** — that comparison
+is what the signature is worth.
+
+### Verify manually
+
+```bash
+# 1. Import the key and check the fingerprint matches the one above
+gpg --import gpg-public-key.asc
+gpg --fingerprint 63C349F81ACBB9929EF8E73EB47BCE304E7C265E
+
+# 2. Verify the checksum file is signed by us
+gpg --verify owlzops-mapper-linux-x86_64.tar.gz.sha256.asc \
+             owlzops-mapper-linux-x86_64.tar.gz.sha256
+
+# 3. Verify the artifact against that checksum
+sha256sum -c owlzops-mapper-linux-x86_64.tar.gz.sha256
+
+# 4. And verify the artifact signature directly
+gpg --verify owlzops-mapper-linux-x86_64.tar.gz.asc \
+             owlzops-mapper-linux-x86_64.tar.gz
+```
+
+On macOS, substitute `shasum -a 256 -c` for `sha256sum -c`.
+
+### What the install script does
+
+`install.sh` detects your OS and architecture, downloads the matching artifact and
+its checksum, and:
+
+- **Always** verifies the SHA256 checksum, and **aborts** on mismatch.
+- **If `gpg` is present**, imports the public key, checks the fingerprint against
+  the value hardcoded in the script, verifies the artifact signature, and
+  **aborts** if either check fails.
+- **If `gpg` is absent**, it says so on stdout and continues with checksum
+  verification only. If you want the signature checked, install `gnupg` first or
+  verify by hand using the commands above.
+
+The binary is extracted into the current directory. Nothing is written outside it,
+no service is installed, and nothing is added to your `PATH` without you doing it.
+
+If you'd rather not pipe a script to a shell — a reasonable position, especially
+for this category of tool — the four commands above are everything the script does
+that matters.
 
 **Build pipeline:** CI pins every GitHub Action to a commit SHA rather than a
 mutable tag, and runs `cargo audit` and `cargo deny` on each build.
