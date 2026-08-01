@@ -433,9 +433,9 @@ The scanner tells you something is wrong. [Owlzops](https://owlzops.com) tells y
 
 **Run the scanner first.** If it comes back clean, we'll tell you so — and we won't sell you the audit. We'd rather lose the sale than charge for confirming what a free tool already told you.
 
-If it didn't come back clean, send the JSON report. We read it before any call, and we'll tell you what we'd do about it whether or not you hire us.
+If it didn't come back clean, send the JSON report. You get a **free 30-minute review call**: we read the report before we talk, and you leave with the remediation order and what we'd do first — whether or not you hire us.
 
-→ [Send a report](https://owlzops.com/contact?service=mapper_consultation&utm_source=github&utm_medium=readme&utm_campaign=mapper_cta) · no pitch, just engineering facts
+→ [Send your report](https://owlzops.com/contact?service=mapper_consultation&utm_source=github&utm_medium=readme&utm_campaign=mapper_cta) · no pitch, just engineering facts
 
 ---
 
