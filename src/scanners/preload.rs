@@ -23,11 +23,30 @@ pub(crate) fn parse_preload_entries(content: &str) -> Vec<&str> {
 }
 
 /// Count how many processes have each preload path mapped in /proc/<pid>/maps.
-fn count_mapped(paths: &[String]) -> HashMap<String, usize> {
+///
+/// Returns `None` when `/proc` is unreadable — the count is UNKNOWN, not zero.
+/// Returns `Some(map)` with zero counts for entries not found.  Paths are
+/// canonicalised before matching because the kernel prints the resolved path
+/// in `/proc/<pid>/maps`.
+fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
+    if paths.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    // Build a mapping from canonical path → original path
+    let canon: Vec<(String, String)> = paths
+        .iter()
+        .map(|p| (crate::utils::canon_path(p).into_owned(), p.clone()))
+        .collect();
+
     let mut counts: HashMap<String, usize> = paths.iter().cloned().map(|p| (p, 0)).collect();
     let Ok(procs) = std::fs::read_dir("/proc") else {
-        return counts;
+        coverage::record(
+            "/proc unreadable; ld.so.preload map corroboration UNKNOWN (not zero)".to_string(),
+        );
+        return None;
     };
+
     for entry in procs.flatten() {
         let file_name = entry.file_name();
         let Some(pid_str) = file_name.to_str() else {
@@ -41,13 +60,19 @@ fn count_mapped(paths: &[String]) -> HashMap<String, usize> {
         else {
             continue;
         };
-        for (path, cnt) in counts.iter_mut() {
-            if maps.contains(path.as_str()) {
-                *cnt += 1;
+
+        // Exact match on the path field (last column), not substring.
+        let mapped: HashSet<&str> = maps
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(5))
+            .collect();
+        for (c, orig) in &canon {
+            if mapped.contains(c.as_str()) {
+                *counts.entry(orig.clone()).or_insert(0) += 1;
             }
         }
     }
-    counts
+    Some(counts)
 }
 
 pub fn scan_ld_preload() -> Vec<PreloadFinding> {
@@ -92,11 +117,15 @@ pub fn scan_ld_preload() -> Vec<PreloadFinding> {
         }
     }
 
-    // Fill mapped_by_pids with live process counts (R23-09)
-    let paths: Vec<String> = findings.iter().map(|f| f.path.clone()).collect();
-    let mapped = count_mapped(&paths);
-    for f in &mut findings {
-        f.mapped_by_pids = mapped.get(&f.path).copied();
+    // Fill mapped_by_pids with live process counts (R23-09 / R23-17)
+    if !findings.is_empty() {
+        let paths: Vec<String> = findings.iter().map(|f| f.path.clone()).collect();
+        if let Some(mapped) = count_mapped(&paths) {
+            for f in &mut findings {
+                f.mapped_by_pids = mapped.get(&f.path).copied();
+            }
+        }
+        // None → field stays None: "unknown", not "zero"
     }
 
     findings
