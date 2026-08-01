@@ -101,6 +101,10 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
         coverage::record(format!(
             "ld.so.preload corroboration: {denied} /proc/<pid>/maps unreadable{hint}"
         ));
+        // R23-25: when some processes are unobservable, a zero count means
+        // "not seen", not "not mapped".  Remove those keys so the field stays
+        // None; non-zero observations are always trustworthy.
+        counts.retain(|_, v| *v > 0);
     }
     if read_ok == 0 {
         // No observations at all — cannot assert zero (R23‑20).

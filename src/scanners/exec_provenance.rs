@@ -61,8 +61,16 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
     let mut findings: Vec<ExecStartFinding> = Vec::new();
     let mut candidate_set: HashSet<String> = HashSet::new();
 
+    // R23-23: finding cap in line with every other scanner budget.
+    const MAX_EXEC_FINDINGS: usize = 2048;
+    let mut over_cap = 0usize;
+
     // Helper – push a finding and (when deep) record its canonical path for batch resolution
     let mut push_candidate = |finding: ExecStartFinding| {
+        if findings.len() >= MAX_EXEC_FINDINGS {
+            over_cap += 1;
+            return;
+        }
         if deep {
             let canon = crate::utils::canon_path(&finding.exec_path).into_owned();
             candidate_set.insert(canon);
@@ -168,6 +176,13 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
                 f.unit_package = prov.lookup(crate::utils::canon_path(&f.unit_path).as_ref());
             }
         }
+    }
+
+    if over_cap > 0 {
+        coverage::record(format!(
+            "exec_provenance: finding cap ({MAX_EXEC_FINDINGS}) reached; \
+             {over_cap} more Exec* entr(ies) NOT inspected"
+        ));
     }
 
     findings
