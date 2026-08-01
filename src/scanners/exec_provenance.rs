@@ -92,8 +92,11 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
     if !candidate_set.is_empty() {
         let prov = crate::scanners::provenance::resolve_batch(&candidate_set);
         for f in &mut findings {
-            // target executable – resolved only when deep is true (insertion skipped above)
-            f.package = prov.lookup(crate::utils::canon_path(&f.exec_path).as_ref());
+            // SEC-045 target ownership is inventory, not forensics.
+            // Only resolve when deep is requested (R22-38).
+            if deep {
+                f.package = prov.lookup(crate::utils::canon_path(&f.exec_path).as_ref());
+            }
             if !f.unit_path.is_empty() {
                 f.unit_package = prov.lookup(crate::utils::canon_path(&f.unit_path).as_ref());
             }
