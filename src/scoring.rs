@@ -29,6 +29,19 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
 pub const SCORING_VERSION: u8 = 7;
 
+// ── Helper: keep evidence strings readable and JSON compact ─
+/// Truncate a list of items for display, appending "+N more" if beyond limit.
+fn evidence_list(items: &[String], limit: usize) -> String {
+    if items.len() <= limit {
+        return items.join("; ");
+    }
+    format!(
+        "{}; +{} more",
+        items[..limit].join("; "),
+        items.len() - limit
+    )
+}
+
 // ── New Finding model (v0.5) ───────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1470,63 +1483,83 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-042 / SEC-049 / SEC-050: System-wide LD_PRELOAD ──
-    for f in &report.security.preload_injections {
-        if f.volatile {
+    // R23-26: one finding per tier – score must not inflate with number of lines.
+    {
+        let mut pre_volatile: Vec<String> = Vec::new();
+        let mut pre_unverifiable: Vec<String> = Vec::new();
+        let mut pre_mapped: Vec<String> = Vec::new();
+        let mut pre_unmapped: Vec<String> = Vec::new();
+
+        for f in &report.security.preload_injections {
+            let mapped = f.mapped_by_pids.map_or("?".to_string(), |n| n.to_string());
+            if f.volatile {
+                pre_volatile.push(f.path.clone());
+            } else if f.package.is_none()
+                && report.security.provenance_source == ProvenanceSource::Unavailable
+            {
+                pre_unverifiable.push(f.path.clone());
+            } else if f.package.is_none() {
+                if f.mapped_by_pids.is_some_and(|n| n > 0) {
+                    pre_mapped.push(format!("{} (mapped by {mapped})", f.path));
+                } else {
+                    pre_unmapped.push(format!("{} (mapped by {mapped})", f.path));
+                }
+            }
+        }
+
+        // Volatile or corroborated → SEC-042 (weight 60 if any volatile, else 55)
+        if !pre_volatile.is_empty() || !pre_mapped.is_empty() {
+            let weight = if !pre_volatile.is_empty() { 60 } else { 55 };
+            let mut entries = pre_volatile;
+            entries.append(&mut pre_mapped);
             findings.push(Finding {
                 id: "SEC-042",
-                title: "System-wide LD_PRELOAD from volatile location (ACTIVE COMPROMISE)".into(),
+                title: "ACTIVE COMPROMISE: system-wide LD_PRELOAD injected".into(),
                 category: Category::Security,
-                weight: 60,
+                weight,
                 evidence: format!(
-                    "{} is injected via /etc/ld.so.preload and resides on a volatile filesystem",
-                    f.path
+                    "{} entr(ies) in /etc/ld.so.preload: {}",
+                    entries.len(),
+                    evidence_list(&entries, 10)
                 ),
-                cis_ref: None,
                 suppressed: None,
+                cis_ref: None,
             });
-        } else if f.package.is_none()
-            && report.security.provenance_source == ProvenanceSource::Unavailable
-        {
-            // R23-02: separate ID — CriticalFlags keys on ID, not weight.
-            // Same contract as SEC-024 (hard) / SEC-025 (downgraded).
+        }
+
+        // Unpackaged but not corroborated → SEC-050
+        if !pre_unmapped.is_empty() {
+            findings.push(Finding {
+                id: "SEC-050",
+                title: "System-wide LD_PRELOAD injected (unpackaged, not yet mapped)".into(),
+                category: Category::Security,
+                weight: 30,
+                evidence: format!(
+                    "{} entr(ies): {}",
+                    pre_unmapped.len(),
+                    evidence_list(&pre_unmapped, 10)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // Ownership unverifiable → SEC-049
+        if !pre_unverifiable.is_empty() {
             findings.push(Finding {
                 id: "SEC-049",
                 title: "System-wide LD_PRELOAD present (ownership unverifiable)".into(),
                 category: Category::Security,
                 weight: 20,
                 evidence: format!(
-                    "{} is listed in /etc/ld.so.preload, but package database is unavailable — ownership cannot be verified",
-                    f.path
+                    "{} entr(ies) in /etc/ld.so.preload; package database unavailable: {}",
+                    pre_unverifiable.len(),
+                    evidence_list(&pre_unverifiable, 10)
                 ),
-                cis_ref: None,
                 suppressed: None,
-            });
-        } else if f.package.is_none()
-            && report.security.provenance_source != ProvenanceSource::Unavailable
-        {
-            // R23-14: corroboration by live processes splits IoC from suspicion.
-            // mapped_by_pids == None (unreadable /proc) NEVER escalates —
-            // uncertainty is surfaced via coverage and drift (SEC-025/049 contract).
-            let corroborated = f.mapped_by_pids.is_some_and(|n| n > 0);
-            findings.push(Finding {
-                id: if corroborated { "SEC-042" } else { "SEC-050" },
-                title: if corroborated {
-                    "ACTIVE COMPROMISE: unpackaged LD_PRELOAD object mapped into live processes".into()
-                } else {
-                    "System-wide LD_PRELOAD injected (unpackaged, not yet mapped)".into()
-                },
-                weight: if corroborated { 55 } else { 30 },
-                category: Category::Security,
-                evidence: format!(
-                    "{} is injected via /etc/ld.so.preload, belongs to no installed package, mapped by {} process(es)",
-                    f.path,
-                    f.mapped_by_pids.map_or("?".to_string(), |n| n.to_string())
-                ),
                 cis_ref: None,
-                suppressed: None,
             });
         }
-        // packaged preload objects are not flagged (normal)
     }
 
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
@@ -1541,18 +1574,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .map(|f| format!("{} → {}", f.source, f.exec_path))
                 .collect()
         };
-
-        // R23-23: keep evidence strings readable and JSON compact.
-        fn evidence_list(items: &[String], limit: usize) -> String {
-            if items.len() <= limit {
-                return items.join("; ");
-            }
-            format!(
-                "{}; +{} more",
-                items[..limit].join("; "),
-                items.len() - limit
-            )
-        }
 
         // Tier 1 — live rogue payload on tmpfs, declared by a non‑vendor unit.
         // Unknown writability is excluded: an EACCES target is not provably present.
