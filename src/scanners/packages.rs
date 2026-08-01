@@ -121,19 +121,30 @@ fn parse_pacman_updates(stdout: &str) -> Vec<UpgradablePackage> {
 // ---------------------------------------------------------------------------
 
 fn dnf_like_upgradable(bin: &str) -> Vec<UpgradablePackage> {
-    crate::utils::run_with_timeout_any_exit(bin, &["check-update"], 30)
+    // R22-35: `-C` (--cacheonly) keeps this a READ. Without it dnf silently
+    // refreshes expired repo metadata — measured at 25.6 s in poll on a cold
+    // cache — which turns a read-only audit into a network operation that also
+    // writes to the host's package cache. Refreshing stays the exclusive job of
+    // `refresh_cache`, gated behind --refresh-packages.
+    crate::utils::run_with_timeout_any_exit(bin, &["-C", "check-update"], 30)
         .map(|out| parse_dnf_check_update(&out))
         .unwrap_or_default()
 }
 
 fn apt_upgradable() -> Vec<UpgradablePackage> {
-    crate::utils::run_with_timeout("apt", &["list", "--upgradable"], 30)
-        .map(|out| parse_apt_upgradable(&out))
-        .unwrap_or_default()
+    // apt reads /var/lib/apt/lists without network, but pin the behaviour
+    // explicitly so a future apt cannot start fetching behind our back.
+    crate::utils::run_with_timeout(
+        "apt",
+        &["-o", "Acquire::Languages=none", "list", "--upgradable"],
+        30,
+    )
+    .map(|out| parse_apt_upgradable(&out))
+    .unwrap_or_default()
 }
 
 fn zypper_upgradable() -> Vec<UpgradablePackage> {
-    crate::utils::run_with_timeout("zypper", &["list-updates"], 30)
+    crate::utils::run_with_timeout("zypper", &["--no-refresh", "list-updates"], 30)
         .map(|out| parse_zypper_updates(&out))
         .unwrap_or_default()
 }
@@ -281,6 +292,15 @@ pub fn gather_packages_info(refresh: bool) -> PackagesInfo {
                 pkg.is_security = true;
             }
         }
+    }
+
+    // R22-35: Warn when upgrade list is read from a possibly stale cache.
+    if !cache_refreshed && upgradable.is_empty() {
+        crate::coverage::record(
+            "packages: upgrade list read from a possibly stale local cache (no network refresh) — \
+             an empty list means NOTHING WAS FOUND IN CACHE, not that the host is up to date; \
+             use --refresh-packages for an authoritative answer",
+        );
     }
 
     PackagesInfo {
