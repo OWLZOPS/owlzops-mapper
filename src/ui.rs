@@ -16,6 +16,26 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 
 // ---------------------------------------------------------------------------
+// Safe output macro – prevents panic on broken pipe (R22-37)
+// ---------------------------------------------------------------------------
+
+/// Term-safe `println!` replacement. If the reader has closed stdout
+/// (`| head`, `| grep -q`, quitting `less`), exit cleanly instead of panicking.
+/// This preserves the scan's exit contract (codes 0-3) and does not affect
+/// socket writes (russh), unlike restoring SIG_DFL globally.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        if let Err(e) = writeln!(stdout, $($arg)*) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                crate::utils::exit_reader_gone();
+            }
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
 // Theme & Icons
 // ---------------------------------------------------------------------------
 
@@ -53,13 +73,13 @@ impl Theme {
                 rel_cat: "\u{2699} ",
                 hyg_cat: "\u{1F9F9} ",
                 sec_item: "\u{1F6E1}  ",
-                alert: "\u{1F6A8} ",        // 🚨
-                warn: "\u{26A0}\u{FE0F}  ", // ⚠️ (with emoji presentation selector)
-                warn_sm: "\u{26A0} ",       // ⚠ (text presentation)
-                ghost: "\u{1F47B} ",        // 👻
-                dna: "\u{1F9EC} ",          // 🧬
-                mag: "\u{1F50D} ",          // 🔍
-                hint: "\u{1F4A1} ",         // 💡
+                alert: "\u{1F6A8} ",
+                warn: "\u{26A0}\u{FE0F}  ",
+                warn_sm: "\u{26A0} ",
+                ghost: "\u{1F47B} ",
+                dna: "\u{1F9EC} ",
+                mag: "\u{1F50D} ",
+                hint: "\u{1F4A1} ",
                 color_reset: "\x1b[0m",
             }
         } else {
@@ -97,12 +117,12 @@ pub fn sanitize_terminal(s: &str) -> String {
     for c in s.chars() {
         match c {
             '\t' => out.push_str("    "),
-            c if c.is_control() => out.push('\u{FFFD}'),          // C0, C1, DEL
-            '\u{202A}'..='\u{202E}'   // bidi overrides (LRE, RLE, PDF, LRO, RLO)
-            | '\u{2066}'..='\u{2069}' // bidi isolates (LRI, RLI, FSI, PDI)
-            | '\u{200B}'..='\u{200D}' // zero-width space, non-joiner, joiner
+            c if c.is_control() => out.push('\u{FFFD}'),
+            '\u{202A}'..='\u{202E}'   // bidi overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{200B}'..='\u{200D}' // zero-width chars
             | '\u{2060}'             // word joiner
-            | '\u{FEFF}'             // BOM / zero-width no-break space
+            | '\u{FEFF}'             // BOM
             => out.push('\u{FFFD}'),
             c => out.push(c),
         }
@@ -111,13 +131,9 @@ pub fn sanitize_terminal(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: table with dynamic column width (no forced width)
+// Helper: table with dynamic column width
 // ---------------------------------------------------------------------------
 
-/// Create a `Table` preset for sections that contain potentially long text.
-/// Uses `ContentArrangement::Dynamic` so columns resize to fit the content,
-/// while `comfy_table`'s internal fallback (80 columns) guarantees no runaway
-/// lines when no terminal is present (e.g. automated SSH calls).
 fn create_dynamic_table() -> Table {
     let mut t = Table::new();
     t.load_preset(UTF8_FULL)
@@ -153,9 +169,9 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_ghost_pids(report, &theme);
 
     if !report.coverage_warnings.is_empty() {
-        println!("\n{}Coverage Warnings (incomplete data):", theme.warn_sm);
+        outln!("\n{}Coverage Warnings (incomplete data):", theme.warn_sm);
         for w in &report.coverage_warnings {
-            println!("   - {}", sanitize_terminal(w));
+            outln!("   - {}", sanitize_terminal(w));
         }
     }
 
@@ -166,7 +182,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
     let theme = Theme::new();
 
     if reports.is_empty() {
-        println!("No reports to display.");
+        outln!("No reports to display.");
         return;
     }
 
@@ -215,8 +231,8 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
         ]);
     }
 
-    println!("{}Owlzops Multi‑Host Audit Summary\n", theme.owl);
-    println!("{t}\n");
+    outln!("{}Owlzops Multi‑Host Audit Summary\n", theme.owl);
+    outln!("{t}\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -224,8 +240,6 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
 // ---------------------------------------------------------------------------
 
 fn render_header(report: &AgentReport, theme: &Theme) {
-    // Always compute the score locally to avoid depending on a possibly
-    // stale `risk_score` from an older remote agent.
     let scored = crate::scoring::score(crate::scoring::evaluate(report));
     let risk_score = scored.total;
 
@@ -249,19 +263,26 @@ fn render_header(report: &AgentReport, theme: &Theme) {
         ""
     };
 
-    println!("{}Owlzops Mapper v{}", theme.owl, report.version);
-    println!(
+    outln!("{}Owlzops Mapper v{}", theme.owl, report.version);
+    outln!(
         "{}Scan completed in {:.2}s",
-        theme.spy, report.duration_secs
+        theme.spy,
+        report.duration_secs
     );
-    println!(
+    outln!(
         "{}Risk Score: {}{}/100{}  ({}) \n",
-        theme.shield, risk_color, risk_score, theme.color_reset, risk_label
+        theme.shield,
+        risk_color,
+        risk_score,
+        theme.color_reset,
+        risk_label
     );
 
-    println!(
+    outln!(
         "  Security −{}  Reliability −{}  Hygiene −{}",
-        scored.security, scored.reliability, scored.hygiene
+        scored.security,
+        scored.reliability,
+        scored.hygiene
     );
 
     let active_findings: Vec<&crate::scoring::Finding> = scored
@@ -271,7 +292,7 @@ fn render_header(report: &AgentReport, theme: &Theme) {
         .collect();
 
     if !active_findings.is_empty() {
-        println!("\nRisk Breakdown:");
+        outln!("\nRisk Breakdown:");
 
         let categories = [
             (
@@ -295,7 +316,7 @@ fn render_header(report: &AgentReport, theme: &Theme) {
                 .collect();
 
             if !cat_findings.is_empty() {
-                println!("\n  {}", label);
+                outln!("\n  {}", label);
 
                 let mut t_cat = create_dynamic_table();
                 t_cat.set_header(vec![
@@ -318,14 +339,14 @@ fn render_header(report: &AgentReport, theme: &Theme) {
                         Cell::new(sanitize_terminal(&f.evidence)),
                     ]);
                 }
-                println!("{t_cat}");
+                outln!("{t_cat}");
             }
         }
-        println!();
+        outln!();
     }
 
     if !report.is_root_execution {
-        println!(
+        outln!(
             "\x1b[1;31m[!] WARNING: Script not run as root. Data is incomplete. Please use `sudo`.\x1b[0m\n"
         );
     }
@@ -343,14 +364,14 @@ fn render_header(report: &AgentReport, theme: &Theme) {
             };
             format!(" ({}{})", first.join(", "), more)
         };
-        println!(
+        outln!(
             "\x1b[1;41;37m[CRITICAL] SYSTEM REBOOT REQUIRED{}\x1b[0m\n",
             suffix
         );
     }
 
     if !report.scan_warnings.is_empty() {
-        println!(
+        outln!(
             "\x1b[1;31m[!] Scan incomplete — {} scanner(s) failed. Report may be unreliable.\x1b[0m\n",
             report.scan_warnings.len()
         );
@@ -464,7 +485,7 @@ fn render_system_overview(report: &AgentReport) {
         Cell::new(sec_mod_str),
     ]);
 
-    println!("{t_sys}\n");
+    outln!("{t_sys}\n");
 }
 
 fn render_top_memory(report: &AgentReport) {
@@ -502,7 +523,7 @@ fn render_top_memory(report: &AgentReport) {
             mem_cell,
         ]);
     }
-    println!("{t_mem}\n");
+    outln!("{t_mem}\n");
 }
 
 fn render_databases(report: &AgentReport) {
@@ -530,7 +551,7 @@ fn render_databases(report: &AgentReport) {
             &format!("{:.2}", db_size_gb),
         ]);
     }
-    println!("{t_dbs}\n");
+    outln!("{t_dbs}\n");
 }
 
 fn render_security_health(report: &AgentReport) {
@@ -662,14 +683,13 @@ fn render_security_health(report: &AgentReport) {
         if details.is_empty() {
             Cell::new(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
         } else {
-            // Group by parent
             let mut parent_counts: HashMap<(&str, u32), usize> = HashMap::new();
             for z in details {
                 let key = (z.parent_name.as_str(), z.ppid);
                 *parent_counts.entry(key).or_insert(0) += 1;
             }
             let mut parents: Vec<_> = parent_counts.into_iter().collect();
-            parents.sort_by_key(|b| std::cmp::Reverse(b.1)); // most zombies first
+            parents.sort_by_key(|b| std::cmp::Reverse(b.1));
             let parts: Vec<_> = parents
                 .iter()
                 .take(3)
@@ -761,13 +781,13 @@ fn render_security_health(report: &AgentReport) {
         t_risk.add_row(vec![Cell::new("User Tools (Provisional)"), prov_cell]);
     }
 
-    println!("{t_risk}\n");
+    outln!("{t_risk}\n");
     if !report.host.dmesg_errors.is_empty() {
-        println!("\x1b[1;31m[!] Critical Kernel Logs (dmesg):\x1b[0m");
+        outln!("\x1b[1;31m[!] Critical Kernel Logs (dmesg):\x1b[0m");
         for err in &report.host.dmesg_errors {
-            println!("    {}", sanitize_terminal(err));
+            outln!("    {}", sanitize_terminal(err));
         }
-        println!();
+        outln!();
     }
 }
 
@@ -809,7 +829,7 @@ fn render_storage(report: &AgentReport) {
             Cell::new(sanitize_terminal(&inode_val)),
         ]);
     }
-    println!("{t_store}\n");
+    outln!("{t_store}\n");
 }
 
 fn render_network_listeners(report: &AgentReport) {
@@ -869,8 +889,8 @@ fn render_network_listeners(report: &AgentReport) {
 
         t_ports.add_row(vec![proto_cell, addr_cell, port_cell, proc_cell]);
     }
-    println!("Active Network Listeners (Red = Exposed, Yellow = User IPC, Green = System IPC):");
-    println!("{t_ports}\n");
+    outln!("Active Network Listeners (Red = Exposed, Yellow = User IPC, Green = System IPC):");
+    outln!("{t_ports}\n");
 }
 
 fn render_ssl_certificates(report: &AgentReport) {
@@ -906,8 +926,8 @@ fn render_ssl_certificates(report: &AgentReport) {
             days_cell,
         ]);
     }
-    println!("SSL Certificates (Let's Encrypt):");
-    println!("{t_ssl}\n");
+    outln!("SSL Certificates (Let's Encrypt):");
+    outln!("{t_ssl}\n");
 }
 
 fn render_shell_users(report: &AgentReport) {
@@ -938,8 +958,8 @@ fn render_shell_users(report: &AgentReport) {
             keys_cell,
         ]);
     }
-    println!("Shell Users & SSH Access:");
-    println!("{t_users}\n");
+    outln!("Shell Users & SSH Access:");
+    outln!("{t_users}\n");
 }
 
 fn render_system_internals(report: &AgentReport) {
@@ -965,7 +985,7 @@ fn render_system_internals(report: &AgentReport) {
         "Custom /etc/hosts overrides",
         &report.network.custom_host_overrides.len().to_string(),
     ]);
-    println!("{t_internals}\n");
+    outln!("{t_internals}\n");
 
     if !report.network.custom_host_overrides.is_empty() {
         let mut t_hosts = create_dynamic_table();
@@ -977,7 +997,7 @@ fn render_system_internals(report: &AgentReport) {
         for host in &report.network.custom_host_overrides {
             t_hosts.add_row(vec![Cell::new(sanitize_terminal(host))]);
         }
-        println!("{t_hosts}\n");
+        outln!("{t_hosts}\n");
     }
 
     if !report.host.cron_jobs.is_empty() {
@@ -1007,8 +1027,8 @@ fn render_system_internals(report: &AgentReport) {
             t_cron.add_row(vec![cmd_cell, status_cell]);
         }
 
-        println!("System & Custom Cronjobs:");
-        println!("{t_cron}\n");
+        outln!("System & Custom Cronjobs:");
+        outln!("{t_cron}\n");
     }
 }
 
@@ -1072,7 +1092,7 @@ fn render_packages(report: &AgentReport) {
         Cell::new("Cache Freshly Refreshed"),
         Cell::new(cache_str),
     ]);
-    println!("{t_pkg}\n");
+    outln!("{t_pkg}\n");
 
     if !report.packages.upgradable.is_empty() {
         let mut t_upg = Table::new();
@@ -1104,10 +1124,10 @@ fn render_packages(report: &AgentReport) {
                 sec_cell,
             ]);
         }
-        println!("Upgradable Packages (top 20):");
-        println!("{t_upg}\n");
+        outln!("Upgradable Packages (top 20):");
+        outln!("{t_upg}\n");
         if report.packages.upgradable.len() > 20 {
-            println!(
+            outln!(
                 "    ... and {} more (see --format json for the full list)\n",
                 report.packages.upgradable.len() - 20
             );
@@ -1194,8 +1214,8 @@ fn render_runtime(report: &AgentReport) {
         "Dangling Volumes",
         &report.topology.dangling_volumes_count.to_string(),
     ]);
-    println!("{} Images & Volumes:", runtime);
-    println!("{t_dock_sum}\n");
+    outln!("{} Images & Volumes:", runtime);
+    outln!("{t_dock_sum}\n");
 
     if !report.topology.dangling_images.is_empty() {
         let mut t_dang = Table::new();
@@ -1216,11 +1236,11 @@ fn render_runtime(report: &AgentReport) {
             }
             t_dang.add_row(vec![Cell::new(sanitize_terminal(&d.id)), size_cell]);
         }
-        println!("Top Dangling Images:");
-        println!(
+        outln!("Top Dangling Images:");
+        outln!(
             "\x1b[1;31m[!] WARNING: Before running image prune, ensure these images are truly unused and you have required backups!\x1b[0m"
         );
-        println!("{t_dang}\n");
+        outln!("{t_dang}\n");
     }
 
     if !report.topology.containers.is_empty() {
@@ -1278,8 +1298,8 @@ fn render_runtime(report: &AgentReport) {
                 mounts_cell,
             ]);
         }
-        println!("{} Containers & Data Persistency:", runtime);
-        println!("{t_docker}\n");
+        outln!("{} Containers & Data Persistency:", runtime);
+        outln!("{t_docker}\n");
     }
 }
 
@@ -1340,8 +1360,8 @@ fn render_capability_audit(report: &AgentReport) {
         ]);
     }
 
-    println!("Non-root processes with elevated capabilities:");
-    println!("{t_caps}\n");
+    outln!("Non-root processes with elevated capabilities:");
+    outln!("{t_caps}\n");
 }
 
 // ── SEC-021: Bind‑Mount Masking ───────────────────────────────────────────
@@ -1369,8 +1389,8 @@ fn render_mount_masking(report: &AgentReport, theme: &Theme) {
             Cell::new(sanitize_terminal(&m.reason)),
         ]);
     }
-    println!("{}Bind‑Mount Masking Detected (SEC‑021):", theme.warn_sm);
-    println!("{t}\n");
+    outln!("{}Bind‑Mount Masking Detected (SEC‑021):", theme.warn_sm);
+    outln!("{t}\n");
 }
 
 // ── SEC-022: Reverse Shells / C2 ──────────────────────────────────────────
@@ -1403,8 +1423,8 @@ fn render_reverse_shells(report: &AgentReport, theme: &Theme) {
             Cell::new(fd),
         ]);
     }
-    println!("{}Reverse Shell / C2 Connections (SEC‑022):", theme.alert);
-    println!("{t}\n");
+    outln!("{}Reverse Shell / C2 Connections (SEC‑022):", theme.alert);
+    outln!("{t}\n");
 }
 
 /// Short label for a forensic origin.
@@ -1459,11 +1479,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                 Cell::new(if l.is_deleted { "yes" } else { "no" }),
             ]);
         }
-        println!(
+        outln!(
             "{}Userspace Rootkit / Library Injection (SEC‑023):",
             theme.dna
         );
-        println!("{t}\n");
+        outln!("{t}\n");
     }
 
     // Memory anomalies (SEC-026 & SEC-028)
@@ -1519,11 +1539,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                     Cell::new(sanitize_terminal(&l.object_path)),
                 ]);
             }
-            println!(
+            outln!(
                 "{}Anomalous Executable Memory (SEC‑026) — verbose:",
                 theme.warn
             );
-            println!("{t}\n");
+            outln!("{t}\n");
         } else {
             struct Row {
                 process: String,
@@ -1662,31 +1682,30 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                 }
                 t.add_row(cells);
             }
-            println!(
+            outln!(
                 "{}Anomalous Executable Memory (SEC‑026 / SEC-028):",
                 theme.warn
             );
-            println!("{t}");
+            outln!("{t}");
             if rows.len() > CAP {
-                println!(
+                outln!(
                     "    …and {} more (process,pid) group(s) — run with -v or see JSON export",
                     rows.len() - CAP
                 );
             }
 
-            // HINT: only show if deep scan was NOT requested (fast path)
             if !verbose {
                 let deep_requested = std::env::args().any(|arg| arg == "--deep");
                 if !deep_requested {
-                    println!(
+                    outln!(
                         "\n    \x1b[1;36m{}HINT: Run `owlzops-mapper audit --deep` to perform memory forensics and verify legitimate JIT compilers.\x1b[0m\n",
                         theme.hint
                     );
                 } else {
-                    println!();
+                    outln!();
                 }
             } else {
-                println!();
+                outln!();
             }
         }
 
@@ -1700,10 +1719,10 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
             .collect();
 
         if !traced.is_empty() {
-            println!("  {}Pointer resolution trace (deep forensics):", theme.mag);
+            outln!("  {}Pointer resolution trace (deep forensics):", theme.mag);
             for l in traced.iter().take(5) {
                 let d = l.deep_forensics.as_ref().unwrap();
-                println!(
+                outln!(
                     "    pid {} @ {}  origin={} ({}%)  entropy={:.1}",
                     l.pid,
                     l.region_addr.as_deref().unwrap_or("?"),
@@ -1712,22 +1731,22 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                     d.entropy
                 );
                 for p in d.resolved_pointers.iter().take(4) {
-                    println!("        → {:<16} {}", p.value, sanitize_terminal(&p.target));
+                    outln!("        → {:<16} {}", p.value, sanitize_terminal(&p.target));
                 }
                 if d.resolved_pointers.len() > 4 {
-                    println!(
+                    outln!(
                         "        … (+{} more pointers, see JSON)",
                         d.resolved_pointers.len() - 4
                     );
                 }
             }
             if traced.len() > 5 {
-                println!(
+                outln!(
                     "    …and {} more regions analyzed (see JSON)\n",
                     traced.len() - 5
                 );
             } else {
-                println!();
+                outln!();
             }
         }
     }
@@ -1738,7 +1757,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         .filter(|l| l.classify() == InjectionClass::JitAdvisory)
         .collect();
     if !jit_advisories.is_empty() {
-        println!(
+        outln!(
             "{}JIT writable-code advisory (SEC‑027): {} suppressed finding(s) with verified runtime topology.\n",
             theme.sec_item,
             jit_advisories.len()
@@ -1755,7 +1774,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         })
         .collect();
     if !prov_trust.is_empty() {
-        println!(
+        outln!(
             "{}Provisional Trust (SEC‑029): {} region(s) in allowlisted binaries (JIT shape unverified).\n",
             theme.sec_item,
             prov_trust.len()
@@ -1776,14 +1795,14 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
             .collect();
 
         if !suppressed.is_empty() {
-            println!(
+            outln!(
                 "{}Files with expected capabilities (SEC‑034): {} suppressed finding(s).\n",
                 theme.sec_item,
                 suppressed.len()
             );
         }
         if !active.is_empty() {
-            println!(
+            outln!(
                 "{}Unexpected file capabilities (SEC‑036): {} active finding(s) — review required.\n",
                 theme.sec_item,
                 active.len()
@@ -1800,14 +1819,14 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
             .partition(|f| classify_setuid(f, src).0 == 0);
 
         if !suppressed_su.is_empty() {
-            println!(
+            outln!(
                 "{}Expected setuid/setgid files (SEC‑037): {} suppressed finding(s).\n",
                 theme.sec_item,
                 suppressed_su.len()
             );
         }
         if !active_su.is_empty() {
-            println!(
+            outln!(
                 "{}Unexpected setuid/setgid files (SEC‑037): {} active finding(s) — review required.\n",
                 theme.sec_item,
                 active_su.len()
@@ -1815,11 +1834,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         }
     }
 
-    // SEC‑035 – eBPF inventory (suppressed, informational)
+    // SEC‑035 – eBPF inventory
     let ebpf = &report.security.ebpf_inventory;
     let ebpf_total = ebpf.programs.len() + ebpf.maps.len() + ebpf.links.len() + ebpf.pins.len();
     if ebpf_total > 0 {
-        println!(
+        outln!(
             "{}eBPF inventory (SEC‑035): {} program(s), {} map(s), {} link(s), {} pin(s).\n",
             theme.sec_item,
             ebpf.programs.len(),
@@ -1829,7 +1848,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         );
     }
 
-    // SEC‑038 – Kernel taint (tiered)
+    // SEC‑038 – Kernel taint
     {
         let taint = &report.security.kernel_taint;
         let has = |c: char| taint.flags.iter().any(|f| f.code == c);
@@ -1837,37 +1856,39 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         let unsigned_or_oot = has('E') || has('O');
         let hidden = !report.security.kernel_modules.hidden_candidates.is_empty();
         if forced || (unsigned_or_oot && hidden) {
-            println!(
+            outln!(
                 "{}Kernel taint (SEC‑038): module tampering (tainted={}) — REVIEW REQUIRED.\n",
-                theme.alert, taint.raw
+                theme.alert,
+                taint.raw
             );
         } else if unsigned_or_oot {
-            println!(
+            outln!(
                 "{}Kernel taint (SEC‑038): unsigned/out-of-tree module (tainted={}) — informational (third-party driver).\n",
-                theme.sec_item, taint.raw
+                theme.sec_item,
+                taint.raw
             );
         }
     }
 
-    // SEC‑039 – LSM confinement (tiered)
+    // SEC‑039 – LSM confinement
     {
         let c = &report.security.confinement;
         if c.selinux_permissive {
-            println!(
+            outln!(
                 "{}SELinux permissive mode (SEC‑039): REVIEW REQUIRED.\n",
                 theme.alert
             );
         }
         if !c.complain_profiles.is_empty() {
-            println!(
-                "{}AppArmor complain mode (SEC‑039): {} profile(s) not enforcing — informational (often an intentional baseline).\n",
+            outln!(
+                "{}AppArmor complain mode (SEC‑039): {} profile(s) not enforcing — informational.\n",
                 theme.sec_item,
                 c.complain_profiles.len()
             );
         }
     }
 
-    // SEC‑041 – ftrace/kprobe hook surface
+    // SEC‑041 – ftrace/kprobe
     {
         let inv = &report.security.ftrace_hooks;
         if !inv.live_tracer_active && !inv.unattributed_syscall_hooks.is_empty() {
@@ -1884,7 +1905,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
             } else {
                 (theme.alert, "REVIEW REQUIRED — possible ftrace rootkit")
             };
-            println!(
+            outln!(
                 "{}ftrace syscall hooks (SEC‑041): {} unexplained hook(s) — {}.\n",
                 prefix,
                 inv.unattributed_syscall_hooks.len(),
@@ -1893,10 +1914,10 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         }
     }
 
-    // SEC‑040 – Hidden kernel module (Diamorphine-class)
+    // SEC‑040 – Hidden kernel module
     let hidden = &report.security.kernel_modules.hidden_candidates;
     if !hidden.is_empty() {
-        println!(
+        outln!(
             "{}HIDDEN KERNEL MODULE (SEC‑040): {} module(s) scrubbed from /proc/modules but live in sysfs/kallsyms — {}",
             theme.alert,
             hidden.len(),
@@ -1909,7 +1930,6 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
     }
 }
 
-/// Short label + severity rank from the source string.
 fn region_kind(source: &str) -> (&'static str, u8) {
     match source {
         s if s.contains("exec-stack") => ("rwx-stack", 4),
@@ -1958,11 +1978,11 @@ fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
                 Cell::new(if g.holds_socket { "yes" } else { "no" }),
             ]);
         }
-        println!(
+        outln!(
             "{}Hidden Process Detected (LKM Rootkit) (SEC‑024):",
             theme.ghost
         );
-        println!("{t}\n");
+        outln!("{t}\n");
     }
 
     if !soft.is_empty() {
@@ -1990,17 +2010,17 @@ fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
                 Cell::new(if g.holds_socket { "yes" } else { "no" }),
             ]);
         }
-        println!(
+        outln!(
             "{}Suspicious PID Visibility Mismatch (downgraded) (SEC‑025):",
             theme.ghost
         );
-        println!("{t}\n");
+        outln!("{t}\n");
     }
 }
 
 fn render_footer() {
-    println!();
-    println!(
+    outln!();
+    outln!(
         "\x1b[3mRun `owlzops-mapper --format json` to export full payload for Blueprint Engine.\x1b[0m\n"
     );
 }

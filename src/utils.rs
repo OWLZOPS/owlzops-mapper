@@ -277,6 +277,16 @@ pub fn terminate_registered_children() {
     });
 }
 
+/// The stdout reader closed the pipe (common with `| head`, `| grep -q`, etc.).
+/// This is not a scan failure. Terminate any managed children and exit
+/// successfully (code 0) to preserve the exit contract and avoid panics.
+/// Does NOT restore SIG_DFL for SIGPIPE because that would break socket
+/// writes in russh — EPIPE is handled locally in the UI layer (R22-37).
+pub fn exit_reader_gone() -> ! {
+    terminate_registered_children();
+    std::process::exit(0);
+}
+
 // ---------------------------------------------------------------------------
 // Child helpers
 // ---------------------------------------------------------------------------
