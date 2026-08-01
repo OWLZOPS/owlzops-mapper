@@ -4,7 +4,7 @@
 
 use crate::coverage;
 use crate::models::PreloadFinding;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Parse ld.so.preload content according to glibc semantics:
 /// - `#` starts a comment (the rest of the line is ignored)
@@ -20,6 +20,34 @@ pub(crate) fn parse_preload_entries(content: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .collect()
+}
+
+/// Count how many processes have each preload path mapped in /proc/<pid>/maps.
+fn count_mapped(paths: &[String]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = paths.iter().cloned().map(|p| (p, 0)).collect();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return counts;
+    };
+    for entry in procs.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok((maps, _)) =
+            crate::safe_io::read_file_capped(&format!("/proc/{pid}/maps"), 1024 * 1024)
+        else {
+            continue;
+        };
+        for (path, cnt) in counts.iter_mut() {
+            if maps.contains(path.as_str()) {
+                *cnt += 1;
+            }
+        }
+    }
+    counts
 }
 
 pub fn scan_ld_preload() -> Vec<PreloadFinding> {
@@ -62,6 +90,13 @@ pub fn scan_ld_preload() -> Vec<PreloadFinding> {
         for f in &mut findings {
             f.package = prov.lookup(crate::utils::canon_path(&f.path).as_ref());
         }
+    }
+
+    // Fill mapped_by_pids with live process counts (R23-09)
+    let paths: Vec<String> = findings.iter().map(|f| f.path.clone()).collect();
+    let mapped = count_mapped(&paths);
+    for f in &mut findings {
+        f.mapped_by_pids = mapped.get(&f.path).copied();
     }
 
     findings

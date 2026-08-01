@@ -187,11 +187,23 @@ const EXEC_DIRECTIVES: &[&str] = &[
 fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
     let unit_path_s = unit_path.to_string_lossy().into_owned();
 
-    let (content, truncated) =
-        match safe_io::read_file_capped_regular(unit_path.to_str().unwrap_or(""), 64 * 1024) {
-            Ok(t) => t,
-            Err(_) => return,
-        };
+    let Some(path_str) = unit_path.to_str() else {
+        coverage::record(format!(
+            "unit path is not valid UTF-8 ({}); ExecStart NOT parsed",
+            unit_path.display()
+        ));
+        return;
+    };
+    let (content, truncated) = match safe_io::read_file_capped_regular(path_str, 64 * 1024) {
+        Ok(t) => t,
+        Err(e) => {
+            coverage::record(format!(
+                "{} unreadable ({e}); ExecStart NOT parsed",
+                unit_path.display()
+            ));
+            return;
+        }
+    };
     if truncated {
         coverage::record(format!("{} truncated", unit_path.display()));
     }
@@ -263,9 +275,14 @@ fn scan_cron_files(push: &mut dyn FnMut(ExecStartFinding)) {
         for entry in entries.flatten() {
             let path = entry.path();
             let path_s = path.to_string_lossy().into_owned();
-            if let Ok((content, _)) =
-                safe_io::read_file_capped_regular(path.to_str().unwrap_or(""), 64 * 1024)
-            {
+            let Some(path_str) = path.to_str() else {
+                coverage::record(format!(
+                    "cron.d path is not valid UTF-8 ({}); skipping",
+                    path.display()
+                ));
+                continue;
+            };
+            if let Ok((content, _)) = safe_io::read_file_capped_regular(path_str, 64 * 1024) {
                 let source = format!(
                     "cron.d:{}",
                     path.file_name().unwrap_or_default().to_string_lossy()
