@@ -265,6 +265,12 @@ fn scan_service_file(unit_path: &Path, scope: UnitScope, push: &mut dyn FnMut(Ex
         .to_string();
 
     // R23-06 / R23-16: determine whether the unit runs as root.
+    //
+    // NOTE: drop-in files (<unit>.d/*.conf) do NOT inherit User= from the
+    // base unit, so for them this is always true (fail-closed).  A full
+    // solution would resolve the base unit by name, but that's deferred
+    // (see R23-19).  The current behaviour errs on the side of FP, which
+    // is the safe direction for SEC-046.
     let runs_as_root = match scope {
         UnitScope::System => unit_runs_as_root(&content),
         UnitScope::UserManager { owner_is_root } => owner_is_root,
