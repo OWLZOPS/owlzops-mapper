@@ -1469,7 +1469,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-042 / SEC-049: System-wide LD_PRELOAD ──
+    // ── SEC-042 / SEC-049 / SEC-050: System-wide LD_PRELOAD ──
     for f in &report.security.preload_injections {
         if f.volatile {
             findings.push(Finding {
@@ -1504,14 +1504,23 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         } else if f.package.is_none()
             && report.security.provenance_source != ProvenanceSource::Unavailable
         {
+            // R23-14: corroboration by live processes splits IoC from suspicion.
+            // mapped_by_pids == None (unreadable /proc) NEVER escalates —
+            // uncertainty is surfaced via coverage and drift (SEC-025/049 contract).
+            let corroborated = f.mapped_by_pids.is_some_and(|n| n > 0);
             findings.push(Finding {
-                id: "SEC-042",
-                title: "System-wide LD_PRELOAD injected (unpackaged object)".into(),
+                id: if corroborated { "SEC-042" } else { "SEC-050" },
+                title: if corroborated {
+                    "ACTIVE COMPROMISE: unpackaged LD_PRELOAD object mapped into live processes".into()
+                } else {
+                    "System-wide LD_PRELOAD injected (unpackaged, not yet mapped)".into()
+                },
+                weight: if corroborated { 55 } else { 30 },
                 category: Category::Security,
-                weight: 30,
                 evidence: format!(
-                    "{} is injected via /etc/ld.so.preload and does NOT belong to any installed package",
-                    f.path
+                    "{} is injected via /etc/ld.so.preload, belongs to no installed package, mapped by {} process(es)",
+                    f.path,
+                    f.mapped_by_pids.map_or("?".to_string(), |n| n.to_string())
                 ),
                 cis_ref: None,
                 suppressed: None,
@@ -2365,6 +2374,16 @@ impl CriticalFlags {
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
             "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043",
         ];
+
+        // R23-14: IOC_IDS finding must carry IoC-band weight. Mixing tiers
+        // under one ID is the source of exit-3 at weight 20/30 (see R23-02).
+        debug_assert!(
+            findings.iter().all(|f| {
+                !(IOC_IDS.contains(&f.id) && f.suppressed.is_none()) || f.weight >= 55
+            }),
+            "IOC_IDS finding with sub-IoC weight — exit-3 semantics broken"
+        );
+
         let count_sysctl = findings
             .iter()
             .filter(|f| f.id == "SEC-007" && f.suppressed.is_none())
