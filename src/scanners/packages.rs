@@ -212,11 +212,10 @@ fn detect_package_manager() -> (PackageManager, Option<String>) {
     ];
 
     for (pm, bin) in bins {
-        let found = crate::utils::run_with_timeout("which", &[bin], 2)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
-        if found {
-            return (*pm, Some(bin.to_string()));
+        // R22-36: resolve_tool searches the same fixed directories without
+        // spawning a process, and does not depend on `which` being installed.
+        if let Some(path) = crate::utils::resolve_tool(bin) {
+            return (*pm, Some(path));
         }
     }
     (PackageManager::Unknown, None)
