@@ -64,6 +64,7 @@ pub fn read_reader_capped<R: Read>(mut reader: R, max_bytes: usize) -> (Vec<u8>,
 ///
 /// This function MUST be used for every scanner path that lives on a host‑
 /// controlled filesystem (i.e. not `/proc`, `/sys`, or `/dev`).
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
