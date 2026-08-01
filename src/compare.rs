@@ -864,6 +864,90 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // ── security.preload_injections (SEC-042/049 drift, R23-08) ─────────────
+    {
+        let b: HashSet<&str> = before
+            .security
+            .preload_injections
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        let a: HashSet<&str> = after
+            .security
+            .preload_injections
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        for added in a.difference(&b) {
+            changes.push(Change {
+                field: "security.preload_injections".into(),
+                before: None,
+                after: Some(format!("ld.so.preload entry {added} appeared")),
+                severity: Severity::Degraded,
+            });
+        }
+        for gone in b.difference(&a) {
+            changes.push(Change {
+                field: "security.preload_injections".into(),
+                before: Some(format!("ld.so.preload entry {gone} was present")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
+    // ── security.core_pattern / modules_disabled / lockdown (SEC-044 drift, R23-08) ──
+    if before.security.core_pattern != after.security.core_pattern {
+        changes.push(Change {
+            field: "security.core_pattern".into(),
+            before: before
+                .security
+                .core_pattern
+                .clone()
+                .or_else(|| Some("(unreadable)".into())),
+            after: after
+                .security
+                .core_pattern
+                .clone()
+                .or_else(|| Some("(unreadable)".into())),
+            severity: Severity::Degraded,
+        });
+    }
+
+    // modules_disabled is a one-way switch: 1→0 impossible without reboot.
+    if before.security.modules_disabled == Some(true)
+        && after.security.modules_disabled == Some(false)
+    {
+        changes.push(Change {
+            field: "security.modules_disabled".into(),
+            before: Some("1 (module loading locked)".into()),
+            after: Some("0 — one-way sysctl reverted: reboot or /proc tampering".into()),
+            severity: Severity::Degraded,
+        });
+    } else if before.security.modules_disabled != after.security.modules_disabled {
+        changes.push(Change {
+            field: "security.modules_disabled".into(),
+            before: before.security.modules_disabled.map(|v| v.to_string()),
+            after: after.security.modules_disabled.map(|v| v.to_string()),
+            severity: Severity::Changed,
+        });
+    }
+
+    // lockdown: weakening to "none" is Degraded.
+    if before.security.lockdown != after.security.lockdown {
+        let sev = if after.security.lockdown.as_deref() == Some("none") {
+            Severity::Degraded
+        } else {
+            Severity::Changed
+        };
+        changes.push(Change {
+            field: "security.lockdown".into(),
+            before: before.security.lockdown.clone(),
+            after: after.security.lockdown.clone(),
+            severity: sev,
+        });
+    }
+
     // ── security.exec_start_injections (SEC‑043/045/046/047/048 drift) ─────
     // Keyed on (unit_path, exec_path). Steady-state informational signals
     // (SEC-045 unpackaged, SEC-047 vendor runtime) BECOME weighted when they

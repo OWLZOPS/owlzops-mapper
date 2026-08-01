@@ -361,7 +361,7 @@ pub struct SecurityInfo {
 
     // ── SEC-044: kernel security facts (core_pattern, modules_disabled, lockdown) ─
     #[serde(default)]
-    pub core_pattern: String,
+    pub core_pattern: Option<String>,
     #[serde(default)]
     pub modules_disabled: Option<bool>, // None = unreadable
     #[serde(default)]
@@ -1075,6 +1075,17 @@ pub struct ExecStartFinding {
     pub writability: ExecWritability,
     /// Package that owns the file, if any
     pub package: Option<String>,
+    /// True when the unit does NOT set `User=` (i.e. runs as root).
+    /// Defaults to `true` for backward compatibility — legacy snapshots
+    /// without this field are treated as root-executed (fail‑closed, R23‑06).
+    #[serde(default = "crate::models::default_true")]
+    pub runs_as_root: bool,
+}
+
+/// Serde default helper: returns `true`.  Used so that old snapshots without
+/// the `runs_as_root` field are treated as root-executed (fail‑closed for SEC‑046).
+pub(crate) fn default_true() -> bool {
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

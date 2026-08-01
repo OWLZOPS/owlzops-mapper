@@ -1469,42 +1469,55 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-042 – System-wide LD_PRELOAD (/etc/ld.so.preload) ──────────────
+    // ── SEC-042 / SEC-049: System-wide LD_PRELOAD ──
     for f in &report.security.preload_injections {
-        let is_ioc = f.volatile
-            || (f.package.is_none()
-                && report.security.provenance_source != ProvenanceSource::Unavailable);
-        if is_ioc {
+        if f.volatile {
             findings.push(Finding {
                 id: "SEC-042",
-                title: "System-wide LD_PRELOAD injected".to_string(),
+                title: "System-wide LD_PRELOAD from volatile location (ACTIVE COMPROMISE)".into(),
                 category: Category::Security,
                 weight: 60,
                 evidence: format!(
-                    "{} (volatile: {}, package: {:?})",
-                    f.path,
-                    f.volatile,
-                    f.package.as_deref()
+                    "{} is injected via /etc/ld.so.preload and resides on a volatile filesystem",
+                    f.path
                 ),
-                suppressed: None,
                 cis_ref: None,
+                suppressed: None,
             });
         } else if f.package.is_none()
             && report.security.provenance_source == ProvenanceSource::Unavailable
         {
+            // R23-02: separate ID — CriticalFlags keys on ID, not weight.
+            // Same contract as SEC-024 (hard) / SEC-025 (downgraded).
             findings.push(Finding {
-                id: "SEC-042",
-                title: "System-wide LD_PRELOAD injected (ownership unverifiable)".to_string(),
+                id: "SEC-049",
+                title: "System-wide LD_PRELOAD present (ownership unverifiable)".into(),
                 category: Category::Security,
                 weight: 20,
                 evidence: format!(
-                    "{} (provenance unavailable — cannot verify library origin)",
+                    "{} is listed in /etc/ld.so.preload, but package database is unavailable — ownership cannot be verified",
                     f.path
                 ),
-                suppressed: None,
                 cis_ref: None,
+                suppressed: None,
+            });
+        } else if f.package.is_none()
+            && report.security.provenance_source != ProvenanceSource::Unavailable
+        {
+            findings.push(Finding {
+                id: "SEC-042",
+                title: "System-wide LD_PRELOAD injected (unpackaged object)".into(),
+                category: Category::Security,
+                weight: 30,
+                evidence: format!(
+                    "{} is injected via /etc/ld.so.preload and does NOT belong to any installed package",
+                    f.path
+                ),
+                cis_ref: None,
+                suppressed: None,
             });
         }
+        // packaged preload objects are not flagged (normal)
     }
 
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
@@ -1602,7 +1615,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
 
         // Privilege — weighted regardless of packaging
-        let weak = sel(&|f| !f.volatile && f.writability == W::NonRootWritable);
+        // R23-06: only flag when the unit actually runs as root.
+        let weak = sel(&|f| f.runs_as_root && !f.volatile && f.writability == W::NonRootWritable);
         if !weak.is_empty() {
             findings.push(Finding {
                 id: "SEC-046",
@@ -1657,21 +1671,30 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-044 – Kernel security facts (core_pattern, lockdown) ──────────
-    if report.security.core_pattern.starts_with('|')
-        && !report.security.core_pattern.contains("systemd-coredump")
-        && !report.security.core_pattern.contains("abrt-hook-ccpp")
-        && !report.security.core_pattern.contains("apport")
-    // Ubuntu default crash handle
+    // R23-07: core_pattern is now Option — None means unreadable (coverage).
+    // Only flag when a handler is piped and the handler binary is not a known
+    // trusted one OR resides on a volatile filesystem.
+    if let Some(cp) = report.security.core_pattern.as_deref()
+        && cp.starts_with('|')
     {
-        findings.push(Finding {
-            id: "SEC-044",
-            title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
-            category: Category::Security,
-            weight: 25,
-            evidence: format!("core_pattern = {}", report.security.core_pattern),
-            suppressed: None,
-            cis_ref: None,
-        });
+        let handler = cp.trim_start_matches('|').trim();
+        let bin = handler.split_whitespace().next().unwrap_or(handler);
+        let known_basenames = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
+        let basename = bin.rsplit('/').next().unwrap_or(bin);
+        let volatile = crate::utils::is_volatile_exec_path(bin);
+        let trusted = known_basenames.contains(&basename) && !volatile;
+
+        if !trusted {
+            findings.push(Finding {
+                id: "SEC-044",
+                title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!("core_pattern = {}", cp),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
     }
 
     if let Some(ref lock) = report.security.lockdown
@@ -3507,5 +3530,23 @@ mod tests {
             ..Default::default()
         };
         assert!(!unit_is_vendor_shipped(&d));
+    }
+
+    #[test]
+    fn sec049_unverifiable_preload_does_not_set_compromise() {
+        let mut r = minimal_report();
+        r.security.provenance_source = ProvenanceSource::Unavailable;
+        r.security.preload_injections = vec![PreloadFinding {
+            path: "/usr/lib/libsnoopy.so".into(),
+            volatile: false,
+            package: None,
+            mapped_by_pids: None,
+        }];
+        let findings = evaluate(&r);
+        assert!(findings.iter().any(|f| f.id == "SEC-049"));
+        assert!(
+            !CriticalFlags::from_findings(&findings).compromised_host,
+            "unverifiable ownership != active compromise"
+        );
     }
 }
