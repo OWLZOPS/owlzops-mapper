@@ -42,38 +42,67 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
         findings.push(finding);
     };
 
-    // System-wide systemd units
-    let unit_dirs = &[
+    // R23-04: full systemd search path — includes /usr/local/lib/systemd,
+    // drop-in directories (<unit>.d/*.conf), user units (/etc/systemd/user,
+    // /run/systemd/user, /usr/lib/systemd/user), and .socket units.
+    const UNIT_DIRS: &[&str] = &[
         "/etc/systemd/system",
         "/run/systemd/system",
         "/usr/lib/systemd/system",
+        "/usr/local/lib/systemd/system", // priority over /usr/lib, not vendor-owned
+        "/etc/systemd/user",
+        "/run/systemd/user",
+        "/usr/lib/systemd/user",
     ];
-    for dir in unit_dirs {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "service") {
-                    scan_service_file(&path, &mut push_candidate);
+
+    fn is_unit_file(p: &Path) -> bool {
+        p.extension()
+            .is_some_and(|e| e == "service" || e == "socket")
+    }
+
+    fn scan_unit_dir(dir: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_unit_file(&path) {
+                scan_service_file(&path, push);
+                continue;
+            }
+            // R23-04: drop-in directories <unit>.d/*.conf
+            if path.extension().is_some_and(|e| e == "d")
+                && let Ok(dropins) = std::fs::read_dir(&path)
+            {
+                for d in dropins.flatten() {
+                    let dp = d.path();
+                    if dp.extension().is_some_and(|e| e == "conf") {
+                        scan_service_file(&dp, push);
+                    }
                 }
             }
         }
     }
 
-    // User systemd units (non-root persistence)
-    if let Ok(entries) = std::fs::read_dir("/home") {
-        for user_entry in entries.flatten() {
-            let user_dir = user_entry.path().join(".config/systemd/user");
-            if user_dir.is_dir()
-                && let Ok(unit_entries) = std::fs::read_dir(&user_dir)
-            {
-                for unit in unit_entries.flatten() {
-                    let path = unit.path();
-                    if path.extension().is_some_and(|e| e == "service") {
-                        scan_service_file(&path, &mut push_candidate);
-                    }
+    for dir in UNIT_DIRS {
+        scan_unit_dir(Path::new(dir), &mut push_candidate);
+    }
+
+    // User systemd units (non-root persistence):
+    // /home/*, /var/home/* (Fedora Atomic), and /root.
+    for home_root in ["/home", "/var/home"] {
+        if let Ok(users) = std::fs::read_dir(home_root) {
+            for user_entry in users.flatten() {
+                let user_dir = user_entry.path().join(".config/systemd/user");
+                if user_dir.is_dir() {
+                    scan_unit_dir(&user_dir, &mut push_candidate);
                 }
             }
         }
+    }
+    let root_user_dir = Path::new("/root/.config/systemd/user");
+    if root_user_dir.is_dir() {
+        scan_unit_dir(root_user_dir, &mut push_candidate);
     }
 
     // Cron jobs
@@ -129,7 +158,18 @@ fn assess_writability(path: &str) -> ExecWritability {
     }
 }
 
-/// Extract ExecStart/ExecStartPre paths from a service file and check them.
+// R23-04: all Exec* directives understood by systemd.
+const EXEC_DIRECTIVES: &[&str] = &[
+    "ExecStart=",
+    "ExecStartPre=",
+    "ExecStartPost=",
+    "ExecReload=",
+    "ExecStop=",
+    "ExecStopPost=",
+    "ExecCondition=",
+];
+
+/// Extract paths from Exec* directives in a service/drop-in file and check them.
 fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
     let unit_path_s = unit_path.to_string_lossy().into_owned();
 
@@ -153,19 +193,16 @@ fn scan_service_file(unit_path: &Path, push: &mut dyn FnMut(ExecStartFinding)) {
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
             continue;
         }
-        // Look for ExecStart= or ExecStartPre=
-        if let Some(rest) = trimmed
-            .strip_prefix("ExecStart=")
-            .or_else(|| trimmed.strip_prefix("ExecStartPre="))
-        {
-            // Strip optional prefixes: "-", "@", "+", "!", "!!"
-            let args = rest.trim_start_matches(['-', '@', '+', '!']);
-            if let Some(first_token) = args.split_whitespace().next() {
-                if first_token.is_empty() {
-                    continue;
-                }
-                // Only absolute paths are candidates; relative commands are ignored.
-                if !first_token.starts_with('/') {
+
+        if let Some(rest) = EXEC_DIRECTIVES.iter().find_map(|d| trimmed.strip_prefix(d)) {
+            // R23-05: systemd allows optional prefixes '-', '@', '+', '!', ':'
+            // and quoted paths.  Strip prefixes, then remove surrounding quotes.
+            let args = rest
+                .trim_start_matches(['-', '@', '+', '!', ':'])
+                .trim_start();
+            if let Some(raw) = args.split_whitespace().next() {
+                let first_token = raw.trim_matches(|c| c == '"' || c == '\'');
+                if first_token.is_empty() || !first_token.starts_with('/') {
                     continue;
                 }
 
@@ -327,5 +364,16 @@ mod tests {
             got,
             vec!["/dev/shm/impl".to_string(), "/tmp/persist.sh".to_string()]
         );
+    }
+
+    #[test]
+    fn quoted_exec_start_is_not_a_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("evil.service");
+        std::fs::write(&unit, "[Service]\nExecStart=-:\"/dev/shm/impl\" --daemon\n").unwrap();
+
+        let mut got = Vec::new();
+        scan_service_file(&unit, &mut |f| got.push(f.exec_path));
+        assert_eq!(got, vec!["/dev/shm/impl".to_string()]);
     }
 }
