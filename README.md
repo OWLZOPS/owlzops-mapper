@@ -425,12 +425,12 @@ Requires Rust 1.85+, Linux target.
 
 ## If the scan came back bad
 
-The scanner tells you something is wrong. [Owlzops](https://owlzops.com) tells you how wrong — then closes it. Fixed price, defined scope, and the engineer who scopes the work is the one who does it.
+The scanner tells you something is wrong. [Owlzops](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_intro) tells you how wrong — then closes it. Fixed price, defined scope, and the engineer who scopes the work is the one who does it.
 
 | What the mapper found | What it means | What we do |
 |---|---|---|
-| Exit code 3 — SEC‑015…024, SEC‑028, SEC‑040, DOCK‑010 | Evidence of a rootkit, backdoor or fileless implant. Something is likely already inside. | [**Infrastructure Security Audit**](https://owlzops.com/#assessment?utm_source=github&utm_medium=readme&utm_campaign=mapper_ioc) — read-only, point-in-time, IoC review and attack-surface map, ranked by what an attacker reaches first |
-| Risk Score ≥ 70, firewall off, `docker.sock` mounted, privileged containers | Systemic architectural exposure. Automated scanners will find this before a human does. | [**Infrastructure Hardening**](https://owlzops.com/#hardening?utm_source=github&utm_medium=readme&utm_campaign=mapper_risk) — staged, reversible remediation with a before/after diff, without breaking production |
+| Exit code 3 — SEC‑015…024, SEC‑028, SEC‑040, DOCK‑010 | Evidence of a rootkit, backdoor or fileless implant. Something is likely already inside. | [**Infrastructure Security Audit**](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_ioc#assessment) — read-only, point-in-time, IoC review and attack-surface map, ranked by what an attacker reaches first |
+| Risk Score ≥ 70, firewall off, `docker.sock` mounted, privileged containers | Systemic architectural exposure. Automated scanners will find this before a human does. | [**Infrastructure Hardening**](https://owlzops.com/?utm_source=github&utm_medium=readme&utm_campaign=mapper_risk#hardening) — staged, reversible remediation with a before/after diff, without breaking production |
 | Pending security updates, CIS gaps, drift since last snapshot | Accumulating debt, and the thing a SOC 2 / ISO 27001 auditor will ask you about | Covered inside the audit — the risk matrix ships with CIS references as engineering evidence. We are not an accredited auditor and don't sign anything off. |
 
 **Run the scanner first.** If it comes back clean, we'll tell you so — and we won't sell you the audit. We'd rather lose the sale than charge for confirming what a free tool already told you.
