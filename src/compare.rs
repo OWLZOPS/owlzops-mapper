@@ -898,21 +898,9 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
 
     // ── security.core_pattern / modules_disabled / lockdown (SEC-044 drift, R23-08) ──
     if before.security.core_pattern != after.security.core_pattern {
-        // R23-19: a new core_pattern is Degraded only if it pipes to an unknown
-        // handler; switching to a known handler or to a simple file is Changed.
+        // R23-31: policy lives in scoring::core_pattern_is_trusted, shared with SEC-044.
         let sev = match after.security.core_pattern.as_deref() {
-            Some(cp) if cp.starts_with('|') => {
-                let handler = cp.trim_start_matches('|').trim();
-                let bin = handler.split_whitespace().next().unwrap_or(handler);
-                let known_basenames = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
-                let basename = bin.rsplit('/').next().unwrap_or(bin);
-                let volatile = crate::utils::is_volatile_exec_path(bin);
-                if known_basenames.contains(&basename) && !volatile {
-                    Severity::Changed
-                } else {
-                    Severity::Degraded
-                }
-            }
+            Some(cp) if !crate::scoring::core_pattern_is_trusted(cp) => Severity::Degraded,
             _ => Severity::Changed,
         };
         changes.push(Change {
