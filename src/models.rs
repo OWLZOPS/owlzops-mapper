@@ -370,6 +370,36 @@ pub struct SecurityInfo {
     // ── SEC-043: ExecStart provenance for systemd units and cron ─
     #[serde(default)]
     pub exec_start_injections: Vec<ExecStartFinding>,
+
+    // ── SEC-050: ld.so.conf.d library path injection ───────────────────────
+    /// Directories from /etc/ld.so.conf and /etc/ld.so.conf.d/*.conf that
+    /// are writable by non-root or reside on volatile filesystems — a
+    /// systemic library search path hijack vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ld_so_conf_injections: Option<Vec<LdSoConfInjection>>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEC-050: ld.so.conf.d injection
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A directory listed in ld.so.conf (or an included conf.d fragment) that is
+/// unsafe — either writable by a non-root user or backed by a volatile
+/// filesystem. Such a directory allows an unprivileged local attacker to
+/// inject a shared library that takes precedence over system libraries via
+/// ld.so.cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LdSoConfInjection {
+    /// The path as written in the config file.
+    pub path: String,
+    /// True if the filesystem is volatile (tmpfs, devtmpfs, etc.).
+    pub volatile: bool,
+    /// True if the directory is writable by a non-root principal (owner/group
+    /// write for non-root, or world-writable).
+    pub writable_by_non_root: bool,
+    /// POSIX mode bits of the directory in octal (e.g. 0o755).  Null if stat failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

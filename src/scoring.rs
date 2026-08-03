@@ -79,11 +79,11 @@ pub(crate) fn unit_is_vendor_shipped(f: &crate::models::ExecStartFinding) -> boo
         || f.unit_path.starts_with("/lib/systemd/system/")
 }
 
-/// Единственный источник истины: политика «доверенного» обработчика core_pattern.
-/// Используется и в SEC-044 (вес находки), и в compare (severity дрейфа).
+/// Single source of truth: policy for whether a core_pattern handler is trusted.
+/// Used by both SEC-044 (finding weight) and compare.rs (drift severity).
 pub(crate) fn core_pattern_is_trusted(cp: &str) -> bool {
     const KNOWN_HANDLERS: [&str; 3] = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
-    // Если не pipe — не перехват, считаем безопасным
+    // If it does not pipe to a handler, it is not a suspicious interceptor.
     let Some(handler) = cp.strip_prefix('|') else {
         return true;
     };
