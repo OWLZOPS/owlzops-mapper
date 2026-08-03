@@ -141,6 +141,16 @@ pub fn is_volatile_exec_path(path: &str) -> bool {
         || path.starts_with("/memfd:")
 }
 
+/// Check whether a path resides on a volatile filesystem (tmpfs, devtmpfs, …).
+/// Used by SEC-050 to flag directories from ld.so.conf that sit on ephemeral
+/// storage — an attacker can place a malicious library there at runtime.
+/// Delegates to `is_volatile_exec_path`; the prefix list intentionally
+/// excludes home directories (volatile for a directory means system-wide tmpfs,
+/// not user‑writable home).
+pub fn is_volatile_mount(path: &str) -> bool {
+    is_volatile_exec_path(path)
+}
+
 /// Home-relative depth: /home/u → 0, /home/u/Downloads → 1, /home/u/a/b → 2.
 /// Covers /root and Fedora Atomic's /var/home/<user>.
 fn home_relative_depth(dir: &str) -> Option<usize> {
