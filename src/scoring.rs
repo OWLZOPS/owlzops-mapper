@@ -30,7 +30,8 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// Bump whenever finding weights, tiers or IDs change: `compare` uses this to
 /// label a risk_score delta as a formula change, not a real drift.
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
-pub const SCORING_VERSION: u8 = 8;
+/// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
+pub const SCORING_VERSION: u8 = 9;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -1576,6 +1577,30 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 cis_ref: None,
             });
         }
+    }
+
+    // ── SEC-051 – ld.so.conf.d library path injection ──
+    if let Some(ref injections) = report.security.ld_so_conf_injections
+        && !injections.is_empty()
+    {
+        let list: Vec<String> = injections
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} (volatile:{}, writable:{})",
+                    f.path, f.volatile, f.writable_by_non_root
+                )
+            })
+            .collect();
+        findings.push(Finding {
+            id: "SEC-051",
+            title: "ld.so.conf paths allow unprivileged library injection".into(),
+            category: Category::Security,
+            weight: 30,
+            evidence: evidence_list(&list, 10),
+            suppressed: None,
+            cis_ref: None,
+        });
     }
 
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──

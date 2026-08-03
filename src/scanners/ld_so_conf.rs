@@ -24,8 +24,14 @@ pub fn scan_ld_so_conf() -> Option<Vec<LdSoConfInjection>> {
         }
 
         if let Some(rest) = line.strip_prefix("include ") {
-            let include_pattern = rest.trim();
-            if include_pattern.starts_with(conf_d_dir)
+            let raw = rest.trim();
+            // Support relative paths like "ld.so.conf.d/*.conf" (Fedora, RHEL, …).
+            let pattern = if !raw.starts_with('/') {
+                format!("/etc/{raw}")
+            } else {
+                raw.to_string()
+            };
+            if pattern.starts_with(conf_d_dir)
                 && let Ok(dir) = fs::read_dir(conf_d_dir)
             {
                 for entry in dir.flatten() {
