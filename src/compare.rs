@@ -896,6 +896,40 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // ── security.ld_so_conf_injections (SEC-051 drift) ─────────────────────
+    {
+        let b_paths: HashSet<&str> = before
+            .security
+            .ld_so_conf_injections
+            .iter()
+            .flat_map(|v| v.iter())
+            .map(|f| f.path.as_str())
+            .collect();
+        let a_paths: HashSet<&str> = after
+            .security
+            .ld_so_conf_injections
+            .iter()
+            .flat_map(|v| v.iter())
+            .map(|f| f.path.as_str())
+            .collect();
+        for added in a_paths.difference(&b_paths) {
+            changes.push(Change {
+                field: "security.ld_so_conf_injections".into(),
+                before: None,
+                after: Some(format!("ld.so.conf path {added} appeared")),
+                severity: Severity::Degraded,
+            });
+        }
+        for gone in b_paths.difference(&a_paths) {
+            changes.push(Change {
+                field: "security.ld_so_conf_injections".into(),
+                before: Some(format!("ld.so.conf path {gone} was present")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // ── security.core_pattern / modules_disabled / lockdown (SEC-044 drift, R23-08) ──
     if before.security.core_pattern != after.security.core_pattern {
         // R23-31: policy lives in scoring::core_pattern_is_trusted, shared with SEC-044.
