@@ -27,7 +27,11 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
-pub const SCORING_VERSION: u8 = 8;
+/// Bump whenever finding weights, tiers or IDs change: `compare` uses this to
+/// label a risk_score delta as a formula change, not a real drift.
+/// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
+/// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
+pub const SCORING_VERSION: u8 = 9;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -74,6 +78,19 @@ pub(crate) fn unit_is_vendor_shipped(f: &crate::models::ExecStartFinding) -> boo
     f.unit_package.is_some()
         || f.unit_path.starts_with("/usr/lib/systemd/system/")
         || f.unit_path.starts_with("/lib/systemd/system/")
+}
+
+/// Single source of truth: policy for whether a core_pattern handler is trusted.
+/// Used by both SEC-044 (finding weight) and compare.rs (drift severity).
+pub(crate) fn core_pattern_is_trusted(cp: &str) -> bool {
+    const KNOWN_HANDLERS: [&str; 3] = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
+    // If it does not pipe to a handler, it is not a suspicious interceptor.
+    let Some(handler) = cp.strip_prefix('|') else {
+        return true;
+    };
+    let bin = handler.split_whitespace().next().unwrap_or("");
+    let basename = bin.rsplit('/').next().unwrap_or(bin);
+    KNOWN_HANDLERS.contains(&basename) && !crate::utils::is_volatile_exec_path(bin)
 }
 
 /// Escalation-risk weight for an ambient capability set held with NoNewPrivs off.
@@ -1562,6 +1579,30 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-051 – ld.so.conf.d library path injection ──
+    if let Some(ref injections) = report.security.ld_so_conf_injections
+        && !injections.is_empty()
+    {
+        let list: Vec<String> = injections
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} (volatile:{}, writable:{})",
+                    f.path, f.volatile, f.writable_by_non_root
+                )
+            })
+            .collect();
+        findings.push(Finding {
+            id: "SEC-051",
+            title: "ld.so.conf paths allow unprivileged library injection".into(),
+            category: Category::Security,
+            weight: 30,
+            evidence: evidence_list(&list, 10),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
     {
         use crate::models::ExecWritability as W;
@@ -1717,29 +1758,19 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
     // ── SEC-044 – Kernel security facts (core_pattern, lockdown) ──────────
     // R23-07: core_pattern is now Option — None means unreadable (coverage).
-    // Only flag when a handler is piped and the handler binary is not a known
-    // trusted one OR resides on a volatile filesystem.
+    // Uses shared core_pattern_is_trusted() so policy stays in one place.
     if let Some(cp) = report.security.core_pattern.as_deref()
-        && cp.starts_with('|')
+        && !core_pattern_is_trusted(cp)
     {
-        let handler = cp.trim_start_matches('|').trim();
-        let bin = handler.split_whitespace().next().unwrap_or(handler);
-        let known_basenames = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
-        let basename = bin.rsplit('/').next().unwrap_or(bin);
-        let volatile = crate::utils::is_volatile_exec_path(bin);
-        let trusted = known_basenames.contains(&basename) && !volatile;
-
-        if !trusted {
-            findings.push(Finding {
-                id: "SEC-044",
-                title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
-                category: Category::Security,
-                weight: 25,
-                evidence: format!("core_pattern = {}", cp),
-                suppressed: None,
-                cis_ref: None,
-            });
-        }
+        findings.push(Finding {
+            id: "SEC-044",
+            title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
+            category: Category::Security,
+            weight: 25,
+            evidence: format!("core_pattern = {}", cp),
+            suppressed: None,
+            cis_ref: None,
+        });
     }
 
     if let Some(ref lock) = report.security.lockdown

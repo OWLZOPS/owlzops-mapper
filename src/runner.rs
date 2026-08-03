@@ -103,7 +103,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::scanners::packages::gather_packages_info(want_refresh_packages)
         });
 
-        // SEC-042/043/044 – blocking I/O, depend only on `deep`.
+        // SEC-042/043/044/050 – blocking I/O, depend only on `deep`.
         // Spawn here to run in parallel with other scanners and be included
         // in duration_secs (fixes R22-34: timer stopped before these ran).
         let persistence_task = tokio::task::spawn_blocking(move || {
@@ -111,6 +111,8 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
                 crate::scanners::preload::scan_ld_preload(),
                 crate::scanners::kernel_facts::gather_kernel_facts(),
                 crate::scanners::exec_provenance::scan_exec_provenance(deep),
+                // NEW: scan ld.so.conf.d for SEC-050
+                crate::scanners::ld_so_conf::scan_ld_so_conf(),
             )
         });
 
@@ -178,11 +180,13 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
-        let (preload, kernel_facts, exec_start) = persistence_res.unwrap_or_else(|e| {
+        // Updated tuple to include ld_so_conf
+        let (preload, kernel_facts, exec_start, ld_so_conf) = persistence_res.unwrap_or_else(|e| {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");
-            scan_warnings
-                .push("persistence scanner panicked — SEC-042/043/044 NOT verified".to_string());
-            (Vec::new(), (None, None, None), Vec::new())
+            scan_warnings.push(
+                "persistence scanner panicked — SEC-042/043/044/050 NOT verified".to_string(),
+            );
+            (Vec::new(), (None, None, None), Vec::new(), None)
         });
 
         // Drain coverage after all scanners finished – scope is attached here,
@@ -211,13 +215,14 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             self_integrity: None,
         };
 
-        // SEC-042/043/044 results (already computed in persistence_task)
+        // SEC-042/043/044/050 results (already computed in persistence_task)
         report.security.preload_injections = preload;
         let (core_pattern, modules_disabled, lockdown) = kernel_facts;
         report.security.core_pattern = core_pattern;
         report.security.modules_disabled = modules_disabled;
         report.security.lockdown = lockdown;
         report.security.exec_start_injections = exec_start;
+        report.security.ld_so_conf_injections = ld_so_conf; // NEW
 
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
