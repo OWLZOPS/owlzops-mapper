@@ -1,6 +1,6 @@
 // src/scanners/preload.rs
-// SEC-042: Inspect /etc/ld.so.preload for injected shared objects.
-// Also covers /etc/ld.so.conf.d/* for library path hijacking (placeholder).
+//! System-wide LD_PRELOAD scanner (/etc/ld.so.preload). SEC-042: Inspect /etc/ld.so.preload for injected shared objects.
+//! Library search path hijacking (/etc/ld.so.conf*) lives in ld_so_conf.rs (SEC-051)
 
 use crate::coverage;
 use crate::models::PreloadFinding;

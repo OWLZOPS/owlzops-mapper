@@ -142,7 +142,7 @@ pub fn is_volatile_exec_path(path: &str) -> bool {
 }
 
 /// Check whether a path resides on a volatile filesystem (tmpfs, devtmpfs, …).
-/// Used by SEC-050 to flag directories from ld.so.conf that sit on ephemeral
+/// Used by SEC-051 to flag directories from ld.so.conf that sit on ephemeral
 /// storage — an attacker can place a malicious library there at runtime.
 /// Delegates to `is_volatile_exec_path`; the prefix list intentionally
 /// excludes home directories (volatile for a directory means system-wide tmpfs,
