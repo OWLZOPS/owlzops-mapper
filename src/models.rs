@@ -371,16 +371,15 @@ pub struct SecurityInfo {
     #[serde(default)]
     pub exec_start_injections: Vec<ExecStartFinding>,
 
-    // ── SEC-050: ld.so.conf.d library path injection ───────────────────────
+    // ── SEC-051: ld.so.conf.d library path injection ───────────────────────
     /// Directories from /etc/ld.so.conf and /etc/ld.so.conf.d/*.conf that
-    /// are writable by non-root or reside on volatile filesystems — a
-    /// systemic library search path hijack vector.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ld_so_conf_injections: Option<Vec<LdSoConfInjection>>,
+    /// are writable by non-root or reside on volatile filesystems.
+    #[serde(default)]
+    pub ld_so_conf_injections: Vec<LdSoConfInjection>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SEC-050: ld.so.conf.d injection
+// SEC-051: ld.so.conf.d injection
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// A directory listed in ld.so.conf (or an included conf.d fragment) that is
@@ -400,6 +399,12 @@ pub struct LdSoConfInjection {
     /// POSIX mode bits of the directory in octal (e.g. 0o755).  Null if stat failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
+    /// Owner UID of the directory.
+    #[serde(default)]
+    pub uid: u32,
+    /// Owner GID of the directory.
+    #[serde(default)]
+    pub gid: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

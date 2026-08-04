@@ -902,14 +902,12 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             .security
             .ld_so_conf_injections
             .iter()
-            .flat_map(|v| v.iter())
             .map(|f| f.path.as_str())
             .collect();
         let a_paths: HashSet<&str> = after
             .security
             .ld_so_conf_injections
             .iter()
-            .flat_map(|v| v.iter())
             .map(|f| f.path.as_str())
             .collect();
         for added in a_paths.difference(&b_paths) {

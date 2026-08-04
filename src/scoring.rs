@@ -1580,15 +1580,18 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-051 – ld.so.conf.d library path injection ──
-    if let Some(ref injections) = report.security.ld_so_conf_injections
-        && !injections.is_empty()
-    {
-        let list: Vec<String> = injections
+    if !report.security.ld_so_conf_injections.is_empty() {
+        let list: Vec<String> = report
+            .security
+            .ld_so_conf_injections
             .iter()
             .map(|f| {
                 format!(
-                    "{} (volatile:{}, writable:{})",
-                    f.path, f.volatile, f.writable_by_non_root
+                    "{} (uid {}, mode {:o}, volatile:{})",
+                    f.path,
+                    f.uid,
+                    f.mode.unwrap_or(0),
+                    f.volatile
                 )
             })
             .collect();
