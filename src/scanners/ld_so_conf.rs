@@ -66,6 +66,16 @@ pub(crate) fn dir_include_pattern(p: &Path) -> String {
     format!("{}/*", p.display())
 }
 
+/// Decision for a MISSING directory listed in ld.so.conf.
+/// Returns `Some(writable)` if it should be reported, or `None` if not.
+/// A missing entry is only suspicious when the parent is writable by non-root
+/// (so an attacker can create it) or volatile — otherwise it's just a stale
+/// leftover from a removed package.
+pub(crate) fn classify_missing(volatile: bool, pmode: u32, puid: u32, pgid: u32) -> Option<bool> {
+    let writable = unsafe_mode(pmode, puid, pgid);
+    should_report(volatile, writable).then_some(writable)
+}
+
 fn expand_include(pattern: &str, queue: &mut Vec<PathBuf>) {
     if queue.len() >= MAX_QUEUE_LEN {
         coverage::record("ld.so.conf: include queue cap reached; SEC-051 partial".to_string());
@@ -122,10 +132,12 @@ fn classify_dir(raw: &str) -> Option<LdSoConfInjection> {
             let parent = path.parent()?;
             let pmd = fs::metadata(parent).ok()?;
             let volatile = crate::utils::is_volatile_mount(&parent.to_string_lossy());
-            return should_report(volatile, true).then(|| LdSoConfInjection {
+            let writable_by_non_root =
+                classify_missing(volatile, pmd.permissions().mode(), pmd.uid(), pmd.gid())?;
+            return Some(LdSoConfInjection {
                 path: raw.to_string(),
                 volatile,
-                writable_by_non_root: true,
+                writable_by_non_root,
                 mode: None, // directory doesn't exist yet
                 uid: pmd.uid(),
                 gid: pmd.gid(),
@@ -266,6 +278,21 @@ mod tests {
             dir_include_pattern(Path::new("/etc/ld.so.conf.d")),
             "/etc/ld.so.conf.d/*"
         );
+    }
+
+    #[test]
+    fn missing_dir_reported_only_when_parent_is_takeable() {
+        // stale entry under root:root 0755 — not a finding
+        assert!(
+            classify_missing(false, 0o755, 0, 0).is_none(),
+            "stale entry under root:root 0755 — must be silent"
+        );
+        // parent is world-writable → attacker can create the directory
+        assert_eq!(classify_missing(false, 0o777, 0, 0), Some(true));
+        // parent owned by non-root with write → takeable
+        assert_eq!(classify_missing(false, 0o755, 1000, 0), Some(true));
+        // volatile axis alone (tmpfs) with non-writable parent → still reported
+        assert_eq!(classify_missing(true, 0o755, 0, 0), Some(false));
     }
 
     #[test]
