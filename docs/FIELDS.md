@@ -331,6 +331,13 @@ An array of objects, one per detected database engine.
 | `core_pattern` | string \| null | `/proc/sys/kernel/core_pattern`; `null` = unreadable (SEC‑044) |
 | `modules_disabled` | boolean \| null | `/proc/sys/kernel/modules_disabled`; `null` = unreadable (SEC‑044) |
 | `lockdown` | string \| null | Kernel lockdown state; `null` = unavailable (SEC‑044) |
+| `ld_so_conf_injections` | array of objects | Directories from ld.so.conf / ld.so.conf.d that allow unprivileged library injection (SEC‑051) |
+| `ld_so_conf_injections[].path` | string | Absolute path as written in the config file |
+| `ld_so_conf_injections[].volatile` | boolean | True if the filesystem is volatile (tmpfs, devtmpfs, …) |
+| `ld_so_conf_injections[].writable_by_non_root` | boolean | True if the directory is writable by a non‑root principal. **Independent** from `volatile`: either axis alone triggers the finding. |
+| `ld_so_conf_injections[].mode` | integer \| null | POSIX mode bits in octal (e.g. 0o755). `null` if the directory does not exist — in that case `uid`/`gid`/`writable_by_non_root` refer to the **parent** directory |
+| `ld_so_conf_injections[].uid` | integer | Owner UID of the directory (or of the parent if `mode` is null) |
+| `ld_so_conf_injections[].gid` | integer | Owner GID of the directory (or of the parent if `mode` is null) |
 
 ---
 

@@ -397,7 +397,7 @@ pub struct LdSoConfInjection {
     /// write for non-root, or world-writable).
     pub writable_by_non_root: bool,
     /// POSIX mode bits of the directory in octal (e.g. 0o755).  Null if stat failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub mode: Option<u32>,
     /// Owner UID of the directory.
     #[serde(default)]
