@@ -56,6 +56,16 @@ pub(crate) fn unsafe_mode(mode: u32, uid: u32, gid: u32) -> bool {
     mode & 0o002 != 0 || (uid != 0 && mode & 0o200 != 0) || (gid != 0 && mode & 0o020 != 0)
 }
 
+/// A directory should be reported if EITHER axis triggers.
+pub(crate) fn should_report(volatile: bool, writable_by_non_root: bool) -> bool {
+    volatile || writable_by_non_root
+}
+
+/// Build a glob pattern from a directory path (for include of a plain directory).
+pub(crate) fn dir_include_pattern(p: &Path) -> String {
+    format!("{}/*", p.display())
+}
+
 fn expand_include(pattern: &str, queue: &mut Vec<PathBuf>) {
     if queue.len() >= MAX_QUEUE_LEN {
         coverage::record("ld.so.conf: include queue cap reached; SEC-051 partial".to_string());
@@ -66,12 +76,11 @@ fn expand_include(pattern: &str, queue: &mut Vec<PathBuf>) {
         return;
     };
     if !file_name.contains('*') {
-        // If a plain directory is included, treat it as "dir/*" to read its
-        // contents rather than failing on a directory read later.
+        // Plain directory include: expand to that directory's contents.
         if let Ok(md) = fs::metadata(p)
             && md.is_dir()
         {
-            let new_pattern = format!("{}/{}", dir.display(), "*");
+            let new_pattern = dir_include_pattern(p);
             expand_include(&new_pattern, queue);
             return;
         }
@@ -112,15 +121,14 @@ fn classify_dir(raw: &str) -> Option<LdSoConfInjection> {
             // an attacker can create it and take priority in the library path.
             let parent = path.parent()?;
             let pmd = fs::metadata(parent).ok()?;
-            return unsafe_mode(pmd.permissions().mode(), pmd.uid(), pmd.gid()).then(|| {
-                LdSoConfInjection {
-                    path: raw.to_string(),
-                    volatile: crate::utils::is_volatile_mount(&parent.to_string_lossy()),
-                    writable_by_non_root: true,
-                    mode: None, // directory doesn't exist yet
-                    uid: pmd.uid(),
-                    gid: pmd.gid(),
-                }
+            let volatile = crate::utils::is_volatile_mount(&parent.to_string_lossy());
+            return should_report(volatile, true).then(|| LdSoConfInjection {
+                path: raw.to_string(),
+                volatile,
+                writable_by_non_root: true,
+                mode: None, // directory doesn't exist yet
+                uid: pmd.uid(),
+                gid: pmd.gid(),
             });
         }
         Err(_) => return None,
@@ -132,10 +140,11 @@ fn classify_dir(raw: &str) -> Option<LdSoConfInjection> {
     let uid = md.uid();
     let gid = md.gid();
     let volatile = crate::utils::is_volatile_mount(raw);
-    unsafe_mode(mode, uid, gid).then(|| LdSoConfInjection {
+    let writable_by_non_root = unsafe_mode(mode, uid, gid);
+    should_report(volatile, writable_by_non_root).then(|| LdSoConfInjection {
         path: raw.to_string(),
         volatile,
-        writable_by_non_root: true,
+        writable_by_non_root,
         mode: Some(mode),
         uid,
         gid,
@@ -241,6 +250,21 @@ mod tests {
         assert!(
             unsafe_mode(0o1777, 0, 0),
             "sticky does not protect library path"
+        );
+    }
+
+    #[test]
+    fn should_report_respects_both_axes() {
+        assert!(should_report(true, false), "volatile alone must fire");
+        assert!(should_report(false, true), "writable alone must fire");
+        assert!(!should_report(false, false), "neither must be silent");
+    }
+
+    #[test]
+    fn dir_include_pattern_is_self_not_parent() {
+        assert_eq!(
+            dir_include_pattern(Path::new("/etc/ld.so.conf.d")),
+            "/etc/ld.so.conf.d/*"
         );
     }
 
