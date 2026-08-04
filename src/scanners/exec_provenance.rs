@@ -8,10 +8,10 @@
 // as a systemd unit.
 
 use crate::coverage;
-use crate::models::{ExecStartFinding, ExecWritability};
+use crate::models::ExecStartFinding;
 use crate::safe_io;
+use crate::scanners::integrity::assess_writability; // shared writability check
 use std::collections::HashSet;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// Return `true` if the unit path already resides in a vendor-controlled
@@ -188,29 +188,6 @@ pub fn scan_exec_provenance(deep: bool) -> Vec<ExecStartFinding> {
     findings
 }
 
-/// Assess who can modify the exec target. `metadata` (not `symlink_metadata`)
-/// deliberately follows symlinks — the bytes that actually execute are what
-/// matter, so /usr/bin/foo → /home/u/evil correctly reports NonRootWritable.
-/// The parent is checked too: write permission on a directory allows
-/// unlink+replace regardless of the file's own mode.
-fn assess_writability(path: &str) -> ExecWritability {
-    let loose = |m: &std::fs::Metadata| {
-        m.uid() != 0 || m.mode() & 0o002 != 0 || (m.mode() & 0o020 != 0 && m.gid() != 0)
-    };
-
-    match std::fs::metadata(path) {
-        Ok(md) if loose(&md) => return ExecWritability::NonRootWritable,
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ExecWritability::Missing,
-        Err(_) => return ExecWritability::Unknown,
-    }
-    match Path::new(path).parent().map(std::fs::metadata) {
-        Some(Ok(dir)) if loose(&dir) => ExecWritability::NonRootWritable,
-        Some(Err(_)) => ExecWritability::Unknown,
-        _ => ExecWritability::RootOnly,
-    }
-}
-
 /// Return `true` if `path` is a symlink pointing to /dev/null — a masked
 /// systemd unit.  These are intentionally disabled and contain no directives.
 fn is_masked_symlink(path: &Path) -> bool {
@@ -333,7 +310,8 @@ fn scan_service_file(unit_path: &Path, scope: UnitScope, push: &mut dyn FnMut(Ex
                     .unwrap_or_else(|_| first_token.to_string());
                 let volatile = crate::utils::is_volatile_exec_path(&resolved);
 
-                let writability = assess_writability(first_token);
+                // Use the shared integrity module for writability assessment
+                let writability = assess_writability(Path::new(first_token));
 
                 push(ExecStartFinding {
                     source: format!("systemd:{}", unit_name),
@@ -467,7 +445,7 @@ fn check_cron_line(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| first_token.to_string());
     let volatile = crate::utils::is_volatile_exec_path(&resolved);
-    let writability = assess_writability(first_token);
+    let writability = assess_writability(Path::new(first_token));
 
     // R23-13: real identity from the user field.
     let runs_as_root = parts

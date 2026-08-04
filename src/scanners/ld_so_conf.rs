@@ -2,6 +2,7 @@
 // SEC-051: Detect unsafe library search paths in ld.so.conf / ld.so.conf.d
 
 use crate::models::LdSoConfInjection;
+use crate::scanners::integrity::unsafe_mode;
 use crate::{coverage, safe_io};
 use std::collections::HashSet;
 use std::fs;
@@ -10,11 +11,8 @@ use std::path::{Path, PathBuf};
 
 const MAX_CONF_BYTES: usize = 64 * 1024;
 const MAX_CONF_FILES: usize = 256;
-const MAX_QUEUE_LEN: usize = MAX_CONF_FILES * 4; // safety cap for glob expansion
+const MAX_QUEUE_LEN: usize = MAX_CONF_FILES * 4;
 
-/// Pure parser for one ld.so.conf file content.
-/// Returns (directories, include-patterns).
-/// Semantics: `#` removes the rest of the line; `include` + isblank.
 pub(crate) fn parse_ld_so_conf(content: &str) -> (Vec<&str>, Vec<&str>) {
     let mut dirs = Vec::new();
     let mut includes = Vec::new();
@@ -39,7 +37,6 @@ pub(crate) fn parse_ld_so_conf(content: &str) -> (Vec<&str>, Vec<&str>) {
     (dirs, includes)
 }
 
-/// Simple glob: only '*' is used in ld.so.conf patterns.
 pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == name,
@@ -49,28 +46,14 @@ pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// A directory is unsafe if a non-root principal can write to it.
-/// Sticky bit intentionally ignored: it prevents deletion but not creation
-/// of new files like `libfoo.so`.
-pub(crate) fn unsafe_mode(mode: u32, uid: u32, gid: u32) -> bool {
-    mode & 0o002 != 0 || (uid != 0 && mode & 0o200 != 0) || (gid != 0 && mode & 0o020 != 0)
-}
-
-/// A directory should be reported if EITHER axis triggers.
 pub(crate) fn should_report(volatile: bool, writable_by_non_root: bool) -> bool {
     volatile || writable_by_non_root
 }
 
-/// Build a glob pattern from a directory path (for include of a plain directory).
 pub(crate) fn dir_include_pattern(p: &Path) -> String {
     format!("{}/*", p.display())
 }
 
-/// Decision for a MISSING directory listed in ld.so.conf.
-/// Returns `Some(writable)` if it should be reported, or `None` if not.
-/// A missing entry is only suspicious when the parent is writable by non-root
-/// (so an attacker can create it) or volatile — otherwise it's just a stale
-/// leftover from a removed package.
 pub(crate) fn classify_missing(volatile: bool, pmode: u32, puid: u32, pgid: u32) -> Option<bool> {
     let writable = unsafe_mode(pmode, puid, pgid);
     should_report(volatile, writable).then_some(writable)
@@ -86,7 +69,6 @@ fn expand_include(pattern: &str, queue: &mut Vec<PathBuf>) {
         return;
     };
     if !file_name.contains('*') {
-        // Plain directory include: expand to that directory's contents.
         if let Ok(md) = fs::metadata(p)
             && md.is_dir()
         {
@@ -127,8 +109,6 @@ fn classify_dir(raw: &str) -> Option<LdSoConfInjection> {
     let md = match fs::metadata(raw) {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Directory does not exist, but if the parent is writable,
-            // an attacker can create it and take priority in the library path.
             let parent = path.parent()?;
             let pmd = fs::metadata(parent).ok()?;
             let volatile = crate::utils::is_volatile_mount(&parent.to_string_lossy());
@@ -138,7 +118,7 @@ fn classify_dir(raw: &str) -> Option<LdSoConfInjection> {
                 path: raw.to_string(),
                 volatile,
                 writable_by_non_root,
-                mode: None, // directory doesn't exist yet
+                mode: None,
                 uid: pmd.uid(),
                 gid: pmd.gid(),
             });
@@ -163,21 +143,15 @@ fn classify_dir(raw: &str) -> Option<LdSoConfInjection> {
     })
 }
 
-/// Scan /etc/ld.so.conf and /etc/ld.so.conf.d/*.conf for directories
-/// that enable unprivileged library injection (SEC-051).
-/// Returns all suspicious directories found, sorted by path.
 pub fn scan_ld_so_conf() -> Vec<LdSoConfInjection> {
     let mut queue = Vec::new();
-    // ldconfig always reads conf.d/*.conf regardless of main file
     expand_include("/etc/ld.so.conf.d/*.conf", &mut queue);
-    // also try the main file for custom paths/includes
     queue.push(PathBuf::from("/etc/ld.so.conf"));
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut dirs: HashSet<String> = HashSet::new(); // dedup across includes
+    let mut dirs: HashSet<String> = HashSet::new();
 
     while let Some(path) = queue.pop() {
-        // R23-44: check limit before inserting
         if seen.len() >= MAX_CONF_FILES {
             coverage::record(
                 "ld.so.conf: include fan-out cap reached; SEC-051 partial".to_string(),
@@ -201,7 +175,6 @@ pub fn scan_ld_so_conf() -> Vec<LdSoConfInjection> {
                 }
                 let (d, inc) = parse_ld_so_conf(&content);
                 for dir in d {
-                    // Normalize trailing slashes
                     dirs.insert(dir.trim_end_matches('/').to_string());
                 }
                 for pattern in inc {
@@ -214,7 +187,7 @@ pub fn scan_ld_so_conf() -> Vec<LdSoConfInjection> {
     }
 
     let mut out: Vec<_> = dirs.iter().filter_map(|d| classify_dir(d)).collect();
-    out.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic output
+    out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
@@ -247,25 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_mode_matrix() {
-        assert!(!unsafe_mode(0o755, 0, 0), "root:root 755 — normal");
-        assert!(unsafe_mode(0o777, 0, 0), "world-writable even for root");
-        assert!(unsafe_mode(0o755, 1000, 0), "owner not root");
-        assert!(
-            unsafe_mode(0o775, 0, 1000),
-            "group not root and group-write"
-        );
-        assert!(
-            !unsafe_mode(0o755, 0, 1000),
-            "group not root, but without w — normal"
-        );
-        assert!(
-            unsafe_mode(0o1777, 0, 0),
-            "sticky does not protect library path"
-        );
-    }
-
-    #[test]
     fn should_report_respects_both_axes() {
         assert!(should_report(true, false), "volatile alone must fire");
         assert!(should_report(false, true), "writable alone must fire");
@@ -282,16 +236,12 @@ mod tests {
 
     #[test]
     fn missing_dir_reported_only_when_parent_is_takeable() {
-        // stale entry under root:root 0755 — not a finding
         assert!(
             classify_missing(false, 0o755, 0, 0).is_none(),
             "stale entry under root:root 0755 — must be silent"
         );
-        // parent is world-writable → attacker can create the directory
         assert_eq!(classify_missing(false, 0o777, 0, 0), Some(true));
-        // parent owned by non-root with write → takeable
         assert_eq!(classify_missing(false, 0o755, 1000, 0), Some(true));
-        // volatile axis alone (tmpfs) with non-writable parent → still reported
         assert_eq!(classify_missing(true, 0o755, 0, 0), Some(false));
     }
 
@@ -305,6 +255,5 @@ mod tests {
         fs::set_permissions(path, perms).unwrap();
         let inj = classify_dir(path).unwrap();
         assert!(inj.writable_by_non_root, "expected writable by non-root");
-        // volatile may be true or false depending on filesystem
     }
 }

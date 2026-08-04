@@ -31,7 +31,8 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// label a risk_score delta as a formula change, not a real drift.
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
 /// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
-pub const SCORING_VERSION: u8 = 9;
+/// v10 (0.5.31): SEC-052/053/054 — systemd generator persistence.
+pub const SCORING_VERSION: u8 = 10;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -1606,6 +1607,82 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-052 / SEC-053 / SEC-054: systemd generator persistence ──
+    {
+        use crate::scanners::generators::{
+            GeneratorVerdict, classify_generator, describe, is_volatile_escape,
+        };
+
+        let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
+
+        for g in &report.security.generators {
+            let escape = g.resolved_path.as_deref().is_some_and(is_volatile_escape);
+            match classify_generator(
+                g.kind,
+                g.origin,
+                g.writability,
+                escape,
+                g.package.as_deref(),
+                report.security.provenance_source,
+            ) {
+                GeneratorVerdict::Ioc => ioc.push(describe(g)),
+                GeneratorVerdict::Unpackaged => unpackaged.push(describe(g)),
+                GeneratorVerdict::Unverifiable => unverifiable.push(describe(g)),
+                GeneratorVerdict::Benign => {}
+            }
+        }
+
+        if !ioc.is_empty() {
+            findings.push(Finding {
+                id: "SEC-052",
+                title: "ACTIVE COMPROMISE: systemd generator controlled by a non-root principal"
+                    .to_string(),
+                category: Category::Security,
+                weight: 55,
+                evidence: format!(
+                    "{} generator target(s) executed as root at every boot and daemon-reload, \
+                     writable by non-root or resolving off the systemd hierarchy: {}",
+                    ioc.len(),
+                    evidence_list(&ioc, 10)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+        if !unpackaged.is_empty() {
+            findings.push(Finding {
+                id: "SEC-053",
+                title: "Unpackaged systemd generator outside the vendor hierarchy".to_string(),
+                category: Category::Security,
+                weight: 30,
+                evidence: format!(
+                    "{} generator(s) belong to no installed package and do not live in \
+                     /usr/lib/systemd/*-generators: {}",
+                    unpackaged.len(),
+                    evidence_list(&unpackaged, 10)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+        if !unverifiable.is_empty() {
+            findings.push(Finding {
+                id: "SEC-054",
+                title: "systemd generator present (ownership unverifiable)".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} non-vendor generator(s); package database unavailable — origin \
+                     cannot be verified: {}",
+                    unverifiable.len(),
+                    evidence_list(&unverifiable, 10)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
     {
         use crate::models::ExecWritability as W;
@@ -2440,9 +2517,9 @@ impl CriticalFlags {
         // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
         // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
         // modules are excluded upstream, so FP is near-zero.
-        const IOC_IDS: [&str; 14] = [
+        const IOC_IDS: [&str; 15] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043",
+            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043", "SEC-052",
         ];
 
         // R23-14: IOC_IDS finding must carry IoC-band weight. Mixing tiers

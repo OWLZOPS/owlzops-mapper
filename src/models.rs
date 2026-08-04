@@ -376,6 +376,12 @@ pub struct SecurityInfo {
     /// are writable by non-root or reside on volatile filesystems.
     #[serde(default)]
     pub ld_so_conf_injections: Vec<LdSoConfInjection>,
+
+    // ── SEC-052/053/054: systemd generator persistence ─────────────────────
+    /// Executables in systemd's generator search paths, plus the search
+    /// directories themselves when they are writable by a non-root principal.
+    #[serde(default)]
+    pub generators: Vec<GeneratorFinding>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -403,6 +409,65 @@ pub struct LdSoConfInjection {
     #[serde(default)]
     pub uid: u32,
     /// Owner GID of the directory.
+    #[serde(default)]
+    pub gid: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEC-052/053/054: systemd generators
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Where the generator was found. systemd.generator(7) reserves
+/// /usr/lib/systemd/*-generators for the package manager; everything else is
+/// administrator or runtime territory. This is the DB-free authorship signal,
+/// same reasoning as `unit_path_is_vendor_dir` for SEC-043.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeneratorOrigin {
+    /// /usr/lib/systemd/{system,user}-generators — package manager only.
+    #[default]
+    Vendor,
+    /// /usr/local/lib/systemd/... — local build, not vendor-owned.
+    LocalAdmin,
+    /// /etc/systemd/... — administrator.
+    Admin,
+    /// /run/systemd/... — runtime, disappears on reboot.
+    Runtime,
+}
+
+/// What the record describes.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeneratorKind {
+    /// An executable systemd will run at boot and on every daemon-reload.
+    #[default]
+    Executable,
+    /// A search directory that a non-root principal can write to — the
+    /// opportunity itself, reported even when the directory is empty.
+    SearchDir,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GeneratorFinding {
+    /// Absolute path of the executable, or of the directory for `SearchDir`.
+    pub path: String,
+    #[serde(default)]
+    pub kind: GeneratorKind,
+    #[serde(default)]
+    pub origin: GeneratorOrigin,
+    /// Owning package, if the provenance backend could attribute it.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Shared vocabulary with SEC-043 — one enum for "who controls these bytes".
+    #[serde(default)]
+    pub writability: ExecWritability,
+    /// Symlink target as written, if the entry is a link. systemd ships several
+    /// generators as links; a link leaving the systemd hierarchy is a signal.
+    #[serde(default)]
+    pub symlink_target: Option<String>,
+    /// Fully resolved path (symlinks followed). None if the link dangles.
+    #[serde(default)]
+    pub resolved_path: Option<String>,
+    #[serde(default)]
+    pub uid: u32,
     #[serde(default)]
     pub gid: u32,
 }

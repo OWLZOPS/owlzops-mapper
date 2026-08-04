@@ -48,6 +48,8 @@ mod confinement;
 pub mod exec_provenance;
 #[cfg(feature = "local-scan")]
 mod ftrace;
+pub mod generators;
+pub mod integrity;
 #[cfg(feature = "local-scan")]
 pub mod kernel_facts;
 #[cfg(feature = "local-scan")]
