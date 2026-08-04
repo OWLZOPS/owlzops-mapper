@@ -60,6 +60,7 @@ pub fn is_local_host(host: &str) -> bool {
 
 // ── Scan execution ─────────────────────────────────────────
 
+#[cfg(feature = "local-scan")]
 /// Aggregate of the persistence-family scanners. A struct rather than a tuple
 /// so adding a scanner is a one-field change instead of widening four call
 /// sites; `Default` doubles as the panic fallback.
@@ -74,6 +75,7 @@ struct PersistenceScan {
     generators: Vec<crate::models::GeneratorFinding>,
 }
 
+#[cfg(feature = "local-scan")]
 /// Single source for the panic warning — the message cannot drift from the
 /// scanner set again (R23-34).
 const PERSISTENCE_IDS: &str = "SEC-042/043/044/049/050/051/052/053/054";

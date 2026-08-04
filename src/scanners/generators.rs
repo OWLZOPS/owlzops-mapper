@@ -13,11 +13,20 @@ const MAX_GENERATORS: usize = 256;
 const GENERATOR_DIRS: &[(&str, GeneratorOrigin)] = &[
     ("/run/systemd/system-generators", GeneratorOrigin::Runtime),
     ("/etc/systemd/system-generators", GeneratorOrigin::Admin),
-    ("/usr/local/lib/systemd/system-generators", GeneratorOrigin::LocalAdmin),
-    ("/usr/lib/systemd/system-generators", GeneratorOrigin::Vendor),
+    (
+        "/usr/local/lib/systemd/system-generators",
+        GeneratorOrigin::LocalAdmin,
+    ),
+    (
+        "/usr/lib/systemd/system-generators",
+        GeneratorOrigin::Vendor,
+    ),
     ("/run/systemd/user-generators", GeneratorOrigin::Runtime),
     ("/etc/systemd/user-generators", GeneratorOrigin::Admin),
-    ("/usr/local/lib/systemd/user-generators", GeneratorOrigin::LocalAdmin),
+    (
+        "/usr/local/lib/systemd/user-generators",
+        GeneratorOrigin::LocalAdmin,
+    ),
     ("/usr/lib/systemd/user-generators", GeneratorOrigin::Vendor),
 ];
 
@@ -171,24 +180,18 @@ pub fn scan_generators() -> Vec<GeneratorFinding> {
     }
 
     // Resolve package ownership for collected candidates.
-    // This requires the local-scan feature (package database access).
-    #[cfg(feature = "local-scan")]
-    {
-        let candidates: HashSet<String> = out
-            .iter()
-            .filter(|g| g.kind == GeneratorKind::Executable)
-            .map(|g| {
-                crate::utils::canon_path(g.resolved_path.as_deref().unwrap_or(&g.path))
-                    .into_owned()
-            })
-            .collect();
-        if !candidates.is_empty() {
-            let prov = crate::scanners::provenance::resolve_batch(&candidates);
-            for g in &mut out {
-                let key =
-                    crate::utils::canon_path(g.resolved_path.as_deref().unwrap_or(&g.path));
-                g.package = prov.lookup(key.as_ref());
-            }
+    let candidates: HashSet<String> = out
+        .iter()
+        .filter(|g| g.kind == GeneratorKind::Executable)
+        .map(|g| {
+            crate::utils::canon_path(g.resolved_path.as_deref().unwrap_or(&g.path)).into_owned()
+        })
+        .collect();
+    if !candidates.is_empty() {
+        let prov = crate::scanners::provenance::resolve_batch(&candidates);
+        for g in &mut out {
+            let key = crate::utils::canon_path(g.resolved_path.as_deref().unwrap_or(&g.path));
+            g.package = prov.lookup(key.as_ref());
         }
     }
 
@@ -200,13 +203,21 @@ pub fn scan_generators() -> Vec<GeneratorFinding> {
 mod tests {
     use super::*;
 
-    fn v() -> ProvenanceSource { ProvenanceSource::Dpkg }
+    fn v() -> ProvenanceSource {
+        ProvenanceSource::Dpkg
+    }
 
     #[test]
     fn writable_search_dir_is_always_ioc() {
         assert_eq!(
-            classify_generator(GeneratorKind::SearchDir, GeneratorOrigin::Admin,
-                               ExecWritability::NonRootWritable, false, None, v()),
+            classify_generator(
+                GeneratorKind::SearchDir,
+                GeneratorOrigin::Admin,
+                ExecWritability::NonRootWritable,
+                false,
+                None,
+                v()
+            ),
             GeneratorVerdict::Ioc
         );
     }
@@ -214,27 +225,49 @@ mod tests {
     #[test]
     fn vendor_generator_is_silent() {
         assert_eq!(
-            classify_generator(GeneratorKind::Executable, GeneratorOrigin::Vendor,
-                               ExecWritability::RootOnly, false, None, v()),
+            classify_generator(
+                GeneratorKind::Executable,
+                GeneratorOrigin::Vendor,
+                ExecWritability::RootOnly,
+                false,
+                None,
+                v()
+            ),
             GeneratorVerdict::Benign
         );
     }
 
     #[test]
     fn admin_generator_tiers_by_provenance() {
-        let call = |p, src| classify_generator(
-            GeneratorKind::Executable, GeneratorOrigin::Admin,
-            ExecWritability::RootOnly, false, p, src);
+        let call = |p, src| {
+            classify_generator(
+                GeneratorKind::Executable,
+                GeneratorOrigin::Admin,
+                ExecWritability::RootOnly,
+                false,
+                p,
+                src,
+            )
+        };
         assert_eq!(call(Some("systemd"), v()), GeneratorVerdict::Benign);
         assert_eq!(call(None, v()), GeneratorVerdict::Unpackaged);
-        assert_eq!(call(None, ProvenanceSource::Unavailable), GeneratorVerdict::Unverifiable);
+        assert_eq!(
+            call(None, ProvenanceSource::Unavailable),
+            GeneratorVerdict::Unverifiable
+        );
     }
 
     #[test]
     fn writability_trumps_everything() {
         assert_eq!(
-            classify_generator(GeneratorKind::Executable, GeneratorOrigin::Vendor,
-                               ExecWritability::NonRootWritable, false, Some("systemd"), v()),
+            classify_generator(
+                GeneratorKind::Executable,
+                GeneratorOrigin::Vendor,
+                ExecWritability::NonRootWritable,
+                false,
+                Some("systemd"),
+                v()
+            ),
             GeneratorVerdict::Ioc
         );
     }
