@@ -1608,6 +1608,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-052 / SEC-053 / SEC-054: systemd generator persistence ──
+    #[cfg(feature = "local-scan")]
     {
         use crate::scanners::generators::{
             GeneratorVerdict, classify_generator, describe, is_volatile_escape,
