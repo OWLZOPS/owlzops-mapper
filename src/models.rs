@@ -379,7 +379,7 @@ pub struct SecurityInfo {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SEC-050: ld.so.conf.d injection
+// SEC-051: ld.so.conf.d injection
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// A directory listed in ld.so.conf (or an included conf.d fragment) that is
