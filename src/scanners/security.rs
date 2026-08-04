@@ -579,6 +579,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         // ── SEC-043: will be populated by runner / main after scan ──
         exec_start_injections: Vec::new(),
         ld_so_conf_injections: Vec::new(),
+        generators: Vec::new(),
     }
 }
 

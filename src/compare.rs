@@ -928,6 +928,55 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // ── security.generators (SEC-052 drift) ────────────────────────────────
+    {
+        let key = |g: &crate::models::GeneratorFinding| g.path.clone();
+        let b: HashMap<String, &_> = before
+            .security
+            .generators
+            .iter()
+            .map(|g| (key(g), g))
+            .collect();
+        let a: HashMap<String, &_> = after
+            .security
+            .generators
+            .iter()
+            .map(|g| (key(g), g))
+            .collect();
+
+        for (path, g) in &a {
+            match b.get(path) {
+                None => changes.push(Change {
+                    field: "security.generators".into(),
+                    before: None,
+                    after: Some(format!("generator {path} appeared ({:?})", g.origin)),
+                    severity: Severity::Degraded,
+                }),
+                Some(prev) if prev.writability != g.writability => changes.push(Change {
+                    field: "security.generators".into(),
+                    before: Some(format!("{path}: {:?}", prev.writability)),
+                    after: Some(format!("{path}: {:?}", g.writability)),
+                    severity: Severity::Degraded,
+                }),
+                Some(prev) if prev.symlink_target != g.symlink_target => changes.push(Change {
+                    field: "security.generators".into(),
+                    before: Some(format!("{path} → {:?}", prev.symlink_target)),
+                    after: Some(format!("{path} → {:?}", g.symlink_target)),
+                    severity: Severity::Degraded,
+                }),
+                _ => {}
+            }
+        }
+        for path in b.keys().filter(|p| !a.contains_key(*p)) {
+            changes.push(Change {
+                field: "security.generators".into(),
+                before: Some(format!("generator {path} was present")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // ── security.core_pattern / modules_disabled / lockdown (SEC-044 drift, R23-08) ──
     if before.security.core_pattern != after.security.core_pattern {
         // R23-31: policy lives in scoring::core_pattern_is_trusted, shared with SEC-044.

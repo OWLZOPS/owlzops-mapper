@@ -61,6 +61,26 @@ pub fn is_local_host(host: &str) -> bool {
 // ── Scan execution ─────────────────────────────────────────
 
 #[cfg(feature = "local-scan")]
+/// Aggregate of the persistence-family scanners. A struct rather than a tuple
+/// so adding a scanner is a one-field change instead of widening four call
+/// sites; `Default` doubles as the panic fallback.
+#[derive(Default)]
+struct PersistenceScan {
+    preload: Vec<crate::models::PreloadFinding>,
+    core_pattern: Option<String>,
+    modules_disabled: Option<bool>,
+    lockdown: Option<String>,
+    exec_start: Vec<crate::models::ExecStartFinding>,
+    ld_so_conf: Vec<crate::models::LdSoConfInjection>,
+    generators: Vec<crate::models::GeneratorFinding>,
+}
+
+#[cfg(feature = "local-scan")]
+/// Single source for the panic warning — the message cannot drift from the
+/// scanner set again (R23-34).
+const PERSISTENCE_IDS: &str = "SEC-042/043/044/049/050/051/052/053/054";
+
+#[cfg(feature = "local-scan")]
 pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let scan_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
@@ -103,16 +123,19 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::scanners::packages::gather_packages_info(want_refresh_packages)
         });
 
-        // SEC-042/043/044/051 – blocking I/O, depend only on `deep`.
-        // Spawn here to run in parallel with other scanners and be included
-        // in duration_secs (fixes R22-34: timer stopped before these ran).
+        // SEC-042/043/044/051/052 – blocking I/O, depend only on `deep`.
         let persistence_task = tokio::task::spawn_blocking(move || {
-            (
-                crate::scanners::preload::scan_ld_preload(),
-                crate::scanners::kernel_facts::gather_kernel_facts(),
-                crate::scanners::exec_provenance::scan_exec_provenance(deep),
-                crate::scanners::ld_so_conf::scan_ld_so_conf(),
-            )
+            let (core_pattern, modules_disabled, lockdown) =
+                crate::scanners::kernel_facts::gather_kernel_facts();
+            PersistenceScan {
+                preload: crate::scanners::preload::scan_ld_preload(),
+                core_pattern,
+                modules_disabled,
+                lockdown,
+                exec_start: crate::scanners::exec_provenance::scan_exec_provenance(deep),
+                ld_so_conf: crate::scanners::ld_so_conf::scan_ld_so_conf(),
+                generators: crate::scanners::generators::scan_generators(),
+            }
         });
 
         let (
@@ -179,14 +202,12 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::models::TopologyInfo::default()
         });
 
-        // Extract all persistence-related results, including ld_so_conf (SEC-051).
-        let (preload, kernel_facts, exec_start, ld_so_conf) = persistence_res.unwrap_or_else(|e| {
+        let p = persistence_res.unwrap_or_else(|e| {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");
-            scan_warnings.push(
-                "persistence scanner panicked — SEC-042/043/044/049/050/051 NOT verified"
-                    .to_string(),
-            );
-            (Vec::new(), (None, None, None), Vec::new(), Vec::new())
+            scan_warnings.push(format!(
+                "persistence scanner panicked — {PERSISTENCE_IDS} NOT verified"
+            ));
+            PersistenceScan::default()
         });
 
         // Drain coverage after all scanners finished – scope is attached here,
@@ -215,14 +236,13 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             self_integrity: None,
         };
 
-        // SEC-042/043/044/051 results (already computed in persistence_task)
-        report.security.preload_injections = preload;
-        let (core_pattern, modules_disabled, lockdown) = kernel_facts;
-        report.security.core_pattern = core_pattern;
-        report.security.modules_disabled = modules_disabled;
-        report.security.lockdown = lockdown;
-        report.security.exec_start_injections = exec_start;
-        report.security.ld_so_conf_injections = ld_so_conf;
+        report.security.preload_injections = p.preload;
+        report.security.core_pattern = p.core_pattern;
+        report.security.modules_disabled = p.modules_disabled;
+        report.security.lockdown = p.lockdown;
+        report.security.exec_start_injections = p.exec_start;
+        report.security.ld_so_conf_injections = p.ld_so_conf;
+        report.security.generators = p.generators;
 
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
