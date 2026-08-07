@@ -2,6 +2,8 @@ use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 #[cfg(feature = "local-scan")]
 use chrono::Utc;
+#[cfg(feature = "local-scan")]
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[cfg(feature = "local-scan")]
 use tracing::{Instrument, info, warn};
@@ -73,6 +75,7 @@ struct PersistenceScan {
     exec_start: Vec<crate::models::ExecStartFinding>,
     ld_so_conf: Vec<crate::models::LdSoConfInjection>,
     generators: Vec<crate::models::GeneratorFinding>,
+    one_way_switches: BTreeMap<String, Option<u8>>,
 }
 
 #[cfg(feature = "local-scan")]
@@ -127,6 +130,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         let persistence_task = tokio::task::spawn_blocking(move || {
             let (core_pattern, modules_disabled, lockdown) =
                 crate::scanners::kernel_facts::gather_kernel_facts();
+            let one_way_switches = crate::scanners::kernel_facts::gather_one_way_switches();
             PersistenceScan {
                 preload: crate::scanners::preload::scan_ld_preload(),
                 core_pattern,
@@ -135,6 +139,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
                 exec_start: crate::scanners::exec_provenance::scan_exec_provenance(deep),
                 ld_so_conf: crate::scanners::ld_so_conf::scan_ld_so_conf(),
                 generators: crate::scanners::generators::scan_generators(),
+                one_way_switches,
             }
         });
 
@@ -243,6 +248,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         report.security.exec_start_injections = p.exec_start;
         report.security.ld_so_conf_injections = p.ld_so_conf;
         report.security.generators = p.generators;
+        report.security.one_way_switches = p.one_way_switches;
 
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 

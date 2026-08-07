@@ -382,6 +382,12 @@ pub struct SecurityInfo {
     /// directories themselves when they are writable by a non-root principal.
     #[serde(default)]
     pub generators: Vec<GeneratorFinding>,
+
+    // ── One-way kernel switches (R23-08 extension) ─
+    /// Values of sysctls that cannot be weakened without a reboot.
+    /// `None` = unreadable (coverage); keyed by canonical path.
+    #[serde(default)]
+    pub one_way_switches: std::collections::BTreeMap<String, Option<u8>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

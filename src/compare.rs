@@ -977,9 +977,8 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // ── security.core_pattern / modules_disabled / lockdown (SEC-044 drift, R23-08) ──
+    // ── security.core_pattern (SEC-044 drift, R23-08) ──────────────────────
     if before.security.core_pattern != after.security.core_pattern {
-        // R23-31: policy lives in scoring::core_pattern_is_trusted, shared with SEC-044.
         let sev = match after.security.core_pattern.as_deref() {
             Some(cp) if !crate::scoring::core_pattern_is_trusted(cp) => Severity::Degraded,
             _ => Severity::Changed,
@@ -1000,44 +999,54 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
-    // modules_disabled is a one-way switch: 1→0 impossible without reboot.
-    if before.security.modules_disabled == Some(true)
-        && after.security.modules_disabled == Some(false)
-    {
-        changes.push(Change {
-            field: "security.modules_disabled".into(),
-            before: Some("1 (module loading locked)".into()),
-            after: Some("0 — one-way sysctl reverted: reboot or /proc tampering".into()),
-            severity: Severity::Degraded,
-        });
-    } else if before.security.modules_disabled != after.security.modules_disabled {
-        changes.push(Change {
-            field: "security.modules_disabled".into(),
-            before: before.security.modules_disabled.map(|v| v.to_string()),
-            after: after.security.modules_disabled.map(|v| v.to_string()),
-            severity: Severity::Changed,
-        });
-    }
-
-    // lockdown: weakening to "none" is Degraded.
-    if before.security.lockdown != after.security.lockdown {
-        let sev = if after.security.lockdown.as_deref() == Some("none") {
-            Severity::Degraded
-        } else {
-            Severity::Changed
-        };
-        changes.push(Change {
-            field: "security.lockdown".into(),
-            before: before.security.lockdown.clone(),
-            after: after.security.lockdown.clone(),
-            severity: sev,
-        });
+    // ── One-way kernel switches (R23-08 extension) ───────────────────────
+    for (label, after_val) in &after.security.one_way_switches {
+        let before_val = before.security.one_way_switches.get(label);
+        match (before_val, after_val) {
+            // Key is new (absent in before) or before value was None (unreadable) but now we have something.
+            (None, _) | (Some(None), _) => {
+                let after_str = match after_val {
+                    Some(v) => v.to_string(),
+                    None => "unreadable".to_string(),
+                };
+                changes.push(Change {
+                    field: format!("security.one_way_switches.{label}"),
+                    before: before_val
+                        .map(|v| v.map_or("unreadable".to_string(), |x| x.to_string()))
+                        .or_else(|| Some("absent".to_string())),
+                    after: Some(after_str),
+                    severity: Severity::Changed,
+                });
+            }
+            // Both present and readable – compare numeric values.
+            (Some(Some(b)), Some(a)) if b != a => {
+                let weakened = a < b;
+                changes.push(Change {
+                    field: format!("security.one_way_switches.{label}"),
+                    before: Some(b.to_string()),
+                    after: Some(a.to_string()),
+                    severity: if weakened {
+                        Severity::Degraded
+                    } else {
+                        Severity::Improved
+                    },
+                });
+            }
+            // Before had a value, after became unreadable.
+            (Some(Some(b)), None) => {
+                changes.push(Change {
+                    field: format!("security.one_way_switches.{label}"),
+                    before: Some(b.to_string()),
+                    after: Some("unreadable".to_string()),
+                    severity: Severity::Degraded,
+                });
+            }
+            // Unchanged: (Some(Some(b)), Some(a)) with b == a, or (Some(None), None), etc.
+            _ => {}
+        }
     }
 
     // ── security.exec_start_injections (SEC‑043/045/046/047/048 drift) ─────
-    // Keyed on (unit_path, exec_path). Steady-state informational signals
-    // (SEC-045 unpackaged, SEC-047 vendor runtime) BECOME weighted when they
-    // appear, vanish, or change between snapshots.
     {
         type ExecKey<'a> = (&'a str, &'a str); // (unit_path, exec_path)
         let before_exec: HashMap<ExecKey<'_>, &ExecStartFinding> = before

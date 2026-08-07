@@ -31,7 +31,7 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// label a risk_score delta as a formula change, not a real drift.
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
 /// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
-/// v10 (0.5.31): SEC-052/053/054 — systemd generator persistence.
+/// v10 (0.5.31): SEC-052/053/054 systemd generators, one-way kernel switches as drift class.
 pub const SCORING_VERSION: u8 = 10;
 
 // ── Helper: keep evidence strings readable and JSON compact ─

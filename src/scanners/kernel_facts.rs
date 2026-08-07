@@ -4,6 +4,45 @@
 
 use crate::coverage;
 use crate::safe_io;
+use std::collections::BTreeMap;
+
+/// Sysctls that can only become stricter (or stay the same) without a reboot.
+/// Weakening any of them between snapshots is either /proc tampering or a
+/// reboot event — both are valuable drift signals.
+const ONE_WAY_SWITCHES: &[(&str, &str)] = &[
+    ("/proc/sys/kernel/modules_disabled", "module loading"),
+    ("/proc/sys/kernel/kexec_load_disabled", "kexec_load"),
+    (
+        "/proc/sys/kernel/unprivileged_bpf_disabled",
+        "unprivileged BPF",
+    ),
+];
+
+/// Read all one-way switches into a BTreeMap.  Unreadable files → `None`.
+/// Missing files (e.g., kernel without BPF) are silently skipped.
+pub(crate) fn gather_one_way_switches() -> BTreeMap<String, Option<u8>> {
+    let mut map = BTreeMap::new();
+    for (path, label) in ONE_WAY_SWITCHES {
+        let value = match safe_io::read_file_capped(path, 4096) {
+            Ok((content, truncated)) => {
+                if truncated {
+                    coverage::record(format!("{path} truncated"));
+                }
+                content.trim().parse::<u8>().ok()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File not present – not an error (e.g., kernel without BPF).
+                continue;
+            }
+            Err(e) => {
+                coverage::record(format!("{path} unreadable ({e})"));
+                None
+            }
+        };
+        map.insert((*label).to_string(), value);
+    }
+    map
+}
 
 /// Gather kernel hardening facts: core_pattern, modules_disabled, lockdown state.
 ///
