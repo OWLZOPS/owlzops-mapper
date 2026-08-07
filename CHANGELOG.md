@@ -1,31 +1,31 @@
 
-## Build System
+## Bug Fixes
 
-- **deps:** Bump russh from 0.62.4 to 0.62.5 (#165)
-- **deps:** Bump clap from 4.6.4 to 4.6.5 (#166)
-- **deps:** Bump taiki-e/install-action from 2.85.2 to 2.85.5 (#168)
-- **deps:** Bump rust_xlsxwriter from 0.96.0 to 0.97.0 (#167)
-- **deps:** Bump thiserror from 2.0.18 to 2.0.19 (#169)
+- Gate provenance resolution behind local-scan feature, fix fmt
+- Gate generators and integrity modules behind local-scan feature
+- Gate SEC-052 scoring block behind local-scan feature
+- Exhaustive match in classify_generator, EACCES handling, misc R23-56
+- Distinguish EACCES from Missing in assess_writability (R23-57)
+- Gate BTreeMap import behind local-scan feature
 
 ## Documentation
 
-- Update CHANGELOG for v0.5.29
-- Updated README.md
+- Update CHANGELOG for v0.5.30
+
+## Features
+
+- One-way kernel switches as a drift class (R23-08 ext)
 
 ## Miscellaneous
 
-- Release v0.5.30 — SEC-051, docs, scoring version bump
+- Reference PERSISTENCE_IDS in runner comment to prevent drift
+- Bump version to 0.5.31
 
-## SEC-050
+## SEC-052
 
-- Detect ld.so.conf.d library path injection
-- Add drift detection for ld_so_conf_injections
+- Systemd generator persistence scanner
 
-## SEC-051
+## style
 
-- Detect ld.so.conf.d library path injection
-- Implement ld.so.conf injection scanner (R23 audit fixes)
-- Address R23-40..R23-44 audit findings
-- Fix volatile regression and directory include (R23-45, R23-46)
-- Fix false positive on stale missing directories (R23-48)
+- Fix formatting
 
