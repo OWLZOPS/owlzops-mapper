@@ -14,12 +14,22 @@ pub(crate) fn unsafe_mode(mode: u32, uid: u32, gid: u32) -> bool {
     mode & 0o002 != 0 || (uid != 0 && mode & 0o200 != 0) || (gid != 0 && mode & 0o020 != 0)
 }
 
+/// EACCES ≠ ENOENT. `Missing` is a statement about host state, `Unknown`
+/// is an admission we could not look. They must never be conflated (R23-57).
+pub(crate) fn writability_from_error(kind: std::io::ErrorKind) -> ExecWritability {
+    match kind {
+        std::io::ErrorKind::NotFound => ExecWritability::Missing,
+        _ => ExecWritability::Unknown,
+    }
+}
+
 /// Who controls the bytes at `path`: the file itself *and* the directory that
 /// holds it (a writable parent means the file can be replaced wholesale).
 /// This is a single source of truth; exec_provenance and generators use it.
 pub(crate) fn assess_writability(path: &Path) -> ExecWritability {
-    let Ok(md) = std::fs::metadata(path) else {
-        return ExecWritability::Missing;
+    let md = match std::fs::metadata(path) {
+        Ok(md) => md,
+        Err(e) => return writability_from_error(e.kind()),
     };
     let file_unsafe = unsafe_mode(md.permissions().mode(), md.uid(), md.gid());
     let parent_unsafe = path
@@ -53,6 +63,20 @@ mod tests {
         assert!(
             unsafe_mode(0o1777, 0, 0),
             "sticky does not protect library path"
+        );
+    }
+
+    #[test]
+    fn eacces_is_unknown_not_missing() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            writability_from_error(ErrorKind::NotFound),
+            ExecWritability::Missing
+        );
+        assert_eq!(
+            writability_from_error(ErrorKind::PermissionDenied),
+            ExecWritability::Unknown,
+            "EACCES is not a statement about absence"
         );
     }
 }

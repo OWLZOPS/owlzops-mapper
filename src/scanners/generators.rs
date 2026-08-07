@@ -85,6 +85,9 @@ pub(crate) fn describe(g: &GeneratorFinding) -> String {
     if g.writability == ExecWritability::Missing {
         s.push_str(" (dangling link — target can be created)");
     }
+    if g.writability == ExecWritability::Unknown {
+        s.push_str(" (target unresolvable — not verified)");
+    }
     s
 }
 
