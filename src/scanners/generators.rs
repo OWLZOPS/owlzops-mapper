@@ -346,7 +346,10 @@ mod tests {
             GeneratorVerdict::Ioc,
             "dangling symlink in vendor dir is an armed slot, not benign"
         );
-        assert_eq!(call(ExecWritability::Unknown), GeneratorVerdict::Unverifiable);
+        assert_eq!(
+            call(ExecWritability::Unknown),
+            GeneratorVerdict::Unverifiable
+        );
         assert_eq!(call(ExecWritability::RootOnly), GeneratorVerdict::Benign);
     }
 }
