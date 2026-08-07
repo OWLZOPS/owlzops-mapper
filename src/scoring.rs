@@ -1669,7 +1669,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !unverifiable.is_empty() {
             findings.push(Finding {
                 id: "SEC-054",
-                title: "systemd generator present (ownership unverifiable)".to_string(),
+                title: "systemd generator present (origin or target unverifiable)".to_string(),
                 category: Category::Security,
                 weight: 20,
                 evidence: format!(
