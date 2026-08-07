@@ -123,7 +123,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             crate::scanners::packages::gather_packages_info(want_refresh_packages)
         });
 
-        // SEC-042/043/044/051/052 – blocking I/O, depend only on `deep`.
+        // Persistence family – see PERSISTENCE_IDS.
         let persistence_task = tokio::task::spawn_blocking(move || {
             let (core_pattern, modules_disabled, lockdown) =
                 crate::scanners::kernel_facts::gather_kernel_facts();

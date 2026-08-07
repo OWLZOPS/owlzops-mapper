@@ -55,7 +55,14 @@ pub(crate) fn classify_generator(
     if kind == GeneratorKind::SearchDir {
         return GeneratorVerdict::Ioc;
     }
-    if writability == ExecWritability::NonRootWritable || volatile_escape {
+    // R23-52: exhaustive match – no silent fall-through to Benign.
+    match writability {
+        ExecWritability::NonRootWritable => return GeneratorVerdict::Ioc,
+        ExecWritability::Missing => return GeneratorVerdict::Ioc,
+        ExecWritability::Unknown => return GeneratorVerdict::Unverifiable,
+        ExecWritability::RootOnly => {}
+    }
+    if volatile_escape {
         return GeneratorVerdict::Ioc;
     }
     if origin == GeneratorOrigin::Vendor || package.is_some() {
@@ -99,7 +106,28 @@ fn inspect_entry(path: &Path, origin: GeneratorOrigin) -> Option<GeneratorFindin
         .flatten()
         .map(|p| p.to_string_lossy().into_owned());
 
-    let resolved = std::fs::canonicalize(path).ok();
+    // R23-52: distinguish NotFound (dangling) from other errors (EACCES etc.)
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(p) => Some(p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            coverage::record(format!(
+                "{} unresolvable ({e}); generator target NOT verified",
+                path.display()
+            ));
+            return Some(GeneratorFinding {
+                path: path.to_string_lossy().into_owned(),
+                kind: GeneratorKind::Executable,
+                origin,
+                package: None,
+                writability: ExecWritability::Unknown,
+                symlink_target,
+                resolved_path: None,
+                uid: lmd.uid(),
+                gid: lmd.gid(),
+            });
+        }
+    };
     let (writability, uid, gid, executable) = match resolved.as_deref() {
         Some(r) => match std::fs::metadata(r) {
             Ok(md) => (
@@ -151,7 +179,10 @@ pub fn scan_generators() -> Vec<GeneratorFinding> {
 
     for (dir, origin) in GENERATOR_DIRS {
         let dir_path = Path::new(dir);
-        if let Some(f) = inspect_dir(dir_path, *origin) {
+        // R23-56: check budget before pushing SearchDir
+        if out.len() >= MAX_GENERATORS {
+            over_cap += 1;
+        } else if let Some(f) = inspect_dir(dir_path, *origin) {
             out.push(f);
         }
         match std::fs::read_dir(dir_path) {
@@ -296,5 +327,29 @@ mod tests {
         let f = inspect_entry(&link, GeneratorOrigin::Admin).unwrap();
         assert_eq!(f.writability, ExecWritability::Missing);
         assert_eq!(f.symlink_target.as_deref(), Some("/nonexistent/payload"));
+    }
+
+    #[test]
+    fn dangling_and_unknown_never_land_in_benign() {
+        let call = |w| {
+            classify_generator(
+                GeneratorKind::Executable,
+                GeneratorOrigin::Vendor,
+                w,
+                false,
+                Some("systemd"),
+                v(),
+            )
+        };
+        assert_eq!(
+            call(ExecWritability::Missing),
+            GeneratorVerdict::Ioc,
+            "dangling symlink in vendor dir is an armed slot, not benign"
+        );
+        assert_eq!(
+            call(ExecWritability::Unknown),
+            GeneratorVerdict::Unverifiable
+        );
+        assert_eq!(call(ExecWritability::RootOnly), GeneratorVerdict::Benign);
     }
 }
