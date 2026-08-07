@@ -2,6 +2,7 @@ use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 #[cfg(feature = "local-scan")]
 use chrono::Utc;
+#[cfg(feature = "local-scan")]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[cfg(feature = "local-scan")]
