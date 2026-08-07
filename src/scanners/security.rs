@@ -1,6 +1,6 @@
 use crate::models::{SecurityInfo, UserInfo};
 use crate::{coverage, safe_io};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -580,6 +580,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         exec_start_injections: Vec::new(),
         ld_so_conf_injections: Vec::new(),
         generators: Vec::new(),
+        one_way_switches: BTreeMap::new(),
     }
 }
 
