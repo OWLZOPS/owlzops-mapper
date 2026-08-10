@@ -295,7 +295,16 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
             }
         }
     } else if let Some(ref hosts_path) = args.audit.hosts {
-        let contents = std::fs::read_to_string(hosts_path).unwrap_or_default();
+        let contents = match std::fs::read_to_string(hosts_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Failed to read hosts file {:?}: {} — refusing to silently fall back to a LOCAL scan",
+                    hosts_path, e
+                );
+                return 1;
+            }
+        };
         let first_host = contents
             .lines()
             .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
@@ -311,17 +320,11 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
                 }
             }
         } else {
-            #[cfg(feature = "local-scan")]
-            {
-                run_local_scan_async(&args.audit).await
-            }
-            #[cfg(not(feature = "local-scan"))]
-            {
-                eprintln!(
-                    "Local audit is not supported on this platform. Please provide a remote host."
-                );
-                return 1;
-            }
+            eprintln!(
+                "hosts file {:?} contains no usable host entries",
+                hosts_path
+            );
+            return 1;
         }
     } else {
         #[cfg(feature = "local-scan")]
