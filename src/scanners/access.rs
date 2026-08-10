@@ -15,6 +15,9 @@ const KEY_TYPES: &[&str] = &[
     "sk-ecdsa-sha2-nistp256@openssh.com",
 ];
 
+/// ~4000 keys at 256 B — anything larger is either abuse or a typo.
+const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
+
 fn strip_options(line: &str) -> Option<String> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     let pos = toks.iter().position(|t| KEY_TYPES.contains(t))?;
@@ -131,8 +134,15 @@ pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
             }
             let ak = format!("{home}/.ssh/authorized_keys");
 
-            match std::fs::read_to_string(&ak) {
-                Ok(content) => {
+            // R24-02: use safe_io capped regular read to prevent DoS via FIFO,
+            // /dev/zero symlinks, or other non-regular files.
+            match crate::safe_io::read_file_capped_regular(&ak, CAP_AUTHORIZED_KEYS) {
+                Ok((content, truncated)) => {
+                    if truncated {
+                        result.coverage_warnings.push(format!(
+                            "user '{user}': {ak} exceeded {CAP_AUTHORIZED_KEYS} B — key audit PARTIAL"
+                        ));
+                    }
                     for l in content.lines() {
                         let l = l.trim();
                         if l.is_empty() || l.starts_with('#') {
@@ -147,6 +157,13 @@ pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                     result.coverage_warnings.push(format!(
                         "user '{user}': {ak} unreadable (permission denied)"
+                    ));
+                }
+                // read_file_capped_regular rejects FIFOs/devices by design.
+                Err(e) if e.kind() == ErrorKind::InvalidInput => {
+                    result.coverage_warnings.push(format!(
+                        "user '{user}': {ak} is NOT a regular file (fifo/device/symlink to one) — \
+                         key audit refused; treat as tampering"
                     ));
                 }
                 Err(e) => result

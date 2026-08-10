@@ -19,7 +19,8 @@ const ONE_WAY_SWITCHES: &[(&str, &str)] = &[
 ];
 
 /// Read all one-way switches into a BTreeMap.  Unreadable files → `None`.
-/// Missing files (e.g., kernel without BPF) are silently skipped.
+/// Missing files (e.g., kernel without BPF) are noted in coverage so that
+/// `compare` can tell "never existed" from "vanished since baseline" (R24-07).
 pub(crate) fn gather_one_way_switches() -> BTreeMap<String, Option<u8>> {
     let mut map = BTreeMap::new();
     for (path, label) in ONE_WAY_SWITCHES {
@@ -31,7 +32,12 @@ pub(crate) fn gather_one_way_switches() -> BTreeMap<String, Option<u8>> {
                 content.trim().parse::<u8>().ok()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // File not present – not an error (e.g., kernel without BPF).
+                // File not present – legitimate on some kernels (e.g. no BPF),
+                // but the *absence* must be visible so that compare.rs can tell
+                // "never existed" from "vanished since baseline" (R24-07).
+                coverage::record(format!(
+                    "{path} absent — one-way switch '{label}' not tracked on this kernel"
+                ));
                 continue;
             }
             Err(e) => {

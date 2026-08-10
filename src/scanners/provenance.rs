@@ -5,10 +5,15 @@
 //! `crate::utils::canon_path`).  The resolver never allocates memory for the
 //! entire package database – it streams through the on-disk files and stops as
 //! soon as every candidate has been resolved.
+//!
+//! Results are memoised per process: the first call walks the package database
+//! and all subsequent calls only query the cache, including negative entries
+//! (files confirmed to belong to no package).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::models::ProvenanceSource;
 
@@ -33,7 +38,81 @@ impl ProvenanceIndex {
     }
 }
 
+// ── Process‑global memo (R24-03) ──────────────────────────────────────────
+
+struct ProvMemo {
+    source: Option<ProvenanceSource>,
+    /// path → Some(pkg) | None  (None = confirmed unpackaged, negative cache)
+    known: HashMap<String, Option<String>>,
+}
+
+static MEMO: OnceLock<Mutex<ProvMemo>> = OnceLock::new();
+
+fn memo() -> &'static Mutex<ProvMemo> {
+    MEMO.get_or_init(|| {
+        Mutex::new(ProvMemo {
+            source: None,
+            known: HashMap::new(),
+        })
+    })
+}
+
+/// Resolve package ownership for a set of paths, using a global cache so that
+/// subsequent calls for overlapping sets avoid re‑walking the database.
 pub fn resolve_batch(candidates: &HashSet<String>) -> ProvenanceIndex {
+    // 1. Serve everything already known; collect genuine misses.
+    let (mut map, missing, cached_source) = {
+        let m = memo().lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = HashMap::new();
+        let mut missing = HashSet::new();
+        for c in candidates {
+            match m.known.get(c) {
+                Some(Some(pkg)) => {
+                    map.insert(c.clone(), pkg.clone());
+                }
+                Some(None) => {} // known-unpackaged: no re‑query
+                None => {
+                    missing.insert(c.clone());
+                }
+            }
+        }
+        (map, missing, m.source)
+    };
+
+    if missing.is_empty()
+        && let Some(source) = cached_source
+    {
+        return ProvenanceIndex { source, map };
+    }
+    // otherwise fall through: either some candidates are missing, or we
+    // haven't yet determined the source (all previous candidates were
+    // negative entries – resolve at least once).
+
+    let fresh = resolve_batch_uncached(&missing);
+
+    // 2. Merge and record negatives so the next scanner never re‑queries.
+    //    Unavailable is a transient backend failure — never cache it.
+    if fresh.source != ProvenanceSource::Unavailable {
+        let mut m = memo().lock().unwrap_or_else(PoisonError::into_inner);
+        for c in &missing {
+            m.known.insert(c.clone(), fresh.map.get(c).cloned());
+        }
+        m.source = Some(fresh.source);
+    }
+
+    map.extend(fresh.map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    ProvenanceIndex {
+        source: if fresh.source == ProvenanceSource::Unavailable {
+            cached_source.unwrap_or(ProvenanceSource::Unavailable)
+        } else {
+            fresh.source
+        },
+        map,
+    }
+}
+
+/// Original uncached resolution, renamed from the previous `resolve_batch`.
+fn resolve_batch_uncached(candidates: &HashSet<String>) -> ProvenanceIndex {
     let unavailable = |why: &str| {
         crate::coverage::record(format!("provenance: {why} — attribution unavailable"));
         ProvenanceIndex {

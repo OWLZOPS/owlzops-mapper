@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 
 use crate::coverage;
 use crate::models::ReverseShellFinding;
@@ -62,7 +63,15 @@ fn collect_established(path: &str, v6: bool) -> HashMap<u64, EstSocket> {
     let mut map = HashMap::new();
     let (content, truncated) = match safe_io::read_file_capped(path, safe_io::CAP_PROC_NET) {
         Ok(v) => v,
-        Err(_) => return map,
+        // Kernel without IPv6 has no /proc/net/tcp6 – silence is correct.
+        Err(e) if e.kind() == ErrorKind::NotFound => return map,
+        Err(e) => {
+            coverage::record(format!(
+                "{path} unreadable ({}) — SEC-022 reverse-shell correlation NOT performed",
+                e.kind()
+            ));
+            return map;
+        }
     };
     if truncated {
         coverage::record(format!(

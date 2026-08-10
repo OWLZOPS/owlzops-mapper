@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::coverage;
@@ -98,7 +99,17 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
 
     let (content, truncated) = match safe_io::read_file_capped(path, safe_io::CAP_PROC_NET) {
         Ok((c, t)) => (c, t),
-        Err(_) => return,
+        // Kernel without IPv6 support → legitimate absence, silence is correct.
+        Err(e) if e.kind() == ErrorKind::NotFound => return,
+        Err(e) => {
+            coverage::record(format!(
+                "{path} unreadable ({}) — listening {} sockets NOT enumerated; \
+                 port inventory INCOMPLETE",
+                e.kind(),
+                proto.label()
+            ));
+            return;
+        }
     };
 
     if truncated {

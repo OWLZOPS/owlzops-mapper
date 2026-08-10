@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt; // for pre_exec
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
@@ -61,7 +62,27 @@ pub fn hardened_command(program: &str, args: &[&str]) -> Command {
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .env("LC_ALL", "C");
+    // R24-04: own session ⇒ (a) kill(-pgid) reaches grandchildren,
+    //                       (b) no controlling TTY ⇒ TIOCSTI injection impossible.
+    // setsid() is async-signal-safe; it only fails when we already are a group
+    // leader, which is harmless in the post-fork child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     cmd
+}
+
+/// SIGKILL the whole process group (pgid == pid thanks to setsid), then reap.
+fn kill_group_and_reap(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL); // belt and braces
+    }
+    let _ = child.wait();
 }
 
 pub(crate) const fn host_budget_secs(t: u64) -> u64 {
@@ -266,7 +287,7 @@ pub fn unregister_child(pid: u32) {
     });
 }
 
-/// Send SIGTERM to all currently tracked child processes and clear the list.
+/// Send SIGTERM to all currently tracked child process groups and clear the list.
 /// Used during graceful shutdown to terminate any remaining `ssh`/`scp`
 /// processes started by the legacy engine.
 pub fn terminate_registered_children() {
@@ -281,7 +302,9 @@ pub fn terminate_registered_children() {
         };
         for pid in pids {
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                // R24-04: whole group — helper processes spawned by the tool
+                // must not survive graceful shutdown as orphans.
+                libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
             }
         }
     });
@@ -361,8 +384,7 @@ pub fn run_child_with_timeout(
                 thread::sleep(Duration::from_millis(50));
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group_and_reap(&mut child);
                 drop(out_handle);
                 drop(err_handle);
                 unregister_child(child_pid);
@@ -371,6 +393,10 @@ pub fn run_child_with_timeout(
         }
     };
 
+    // The direct child exited. Anything still holding the stdout pipe is an
+    // orphaned grandchild — kill the group so the reader threads see EOF
+    // instead of blocking join() on a tokio blocking-pool thread forever.
+    unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
     unregister_child(child_pid);
     Some(std::process::Output {
         status,
@@ -381,6 +407,7 @@ pub fn run_child_with_timeout(
 
 /// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
 /// R10-05: defensive reap in the `Err(_)` branch so no zombie escapes.
+/// R24-04: uses group kill to reach grandchildren.
 fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
     loop {
@@ -390,13 +417,12 @@ fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::Exit
                 thread::sleep(Duration::from_millis(50));
             }
             Ok(None) => {
-                let _ = child.kill();
+                kill_group_and_reap(child);
                 return child.wait().ok();
             }
             Err(_) => {
                 // try_wait failed (realistically ECHILD) – reap defensively
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group_and_reap(child);
                 return None;
             }
         }
@@ -416,6 +442,8 @@ pub fn run_with_timeout_any_exit(
 }
 
 // R10-05: capped stdout reader + defensive take() guard instead of `?`
+// R24-04: group kill on timeout and after successful exit to prevent
+// orphaned grandchildren from holding the pipe.
 fn run_with_timeout_inner(
     program: &str,
     args: &[&str],
@@ -460,6 +488,10 @@ fn run_with_timeout_inner(
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(stdout) => {
             let status = poll_wait(&mut child, Duration::from_secs(2));
+            // The child exited (or was killed), but there might still be
+            // orphaned grandchildren writing to the pipe — ensure they are
+            // terminated so the reader thread does not deadlock.
+            unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
             let result = if require_success {
                 match status {
                     Some(s) if s.success() => Some(stdout),
@@ -472,8 +504,7 @@ fn run_with_timeout_inner(
             result
         }
         Err(_timeout) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group_and_reap(&mut child);
             unregister_child(child_pid);
             None
         }
