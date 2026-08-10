@@ -509,8 +509,9 @@ pub struct PamScriptInfo {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PamFinding {
-    /// PAM service name (file name without /etc/pam.d/).
-    pub service: String,
+    /// List of PAM service files that reference this module (e.g. "sshd (auth sufficient)").
+    #[serde(default)]
+    pub services: Vec<String>,
     /// The suspicious module line.
     #[serde(flatten)]
     pub module: PamModule,
@@ -525,6 +526,10 @@ pub struct PamFinding {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
+    /// Whether the parent directory of the module path can be taken over
+    /// by a non-root user (for Missing modules).
+    #[serde(default)]
+    pub parent_takeable: bool,
     /// Additional info if the module is pam_exec and the script is suspicious.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_info: Option<Box<PamScriptInfo>>,

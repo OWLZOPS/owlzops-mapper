@@ -977,6 +977,53 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // ── security.pam_injections (SEC-055 drift) ────────────────────────────
+    {
+        let key = |f: &crate::models::PamFinding| -> String { f.module.module_path.clone() };
+        let b: HashMap<String, &_> = before
+            .security
+            .pam_injections
+            .iter()
+            .map(|f| (key(f), f))
+            .collect();
+        let a: HashMap<String, &_> = after
+            .security
+            .pam_injections
+            .iter()
+            .map(|f| (key(f), f))
+            .collect();
+
+        for (k, f) in &a {
+            match b.get(k) {
+                None => changes.push(Change {
+                    field: "security.pam_injections".into(),
+                    before: None,
+                    after: Some(format!(
+                        "PAM module {} appeared ({} services)",
+                        k,
+                        f.services.len()
+                    )),
+                    severity: Severity::Degraded,
+                }),
+                Some(prev) if prev.writability != f.writability => changes.push(Change {
+                    field: "security.pam_injections".into(),
+                    before: Some(format!("{}: {:?}", k, prev.writability)),
+                    after: Some(format!("{}: {:?}", k, f.writability)),
+                    severity: Severity::Degraded,
+                }),
+                _ => {}
+            }
+        }
+        for k in b.keys().filter(|k| !a.contains_key(k.as_str())) {
+            changes.push(Change {
+                field: "security.pam_injections".into(),
+                before: Some(format!("PAM module {} was present", k)),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // ── security.core_pattern (SEC-044 drift, R23-08) ──────────────────────
     if before.security.core_pattern != after.security.core_pattern {
         let sev = match after.security.core_pattern.as_deref() {
