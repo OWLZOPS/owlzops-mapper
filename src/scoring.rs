@@ -32,7 +32,8 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
 /// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
 /// v10 (0.5.31): SEC-052/053/054 systemd generators, one-way kernel switches as drift class.
-pub const SCORING_VERSION: u8 = 10;
+/// v11 (0.5.32): (PAM stack injection SEC‑055/056/057)
+pub const SCORING_VERSION: u8 = 11;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.

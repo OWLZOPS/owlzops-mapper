@@ -55,7 +55,7 @@ Risk Score is split into **Security / Reliability / Hygiene** so one noisy categ
 ## Example output (redacted)
 
 ```
-🦉 Owlzops Mapper v0.5.28
+🦉 Owlzops Mapper v0.5.31
 🔍 Scan completed in 2.50s
 🔒 Risk Score: 60/100 (At Risk)
 
@@ -327,6 +327,9 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | **SEC‑042** - System‑wide LD_PRELOAD injected (volatile or corroborated)   | **+55 or +60**                    |
 | **SEC‑049** - System‑wide LD_PRELOAD present (ownership unverifiable)      | **+20**                           |
 | **SEC‑050** - System‑wide LD_PRELOAD injected (unpackaged, not yet mapped) | **+30**                           |
+| **SEC‑055** – PAM module outside trusted directory / writable by non‑root  | **+55**                           |
+| **SEC‑056** – Unpackaged or root‑only PAM execution target (script)        | **+30**                           |
+| **SEC‑057** – PAM slot writable by non‑root (staged injection)             | **+30**                           |
 **Kernel & confinement**
 
 | Finding | Penalty |

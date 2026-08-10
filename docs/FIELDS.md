@@ -338,6 +338,18 @@ An array of objects, one per detected database engine.
 | `ld_so_conf_injections[].mode` | integer \| null | POSIX mode bits in octal (e.g. 0o755). `null` if the directory does not exist — in that case `uid`/`gid`/`writable_by_non_root` refer to the **parent** directory |
 | `ld_so_conf_injections[].uid` | integer | Owner UID of the directory (or of the parent if `mode` is null) |
 | `ld_so_conf_injections[].gid` | integer | Owner GID of the directory (or of the parent if `mode` is null) |
+| `pam_injections` | array of objects | PAM stack injection findings (SEC‑055/056/057) |
+| `pam_injections[].services` | array of strings | PAM service files referencing this target (e.g. `"sshd (auth sufficient)"`) |
+| `pam_injections[].module` | object | PAM module entry (flattened) |
+| `pam_injections[].module.module_path` | string | Resolved path of the module or script |
+| `pam_injections[].target_kind` | string | `"Module"` for `.so` files, `"ExecScript"` for scripts executed by pam_exec |
+| `pam_injections[].declared_as` | string \| null | Path as written in the config, if different from `module_path` (e.g. contains `..`). `null` when identical |
+| `pam_injections[].writability` | string | `"root_only"`, `"non_root_writable"`, `"missing"`, or `"unknown"` |
+| `pam_injections[].volatile` | boolean | True if the target is on a volatile filesystem |
+| `pam_injections[].package` | string \| null | Owning package, if any |
+| `pam_injections[].uid` | integer | Owner UID of the target file |
+| `pam_injections[].gid` | integer | Owner GID of the target file |
+| `pam_injections[].parent_takeable` | boolean | Whether a non‑root user can take over the parent directory (relevant for `missing` targets) |
 
 ---
 
