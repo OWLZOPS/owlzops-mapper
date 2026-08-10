@@ -489,13 +489,7 @@ pub struct GeneratorFinding {
 /// One line from a PAM service configuration.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PamModule {
-    #[serde(default)]
-    pub type_: String,
-    #[serde(default)]
-    pub control: String,
     pub module_path: String,
-    #[serde(default)]
-    pub args: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

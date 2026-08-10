@@ -1689,32 +1689,34 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         use crate::models::ExecWritability;
         let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
         for f in &report.security.pam_injections {
-            let evidence = if f.services.len() <= 3 {
+            let services_count = f.services.len();
+            let services_str = if services_count <= 3 {
+                f.services.join(", ")
+            } else {
+                let first_three = f
+                    .services
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{first_three}...")
+            };
+            let evidence = if services_count <= 3 {
                 format!(
-                    "{} ({}): {} {} {} — used by: {}",
+                    "{} ({} service{}): — used by: {}",
                     f.module.module_path,
-                    f.services.len(),
-                    f.module.type_,
-                    f.module.control,
-                    f.module.args,
-                    f.services.join(", ")
+                    services_count,
+                    if services_count == 1 { "" } else { "s" },
+                    services_str
                 )
             } else {
                 format!(
-                    "{} ({} services): {} {} {} — used by: {}...",
-                    f.module.module_path,
-                    f.services.len(),
-                    f.module.type_,
-                    f.module.control,
-                    f.module.args,
-                    f.services
-                        .iter()
-                        .take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "{} ({} services): — used by: {}",
+                    f.module.module_path, services_count, services_str
                 )
             };
+
             match f.writability {
                 ExecWritability::NonRootWritable => ioc.push(evidence),
                 ExecWritability::Missing if f.parent_takeable => ioc.push(evidence),

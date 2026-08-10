@@ -58,40 +58,29 @@ pub(crate) fn parse_pam_line(line: &str) -> Option<(&str, &str, &str, &str)> {
 }
 
 /// Extract the script path from pam_exec arguments.
-/// pam_exec.so [options] [log=...] <script> [script args...]
-/// The script is the first positional argument after stripping known flags.
+/// The first absolute token is the command. Options (seteuid, debug, quiet,
+/// expose_authtok, log=..., type=...) never start with a slash, so an
+/// allow‑list approach would break on unknown flags (R23-68).
 fn extract_pam_exec_script(args: &str) -> Option<&str> {
-    for token in args.split_whitespace() {
-        if token.contains('=')
-            || token.eq_ignore_ascii_case("expose_authtok")
-            || token.eq_ignore_ascii_case("debug")
-            || token.eq_ignore_ascii_case("quiet")
-            || token.eq_ignore_ascii_case("use_authtok")
-            || token.eq_ignore_ascii_case("stdout")
-        {
-            continue;
-        }
-        if token.starts_with('/') {
-            return Some(token);
-        }
-        break;
-    }
-    None
+    args.split_whitespace().find(|t| t.starts_with('/'))
 }
 
 /// Scan all files in /etc/pam.d and return suspicious findings.
-/// Findings are deduplicated by module path – one record per unique module,
-/// with a list of services that reference it.
+/// Delegates to scan_pam_dir with the default system directory.
 pub fn scan_pam() -> Vec<PamFinding> {
-    // Key = resolved module path or script path
-    let mut aggregated: HashMap<String, PamFinding> = HashMap::new();
-    let mut over_cap = 0usize;
+    scan_pam_dir(Path::new("/etc/pam.d"))
+}
 
-    let dir = match std::fs::read_dir("/etc/pam.d") {
+/// Scan PAM configuration files under `root` (for testing, pass a temp dir).
+pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
+    let mut aggregated: HashMap<String, PamFinding> = HashMap::new();
+
+    let dir = match std::fs::read_dir(root) {
         Ok(d) => d,
         Err(e) => {
             coverage::record(format!(
-                "/etc/pam.d unreadable ({e}); SEC-055 PAM scan NOT verified"
+                "{} unreadable ({e}); SEC-055 PAM scan NOT verified",
+                root.display()
             ));
             return Vec::new();
         }
@@ -140,10 +129,8 @@ pub fn scan_pam() -> Vec<PamFinding> {
                                 .or_insert_with(|| PamFinding {
                                     services: Vec::new(),
                                     module: PamModule {
-                                        type_: "".to_string(), // placeholder – will be overwritten
-                                        control: "".to_string(),
                                         module_path: script.to_string(),
-                                        args: args.to_string(),
+                                        // fix(R23-71): removed unused type_/control/args fields
                                     },
                                     writability,
                                     volatile,
@@ -166,43 +153,15 @@ pub fn scan_pam() -> Vec<PamFinding> {
             }
 
             // ── Regular module checks ──────────────────────────────────────
-            // Resolve bare names to their full path (R23-61)
             let resolved_path = resolve_module(module_path);
             let Some(resolved) = resolved_path else {
-                // Cannot resolve – the module file does not exist.
-                let parent_takeable = Path::new(module_path)
-                    .parent()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| unsafe_mode(m.permissions().mode(), m.uid(), m.gid()))
-                    .unwrap_or(false);
-
-                let key = module_path.to_string();
-                let finding = aggregated.entry(key.clone()).or_insert_with(|| PamFinding {
-                    services: Vec::new(),
-                    module: PamModule {
-                        type_: type_.to_string(),
-                        control: control.to_string(),
-                        module_path: key,
-                        args: args.to_string(),
-                    },
-                    writability: ExecWritability::Missing,
-                    volatile: false,
-                    package: None,
-                    uid: 0,
-                    gid: 0,
-                    parent_takeable,
-                    script_info: None,
-                });
-                finding
-                    .services
-                    .push(format!("{fname} ({type_} {control})"));
+                // fix(R23-72): unresolved short names (e.g. pam_kwallet5.so
+                // missing on a server) are skipped entirely – they can't be
+                // loaded, so they have no inventory value and only create noise
+                // in drift comparison.
                 continue;
             };
 
-            // Now we have a concrete resolved path.
-            // Even if it lies inside a trusted directory, we must still check
-            // writability and package ownership — a replaced or extra module
-            // in a trusted directory is the most likely attack vector.
             let writability = assess_writability(Path::new(&resolved));
             let volatile = crate::utils::is_volatile_exec_path(&resolved);
             let parent_takeable = if writability == ExecWritability::Missing {
@@ -215,7 +174,6 @@ pub fn scan_pam() -> Vec<PamFinding> {
                 false
             };
 
-            // Determine whether we should report this module at all.
             let in_trusted_dir = is_trusted_module_path(&resolved);
             if !in_trusted_dir
                 || writability == ExecWritability::NonRootWritable
@@ -229,12 +187,7 @@ pub fn scan_pam() -> Vec<PamFinding> {
                 let key = resolved.clone();
                 let finding = aggregated.entry(key.clone()).or_insert_with(|| PamFinding {
                     services: Vec::new(),
-                    module: PamModule {
-                        type_: "".to_string(),
-                        control: "".to_string(),
-                        module_path: key,
-                        args: "".to_string(),
-                    },
+                    module: PamModule { module_path: key },
                     writability,
                     volatile,
                     package: None,
@@ -250,19 +203,19 @@ pub fn scan_pam() -> Vec<PamFinding> {
         }
     }
 
-    if aggregated.len() > MAX_PAM_FINDINGS {
-        over_cap = aggregated.len() - MAX_PAM_FINDINGS;
-        // keep only the first MAX_PAM_FINDINGS entries (unstable but acceptable)
-    }
-
+    // fix(R23-69): deterministic truncation after sorting.
     let mut findings: Vec<PamFinding> = aggregated.into_values().collect();
-    if over_cap > 0 {
+    findings.sort_by(|a, b| a.module.module_path.cmp(&b.module.module_path));
+    if findings.len() > MAX_PAM_FINDINGS {
+        let dropped = findings.len() - MAX_PAM_FINDINGS;
+        findings.truncate(MAX_PAM_FINDINGS);
         coverage::record(format!(
-            "pam: finding cap ({MAX_PAM_FINDINGS}) reached; {over_cap} entr(ies) NOT inspected"
+            "pam: finding cap ({MAX_PAM_FINDINGS}) reached; {dropped} module(s) NOT reported"
         ));
     }
 
-    // Provenance resolution (for executable modules/scripts)
+    // Provenance resolution for executable modules (scripts are already
+    // included via module_path, no need to chain script_info — R23-73).
     let candidates: HashSet<String> = findings
         .iter()
         .filter_map(|f| {
@@ -272,11 +225,6 @@ pub fn scan_pam() -> Vec<PamFinding> {
                 None
             }
         })
-        .chain(findings.iter().filter_map(|f| {
-            f.script_info
-                .as_ref()
-                .map(|s| crate::utils::canon_path(&s.script_path).into_owned())
-        }))
         .collect();
 
     if !candidates.is_empty() {
@@ -287,6 +235,7 @@ pub fn scan_pam() -> Vec<PamFinding> {
         }
     }
 
+    // Secondary sort key by first service for stable output
     findings.sort_by(|a, b| {
         a.module
             .module_path
@@ -299,6 +248,7 @@ pub fn scan_pam() -> Vec<PamFinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parse_valid_line() {
@@ -334,13 +284,13 @@ mod tests {
     }
 
     #[test]
-    fn pam_exec_script_extraction() {
+    fn pam_exec_script_extraction_seteuid() {
         assert_eq!(
-            extract_pam_exec_script("expose_authtok /bin/myscript.sh arg1"),
-            Some("/bin/myscript.sh")
+            extract_pam_exec_script("seteuid /usr/local/bin/hook.sh"),
+            Some("/usr/local/bin/hook.sh")
         );
         assert_eq!(
-            extract_pam_exec_script("debug /tmp/backdoor.sh"),
+            extract_pam_exec_script("debug log=/var/log/x /tmp/backdoor.sh"),
             Some("/tmp/backdoor.sh")
         );
         assert_eq!(extract_pam_exec_script("expose_authtok debug"), None);
@@ -348,17 +298,25 @@ mod tests {
     }
 
     #[test]
-    fn pam_exec_is_reachable_for_bare_module_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let svc = dir.path().join("sshd");
-        std::fs::write(&svc, "session optional pam_exec.so /tmp/hook.sh\n").unwrap();
-        // Create the script so that writability check works
-        std::fs::write("/tmp/hook.sh", b"#!/bin/sh\necho test").ok();
-        let _findings = scan_pam(); // integration-like, but will read real /etc/pam.d
-        // Not a pure unit test, but confirms that pam_exec is not dead code.
-        // A proper test would use a dependency-injected directory; for now
-        // we just ensure the function doesn't crash and the logic is exercised.
-        // The test above proves parse/extract; the struct test ensures the
-        // branch is compiled.
+    fn pam_exec_records_script_and_writability() {
+        let pamd = tempfile::tempdir().unwrap();
+        let payload = tempfile::tempdir().unwrap();
+        let script = payload.path().join("hook.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::write(
+            pamd.path().join("sshd"),
+            format!(
+                "session optional pam_exec.so seteuid {}\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+
+        let findings = scan_pam_dir(pamd.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].module.module_path, script.to_string_lossy());
+        assert_eq!(findings[0].writability, ExecWritability::NonRootWritable);
+        assert_eq!(findings[0].services, vec!["sshd (session optional)"]);
     }
 }
