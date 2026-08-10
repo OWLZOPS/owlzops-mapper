@@ -1684,6 +1684,77 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-055 / SEC-056 / SEC-057: PAM stack injection ──────────────────
+    #[cfg(feature = "local-scan")]
+    {
+        use crate::models::ExecWritability;
+        let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
+        for f in &report.security.pam_injections {
+            let evidence = format!(
+                "{}: {} {} {} {}",
+                f.service, f.module.type_, f.module.control, f.module.module_path, f.module.args
+            );
+            match f.writability {
+                ExecWritability::NonRootWritable | ExecWritability::Missing => {
+                    ioc.push(evidence);
+                }
+                ExecWritability::Unknown => {
+                    unverifiable.push(evidence);
+                }
+                _ => {
+                    if f.volatile {
+                        ioc.push(evidence);
+                    } else if f.package.is_none() {
+                        unpackaged.push(evidence);
+                    }
+                }
+            }
+        }
+
+        if !ioc.is_empty() {
+            findings.push(Finding {
+                id: "SEC-055",
+                title: "ACTIVE COMPROMISE: PAM module writable or volatile (authentication bypass)"
+                    .to_string(),
+                category: Category::Security,
+                weight: 55,
+                evidence: format!("{} PAM line(s): {}", ioc.len(), evidence_list(&ioc, 10)),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+        if !unpackaged.is_empty() {
+            findings.push(Finding {
+                id: "SEC-056",
+                title: "Unpackaged PAM module outside trusted directories".to_string(),
+                category: Category::Security,
+                weight: 30,
+                evidence: format!(
+                    "{} PAM line(s): {}",
+                    unpackaged.len(),
+                    evidence_list(&unpackaged, 10)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+        if !unverifiable.is_empty() {
+            findings.push(Finding {
+                id: "SEC-057",
+                title: "PAM module present (ownership unverifiable)".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} PAM line(s): {}",
+                    unverifiable.len(),
+                    evidence_list(&unverifiable, 10)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
     {
         use crate::models::ExecWritability as W;
@@ -2518,9 +2589,10 @@ impl CriticalFlags {
         // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
         // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
         // modules are excluded upstream, so FP is near-zero.
-        const IOC_IDS: [&str; 15] = [
+        const IOC_IDS: [&str; 16] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
             "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043", "SEC-052",
+            "SEC-055",
         ];
 
         // R23-14: IOC_IDS finding must carry IoC-band weight. Mixing tiers

@@ -61,4 +61,6 @@ pub mod kernel_taint;
 #[cfg(feature = "local-scan")]
 pub mod ld_so_conf;
 #[cfg(feature = "local-scan")]
+pub mod pam;
+#[cfg(feature = "local-scan")]
 pub mod preload;

@@ -388,6 +388,10 @@ pub struct SecurityInfo {
     /// `None` = unreadable (coverage); keyed by canonical path.
     #[serde(default)]
     pub one_way_switches: std::collections::BTreeMap<String, Option<u8>>,
+
+    // ── SEC-055/056/057: PAM stack injection ──────────────────────────────
+    #[serde(default)]
+    pub pam_injections: Vec<PamFinding>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -476,6 +480,54 @@ pub struct GeneratorFinding {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEC-055/056/057: PAM stack injection
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One line from a PAM service configuration.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PamModule {
+    #[serde(default)]
+    pub type_: String,
+    #[serde(default)]
+    pub control: String,
+    pub module_path: String,
+    #[serde(default)]
+    pub args: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PamScriptInfo {
+    pub script_path: String,
+    #[serde(default)]
+    pub writability: ExecWritability,
+    #[serde(default)]
+    pub volatile: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PamFinding {
+    /// PAM service name (file name without /etc/pam.d/).
+    pub service: String,
+    /// The suspicious module line.
+    #[serde(flatten)]
+    pub module: PamModule,
+    #[serde(default)]
+    pub writability: ExecWritability,
+    #[serde(default)]
+    pub volatile: bool,
+    /// Owning package, if resolved.
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+    /// Additional info if the module is pam_exec and the script is suspicious.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_info: Option<Box<PamScriptInfo>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
