@@ -581,6 +581,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         ld_so_conf_injections: Vec::new(),
         generators: Vec::new(),
         one_way_switches: BTreeMap::new(),
+        // ── SEC-055
+        pam_injections: Vec::new(),
     }
 }
 

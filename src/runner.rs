@@ -76,12 +76,13 @@ struct PersistenceScan {
     ld_so_conf: Vec<crate::models::LdSoConfInjection>,
     generators: Vec<crate::models::GeneratorFinding>,
     one_way_switches: BTreeMap<String, Option<u8>>,
+    pam: Vec<crate::models::PamFinding>,
 }
 
 #[cfg(feature = "local-scan")]
 /// Single source for the panic warning — the message cannot drift from the
 /// scanner set again (R23-34).
-const PERSISTENCE_IDS: &str = "SEC-042/043/044/049/050/051/052/053/054";
+const PERSISTENCE_IDS: &str = "SEC-042/043/044/049/050/051/052/053/054/055/056/057";
 
 #[cfg(feature = "local-scan")]
 pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
@@ -140,6 +141,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
                 ld_so_conf: crate::scanners::ld_so_conf::scan_ld_so_conf(),
                 generators: crate::scanners::generators::scan_generators(),
                 one_way_switches,
+                pam: crate::scanners::pam::scan_pam(),
             }
         });
 
@@ -249,6 +251,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         report.security.ld_so_conf_injections = p.ld_so_conf;
         report.security.generators = p.generators;
         report.security.one_way_switches = p.one_way_switches;
+        report.security.pam_injections = p.pam;
 
         report.risk_score = crate::scoring::score(crate::scoring::evaluate(&report)).total;
 
