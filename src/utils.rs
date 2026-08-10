@@ -342,16 +342,14 @@ pub fn run_child_with_timeout(
 
     // stdout safety block
     let Some(out_pipe) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group_and_reap(&mut child);
         unregister_child(child_pid);
         return None;
     };
 
     // stderr safety block
     let Some(err_pipe) = child.stderr.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group_and_reap(&mut child);
         unregister_child(child_pid);
         return None;
     };
@@ -464,8 +462,7 @@ fn run_with_timeout_inner(
     let (tx, rx) = mpsc::channel();
     // Defensive: if stdout was somehow not captured, reap the child immediately
     let Some(child_stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group_and_reap(&mut child);
         unregister_child(child_pid);
         return None;
     };
