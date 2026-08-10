@@ -32,7 +32,19 @@ pub(crate) fn gather_one_way_switches() -> BTreeMap<String, Option<u8>> {
                 if truncated {
                     coverage::record(format!("{path} truncated"));
                 }
-                content.trim().parse::<u8>().ok()
+                match content.trim().parse::<u8>() {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        // R24-16: non-numeric content is itself an anomaly —
+                        // possible /proc tampering or overlay. Distinguish it
+                        // from a plain EACCES by recording coverage.
+                        coverage::record(format!(
+                            "{path} contains a non-numeric value — switch state UNKNOWN \
+                             (possible /proc tampering)"
+                        ));
+                        None
+                    }
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // File not present – legitimate on some kernels (e.g. no BPF),
