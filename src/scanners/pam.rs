@@ -95,6 +95,17 @@ pub(crate) fn extract_pam_exec_targets(args: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Return true if `path` is an executable file, does not exist yet
+/// (staged payload), or its executability cannot be determined (fail-open).
+/// Non-executable regular files (logs, configs) are **not** targets (R23-88).
+fn is_exec_target(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(md) => md.permissions().mode() & 0o111 != 0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => true, // EACCES etc. – check anyway
+    }
+}
+
 /// Scan all files in /etc/pam.d and return suspicious findings.
 /// Delegates to scan_pam_dir with the default system directory.
 pub fn scan_pam() -> Vec<PamFinding> {
@@ -149,7 +160,12 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
             // the trusted directories must still be caught (R23-80).
             let basename = module_path.rsplit('/').next().unwrap_or(module_path);
             if basename == "pam_exec.so" {
-                for script in extract_pam_exec_targets(args) {
+                for (idx, script) in extract_pam_exec_targets(args).into_iter().enumerate() {
+                    // idx == 0 is the command itself – always inspect.
+                    if idx > 0 && !is_exec_target(script) {
+                        continue; // R23-88: skip non‑executable data arguments
+                    }
+
                     let writability = assess_writability(Path::new(script));
                     let volatile = crate::utils::is_volatile_exec_path(script);
 
@@ -340,6 +356,35 @@ mod tests {
         let targets2 = extract_pam_exec_targets("debug log=/var/log/x /tmp/backdoor.sh");
         assert_eq!(targets2, vec!["/tmp/backdoor.sh"]);
         assert!(extract_pam_exec_targets("expose_authtok debug").is_empty());
+    }
+
+    #[test]
+    fn data_arguments_are_not_targets() {
+        let payload = tempfile::tempdir().unwrap();
+        let log = payload.path().join("pam.log");
+        std::fs::write(&log, b"").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            !is_exec_target(&log.to_string_lossy()),
+            "log file is not an exec target"
+        );
+
+        // A staged (not yet existing) target is still considered a target.
+        assert!(
+            is_exec_target("/nonexistent/staged.sh"),
+            "non-existent target is still checked"
+        );
+
+        // A command line where the second token is a non-executable regular file.
+        let line = format!("/bin/sh -c '{}'", log.display());
+        let targets = extract_pam_exec_targets(&line);
+        assert_eq!(targets.len(), 2);
+        let non_exec = targets[1];
+        assert!(
+            !is_exec_target(non_exec),
+            "non-executable file must not be a target"
+        );
     }
 
     #[test]
