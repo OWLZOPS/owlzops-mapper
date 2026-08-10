@@ -492,13 +492,14 @@ pub struct PamModule {
     pub module_path: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PamScriptInfo {
-    pub script_path: String,
-    #[serde(default)]
-    pub writability: ExecWritability,
-    #[serde(default)]
-    pub volatile: bool,
+/// What kind of PAM object a finding describes.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PamTargetKind {
+    /// A shared object (.so) loaded by the PAM stack.
+    #[default]
+    Module,
+    /// An external script executed by pam_exec (or similar modules).
+    ExecScript,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -524,9 +525,14 @@ pub struct PamFinding {
     /// by a non-root user (for Missing modules).
     #[serde(default)]
     pub parent_takeable: bool,
-    /// Additional info if the module is pam_exec and the script is suspicious.
+    /// What kind of target this is (module or exec script).
+    #[serde(default)]
+    pub target_kind: PamTargetKind,
+    /// The path exactly as written in the PAM configuration file, if it differs
+    /// from the resolved module_path (e.g. due to ".." or symlink).  Helps
+    /// the analyst locate the line in /etc/pam.d.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub script_info: Option<Box<PamScriptInfo>>,
+    pub declared_as: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

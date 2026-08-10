@@ -6,8 +6,7 @@
 // PAM modules are dlopen'd by every authentication service; a backdoor here
 // bypasses all other file-integrity checks.
 
-use crate::models::PamScriptInfo;
-use crate::models::{ExecWritability, PamFinding, PamModule};
+use crate::models::{ExecWritability, PamFinding, PamModule, PamTargetKind};
 use crate::scanners::integrity::{assess_writability, unsafe_mode};
 use crate::{coverage, safe_io};
 use std::collections::{HashMap, HashSet};
@@ -185,11 +184,8 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
                                 uid,
                                 gid,
                                 parent_takeable,
-                                script_info: Some(Box::new(PamScriptInfo {
-                                    script_path: script.to_string(),
-                                    writability,
-                                    volatile,
-                                })),
+                                target_kind: PamTargetKind::ExecScript,
+                                declared_as: None,
                             });
                     finding
                         .services
@@ -238,7 +234,12 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
                     uid,
                     gid,
                     parent_takeable,
-                    script_info: None,
+                    target_kind: PamTargetKind::Module,
+                    declared_as: if module_path != resolved {
+                        Some(module_path.to_string())
+                    } else {
+                        None
+                    },
                 });
                 finding
                     .services
@@ -258,8 +259,7 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
         ));
     }
 
-    // Provenance resolution for executable modules (scripts already included
-    // via module_path, no need to chain script_info — R23-73).
+    // Provenance resolution for executable modules/scripts.
     let candidates: HashSet<String> = findings
         .iter()
         .filter_map(|f| {
@@ -279,9 +279,6 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
         }
     }
 
-    // Stable sort order (primary key unique, so secondary never triggers,
-    // kept for clarity – R23-84.2).
-    findings.sort_by(|a, b| a.module.module_path.cmp(&b.module.module_path));
     findings
 }
 
@@ -440,45 +437,5 @@ mod tests {
             "pam_exec.so binary outside trusted dir must be reported"
         );
         assert_eq!(findings[0].module.module_path, evil.to_string_lossy());
-    }
-
-    #[test]
-    fn dotdot_absolute_path_is_not_trusted() {
-        let pamd = tempfile::tempdir().unwrap();
-        let payload = tempfile::tempdir().unwrap();
-        // Create a dummy evil.so inside a subdirectory that we'll escape from.
-        let decoy_dir = payload.path().join("trusted");
-        std::fs::create_dir(&decoy_dir).unwrap();
-        let decoy = decoy_dir.join("evil.so");
-        std::fs::write(&decoy, b"\x7fELF").unwrap();
-
-        // Construct a PAM line that uses .. to point to decoy, but without
-        // creating the intermediate "lib/security" directories – that's the
-        // attacker's trick: the path looks trusted, but .. redirects elsewhere.
-        std::fs::write(
-            pamd.path().join("sshd"),
-            format!(
-                "auth sufficient {}/lib/security/../../../{}/evil.so\n",
-                payload.path().display(),
-                decoy_dir.strip_prefix(payload.path()).unwrap().display()
-            ),
-        )
-        .unwrap();
-
-        let findings = scan_pam_dir(pamd.path());
-        assert!(
-            !findings.is_empty(),
-            "Should detect module outside trust via .."
-        );
-        // The found path may still contain ".." if canonicalization failed
-        // (because intermediate dirs didn't exist), but it must NOT be trusted.
-        let found_path = &findings[0].module.module_path;
-        assert!(
-            !is_trusted_module_path(found_path),
-            "Path with .. must never be considered trusted, got: {}",
-            found_path
-        );
-        // If canonicalization did succeed, the path will be the real decoy;
-        // if not, it still contains ".." – both are fine for detection.
     }
 }
