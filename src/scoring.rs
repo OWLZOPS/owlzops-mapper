@@ -32,7 +32,8 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
 /// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
 /// v10 (0.5.31): SEC-052/053/054 systemd generators, one-way kernel switches as drift class.
-pub const SCORING_VERSION: u8 = 10;
+/// v11 (0.5.32): (PAM stack injection SEC‑055/056/057)
+pub const SCORING_VERSION: u8 = 11;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -1689,32 +1690,34 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         use crate::models::ExecWritability;
         let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
         for f in &report.security.pam_injections {
-            let evidence = if f.services.len() <= 3 {
+            let services_count = f.services.len();
+            let services_str = if services_count <= 3 {
+                f.services.join(", ")
+            } else {
+                let first_three = f
+                    .services
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{first_three}...")
+            };
+            let evidence = if services_count <= 3 {
                 format!(
-                    "{} ({}): {} {} {} — used by: {}",
+                    "{} ({} service{}): — used by: {}",
                     f.module.module_path,
-                    f.services.len(),
-                    f.module.type_,
-                    f.module.control,
-                    f.module.args,
-                    f.services.join(", ")
+                    services_count,
+                    if services_count == 1 { "" } else { "s" },
+                    services_str
                 )
             } else {
                 format!(
-                    "{} ({} services): {} {} {} — used by: {}...",
-                    f.module.module_path,
-                    f.services.len(),
-                    f.module.type_,
-                    f.module.control,
-                    f.module.args,
-                    f.services
-                        .iter()
-                        .take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "{} ({} services): — used by: {}",
+                    f.module.module_path, services_count, services_str
                 )
             };
+
             match f.writability {
                 ExecWritability::NonRootWritable => ioc.push(evidence),
                 ExecWritability::Missing if f.parent_takeable => ioc.push(evidence),
