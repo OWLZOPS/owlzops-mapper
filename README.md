@@ -55,7 +55,7 @@ Risk Score is split into **Security / Reliability / Hygiene** so one noisy categ
 ## Example output (redacted)
 
 ```
-🦉 Owlzops Mapper v0.5.31
+🦉 Owlzops Mapper v0.5.32
 🔍 Scan completed in 2.50s
 🔒 Risk Score: 60/100 (At Risk)
 
