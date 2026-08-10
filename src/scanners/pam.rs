@@ -70,14 +70,11 @@ fn resolve_module(module: &str) -> Option<String> {
 }
 
 /// Pure parser for one line of a PAM config file.
-///
 /// Fields are separated by runs of whitespace (not single characters).
 /// The control field may be a bracketed list: `[success=1 default=ignore]`.
 /// The module path is always the third token; remaining text becomes args.
-///
 /// Returns `Some((type, control, module_path, args_str))` or `None` for
 /// comments / empty lines / lines with fewer than three tokens.
-///
 /// This parser implements the same rules as libpam's `_pam_assemble_line`
 /// (R24-01).  It is zero-copy and allocation-free.
 pub(crate) fn parse_pam_line(line: &str) -> Option<(&str, &str, &str, &str)> {
@@ -215,9 +212,11 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
 
                     // R23-75: always record the script – it's never in a trusted
                     // directory; scoring decides the tier.
-                    let (uid, gid) = std::fs::metadata(script)
-                        .map(|m| (m.uid(), m.gid()))
-                        .unwrap_or((0, 0));
+                    // R24-09: `uid`/`gid` are `Option<u32>`, `None` means stat(2) failed.
+                    let (uid, gid) = match std::fs::metadata(script) {
+                        Ok(m) => (Some(m.uid()), Some(m.gid())),
+                        Err(_) => (None, None),
+                    };
 
                     let finding =
                         aggregated
@@ -269,9 +268,11 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
                 || volatile
                 || (writability == ExecWritability::Missing && parent_takeable)
             {
-                let (uid, gid) = std::fs::metadata(&resolved)
-                    .map(|m| (m.uid(), m.gid()))
-                    .unwrap_or((0, 0));
+                // R24-09: `uid`/`gid` are `Option<u32>`, `None` means stat(2) failed.
+                let (uid, gid) = match std::fs::metadata(&resolved) {
+                    Ok(m) => (Some(m.uid()), Some(m.gid())),
+                    Err(_) => (None, None),
+                };
 
                 let key = resolved.clone();
                 let finding = aggregated.entry(key.clone()).or_insert_with(|| PamFinding {
