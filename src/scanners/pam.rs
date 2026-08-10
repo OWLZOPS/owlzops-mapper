@@ -70,18 +70,51 @@ fn resolve_module(module: &str) -> Option<String> {
 }
 
 /// Pure parser for one line of a PAM config file.
-/// Returns Some((type, control, module_path, args_str)) or None if comment/empty.
+///
+/// Fields are separated by runs of whitespace (not single characters).
+/// The control field may be a bracketed list: `[success=1 default=ignore]`.
+/// The module path is always the third token; remaining text becomes args.
+///
+/// Returns `Some((type, control, module_path, args_str))` or `None` for
+/// comments / empty lines / lines with fewer than three tokens.
+///
+/// This parser implements the same rules as libpam's `_pam_assemble_line`
+/// (R24-01).  It is zero-copy and allocation-free.
 pub(crate) fn parse_pam_line(line: &str) -> Option<(&str, &str, &str, &str)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
+    let s = line.trim();
+    if s.is_empty() || s.starts_with('#') {
         return None;
     }
-    let mut parts = trimmed.splitn(4, |c: char| c.is_whitespace());
-    let type_ = parts.next()?;
-    let control = parts.next()?;
-    let module = parts.next()?;
-    let args = parts.next().unwrap_or("");
-    Some((type_, control, module, args))
+
+    // Extract one token:
+    //   - `[ … ]` is kept as a single token (including brackets)
+    //   - otherwise a whitespace-delimited word
+    // Returns (token, rest_of_line).  Zero allocations.
+    fn take_token(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start_matches(char::is_whitespace);
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(after) = s.strip_prefix('[') {
+            return Some(match after.find(']') {
+                // end is relative to after, +2 accounts for '[' and ']'
+                Some(end) => (&s[..end + 2], &s[end + 2..]),
+                None => (s, ""), // unterminated '[' – swallow the rest (fail‑closed)
+            });
+        }
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        Some((&s[..end], &s[end..]))
+    }
+
+    let (type_, rest) = take_token(s)?;
+    let (control, rest) = take_token(rest)?;
+    let (module, rest) = take_token(rest)?;
+    Some((
+        type_,
+        control,
+        module,
+        rest.trim_start_matches(char::is_whitespace),
+    ))
 }
 
 /// Extract all absolute paths from pam_exec arguments.
@@ -324,6 +357,40 @@ mod tests {
         assert!(parse_pam_line("# comment").is_none());
         assert!(parse_pam_line("").is_none());
         assert!(parse_pam_line("   ").is_none());
+    }
+
+    // R24-01: the parser now handles column‑aligned (RHEL‑style) configs,
+    // bracketed control syntax, and double‑space evasion.
+    #[test]
+    fn column_aligned_line_is_parsed() {
+        let (t, c, m, a) =
+            parse_pam_line("auth        required                    pam_env.so").unwrap();
+        assert_eq!((t, c, m, a), ("auth", "required", "pam_env.so", ""));
+    }
+
+    #[test]
+    fn bracketed_control_is_one_token() {
+        let (t, c, m, a) =
+            parse_pam_line("auth [success=1 default=ignore] pam_unix.so nullok").unwrap();
+        assert_eq!(t, "auth");
+        assert_eq!(c, "[success=1 default=ignore]");
+        assert_eq!(m, "pam_unix.so");
+        assert_eq!(a, "nullok");
+    }
+
+    #[test]
+    fn double_space_evasion_does_not_hide_payload() {
+        let (_, _, m, _) = parse_pam_line("auth  sufficient  /dev/shm/evil.so").unwrap();
+        assert_eq!(
+            m, "/dev/shm/evil.so",
+            "SEC-055 must not be evadable with one extra space"
+        );
+    }
+
+    #[test]
+    fn unterminated_bracket_does_not_shift_columns() {
+        // fail-closed: no module resolved, but no column corruption either
+        assert!(parse_pam_line("auth [success=1 pam_unix.so").is_none());
     }
 
     #[test]
