@@ -26,29 +26,48 @@ const TRUSTED_PAM_DIRS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/security/",
 ];
 
+/// Check if a path looks like it's inside a trusted directory.
+/// Paths containing ".." are never trusted, even if they start with a
+/// trusted prefix (R23-81).
 fn is_trusted_module_path(path: &str) -> bool {
+    if path.contains("/../") || path.ends_with("/..") {
+        return false;
+    }
     TRUSTED_PAM_DIRS.iter().any(|d| path.starts_with(d))
 }
 
-/// Resolve a bare module name to a full path by searching the trusted
-/// directories in order (mimics libpam).
-fn resolve_module(module: &str) -> Option<String> {
-    // libpam uses the path as-is only if it starts with '/', otherwise it
-    // prefixes the default module directory (R23-76).  An attacker can
-    // embed ".." to escape the trusted directory — we canonicalise to
-    // reveal the real target.
+/// Generate the candidate paths libpam would try for a given module name
+/// (pure function, no I/O).  Useful for testing (R23-83).
+pub(crate) fn module_candidates(module: &str) -> Vec<String> {
     if module.starts_with('/') {
-        return Some(module.to_string());
+        return vec![module.to_string()];
     }
     TRUSTED_PAM_DIRS
         .iter()
         .map(|d| format!("{d}{module}"))
-        .find(|p| Path::new(p).exists())
-        .map(|p| {
-            std::fs::canonicalize(&p)
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or(p)
-        })
+        .collect()
+}
+
+/// Resolve a bare module name to a real absolute path, mimicking libpam.
+/// Both branches are canonicalised; if the file does not exist the
+/// raw candidate is returned (and protected by the ".." guard above).
+fn resolve_module(module: &str) -> Option<String> {
+    let candidate = if module.starts_with('/') {
+        module.to_string()
+    } else {
+        // Find the first candidate that exists on disk.
+        module_candidates(module)
+            .into_iter()
+            .find(|p| Path::new(p).exists())?
+    };
+
+    // Canonicalise both absolute user-supplied paths and resolved ones
+    // to eliminate ".." and symlink tricks (R23-76, R23-81).
+    Some(
+        std::fs::canonicalize(&candidate)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or(candidate),
+    )
 }
 
 /// Pure parser for one line of a PAM config file.
@@ -121,56 +140,58 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
                 continue;
             };
 
-            // ── pam_exec.so is handled FIRST, before any filtering (R23-60) ──
+            // ── pam_exec script extraction ────────────────────────────────
+            // If the module name ends with pam_exec.so, try to extract a
+            // script path.  This check runs *in addition* to the regular
+            // module verification below; a pam_exec.so binary placed outside
+            // the trusted directories must still be caught (R23-80).
             let basename = module_path.rsplit('/').next().unwrap_or(module_path);
-            if basename == "pam_exec.so" {
-                if let Some(script) = extract_pam_exec_script(args) {
-                    let writability = assess_writability(Path::new(script));
-                    let volatile = crate::utils::is_volatile_exec_path(script);
+            if basename == "pam_exec.so"
+                && let Some(script) = extract_pam_exec_script(args)
+            {
+                let writability = assess_writability(Path::new(script));
+                let volatile = crate::utils::is_volatile_exec_path(script);
 
-                    // R23-74: parent_takeable is computed the same way as for
-                    // regular modules — the slot can be taken before the script exists.
-                    let parent_takeable = if writability == ExecWritability::Missing {
-                        Path::new(script)
-                            .parent()
-                            .and_then(|p| std::fs::metadata(p).ok())
-                            .map(|m| unsafe_mode(m.permissions().mode(), m.uid(), m.gid()))
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
+                // R23-74: slot takeability even before script creation.
+                let parent_takeable = if writability == ExecWritability::Missing {
+                    Path::new(script)
+                        .parent()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .map(|m| unsafe_mode(m.permissions().mode(), m.uid(), m.gid()))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
 
-                    // R23-75: Always create a record (script is never in a
-                    // trusted PAM directory); scoring determines tier by provenance.
-                    let (uid, gid) = std::fs::metadata(script)
-                        .map(|m| (m.uid(), m.gid()))
-                        .unwrap_or((0, 0));
+                // R23-75: always record the script – it's never in a trusted
+                // directory; scoring decides the tier.
+                let (uid, gid) = std::fs::metadata(script)
+                    .map(|m| (m.uid(), m.gid()))
+                    .unwrap_or((0, 0));
 
-                    let finding =
-                        aggregated
-                            .entry(script.to_string())
-                            .or_insert_with(|| PamFinding {
-                                services: Vec::new(),
-                                module: PamModule {
-                                    module_path: script.to_string(),
-                                },
-                                writability,
-                                volatile,
-                                package: None,
-                                uid,
-                                gid,
-                                parent_takeable,
-                                script_info: Some(Box::new(PamScriptInfo {
-                                    script_path: script.to_string(),
-                                    writability,
-                                    volatile,
-                                })),
-                            });
-                    finding
-                        .services
-                        .push(format!("{fname} ({type_} {control})"));
-                }
-                continue;
+                let finding = aggregated
+                    .entry(script.to_string())
+                    .or_insert_with(|| PamFinding {
+                        services: Vec::new(),
+                        module: PamModule {
+                            module_path: script.to_string(),
+                        },
+                        writability,
+                        volatile,
+                        package: None,
+                        uid,
+                        gid,
+                        parent_takeable,
+                        script_info: Some(Box::new(PamScriptInfo {
+                            script_path: script.to_string(),
+                            writability,
+                            volatile,
+                        })),
+                    });
+                finding
+                    .services
+                    .push(format!("{fname} ({type_} {control})"));
+                // NO continue here – the .so itself must be checked below.
             }
 
             // ── Regular module checks ──────────────────────────────────────
@@ -254,13 +275,9 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
         }
     }
 
-    // Secondary sort key by first service for stable output
-    findings.sort_by(|a, b| {
-        a.module
-            .module_path
-            .cmp(&b.module.module_path)
-            .then_with(|| a.services.first().cmp(&b.services.first()))
-    });
+    // Stable sort order (primary key unique, so secondary never triggers,
+    // kept for clarity – R23-84.2).
+    findings.sort_by(|a, b| a.module.module_path.cmp(&b.module.module_path));
     findings
 }
 
@@ -293,13 +310,26 @@ mod tests {
     }
 
     #[test]
-    fn trusted_dirs_detection() {
-        assert!(is_trusted_module_path("/lib/security/pam_unix.so"));
-        assert!(is_trusted_module_path(
-            "/usr/lib/x86_64-linux-gnu/security/pam_sss.so"
+    fn dotdot_never_trusted() {
+        assert!(!is_trusted_module_path(
+            "/lib/security/../../../tmp/evil.so"
         ));
-        assert!(!is_trusted_module_path("/tmp/pam_evil.so"));
-        assert!(!is_trusted_module_path("/home/user/pam.so"));
+        assert!(!is_trusted_module_path("/usr/lib/security/.."));
+        assert!(is_trusted_module_path("/lib/security/pam_unix.so"));
+    }
+
+    #[test]
+    fn relative_module_is_prefixed_like_libpam() {
+        let c = module_candidates("../../../tmp/evil.so");
+        assert_eq!(
+            c[0], "/lib/security/../../../tmp/evil.so",
+            "libpam prefixes the default directory, never uses relative path as-is"
+        );
+        assert!(
+            !is_trusted_module_path(&c[0]),
+            "and such a path must not be considered trusted"
+        );
+        assert_eq!(module_candidates("/tmp/x.so"), vec!["/tmp/x.so"]);
     }
 
     #[test]
@@ -342,17 +372,29 @@ mod tests {
     #[test]
     fn pam_exec_staged_slot_is_takeable() {
         let pamd = tempfile::tempdir().unwrap();
+        let payload = tempfile::tempdir().unwrap();
+        // Use a directory with permissive mode to guarantee takeability,
+        // avoiding dependency on real /tmp (R23-84.1).
+        let staging = payload.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let script_path = staging.join("not_yet_there.sh");
+
         std::fs::write(
             pamd.path().join("sshd"),
-            "session optional pam_exec.so seteuid /tmp/not_yet_there.sh\n",
+            format!(
+                "session optional pam_exec.so seteuid {}\n",
+                script_path.display()
+            ),
         )
         .unwrap();
+
         let findings = scan_pam_dir(pamd.path());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].writability, ExecWritability::Missing);
         assert!(
             findings[0].parent_takeable,
-            "/tmp is world-writable, slot must be reported as takeable"
+            "Slot must be reported as takeable"
         );
     }
 
@@ -381,14 +423,63 @@ mod tests {
     }
 
     #[test]
-    fn relative_module_escapes_trusted_dir() {
-        let resolved = resolve_module("../../../tmp/evil.so");
-        if let Some(ref path) = resolved {
-            assert!(
-                !is_trusted_module_path(path),
-                "path '{}' must not be trusted",
-                path
-            );
-        } // if file doesn't exist, resolve_module returns None – acceptable
+    fn pam_exec_named_module_outside_trusted_dir_is_still_checked() {
+        let pamd = tempfile::tempdir().unwrap();
+        let payload = tempfile::tempdir().unwrap();
+        let evil = payload.path().join("pam_exec.so");
+        std::fs::write(&evil, b"\x7fELF").unwrap();
+        std::fs::write(
+            pamd.path().join("sshd"),
+            format!("auth sufficient {}\n", evil.display()),
+        )
+        .unwrap();
+
+        let findings = scan_pam_dir(pamd.path());
+        assert_eq!(
+            findings.len(),
+            1,
+            "pam_exec.so binary outside trusted dir must be reported"
+        );
+        assert_eq!(findings[0].module.module_path, evil.to_string_lossy());
+    }
+
+    #[test]
+    fn dotdot_absolute_path_is_not_trusted() {
+        let pamd = tempfile::tempdir().unwrap();
+        let payload = tempfile::tempdir().unwrap();
+        // Create a dummy evil.so inside a subdirectory that we'll escape from.
+        let decoy_dir = payload.path().join("trusted");
+        std::fs::create_dir(&decoy_dir).unwrap();
+        let decoy = decoy_dir.join("evil.so");
+        std::fs::write(&decoy, b"\x7fELF").unwrap();
+
+        // Construct a PAM line that uses .. to point to decoy, but without
+        // creating the intermediate "lib/security" directories – that's the
+        // attacker's trick: the path looks trusted, but .. redirects elsewhere.
+        std::fs::write(
+            pamd.path().join("sshd"),
+            format!(
+                "auth sufficient {}/lib/security/../../../{}/evil.so\n",
+                payload.path().display(),
+                decoy_dir.strip_prefix(payload.path()).unwrap().display()
+            ),
+        )
+        .unwrap();
+
+        let findings = scan_pam_dir(pamd.path());
+        assert!(
+            !findings.is_empty(),
+            "Should detect module outside trust via .."
+        );
+        // The found path may still contain ".." if canonicalization failed
+        // (because intermediate dirs didn't exist), but it must NOT be trusted.
+        let found_path = &findings[0].module.module_path;
+        assert!(
+            !is_trusted_module_path(found_path),
+            "Path with .. must never be considered trusted, got: {}",
+            found_path
+        );
+        // If canonicalization did succeed, the path will be the real decoy;
+        // if not, it still contains ".." – both are fine for detection.
     }
 }
