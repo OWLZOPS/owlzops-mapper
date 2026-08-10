@@ -111,14 +111,29 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
             for h in &args.host {
                 hosts.push(h.clone());
             }
-            if let Some(ref path) = args.hosts
-                && let Ok(contents) = std::fs::read_to_string(path)
-            {
+            // R24-13: an unreadable --hosts file must never degrade into a
+            // local scan — the object of the audit would silently change.
+            if let Some(ref path) = args.hosts {
+                let contents = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to read hosts file {:?}: {} — refusing to silently fall back to a LOCAL scan",
+                            path, e
+                        );
+                        return 2;
+                    }
+                };
+                let before = hosts.len();
                 for line in contents.lines() {
                     let h = line.trim();
                     if !h.is_empty() && !h.starts_with('#') {
                         hosts.push(h.to_string());
                     }
+                }
+                if hosts.len() == before && args.host.is_empty() {
+                    eprintln!("hosts file {:?} contains no usable host entries", path);
+                    return 2;
                 }
             }
 

@@ -16,7 +16,7 @@ const KEY_TYPES: &[&str] = &[
 ];
 
 /// ~4000 keys at 256 B — anything larger is either abuse or a typo.
-const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
+pub(crate) const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
 
 fn strip_options(line: &str) -> Option<String> {
     let toks: Vec<&str> = line.split_whitespace().collect();
