@@ -1685,22 +1685,41 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     // ── SEC-055 / SEC-056 / SEC-057: PAM stack injection ──────────────────
-    #[cfg(feature = "local-scan")]
     {
         use crate::models::ExecWritability;
         let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
         for f in &report.security.pam_injections {
-            let evidence = format!(
-                "{}: {} {} {} {}",
-                f.service, f.module.type_, f.module.control, f.module.module_path, f.module.args
-            );
+            let evidence = if f.services.len() <= 3 {
+                format!(
+                    "{} ({}): {} {} {} — used by: {}",
+                    f.module.module_path,
+                    f.services.len(),
+                    f.module.type_,
+                    f.module.control,
+                    f.module.args,
+                    f.services.join(", ")
+                )
+            } else {
+                format!(
+                    "{} ({} services): {} {} {} — used by: {}...",
+                    f.module.module_path,
+                    f.services.len(),
+                    f.module.type_,
+                    f.module.control,
+                    f.module.args,
+                    f.services
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             match f.writability {
-                ExecWritability::NonRootWritable | ExecWritability::Missing => {
-                    ioc.push(evidence);
-                }
-                ExecWritability::Unknown => {
-                    unverifiable.push(evidence);
-                }
+                ExecWritability::NonRootWritable => ioc.push(evidence),
+                ExecWritability::Missing if f.parent_takeable => ioc.push(evidence),
+                ExecWritability::Missing => {} // stale config line
+                ExecWritability::Unknown => unverifiable.push(evidence),
                 _ => {
                     if f.volatile {
                         ioc.push(evidence);
