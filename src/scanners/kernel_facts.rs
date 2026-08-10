@@ -10,11 +10,14 @@ use std::collections::BTreeMap;
 /// Weakening any of them between snapshots is either /proc tampering or a
 /// reboot event — both are valuable drift signals.
 const ONE_WAY_SWITCHES: &[(&str, &str)] = &[
-    ("/proc/sys/kernel/modules_disabled", "module loading"),
-    ("/proc/sys/kernel/kexec_load_disabled", "kexec_load"),
+    ("/proc/sys/kernel/modules_disabled", "modules_disabled"),
+    (
+        "/proc/sys/kernel/kexec_load_disabled",
+        "kexec_load_disabled",
+    ),
     (
         "/proc/sys/kernel/unprivileged_bpf_disabled",
-        "unprivileged BPF",
+        "unprivileged_bpf_disabled",
     ),
 ];
 

@@ -385,7 +385,8 @@ pub struct SecurityInfo {
 
     // ── One-way kernel switches (R23-08 extension) ─
     /// Values of sysctls that cannot be weakened without a reboot.
-    /// `None` = unreadable (coverage); keyed by canonical path.
+    /// `None` = unreadable (coverage); keyed by stable human label
+    /// (no spaces, jq‑friendly).
     #[serde(default)]
     pub one_way_switches: std::collections::BTreeMap<String, Option<u8>>,
 
@@ -517,10 +518,14 @@ pub struct PamFinding {
     /// Owning package, if resolved.
     #[serde(default)]
     pub package: Option<String>,
+    /// Owner UID of the target. `None` = stat(2) failed or the file is absent —
+    /// explicitly UNKNOWN, never silently 0/root (R24-09).
     #[serde(default)]
-    pub uid: u32,
+    pub uid: Option<u32>,
+    /// Owner GID of the target. `None` = stat(2) failed or the file is absent —
+    /// explicitly UNKNOWN, never silently 0/root (R24-09).
     #[serde(default)]
-    pub gid: u32,
+    pub gid: Option<u32>,
     /// Whether the parent directory of the module path can be taken over
     /// by a non-root user (for Missing modules).
     #[serde(default)]

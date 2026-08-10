@@ -393,16 +393,35 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
             if parts.len() == 7 && valid_shells.contains(parts[6]) {
                 let username = parts[0].to_string();
 
-                // Count authorized keys
+                // Count authorized keys (R24-11: use capped-regular to prevent
+                // FIFO / device hangs and to honour the Capped I/O doctrine).
                 let home = parts[5];
                 let auth_keys_path = format!("{}/.ssh/authorized_keys", home);
-                let count = safe_io::read_file_capped(&auth_keys_path, 4 * 1024 * 1024)
-                    .map(|(s, _)| {
+                let count = match safe_io::read_file_capped_regular(
+                    &auth_keys_path,
+                    crate::scanners::access::CAP_AUTHORIZED_KEYS,
+                ) {
+                    Ok((s, truncated)) => {
+                        if truncated {
+                            coverage::record(format!(
+                                "{auth_keys_path} exceeded cap — key count PARTIAL for '{username}'"
+                            ));
+                        }
                         s.lines()
                             .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
                             .count()
-                    })
-                    .unwrap_or(0);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(e) => {
+                        // 0 here means UNKNOWN, not "no keys" — say so.
+                        coverage::record(format!(
+                            "{auth_keys_path} unreadable ({}) — key count for '{username}' \
+                             reported as 0 but is UNKNOWN",
+                            e.kind()
+                        ));
+                        0
+                    }
+                };
                 auth_keys_map.insert(username.clone(), count);
                 shell_usernames.push(username);
             }
@@ -683,5 +702,18 @@ mod tests {
             !sudo_target_is_tamper_proof(p.to_str().unwrap()),
             "free name in a user-owned dir must never be excluded"
         );
+    }
+
+    // R24-11: FIFO authorized_keys must not block the scanner.
+    #[test]
+    fn fifo_authorized_keys_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("authorized_keys");
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let err = crate::safe_io::read_file_capped_regular(p.to_str().unwrap(), 1024)
+            .expect_err("FIFO must be refused, not opened");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

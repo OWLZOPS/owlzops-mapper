@@ -16,7 +16,7 @@ const KEY_TYPES: &[&str] = &[
 ];
 
 /// ~4000 keys at 256 B — anything larger is either abuse or a typo.
-const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
+pub(crate) const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
 
 fn strip_options(line: &str) -> Option<String> {
     let toks: Vec<&str> = line.split_whitespace().collect();
@@ -160,7 +160,8 @@ pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
                     ));
                 }
                 // read_file_capped_regular rejects FIFOs/devices by design.
-                Err(e) if e.kind() == ErrorKind::InvalidInput => {
+                // It signals this with ErrorKind::InvalidData (R24-12).
+                Err(e) if e.kind() == ErrorKind::InvalidData => {
                     result.coverage_warnings.push(format!(
                         "user '{user}': {ak} is NOT a regular file (fifo/device/symlink to one) — \
                          key audit refused; treat as tampering"
