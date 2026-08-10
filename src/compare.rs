@@ -1047,48 +1047,57 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     }
 
     // ── One-way kernel switches (R23-08 extension) ───────────────────────
-    for (label, after_val) in &after.security.one_way_switches {
+    // R24-07: union of both key sets — a switch that vanishes between
+    // snapshots is a tamper/kernel‑swap signal, never "unchanged".
+    let labels: std::collections::BTreeSet<&String> = before
+        .security
+        .one_way_switches
+        .keys()
+        .chain(after.security.one_way_switches.keys())
+        .collect();
+    for label in labels {
         let before_val = before.security.one_way_switches.get(label);
+        let after_val = after.security.one_way_switches.get(label);
         match (before_val, after_val) {
-            // Key is new (absent in before) or before value was None (unreadable) but now we have something.
-            (None, _) | (Some(None), _) => {
-                let after_str = match after_val {
-                    Some(v) => v.to_string(),
-                    None => "unreadable".to_string(),
-                };
-                changes.push(Change {
-                    field: format!("security.one_way_switches.{label}"),
-                    before: before_val
-                        .map(|v| v.map_or("unreadable".to_string(), |x| x.to_string()))
-                        .or_else(|| Some("absent".to_string())),
-                    after: Some(after_str),
-                    severity: Severity::Changed,
-                });
-            }
-            // Both present and readable – compare numeric values.
-            (Some(Some(b)), Some(a)) if b != a => {
-                let weakened = a < b;
-                changes.push(Change {
-                    field: format!("security.one_way_switches.{label}"),
-                    before: Some(b.to_string()),
-                    after: Some(a.to_string()),
-                    severity: if weakened {
-                        Severity::Degraded
-                    } else {
-                        Severity::Improved
-                    },
-                });
-            }
-            // Before had a value, after became unreadable.
-            (Some(Some(b)), None) => {
-                changes.push(Change {
-                    field: format!("security.one_way_switches.{label}"),
-                    before: Some(b.to_string()),
-                    after: Some("unreadable".to_string()),
-                    severity: Severity::Degraded,
-                });
-            }
-            // Unchanged: (Some(Some(b)), Some(a)) with b == a, or (Some(None), None), etc.
+            // Present in baseline, gone now — the file disappeared.
+            (Some(prev), None) => changes.push(Change {
+                field: format!("security.one_way_switches.{label}"),
+                before: Some(prev.map_or("unreadable".to_string(), |x| x.to_string())),
+                after: Some("absent".to_string()),
+                severity: Severity::Degraded,
+            }),
+            // Appeared since baseline.
+            (None, Some(val)) => changes.push(Change {
+                field: format!("security.one_way_switches.{label}"),
+                before: None,
+                after: Some(val.map_or("unreadable".to_string(), |x| x.to_string())),
+                severity: Severity::Changed,
+            }),
+            // Value changed.
+            (Some(Some(b)), Some(Some(a))) if b != a => changes.push(Change {
+                field: format!("security.one_way_switches.{label}"),
+                before: Some(b.to_string()),
+                after: Some(a.to_string()),
+                severity: Severity::Degraded,
+            }),
+            // Became unreadable.
+            (Some(Some(_)), Some(None)) => changes.push(Change {
+                field: format!("security.one_way_switches.{label}"),
+                before: Some("readable".to_string()),
+                after: Some("unreadable".to_string()),
+                severity: Severity::Degraded,
+            }),
+            // Became readable.
+            (Some(None), Some(Some(a))) => changes.push(Change {
+                field: format!("security.one_way_switches.{label}"),
+                before: Some("unreadable".to_string()),
+                after: Some(a.to_string()),
+                severity: Severity::Changed,
+            }),
+            // Both None (unreadable both times) — no change.
+            (Some(None), Some(None)) => {}
+            // Both Some and equal — no change.
+            (Some(Some(b)), Some(Some(a))) if b == a => {}
             _ => {}
         }
     }
