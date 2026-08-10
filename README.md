@@ -62,19 +62,19 @@ Risk Score is split into **Security / Reliability / Hygiene** so one noisy categ
 Security −60  Reliability −5  Hygiene −15
 
 🛡 Security Findings
-╭──────────────────┬─────────┬──────────────────────────────────────────────────╮
-│ CIS / Ref        ┆ Penalty ┆ Finding                                          │
-╞══════════════════╪═════════╪══════════════════════════════════════════════════╡
-│ SEC-014          ┆ -30     ┆ Cleartext credentials in process memory          │
-│ SEC-012 (CIS 5.3.4) ┆ -15  ┆ Passwordless sudo to ALL commands                │
-│ DOCK-005         ┆ -15     ┆ Container bind-mounts docker.sock               │
-│ SEC-002 (CIS 5.2.10) ┆ -25 ┆ SSH root login allowed                           │
-│ OPS-002 (CIS 4.1.1.1) ┆ -10 ┆ Intrusion detection & audit logging inactive    │
-│ SEC-008 (CIS 5.2.4) ┆ -10 ┆ SSH password authentication enabled               │
-│ DOCK-001 (CIS 5.10) ┆ -5   ┆ Containers run without memory limits             │
-│ DOCK-002 (CIS 5.11) ┆ -3   ┆ Containers run without CPU limits                │
-│ …                ┆         ┆                                                  │
-╰──────────────────┴─────────┴──────────────────────────────────────────────────╯
+╭─────────────────────────────────────────────────────────────────────────────────────────────╮
+│ CIS / Ref                 ┆ Penalty  ┆ Finding                                              │
+╞═══════════════════════════╪══════════╪══════════════════════════════════════════════════════╡
+│ SEC-014                   ┆   -30    ┆ Cleartext credentials in process memory              │
+│ SEC-012 (CIS 5.3.4)       ┆   -15    ┆ Passwordless sudo to ALL commands                    │
+│ DOCK-005                  ┆   -15    ┆ Container bind-mounts docker.sock                    │
+│ SEC-002 (CIS 5.2.10)      ┆   -25    ┆ SSH root login allowed                               │
+│ OPS-002 (CIS 4.1.1.1)     ┆   -10    ┆ Intrusion detection & audit logging inactive         │
+│ SEC-008 (CIS 5.2.4)       ┆   -10    ┆ SSH password authentication enabled                  │
+│ DOCK-001 (CIS 5.10)       ┆   -5     ┆ Containers run without memory limits                 │
+│ DOCK-002 (CIS 5.11)       ┆   -3     ┆ Containers run without CPU limits                    │
+│ …                         ┆          ┆                                                      │
+╰─────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 Full evidence column, memory-forensics tables and suppression counts appear with `--deep`.
