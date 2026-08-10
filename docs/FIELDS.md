@@ -331,6 +331,17 @@ An array of objects, one per detected database engine.
 | `core_pattern` | string \| null | `/proc/sys/kernel/core_pattern`; `null` = unreadable (SEC‑044) |
 | `modules_disabled` | boolean \| null | `/proc/sys/kernel/modules_disabled`; `null` = unreadable (SEC‑044) |
 | `lockdown` | string \| null | Kernel lockdown state; `null` = unavailable (SEC‑044) |
+| `generators` | array of objects | Systemd generator persistence findings (SEC‑052/053/054) |
+| `generators[].path` | string | Absolute path of the executable or search directory |
+| `generators[].kind` | string | `"Executable"` or `"SearchDir"` |
+| `generators[].origin` | string | Where the generator was found: `"Vendor"`, `"LocalAdmin"`, `"Admin"`, `"Runtime"` |
+| `generators[].package` | string \| null | Owning package, if any |
+| `generators[].writability` | string | `"root_only"`, `"non_root_writable"`, `"missing"`, or `"unknown"` |
+| `generators[].symlink_target` | string \| null | Symlink target as written, if the entry is a link |
+| `generators[].resolved_path` | string \| null | Fully resolved path (symlinks followed); null if the link dangles |
+| `generators[].uid` | integer | Owner UID of the file |
+| `generators[].gid` | integer | Owner GID of the file |
+| `one_way_switches` | object | Values of sysctls that cannot be weakened without a reboot. `null` = unreadable; keyed by stable label (no spaces). |
 | `ld_so_conf_injections` | array of objects | Directories from ld.so.conf / ld.so.conf.d that allow unprivileged library injection (SEC‑051) |
 | `ld_so_conf_injections[].path` | string | Absolute path as written in the config file |
 | `ld_so_conf_injections[].volatile` | boolean | True if the filesystem is volatile (tmpfs, devtmpfs, …) |
@@ -340,8 +351,7 @@ An array of objects, one per detected database engine.
 | `ld_so_conf_injections[].gid` | integer | Owner GID of the directory (or of the parent if `mode` is null) |
 | `pam_injections` | array of objects | PAM stack injection findings (SEC‑055/056/057) |
 | `pam_injections[].services` | array of strings | PAM service files referencing this target (e.g. `"sshd (auth sufficient)"`) |
-| `pam_injections[].module` | object | PAM module entry (flattened) |
-| `pam_injections[].module.module_path` | string | Resolved path of the module or script |
+| `pam_injections[].module_path` | string | Resolved path of the module or script. Serialised at the top level of the finding (`#[serde(flatten)]` on the inner `PamModule`) — there is **no** nested `module` object in the JSON |
 | `pam_injections[].target_kind` | string | `"Module"` for `.so` files, `"ExecScript"` for scripts executed by pam_exec |
 | `pam_injections[].declared_as` | string \| null | Path as written in the config, if different from `module_path` (e.g. contains `..`). `null` when identical |
 | `pam_injections[].writability` | string | `"root_only"`, `"non_root_writable"`, `"missing"`, or `"unknown"` |
