@@ -85,12 +85,15 @@ pub(crate) fn parse_pam_line(line: &str) -> Option<(&str, &str, &str, &str)> {
     Some((type_, control, module, args))
 }
 
-/// Extract the script path from pam_exec arguments.
-/// The first absolute token is the command. Options (seteuid, debug, quiet,
-/// expose_authtok, log=..., type=...) never start with a slash, so an
-/// allow‑list approach would break on unknown flags (R23-68).
-fn extract_pam_exec_script(args: &str) -> Option<&str> {
-    args.split_whitespace().find(|t| t.starts_with('/'))
+/// Extract all absolute paths from pam_exec arguments.
+/// The first token is the command; subsequent absolute tokens may be its
+/// arguments (e.g., /bin/sh -c '/dev/shm/impl').  Shell quoting is stripped.
+/// This replaces the earlier single-path extraction to catch wrappers (R23-85).
+pub(crate) fn extract_pam_exec_targets(args: &str) -> Vec<&str> {
+    args.split_whitespace()
+        .map(|t| t.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|t| t.starts_with('/'))
+        .collect()
 }
 
 /// Scan all files in /etc/pam.d and return suspicious findings.
@@ -141,56 +144,57 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
             };
 
             // ── pam_exec script extraction ────────────────────────────────
-            // If the module name ends with pam_exec.so, try to extract a
-            // script path.  This check runs *in addition* to the regular
+            // If the module name ends with pam_exec.so, try to extract
+            // script paths.  This check runs *in addition* to the regular
             // module verification below; a pam_exec.so binary placed outside
             // the trusted directories must still be caught (R23-80).
             let basename = module_path.rsplit('/').next().unwrap_or(module_path);
-            if basename == "pam_exec.so"
-                && let Some(script) = extract_pam_exec_script(args)
-            {
-                let writability = assess_writability(Path::new(script));
-                let volatile = crate::utils::is_volatile_exec_path(script);
+            if basename == "pam_exec.so" {
+                for script in extract_pam_exec_targets(args) {
+                    let writability = assess_writability(Path::new(script));
+                    let volatile = crate::utils::is_volatile_exec_path(script);
 
-                // R23-74: slot takeability even before script creation.
-                let parent_takeable = if writability == ExecWritability::Missing {
-                    Path::new(script)
-                        .parent()
-                        .and_then(|p| std::fs::metadata(p).ok())
-                        .map(|m| unsafe_mode(m.permissions().mode(), m.uid(), m.gid()))
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+                    // R23-74: slot takeability even before script creation.
+                    let parent_takeable = if writability == ExecWritability::Missing {
+                        Path::new(script)
+                            .parent()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .map(|m| unsafe_mode(m.permissions().mode(), m.uid(), m.gid()))
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
 
-                // R23-75: always record the script – it's never in a trusted
-                // directory; scoring decides the tier.
-                let (uid, gid) = std::fs::metadata(script)
-                    .map(|m| (m.uid(), m.gid()))
-                    .unwrap_or((0, 0));
+                    // R23-75: always record the script – it's never in a trusted
+                    // directory; scoring decides the tier.
+                    let (uid, gid) = std::fs::metadata(script)
+                        .map(|m| (m.uid(), m.gid()))
+                        .unwrap_or((0, 0));
 
-                let finding = aggregated
-                    .entry(script.to_string())
-                    .or_insert_with(|| PamFinding {
-                        services: Vec::new(),
-                        module: PamModule {
-                            module_path: script.to_string(),
-                        },
-                        writability,
-                        volatile,
-                        package: None,
-                        uid,
-                        gid,
-                        parent_takeable,
-                        script_info: Some(Box::new(PamScriptInfo {
-                            script_path: script.to_string(),
-                            writability,
-                            volatile,
-                        })),
-                    });
-                finding
-                    .services
-                    .push(format!("{fname} ({type_} {control})"));
+                    let finding =
+                        aggregated
+                            .entry(script.to_string())
+                            .or_insert_with(|| PamFinding {
+                                services: Vec::new(),
+                                module: PamModule {
+                                    module_path: script.to_string(),
+                                },
+                                writability,
+                                volatile,
+                                package: None,
+                                uid,
+                                gid,
+                                parent_takeable,
+                                script_info: Some(Box::new(PamScriptInfo {
+                                    script_path: script.to_string(),
+                                    writability,
+                                    volatile,
+                                })),
+                            });
+                    finding
+                        .services
+                        .push(format!("{fname} ({type_} {control})"));
+                }
                 // NO continue here – the .so itself must be checked below.
             }
 
@@ -333,17 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn pam_exec_script_extraction_seteuid() {
-        assert_eq!(
-            extract_pam_exec_script("seteuid /usr/local/bin/hook.sh"),
-            Some("/usr/local/bin/hook.sh")
-        );
-        assert_eq!(
-            extract_pam_exec_script("debug log=/var/log/x /tmp/backdoor.sh"),
-            Some("/tmp/backdoor.sh")
-        );
-        assert_eq!(extract_pam_exec_script("expose_authtok debug"), None);
-        assert_eq!(extract_pam_exec_script(""), None);
+    fn shell_wrapper_payload_is_not_hidden() {
+        let targets = extract_pam_exec_targets("seteuid /bin/sh -c '/dev/shm/impl'");
+        assert_eq!(targets, vec!["/bin/sh", "/dev/shm/impl"]);
+        let targets2 = extract_pam_exec_targets("debug log=/var/log/x /tmp/backdoor.sh");
+        assert_eq!(targets2, vec!["/tmp/backdoor.sh"]);
+        assert!(extract_pam_exec_targets("expose_authtok debug").is_empty());
     }
 
     #[test]
