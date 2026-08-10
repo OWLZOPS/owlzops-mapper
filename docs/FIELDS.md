@@ -347,8 +347,8 @@ An array of objects, one per detected database engine.
 | `pam_injections[].writability` | string | `"root_only"`, `"non_root_writable"`, `"missing"`, or `"unknown"` |
 | `pam_injections[].volatile` | boolean | True if the target is on a volatile filesystem |
 | `pam_injections[].package` | string \| null | Owning package, if any |
-| `pam_injections[].uid` | integer | Owner UID of the target file |
-| `pam_injections[].gid` | integer | Owner GID of the target file |
+| `pam_injections[].uid` | integer \| null | Owner UID of the target; `null` means stat(2) failed or the file is absent — explicitly UNKNOWN, never silently 0/root |
+| `pam_injections[].gid` | integer \| null | Owner GID of the target; `null` means stat(2) failed or the file is absent — explicitly UNKNOWN, never silently 0/root |
 | `pam_injections[].parent_takeable` | boolean | Whether a non‑root user can take over the parent directory (relevant for `missing` targets) |
 
 ---

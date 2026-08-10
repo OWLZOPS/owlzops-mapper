@@ -1073,17 +1073,23 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                 after: Some(val.map_or("unreadable".to_string(), |x| x.to_string())),
                 severity: Severity::Changed,
             }),
-            // Value changed.
+            // Value changed. Direction matters: a *higher* value is stricter
+            // (→ Improved), a *lower* one is a tamper/reboot signal (→ Degraded).
             (Some(Some(b)), Some(Some(a))) if b != a => changes.push(Change {
                 field: format!("security.one_way_switches.{label}"),
                 before: Some(b.to_string()),
                 after: Some(a.to_string()),
-                severity: Severity::Degraded,
+                severity: if a < b {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                },
             }),
-            // Became unreadable.
-            (Some(Some(_)), Some(None)) => changes.push(Change {
+            // Became unreadable. Preserve the baseline value so the analyst
+            // knows whether it was 0 or 1 before it became unreadable.
+            (Some(Some(b)), Some(None)) => changes.push(Change {
                 field: format!("security.one_way_switches.{label}"),
-                before: Some("readable".to_string()),
+                before: Some(b.to_string()),
                 after: Some("unreadable".to_string()),
                 severity: Severity::Degraded,
             }),
@@ -1785,5 +1791,69 @@ mod tests {
                 .any(|c| c.field == "security.file_capabilities"),
             "identical cap inventory must produce no drift"
         );
+    }
+
+    // ── R24-15: one‑way switch direction tests ────────────────────────────
+
+    #[test]
+    fn one_way_switch_hardening_is_improved_not_degraded() {
+        let mut before = test_report();
+        before.security.one_way_switches = [("modules_disabled".to_string(), Some(0))]
+            .into_iter()
+            .collect();
+        let mut after = test_report();
+        after.security.one_way_switches = [("modules_disabled".to_string(), Some(1))]
+            .into_iter()
+            .collect();
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.one_way_switches.modules_disabled")
+            .expect("value change must surface");
+        assert_eq!(
+            c.severity,
+            Severity::Improved,
+            "locking module loading is hardening, not a regression"
+        );
+    }
+
+    #[test]
+    fn one_way_switch_weakening_is_degraded() {
+        // 1 -> 0 cannot happen without a reboot: /proc tampering or kernel swap.
+        let mut before = test_report();
+        before.security.one_way_switches = [("modules_disabled".to_string(), Some(1))]
+            .into_iter()
+            .collect();
+        let mut after = test_report();
+        after.security.one_way_switches = [("modules_disabled".to_string(), Some(0))]
+            .into_iter()
+            .collect();
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.one_way_switches.modules_disabled")
+            .expect("value change must surface");
+        assert_eq!(c.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn vanished_one_way_switch_is_never_silent() {
+        // R24-07 guard: absent != unchanged.
+        let mut before = test_report();
+        before.security.one_way_switches = [("kexec_load_disabled".to_string(), Some(1))]
+            .into_iter()
+            .collect();
+        let after = test_report(); // empty map
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.one_way_switches.kexec_load_disabled")
+            .expect("a vanished switch must never be silent");
+        assert_eq!(c.before.as_deref(), Some("1"));
+        assert_eq!(c.after.as_deref(), Some("absent"));
+        assert_eq!(c.severity, Severity::Degraded);
     }
 }
