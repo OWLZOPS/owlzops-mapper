@@ -626,21 +626,14 @@ mod tests {
         let pamd = tempfile::tempdir().unwrap();
         let sshd_path = pamd.path().join("sshd");
         std::fs::write(&sshd_path, "auth required pam_unix.so\n").unwrap();
-        // Read-only for everyone – must not be flagged by SEC‑058.
-        // However, the parent tempdir is still writable, so the file is
-        // considered NonRootWritable through the parent.  To really test
-        // root-only we would need a root-owned directory, so this test
-        // only verifies that we do *not* get a false negative when the
-        // file itself is non‑writable but the parent is writable.
-        // The current implementation flags it, which is correct.
-        // We still keep the test as documentation of the expected behaviour.
         std::fs::set_permissions(&sshd_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Now make the parent directory non-writable. This must happen after
+        // file creation, otherwise we cannot write the file or change its mode.
+        std::fs::set_permissions(&pamd, std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let findings = scan_pam_dir(pamd.path());
-        // The config slot IS flagged because the parent tempdir is writable.
-        // That's the correct behaviour for SEC‑058.
         assert!(
-            findings
+            !findings
                 .iter()
                 .any(|f| f.target_kind == PamTargetKind::Config
                     && f.module.module_path == sshd_path.to_string_lossy())
