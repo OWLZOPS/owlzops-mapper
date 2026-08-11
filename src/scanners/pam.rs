@@ -170,6 +170,33 @@ pub(crate) fn scan_pam_dir(root: &Path) -> Vec<PamFinding> {
             continue;
         };
 
+        // ── SEC-058: writability of the PAM config file itself ────────────
+        // If an unprivileged user can modify the config file, all modules
+        // inside it are compromised regardless of their own integrity.
+        let config_writability = assess_writability(&path);
+        if config_writability != ExecWritability::RootOnly {
+            let (uid, gid) = std::fs::metadata(&path)
+                .map(|m| (Some(m.uid()), Some(m.gid())))
+                .unwrap_or((None, None));
+            let volatile = crate::utils::is_volatile_exec_path(path_str);
+            aggregated
+                .entry(path_str.to_string())
+                .or_insert_with(|| PamFinding {
+                    services: vec![format!("{fname} (config slot)")],
+                    module: PamModule {
+                        module_path: path_str.to_string(),
+                    },
+                    writability: config_writability,
+                    volatile,
+                    package: None,
+                    uid,
+                    gid,
+                    parent_takeable: false,
+                    target_kind: PamTargetKind::Config,
+                    declared_as: None,
+                });
+        }
+
         let (content, truncated) = match safe_io::read_file_capped_regular(path_str, 64 * 1024) {
             Ok(t) => t,
             Err(_) => continue,
@@ -455,6 +482,9 @@ mod tests {
         );
     }
 
+    // ── Tests below now tolerate the extra SEC‑058 Config finding by
+    //     filtering on target_kind instead of requiring an exact count. ──
+
     #[test]
     fn pam_exec_records_script_and_writability() {
         let pamd = tempfile::tempdir().unwrap();
@@ -472,18 +502,26 @@ mod tests {
         .unwrap();
 
         let findings = scan_pam_dir(pamd.path());
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].module.module_path, script.to_string_lossy());
-        assert_eq!(findings[0].writability, ExecWritability::NonRootWritable);
-        assert_eq!(findings[0].services, vec!["sshd (session optional)"]);
+        let exec_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.target_kind != PamTargetKind::Config)
+            .collect();
+        assert_eq!(exec_findings.len(), 1);
+        assert_eq!(
+            exec_findings[0].module.module_path,
+            script.to_string_lossy()
+        );
+        assert_eq!(
+            exec_findings[0].writability,
+            ExecWritability::NonRootWritable
+        );
+        assert_eq!(exec_findings[0].services, vec!["sshd (session optional)"]);
     }
 
     #[test]
     fn pam_exec_staged_slot_is_takeable() {
         let pamd = tempfile::tempdir().unwrap();
         let payload = tempfile::tempdir().unwrap();
-        // Use a directory with permissive mode to guarantee takeability,
-        // avoiding dependency on real /tmp (R23-84.1).
         let staging = payload.path().join("staging");
         std::fs::create_dir(&staging).unwrap();
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -499,10 +537,14 @@ mod tests {
         .unwrap();
 
         let findings = scan_pam_dir(pamd.path());
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].writability, ExecWritability::Missing);
+        let exec_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.target_kind != PamTargetKind::Config)
+            .collect();
+        assert_eq!(exec_findings.len(), 1);
+        assert_eq!(exec_findings[0].writability, ExecWritability::Missing);
         assert!(
-            findings[0].parent_takeable,
+            exec_findings[0].parent_takeable,
             "Slot must be reported as takeable"
         );
     }
@@ -524,8 +566,12 @@ mod tests {
         .unwrap();
 
         let findings = scan_pam_dir(pamd.path());
+        let exec_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.target_kind != PamTargetKind::Config)
+            .collect();
         assert_eq!(
-            findings.len(),
+            exec_findings.len(),
             1,
             "root-only script must still create a finding"
         );
@@ -544,11 +590,53 @@ mod tests {
         .unwrap();
 
         let findings = scan_pam_dir(pamd.path());
+        let exec_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.target_kind != PamTargetKind::Config)
+            .collect();
         assert_eq!(
-            findings.len(),
+            exec_findings.len(),
             1,
             "pam_exec.so binary outside trusted dir must be reported"
         );
-        assert_eq!(findings[0].module.module_path, evil.to_string_lossy());
+        assert_eq!(exec_findings[0].module.module_path, evil.to_string_lossy());
+    }
+
+    // ── SEC-058 specific tests ────────────────────────────────────────────
+    #[test]
+    fn writable_pam_config_is_flagged() {
+        let pamd = tempfile::tempdir().unwrap();
+        let sshd_path = pamd.path().join("sshd");
+        std::fs::write(&sshd_path, "auth required pam_unix.so\n").unwrap();
+        std::fs::set_permissions(&sshd_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let findings = scan_pam_dir(pamd.path());
+        let config_finding = findings
+            .iter()
+            .find(|f| {
+                f.target_kind == PamTargetKind::Config
+                    && f.module.module_path == sshd_path.to_string_lossy()
+            })
+            .expect("writable config file must be reported");
+        assert_eq!(config_finding.writability, ExecWritability::NonRootWritable);
+    }
+
+    #[test]
+    fn root_only_pam_config_is_not_flagged() {
+        let pamd = tempfile::tempdir().unwrap();
+        let sshd_path = pamd.path().join("sshd");
+        std::fs::write(&sshd_path, "auth required pam_unix.so\n").unwrap();
+        std::fs::set_permissions(&sshd_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Now make the parent directory non-writable. This must happen after
+        // file creation, otherwise we cannot write the file or change its mode.
+        std::fs::set_permissions(&pamd, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let findings = scan_pam_dir(pamd.path());
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.target_kind == PamTargetKind::Config
+                    && f.module.module_path == sshd_path.to_string_lossy())
+        );
     }
 }

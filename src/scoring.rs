@@ -1685,9 +1685,9 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-055 / SEC-056 / SEC-057: PAM stack injection ──────────────────
+    // ── SEC-055 / SEC-056 / SEC-057 / SEC-058: PAM stack injection ────────
     {
-        use crate::models::ExecWritability;
+        use crate::models::{ExecWritability, PamTargetKind};
         let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
         for f in &report.security.pam_injections {
             let services_count = f.services.len();
@@ -1718,6 +1718,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 )
             };
 
+            // SEC-058: config slot itself is writable → immediate IoC
+            if f.target_kind == PamTargetKind::Config && f.writability != ExecWritability::RootOnly
+            {
+                ioc.push(evidence);
+                continue;
+            }
+
             match f.writability {
                 ExecWritability::NonRootWritable => ioc.push(evidence),
                 ExecWritability::Missing if f.parent_takeable => ioc.push(evidence),
@@ -1736,7 +1743,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !ioc.is_empty() {
             findings.push(Finding {
                 id: "SEC-055",
-                title: "ACTIVE COMPROMISE: PAM module writable or volatile (authentication bypass)"
+                title: "ACTIVE COMPROMISE: PAM module/config writable or volatile (authentication bypass)"
                     .to_string(),
                 category: Category::Security,
                 weight: 55,
@@ -2676,7 +2683,7 @@ static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
     ("ping4", &["CAP_NET_RAW"]),
     ("ping6", &["CAP_NET_RAW"]),
     ("mtr", &["CAP_NET_RAW"]),
-    ("mtr-packet", &["CAP_NET_RAW"]),
+    ("mtr-packet", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
     ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
 ];
 
