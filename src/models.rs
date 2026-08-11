@@ -501,6 +501,9 @@ pub enum PamTargetKind {
     Module,
     /// An external script executed by pam_exec (or similar modules).
     ExecScript,
+    /// The PAM service configuration file itself (writable by non‑root) –
+    /// an attacker who can write to this file can inject arbitrary modules.
+    Config,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
