@@ -61,7 +61,9 @@ pub struct AuditArgs {
     #[arg(long, default_value_t = false)]
     pub copy_binary: bool,
 
-    #[arg(long, default_value = "/tmp/owlzops-mapper")]
+    /// Upload target. MUST NOT live in a world-writable directory: the binary
+    /// is executed under sudo, so anyone able to replace it gets root.
+    #[arg(long, default_value = "/root/.cache/owlzops-mapper")]
     pub remote_path: String,
 
     #[arg(long)]
