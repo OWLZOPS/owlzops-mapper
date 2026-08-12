@@ -29,7 +29,8 @@ shellexpand = "3"
 libc = "0.2.186"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-russh = "0.62"
+# Switched to ring backend to avoid aws-lc-rs -> glibc >= 2.38 requirement.
+russh = { version = "0.62", default-features = false, features = ["ring"] }
 zeroize = { version = "1.6", features = ["derive"] }
 dialoguer = "0.12"
 thiserror = "2.0"
