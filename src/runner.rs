@@ -11,6 +11,12 @@ use tracing::{Instrument, info, warn};
 // ── Validation helpers (public – also used in main) ────────
 
 /// Validate that a remote path looks safe to pass to SSH exec.
+///
+/// Rejects:
+/// - unexpected characters
+/// - relative paths
+/// - paths containing `..`
+/// - paths under world-writable directories (`/tmp`, `/var/tmp`, `/dev/shm`)
 pub fn validate_remote_path(path: &str) -> Result<(), String> {
     if path.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_./".contains(c)) {
         return Err(format!(
@@ -19,6 +25,18 @@ pub fn validate_remote_path(path: &str) -> Result<(), String> {
     }
     if !path.starts_with('/') {
         return Err("remote path must be absolute".to_string());
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        return Err("remote path must not contain '..'".to_string());
+    }
+    let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    for bad in ["/tmp", "/var/tmp", "/dev/shm"] {
+        if dir == bad || dir.starts_with(&format!("{bad}/")) {
+            return Err(format!(
+                "--remote-path {path} lives under {bad} (mode 1777): anyone on the target \
+                 could replace the binary between upload and the sudo exec"
+            ));
+        }
     }
     Ok(())
 }

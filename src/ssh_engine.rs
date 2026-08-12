@@ -244,9 +244,11 @@ async fn upload_via_channel(
         channel
             .exec(
                 true,
+                // Security: drop any pre-created staging inode (rm -f),
+                // create with umask 077, set absolute mode 700, then atomic replace.
                 format!(
-                    "cat > {}.tmp && mv {}.tmp {} && chmod +x {}",
-                    remote_path, remote_path, remote_path, remote_path
+                    "rm -f -- {p}.tmp && umask 077 && cat > {p}.tmp && chmod 700 -- {p}.tmp && mv -f -- {p}.tmp {p}",
+                    p = remote_path
                 ),
             )
             .await
@@ -298,7 +300,7 @@ async fn upload_via_channel(
             }),
         }
     }
-    .await;
+        .await;
 
     pb.finish_and_clear();
 
