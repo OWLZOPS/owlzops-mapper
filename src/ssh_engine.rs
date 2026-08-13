@@ -39,8 +39,8 @@ pub enum RemoteError {
     Ssh { host: String, source: russh::Error },
     #[error("authentication failed for {user}@{host}")]
     Auth { host: String, user: String },
-    #[error("sudo rejected password on {host}")]
-    SudoAuth { host: String },
+    #[error("sudo authentication failed on {host}: {detail}")]
+    SudoAuth { host: String, detail: String },
     #[error("timeout on {host}")]
     Timeout { host: String },
     #[error("remote command exited with {code} on {host}: {stderr}")]
@@ -105,6 +105,7 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
         if p.is_empty() {
             return Err(RemoteError::SudoAuth {
                 host: "localhost".to_string(),
+                detail: "empty sudo password entered".to_string(),
             });
         }
         return Ok(Zeroizing::new(p));
@@ -121,6 +122,7 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
     if pass.is_empty() {
         return Err(RemoteError::SudoAuth {
             host: "localhost".to_string(),
+            detail: "empty sudo password provided via stdin".to_string(),
         });
     }
     Ok(Zeroizing::new(pass))
@@ -587,8 +589,14 @@ pub async fn run_remote_scan_russh(
                         || se.contains("Sorry, try again")
                         || se.contains("a password is required"))
                 {
+                    tracing::error!(
+                        host = %hostname,
+                        stderr = %se.trim(),
+                        "sudo authentication failed on remote host"
+                    );
                     Err(RemoteError::SudoAuth {
                         host: hostname.clone(),
+                        detail: se.trim().to_string(),
                     })
                 } else if !stdout.is_empty() && stdout.starts_with(b"{") {
                     Ok(stdout)
