@@ -287,6 +287,45 @@ async fn sudo_is_passwordless(session: &client::Handle<ClientHandler>, remote_pa
     .is_ok()
 }
 
+/// Validate sudo credentials before uploading anything.
+///
+/// Runs `sudo -k -S -p '' -- true` on the remote host and feeds the password
+/// via stdin. This avoids uploading a 10MB binary only to discover that the
+/// password was wrong (wasted round-trips and leftover files).
+async fn validate_sudo_password(
+    session: &client::Handle<ClientHandler>,
+    sudo_pass: &Zeroizing<String>,
+    host: &str,
+) -> Result<(), RemoteError> {
+    let mut ch = session.channel_open_session().await?;
+    ch.exec(true, "LC_ALL=C sudo -k -S -p '' -- true").await?;
+
+    let mut line = Zeroizing::new(sudo_pass.to_string());
+    line.push('\n');
+    ch.data(line.as_bytes()).await?;
+    ch.eof().await?;
+
+    let mut stderr = Vec::new();
+    let mut exit_code = None;
+    while let Some(msg) = ch.wait().await {
+        match msg {
+            ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    let se = String::from_utf8_lossy(&stderr);
+    if exit_code != Some(0) || se.contains("incorrect password") || se.contains("Sorry") {
+        return Err(RemoteError::SudoAuth {
+            host: host.to_string(),
+            detail: crate::utils::sanitize_for_log(se.trim()),
+        });
+    }
+    Ok(())
+}
+
 /// Upload a binary file over an existing russh channel by piping `cat > path`
 /// and feeding the file in chunks. If `upload_pb` is provided it is used to
 /// show progress; otherwise a hidden bar is substituted so call sites do not
@@ -548,6 +587,12 @@ pub async fn run_remote_scan_russh(
             host: hostname.clone(),
             user: ssh_user.to_string(),
         });
+    }
+
+    // Pre-flight sudo password check: fail early, before any upload or directory
+    // creation, if the password is wrong.
+    if let Some(pass) = sudo_pass {
+        validate_sudo_password(&session, pass, &hostname).await?;
     }
 
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
