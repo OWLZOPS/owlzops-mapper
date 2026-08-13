@@ -756,7 +756,14 @@ pub async fn run_remote_scan_russh(
     // Teardown always executes, even after Elapsed.
     if uploaded.load(Ordering::Relaxed) && !keep_binary {
         cleanup_remote_binary(&session, &actual_remote_path, &hostname).await;
+    } else if uploaded.load(Ordering::Relaxed) && keep_binary {
+        tracing::warn!(
+            host = %hostname,
+            path = %actual_remote_path,
+            "binary kept on remote host (--keep-binary); remove it manually if needed"
+        );
     }
+
     let _ = tokio::time::timeout(
         Duration::from_secs(5),
         session.disconnect(russh::Disconnect::ByApplication, "audit complete", "en"),
