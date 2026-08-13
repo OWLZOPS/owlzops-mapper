@@ -14,20 +14,51 @@ use zeroize::Zeroizing;
 use crate::known_hosts::KnownHostsChecker;
 use crate::safe_io;
 
+// ---------------------------------------------------------------------------
+// Remote channel constants
+// ---------------------------------------------------------------------------
+
+/// Hard cap for stderr of the **main** remote audit command.
 const CAP_REMOTE_STDERR: usize = 256 * 1024; // 256 KiB
+
+/// Every short probe (`mktemp`, `sudo -n` check) carries its own deadline.
+/// The sum of probes still has to fit inside the host budget; a single wedged
+/// channel can no longer outlive it.
 const PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Cap for stdout/stderr of a short probe. A hostile host replacing `mktemp`
+/// with `/dev/zero` must not OOM the scanner. Truncation is recorded in
+/// coverage (Raw Truth), not silently dropped.
 const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 
+// ---------------------------------------------------------------------------
+// Sudo outcome classification
+// ---------------------------------------------------------------------------
+
+/// Result of a `sudo` probe. Never a bare bool: "not permitted" and "the
+/// binary would not start" are different facts and must not collapse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SudoOutcome {
     Ok,
+    /// `sudo -n` could not proceed; credentials are needed but were not supplied.
     PasswordRequired,
+    /// A password was supplied and rejected.
     BadPassword,
+    /// `Defaults requiretty`.
     NeedsTty,
+    /// sudoers does not authorise this command for this user.
     NotPermitted,
+    /// Recognised nothing. Never treated as success.
     Unknown,
 }
 
+/// Single source of truth for sudo's stderr.
+///
+/// Refines an ALREADY-FAILING exit code — sudo prints warnings on success too,
+/// so this must never be used to declare success on its own.
+///
+/// Order matters: the authorization wordings also contain "Sorry", so
+/// `NeedsTty` and `NotPermitted` are checked first.
 pub(crate) fn classify_sudo_stderr(se: &str) -> SudoOutcome {
     if se.contains("no tty present") || se.contains("you must have a tty") {
         SudoOutcome::NeedsTty
@@ -46,6 +77,10 @@ pub(crate) fn classify_sudo_stderr(se: &str) -> SudoOutcome {
         SudoOutcome::Unknown
     }
 }
+
+// ---------------------------------------------------------------------------
+// Remote errors
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -73,6 +108,10 @@ pub enum RemoteError {
     Auth { host: String, user: String },
     #[error("sudo authentication failed on {host}: {detail}")]
     SudoAuth { host: String, detail: String },
+    /// `Defaults requiretty` is a deliberate host policy. We refuse to defeat
+    /// it by allocating a PTY; instead we tell the operator how to install the
+    /// binary at a fixed path and grant NOPASSWD for that path. Recommending a
+    /// staging path under /tmp would be `NOPASSWD: ALL` in disguise.
     #[error(
         "host {host} has `Defaults requiretty` in sudoers — sudo refuses to run without a \
          terminal. This is a deliberate host policy; owlzops-mapper will not defeat it. \
@@ -84,6 +123,8 @@ pub enum RemoteError {
     SudoRequiresTty { host: String, path: String },
     #[error("timeout on {host}")]
     Timeout { host: String },
+    /// Not a timeout: the channel closed without ever reporting an exit
+    /// status. Saying "timeout" would send the operator after --remote-timeout.
     #[error("channel on {host} closed without an exit status while running `{cmd}`")]
     ChannelClosedEarly { host: String, cmd: String },
     #[error("remote command exited with {code} on {host}: {stderr}")]
@@ -96,6 +137,7 @@ pub enum RemoteError {
     UploadFailed { host: String, detail: String },
 }
 
+// Required by russh::client::Handler::Error bound
 impl From<russh::Error> for RemoteError {
     fn from(source: russh::Error) -> Self {
         RemoteError::Ssh {
@@ -114,6 +156,10 @@ impl RemoteError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Client handler
+// ---------------------------------------------------------------------------
+
 struct ClientHandler {
     known_hosts_checker: KnownHostsChecker,
 }
@@ -129,6 +175,12 @@ impl client::Handler for ClientHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sudo password resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve sudo password from environment or interactive prompt. The returned
+/// string is zeroizing; never log it.
 pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
     if let Ok(p) = std::env::var("OWLZOPS_SUDO_PASS")
         && !p.is_empty()
@@ -170,7 +222,12 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
     Ok(Zeroizing::new(pass))
 }
 
+// ---------------------------------------------------------------------------
+// Host/port parsing and TCP hardening
+// ---------------------------------------------------------------------------
+
 pub(crate) fn split_host_port(host: &str) -> (String, u16) {
+    // [addr]:port
     if let Some(rest) = host.strip_prefix('[')
         && let Some((addr, tail)) = rest.split_once(']')
     {
@@ -180,9 +237,11 @@ pub(crate) fn split_host_port(host: &str) -> (String, u16) {
             .unwrap_or(22);
         return (addr.to_string(), port);
     }
+    // bare IPv6 (>=2 colons, no brackets)
     if host.matches(':').count() >= 2 {
         return (host.to_string(), 22);
     }
+    // host:port
     if let Some((h, p)) = host.rsplit_once(':')
         && !p.is_empty()
         && p.bytes().all(|b| b.is_ascii_digit())
@@ -192,6 +251,10 @@ pub(crate) fn split_host_port(host: &str) -> (String, u16) {
     (host.to_string(), 22)
 }
 
+/// Kernel-level dead-transport detection. Idle-death of a peer is detected
+/// within ~KEEPIDLE + KEEPINTVL*KEEPCNT seconds (≈60 s). TCP_USER_TIMEOUT
+/// ensures that unsent data does not hang in retransmissions beyond that window
+/// when the budget expires.
 #[cfg(target_os = "linux")]
 fn harden_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     const KEEPIDLE_S: libc::c_int = 30;
@@ -204,6 +267,7 @@ fn harden_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
         name: libc::c_int,
         v: &T,
     ) -> std::io::Result<()> {
+        // SAFETY: pointer and size match T; kernel copies value synchronously.
         let rc = unsafe {
             libc::setsockopt(
                 fd,
@@ -237,15 +301,25 @@ fn harden_tcp(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn harden_tcp(_stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    // macOS: SO_KEEPALIVE exists, but TCP_KEEPIDLE/USER_TIMEOUT don't.
+    // Dead-transport detection is handled by application-level tokio deadlines.
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Short probe helpers (mktemp, sudo -n)
+// ---------------------------------------------------------------------------
+
+/// Append `data` to `buf` up to `PROBE_OUTPUT_CAP`. Returns whether all data
+/// fit; if false, the rest is discarded and the caller records the truncation.
 fn push_capped(buf: &mut Vec<u8>, data: &[u8]) -> bool {
     let room = PROBE_OUTPUT_CAP.saturating_sub(buf.len());
     buf.extend_from_slice(&data[..room.min(data.len())]);
     room >= data.len()
 }
 
+/// Execute a short command on the remote host, returning trimmed stdout.
+/// The caller is responsible for any timeout — this inner function has none.
 async fn exec_capture_inner(
     session: &client::Handle<ClientHandler>,
     host: &str,
@@ -281,6 +355,7 @@ async fn exec_capture_inner(
             code,
             stderr: crate::utils::sanitize_for_log(&String::from_utf8_lossy(&stderr)),
         }),
+        // Channel closed without exit status: not a timeout.
         None => Err(RemoteError::ChannelClosedEarly {
             host: host.to_string(),
             cmd: cmd.to_string(),
@@ -288,6 +363,7 @@ async fn exec_capture_inner(
     }
 }
 
+/// Execute a short command with its own deadline.
 async fn exec_capture(
     session: &client::Handle<ClientHandler>,
     host: &str,
@@ -300,6 +376,18 @@ async fn exec_capture(
         })?
 }
 
+// ---------------------------------------------------------------------------
+// Remote staging (temporary until R25-04/R25-07)
+// ---------------------------------------------------------------------------
+
+/// Create a private staging directory on the remote host.
+///
+/// `mktemp -d` gives mode 0700 and an unpredictable name in one atomic step —
+/// no pre-created inode to inherit, no sticky-directory race (R24-41/R24-96).
+///
+/// TODO R25-04: choose root (`/var/tmp` first, fallback `/tmp`) based on
+/// `/proc/mounts` to avoid `noexec`.
+/// TODO R25-07: replace the ad-hoc validation with `staging_dir_is_sane`.
 async fn make_remote_staging(
     session: &client::Handle<ClientHandler>,
     host: &str,
@@ -307,6 +395,7 @@ async fn make_remote_staging(
     let out = exec_capture(session, host, "LC_ALL=C mktemp -d /tmp/owlzops-XXXXXXXX").await?;
     let dir = out.trim();
 
+    // Temporary validation; will be replaced by staging_dir_is_sane.
     let ok = dir.starts_with("/tmp/owlzops-")
         && dir.len() < 128
         && dir
@@ -324,6 +413,19 @@ async fn make_remote_staging(
     Ok(format!("{dir}/owlzops-mapper"))
 }
 
+// ---------------------------------------------------------------------------
+// Pre-flight sudo password check
+// ---------------------------------------------------------------------------
+
+/// Validate sudo credentials **before** uploading anything.
+///
+/// Runs `sudo -k -S -p '' -- true` and feeds the password via stdin. If the
+/// password is wrong, we return early and do not create a staging directory or
+/// transfer a 10 MB binary.
+///
+/// R25-02: remote stderr is sanitized ONCE, here, and the sanitized `detail`
+/// flows to the caller. We deliberately do NOT emit a raw `tracing::error!`
+/// here; the caller logs the final `RemoteError` once.
 async fn validate_sudo_password(
     session: &client::Handle<ClientHandler>,
     sudo_pass: &Zeroizing<String>,
@@ -359,7 +461,7 @@ async fn validate_sudo_password(
         return Err(match outcome {
             SudoOutcome::NeedsTty => RemoteError::SudoRequiresTty {
                 host: host.to_string(),
-                path: String::new(), // TODO: fill with actual path if available
+                path: String::new(), // Path not known yet; filled by caller if needed
             },
             _ => RemoteError::SudoAuth {
                 host: host.to_string(),
@@ -370,6 +472,16 @@ async fn validate_sudo_password(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Binary upload
+// ---------------------------------------------------------------------------
+
+/// Upload a binary file over an existing russh channel.
+///
+/// The directory may be `mktemp`-owned (0700, unpredictable) or operator
+/// supplied; in both cases the file is written to a temporary `.part` and
+/// atomically moved to the final name. The rename ensures no partially written
+/// file is ever executable.
 async fn upload_via_channel(
     channel: &mut Channel<client::Msg>,
     local_bin: &str,
@@ -468,6 +580,16 @@ async fn upload_via_channel(
     res
 }
 
+// ---------------------------------------------------------------------------
+// Cleanup
+// ---------------------------------------------------------------------------
+
+/// Best-effort removal of the uploaded binary.
+///
+/// TODO R25-06: This currently decides `rm -rf` based on a string prefix
+/// (`/tmp/owlzops-`). That is unsafe: an operator-provided path like
+/// `/tmp/owlzops-mine/mapper` would also match and be recursively deleted.
+/// Replace with `Staging` enum that records ownership at creation time.
 async fn cleanup_remote_binary(
     session: &client::Handle<ClientHandler>,
     remote_path: &str,
@@ -507,6 +629,10 @@ async fn cleanup_remote_binary(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main remote scan
+// ---------------------------------------------------------------------------
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_remote_scan_russh(
     host: &str,
@@ -544,6 +670,7 @@ pub async fn run_remote_scan_russh(
         );
     }
 
+    // Kernel-level dead-transport detection; best-effort
     if let Err(e) = harden_tcp(&stream) {
         tracing::warn!(
             host = %hostname,
@@ -552,6 +679,8 @@ pub async fn run_remote_scan_russh(
         );
     }
 
+    // Internal SSH timers removed – duration is entirely controlled
+    // by external tokio deadlines (connect / handshake+auth / overall).
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: None,
@@ -567,6 +696,8 @@ pub async fn run_remote_scan_russh(
         })?,
     };
 
+    // Wrap handshake + auth in a 30-second deadline; load key
+    // before the deadline so local disk I/O does not count against it.
     let ssh_key_path = ssh_key_path.to_string();
     let key = tokio::task::spawn_blocking(move || load_secret_key(&ssh_key_path, None))
         .await
@@ -606,13 +737,19 @@ pub async fn run_remote_scan_russh(
 
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
     let uploaded = AtomicBool::new(false);
+
+    // Store the actual staging path so teardown can know it even after the
+    // overall timeout. Mutex is used because the async block may be dropped by
+    // `timeout` while teardown still needs the value.
     let staging_path: Mutex<Option<String>> = Mutex::new(None);
 
     let result = tokio::time::timeout(overall, async {
+        // Pre-flight sudo password check (R25-03: inside overall budget)
         if let Some(pass) = sudo_pass {
             validate_sudo_password(&session, pass, &hostname).await?;
         }
 
+        // Determine actual remote path
         let actual_remote_path: String;
         if copy_binary {
             if let Some(p) = remote_path {
@@ -635,6 +772,7 @@ pub async fn run_remote_scan_russh(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(actual_remote_path.clone());
 
+        // Upload binary if requested
         if copy_binary {
             let default_exe = std::path::PathBuf::from("./owlzops-mapper");
             let current_exe = std::env::current_exe().unwrap_or(default_exe);
@@ -660,6 +798,14 @@ pub async fn run_remote_scan_russh(
             .await
             .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
+        // Decide whether to use sudo.
+        //
+        // If sudo_pass is provided, we use -S. If not, but NOPASSWD is
+        // available, we use sudo -n automatically. If sudo is unavailable,
+        // we record a coverage warning (degraded scan) but DO NOT silently
+        // fall back to an unprivileged scan without telling the report.
+        //
+        // R25-05: classify the probe result, never collapse to bool.
         let use_sudo = if sudo_pass.is_some() {
             true
         } else {
@@ -694,6 +840,9 @@ pub async fn run_remote_scan_russh(
                                 detail: crate::utils::sanitize_for_log(&stderr),
                             });
                         }
+                        // The binary itself did not start (noexec, wrong arch,
+                        // truncated upload). Silently dropping to unprivileged
+                        // scan would hand back a clean-looking report.
                         SudoOutcome::Unknown => {
                             return Err(RemoteError::UploadFailed {
                                 host: hostname.clone(),
@@ -734,6 +883,7 @@ pub async fn run_remote_scan_russh(
                 actual_remote_path, deep_arg
             )
         };
+        // Keep a copy for ChannelClosedEarly error (cmd is moved into exec).
         let cmd_for_error = cmd.clone();
         exec_channel
             .exec(true, cmd)
@@ -850,12 +1000,15 @@ pub async fn run_remote_scan_russh(
     })
     .await;
 
+    // Teardown always executes, even after Elapsed.
+    //
+    // We must not hold a MutexGuard across .await; clone the Option<String>
+    // and drop the guard immediately. This preserves Send for the outer task.
     if uploaded.load(Ordering::Relaxed) {
         let maybe_path = staging_path
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        // MutexGuard is dropped here; it must not live across .await.
         if let Some(path) = maybe_path {
             if !keep_binary {
                 cleanup_remote_binary(&session, &path, &hostname).await;
