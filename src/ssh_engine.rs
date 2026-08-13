@@ -589,11 +589,6 @@ pub async fn run_remote_scan_russh(
                         || se.contains("Sorry, try again")
                         || se.contains("a password is required"))
                 {
-                    tracing::error!(
-                        host = %hostname,
-                        stderr = %se.trim(),
-                        "sudo authentication failed on remote host"
-                    );
                     Err(RemoteError::SudoAuth {
                         host: hostname.clone(),
                         detail: se.trim().to_string(),
