@@ -318,6 +318,11 @@ async fn validate_sudo_password(
 
     let se = String::from_utf8_lossy(&stderr);
     if exit_code != Some(0) || se.contains("incorrect password") || se.contains("Sorry") {
+        tracing::error!(
+            host = %host,
+            stderr = %se.trim(),
+            "sudo password validation failed before upload"
+        );
         return Err(RemoteError::SudoAuth {
             host: host.to_string(),
             detail: crate::utils::sanitize_for_log(se.trim()),
