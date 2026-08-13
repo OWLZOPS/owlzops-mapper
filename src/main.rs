@@ -261,7 +261,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         ssh_user: String::new(),
                         ssh_key: String::new(),
                         copy_binary: false,
-                        remote_path: String::new(),
+                        remote_path: None,
                         local_binary: None,
                         ..args.clone()
                     };
@@ -375,7 +375,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 warn!("{e}");
                                 return None;
                             }
-                            if let Err(e) = runner::validate_remote_path(&a.remote_path) {
+                            if let Some(rp) = &a.remote_path
+                                && let Err(e) = runner::validate_remote_path(rp)
+                            {
                                 warn!("{e}");
                                 return None;
                             }
@@ -391,7 +393,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     &host,
                                     &a.ssh_user,
                                     &ssh_key_expanded,
-                                    &a.remote_path,
+                                    a.remote_path.as_deref(),
                                     pass.as_deref(),
                                     a.copy_binary,
                                     a.keep_binary,

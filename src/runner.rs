@@ -398,7 +398,7 @@ async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentRepo
         host,
         &args.ssh_user,
         &ssh_key_expanded,
-        &args.remote_path,
+        args.remote_path.as_deref(),
         None, // sudo_pass
         args.copy_binary,
         args.keep_binary,

@@ -61,10 +61,13 @@ pub struct AuditArgs {
     #[arg(long, default_value_t = false)]
     pub copy_binary: bool,
 
-    /// Upload target. MUST NOT live in a world-writable directory: the binary
-    /// is executed under sudo, so anyone able to replace it gets root.
-    #[arg(long, default_value = "/root/.cache/owlzops-mapper")]
-    pub remote_path: String,
+    /// Where to place the binary on the remote host. When omitted, a private
+    /// directory is created there with `mktemp -d` (mode 0700, unpredictable
+    /// name) and removed afterwards — this is the recommended form.
+    /// An explicit path is validated: a group/world-writable parent is refused,
+    /// because the binary is executed under sudo (R24-41).
+    #[arg(long)]
+    pub remote_path: Option<String>,
 
     #[arg(long)]
     pub local_binary: Option<String>,
