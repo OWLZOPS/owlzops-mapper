@@ -224,20 +224,94 @@ pub fn canon_path(path: &str) -> Cow<'_, str> {
 // Log sanitization (R16 hardening)
 // ---------------------------------------------------------------------------
 
-/// Neutralise C0/C1 control bytes (incl. \n and ESC) before they reach a
-/// terminal-backed tracing sink. \t is kept as a single space for readability.
-pub fn sanitize_for_log(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c == '\t' {
-                ' '
-            } else if c.is_control() {
-                '\u{FFFD}'
-            } else {
-                c
+/// Strip ANSI escape sequences from `s`.
+///
+/// Handles CSI, OSC, DCS, and simple ESC sequences based on the ANSI escape
+/// code grammar. The state machine advances over the escape sequence and
+/// returns a new string without them.
+fn strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1B {
+            // ESC found, try to parse the sequence.
+            i += 1;
+            if i >= bytes.len() {
+                break;
             }
-        })
-        .collect()
+
+            match bytes[i] {
+                // CSI: ESC [ ... final byte 0x40-0x7E
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1; // skip final byte
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \)
+                b']' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // DCS, SOS, PM, APC: ESC P/X/^/_ ... terminated by ST (ESC \)
+                b'P' | b'X' | b'^' | b'_' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Simple escape: ESC followed by a single character in 0x30..=0x7E
+                c if (0x30..=0x7E).contains(&c) => {
+                    i += 1; // skip the character
+                }
+                // Invalid or unknown, skip the ESC itself
+                _ => {}
+            }
+        } else {
+            // Copy non-ESC bytes, but we'll later filter control chars.
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    // Convert back to UTF-8, replacing invalid sequences.
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+/// Replace all control characters with spaces, then truncate to `max_chars`.
+fn sanitize_and_truncate(s: &str, max_chars: usize) -> String {
+    let stripped = strip_ansi(s);
+    let sanitized: String = stripped
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    sanitized.chars().take(max_chars).collect()
+}
+
+/// Neutralise C0/C1 control bytes and ANSI escape sequences before they reach
+/// a terminal-backed tracing sink. The result is safe to embed in log messages
+/// and terminal output, truncated to 300 characters.
+pub fn sanitize_for_log(s: &str) -> String {
+    sanitize_and_truncate(s, 300)
 }
 
 // ---------------------------------------------------------------------------
@@ -976,5 +1050,25 @@ mod tests {
         // The carve-out must not leak to the rest of /run.
         assert!(is_volatile_exec_path("/run/user/1000/.x/implant"));
         assert!(is_volatile_exec_path("/run/wrappersX/payload"));
+    }
+
+    // --- New tests for sanitize_for_log ---
+
+    #[test]
+    fn sanitize_for_log_removes_ansi_csi_sequences() {
+        let input = "\x1b[31mred\x1b[0m text";
+        assert_eq!(sanitize_for_log(input), "red text");
+    }
+
+    #[test]
+    fn sanitize_for_log_replaces_control_chars_with_spaces() {
+        let input = "hello\x01\x1b[2Jworld";
+        assert_eq!(sanitize_for_log(input), "hello world");
+    }
+
+    #[test]
+    fn sanitize_for_log_truncates_to_300_chars() {
+        let input = "a".repeat(500);
+        assert_eq!(sanitize_for_log(&input).chars().count(), 300);
     }
 }
