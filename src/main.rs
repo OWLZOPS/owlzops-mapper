@@ -107,6 +107,18 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
         Commands::Audit(args) => {
+            // R25-12: --keep-binary exists to avoid re-uploading. With mktemp
+            // staging the next run picks a fresh random directory, so nothing
+            // is ever reused: the flag only accumulates leftovers. Refuse the
+            // combination up front.
+            if args.keep_binary && args.copy_binary && args.remote_path.is_none() {
+                eprintln!(
+                    "--keep-binary requires an explicit --remote-path: with the default \
+                     mktemp staging the kept binary can never be reused, only left behind"
+                );
+                return 2;
+            }
+
             let mut hosts: Vec<String> = Vec::new();
             for h in &args.host {
                 hosts.push(h.clone());
