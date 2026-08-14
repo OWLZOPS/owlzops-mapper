@@ -1899,6 +1899,7 @@ mod tests {
                 ..Default::default()
             },
             self_integrity: None,
+            failed_scanners: Vec::new(),
         }
     }
 

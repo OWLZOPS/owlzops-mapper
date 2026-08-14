@@ -26,6 +26,8 @@ pub struct AgentReport {
     pub scan_warnings: Vec<String>,
     #[serde(default)]
     pub coverage_warnings: Vec<String>,
+    #[serde(default)]
+    pub failed_scanners: Vec<String>,
     #[serde(default = "default_scoring_version")]
     pub scoring_version: u8,
     /// Self‑integrity preflight result. None = check not performed or legacy snapshot.
@@ -60,6 +62,7 @@ impl Default for AgentReport {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            failed_scanners: Vec::new(),
         }
     }
 }

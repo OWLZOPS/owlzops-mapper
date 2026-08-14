@@ -184,10 +184,12 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         );
 
         let mut scan_warnings = Vec::new();
+        let mut failed_scanners = Vec::new();
 
         let host_info = host_res.unwrap_or_else(|e| {
             warn!(scanner = "host", error = ?e, "scanner panicked");
             scan_warnings.push("host scanner panicked".to_string());
+            failed_scanners.push("host".to_string());
             crate::models::HostInfo {
                 hostname: "unknown".to_string(),
                 ..Default::default()
@@ -196,16 +198,19 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         let dbs = dbs_res.unwrap_or_else(|e| {
             warn!(scanner = "databases", error = ?e, "scanner panicked");
             scan_warnings.push("databases scanner panicked".to_string());
+            failed_scanners.push("databases".to_string());
             vec![]
         });
         let network_info = network_res.unwrap_or_else(|e| {
             warn!(scanner = "network", error = ?e, "scanner panicked");
             scan_warnings.push("network scanner panicked".to_string());
+            failed_scanners.push("network".to_string());
             crate::models::NetworkInfo::default()
         });
         let storage_info = storage_res.unwrap_or_else(|e| {
             warn!(scanner = "storage", error = ?e, "scanner panicked");
             scan_warnings.push("storage scanner panicked".to_string());
+            failed_scanners.push("storage".to_string());
             crate::models::StorageInfo::default()
         });
         let security_info = security_res.unwrap_or_else(|e| {
@@ -213,17 +218,20 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             scan_warnings.push(
                 "security scanner panicked — SSH/sudo/sysctl fields NOT verified".to_string(),
             );
+            failed_scanners.push("security".to_string());
             crate::models::SecurityInfo::default()
         });
         let packages_info = packages_res.unwrap_or_else(|e| {
             warn!(scanner = "packages", error = ?e, "scanner panicked");
             scan_warnings.push("packages scanner panicked".to_string());
+            failed_scanners.push("packages".to_string());
             crate::models::PackagesInfo::default()
         });
 
         let topology_info = topology_info.unwrap_or_else(|e| {
             warn!(scanner = "docker", error = ?e, "docker scanner panicked");
             scan_warnings.push("docker scanner panicked".to_string());
+            failed_scanners.push("docker".to_string());
             crate::models::TopologyInfo::default()
         });
 
@@ -232,6 +240,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             scan_warnings.push(format!(
                 "persistence scanner panicked — {PERSISTENCE_IDS} NOT verified"
             ));
+            failed_scanners.push("persistence".to_string());
             PersistenceScan::default()
         });
 
@@ -250,6 +259,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             is_root_execution: is_root,
             scan_warnings,
             coverage_warnings,
+            failed_scanners,
             host: host_info,
             databases: dbs,
             network: network_info,

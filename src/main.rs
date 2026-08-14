@@ -1001,6 +1001,7 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            failed_scanners: Vec::new(),
         }
     }
 

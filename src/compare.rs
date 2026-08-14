@@ -1433,6 +1433,7 @@ mod tests {
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
             self_integrity: None,
+            failed_scanners: Vec::new(),
         }
     }
 
