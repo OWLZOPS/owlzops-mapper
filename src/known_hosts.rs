@@ -78,6 +78,74 @@ impl KnownHostsChecker {
         }
     }
 
+    /// Host key algorithms already pinned for this host in either trust store.
+    /// Constraining the SSH offer to these prevents russh preference changes
+    /// from turning into fleet-wide HostKeyChanged (R25-30). Empty = unknown
+    /// host; caller should fall back to the default set.
+    pub fn pinned_algorithms(&self) -> Vec<russh::keys::ssh_key::Algorithm> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        for path in [&self.system_file, &self.pin_file] {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                let mut f = line.split_whitespace();
+                let (Some(hf), Some(kt), Some(_kd)) = (f.next(), f.next(), f.next()) else {
+                    continue;
+                };
+
+                if !self.line_host_matches(hf) {
+                    continue;
+                }
+
+                let Some(alg) = Self::algorithm_from_openssh_name(kt) else {
+                    continue;
+                };
+
+                // Algorithm does not implement Ord/Hash in every russh version;
+                // use a stable debug key for deduplication.
+                if seen.insert(format!("{alg:?}")) {
+                    out.push(alg);
+                }
+            }
+        }
+
+        out
+    }
+
+    fn algorithm_from_openssh_name(name: &str) -> Option<russh::keys::ssh_key::Algorithm> {
+        use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
+
+        match name {
+            "ssh-ed25519" => Some(Algorithm::Ed25519),
+            "ssh-rsa" => Some(Algorithm::Rsa { hash: None }),
+            "rsa-sha2-256" => Some(Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            }),
+            "rsa-sha2-512" => Some(Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            }),
+            "ecdsa-sha2-nistp256" => Some(Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            }),
+            "ecdsa-sha2-nistp384" => Some(Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP384,
+            }),
+            "ecdsa-sha2-nistp521" => Some(Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP521,
+            }),
+            _ => None,
+        }
+    }
+
     /// Verify the presented server key.
     ///
     /// Logic:

@@ -957,19 +957,36 @@ pub async fn run_remote_scan_russh(
         );
     }
 
+    let known_hosts_checker =
+        KnownHostsChecker::new(hostname.clone(), port).map_err(|e| RemoteError::HostKeyCheck {
+            host: hostname.clone(),
+            detail: e.to_string(),
+        })?;
+
+    let pinned = known_hosts_checker.pinned_algorithms();
+
+    // Constrain the server's host key choice to algorithms already present in
+    // known_hosts. Without this, a russh preference change can make the entire
+    // fleet see HostKeyChanged on a legitimate server (R25-30).
+    let preferred = if pinned.is_empty() {
+        // Unknown host: keep the default offer; verify() will TOFU the key.
+        russh::Preferred::default()
+    } else {
+        russh::Preferred {
+            key: pinned.into(),
+            ..russh::Preferred::default()
+        }
+    };
+
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: None,
+        preferred,
         ..Default::default()
     });
 
     let handler = ClientHandler {
-        known_hosts_checker: KnownHostsChecker::new(hostname.clone(), port).map_err(|e| {
-            RemoteError::HostKeyCheck {
-                host: hostname.clone(),
-                detail: e.to_string(),
-            }
-        })?,
+        known_hosts_checker,
     };
 
     let ssh_key_path = ssh_key_path.to_string();
