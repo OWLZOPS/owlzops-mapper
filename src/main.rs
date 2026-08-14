@@ -17,7 +17,7 @@ mod utils;
 mod verdict_cache;
 
 use crate::utils::host_budget_secs;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[cfg(feature = "local-scan")]
@@ -49,6 +49,9 @@ pub(crate) const FLEET_TEARDOWN_GRACE: Duration = Duration::from_secs(10);
 const HARD_EXIT_MARGIN: Duration = Duration::from_secs(5);
 /// Time allowed for the JSONL writer to drain after the scan loop finishes.
 pub(crate) const JSONL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Exit code for invalid CLI usage. Outside the 0..=3 verdict band (R25-36).
+const EXIT_USAGE: i32 = 64; // sysexits.h EX_USAGE
 
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
@@ -130,7 +133,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     "--keep-binary requires an explicit --remote-path: with the default \
                      mktemp staging the kept binary can never be reused, only left behind"
                 );
-                return 2;
+                return EXIT_USAGE;
             }
 
             let mut hosts: Vec<String> = Vec::new();
@@ -147,7 +150,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             "Failed to read hosts file {:?}: {} — refusing to silently fall back to a LOCAL scan",
                             path, e
                         );
-                        return 2;
+                        return EXIT_USAGE;
                     }
                 };
                 let before = hosts.len();
@@ -159,7 +162,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 }
                 if hosts.len() == before && args.host.is_empty() {
                     eprintln!("hosts file {:?} contains no usable host entries", path);
-                    return 2;
+                    return EXIT_USAGE;
                 }
             }
 
@@ -191,7 +194,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         Ok(p) => Some(Arc::new(p)),
                         Err(e) => {
                             eprintln!("Error: {e}");
-                            return 2;
+                            return EXIT_USAGE;
                         }
                     }
                 } else {
@@ -693,7 +696,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 eprintln!(
                     "Local audit is not supported on this platform. Use --host to scan a remote host."
                 );
-                2 // ← clippy: needless_return removed
+                EXIT_USAGE
             }
         }
 
@@ -925,7 +928,22 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    let matches = match Cli::command().try_get_matches() {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
