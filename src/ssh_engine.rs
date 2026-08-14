@@ -42,6 +42,10 @@ const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 /// separate from the overall per-host budget.
 const UPLOAD_BUDGET: Duration = Duration::from_secs(120);
 
+/// No progress for this long during a single write means the transfer is dead.
+/// A slow link is not a dead link; bounding stall punishes only actual hangs.
+const UPLOAD_STALL_BUDGET: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Sudo outcome classification
 // ---------------------------------------------------------------------------
@@ -442,13 +446,13 @@ pub(crate) enum RemoteArtifact {
     /// `mktemp -d` created this directory for us: the whole subtree is ours.
     OwnedDir { dir: String, bin: String },
     /// We wrote a file into an operator-supplied directory. Only that file.
-    UploadedFile { bin: String },
+    UploadedFile { bin: String, part: String },
 }
 
 impl RemoteArtifact {
     pub(crate) fn bin(&self) -> &str {
         match self {
-            Self::OwnedDir { bin, .. } | Self::UploadedFile { bin } => bin,
+            Self::OwnedDir { bin, .. } | Self::UploadedFile { bin, .. } => bin,
         }
     }
 
@@ -457,8 +461,8 @@ impl RemoteArtifact {
     pub(crate) fn teardown_cmd(&self, replaced: bool) -> String {
         match self {
             Self::OwnedDir { dir, .. } => format!("rm -rf -- {dir}"),
-            Self::UploadedFile { bin } if !replaced => format!("rm -f -- {bin}.part"),
-            Self::UploadedFile { bin } => format!("rm -f -- {bin} {bin}.part"),
+            Self::UploadedFile { part, .. } if !replaced => format!("rm -f -- {part}"),
+            Self::UploadedFile { bin, .. } => format!("rm -f -- {bin}"),
         }
     }
 }
@@ -649,6 +653,7 @@ async fn upload_via_channel(
     channel: &mut Channel<client::Msg>,
     local_bin: &str,
     remote_path: &str,
+    part_path: &str,
     host: &str,
     upload_pb: Option<ProgressBar>,
 ) -> Result<(), RemoteError> {
@@ -683,8 +688,9 @@ async fn upload_via_channel(
             .exec(
                 true,
                 format!(
-                    "set -C; umask 077; cat > {p}.part && chmod 700 -- {p}.part && mv -f -- {p}.part {p}",
-                    p = remote_path
+                    "set -C; umask 077; cat > {part} && chmod 700 -- {part} && mv -f -- {part} {bin}",
+                    part = part_path,
+                    bin = remote_path,
                 ),
             )
             .await
@@ -697,31 +703,78 @@ async fn upload_via_channel(
                 source: e,
             })?;
         let mut buf = [0u8; 32 * 1024];
-        loop {
-            let n = file.read(&mut buf).await.map_err(|e| RemoteError::Io {
-                host: host.to_string(),
-                source: e,
-            })?;
-            if n == 0 {
-                break;
-            }
-            channel
-                .data(&buf[..n])
-                .await
-                .map_err(|e| RemoteError::from_russh(e, host))?;
-            pb.inc(n as u64);
-        }
-        channel
-            .eof()
-            .await
-            .map_err(|e| RemoteError::from_russh(e, host))?;
-
         let mut stderr = Vec::new();
         let mut exit: Option<u32> = None;
         let mut stderr_truncated = false;
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                ChannelMsg::ExtendedData { data, ext: 1 } => {
+        let mut eof_sent = false;
+
+        loop {
+            if exit.is_some() {
+                break;
+            }
+
+            tokio::select! {
+                msg = channel.wait() => {
+                    match msg {
+                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                            let room = PROBE_OUTPUT_CAP.saturating_sub(stderr.len());
+                            if room > 0 {
+                                let take = data.len().min(room);
+                                stderr.extend_from_slice(&data[..take]);
+                                if data.len() > room {
+                                    stderr_truncated = true;
+                                }
+                            }
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            exit = Some(exit_status);
+                        }
+                        Some(ChannelMsg::Close) => break,
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                read = file.read(&mut buf) => {
+                    let n = read.map_err(|e| RemoteError::Io {
+                        host: host.to_string(),
+                        source: e,
+                    })?;
+                    if n == 0 {
+                        // EOF: close stdin, then continue to drain exit status/close.
+                        if !eof_sent {
+                            channel
+                                .eof()
+                                .await
+                                .map_err(|e| RemoteError::from_russh(e, host))?;
+                            eof_sent = true;
+                        }
+                        continue;
+                    }
+
+                    let send_fut = channel.data(&buf[..n]);
+                    match tokio::time::timeout(UPLOAD_STALL_BUDGET, send_fut).await {
+                        Ok(res) => {
+                            res.map_err(|e| RemoteError::from_russh(e, host))?;
+                            pb.inc(n as u64);
+                        }
+                        Err(_) => {
+                            return Err(RemoteError::UploadFailed {
+                                host: host.to_string(),
+                                detail: format!(
+                                    "upload stalled: no progress for {} seconds",
+                                    UPLOAD_STALL_BUDGET.as_secs()
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain any remaining stderr/exit if not already done.
+        while exit.is_none() {
+            match channel.wait().await {
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
                     let room = PROBE_OUTPUT_CAP.saturating_sub(stderr.len());
                     if room > 0 {
                         let take = data.len().min(room);
@@ -731,12 +784,10 @@ async fn upload_via_channel(
                         }
                     }
                 }
-                // Do NOT break here: extended data may still be in flight, and
-                // it is the diagnostic this branch exists to surface. The loop
-                // is bounded by UPLOAD_BUDGET, so waiting for Close is safe.
-                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
-                ChannelMsg::Close => break,
-                _ => {}
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
+                Some(ChannelMsg::Close) => break,
+                Some(_) => {}
+                None => break,
             }
         }
 
@@ -836,6 +887,30 @@ pub struct RemoteCoverage {
 // ---------------------------------------------------------------------------
 // Main remote scan
 // ---------------------------------------------------------------------------
+
+fn random_part_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(std::process::id() as u64);
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    let mut h = hasher.finish();
+    let mut out = String::with_capacity(8);
+    for _ in 0..8 {
+        out.push(char::from(b'a' + (h % 26) as u8));
+        h = h
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+    }
+    out
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_remote_scan_russh(
@@ -986,8 +1061,11 @@ pub async fn run_remote_scan_russh(
                         });
                     }
                 }
+
+                let part = format!("{}.owlzops-{}.part", p, random_part_suffix());
                 let a = RemoteArtifact::UploadedFile {
                     bin: actual_remote_path.clone(),
+                    part: part.clone(),
                 };
                 let _ = artifact.set(a);
             } else {
@@ -1016,10 +1094,17 @@ pub async fn run_remote_scan_russh(
                 .channel_open_session()
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+
+            let part_for_upload = match artifact.get() {
+                Some(RemoteArtifact::UploadedFile { part, .. }) => part.clone(),
+                _ => String::new(), // should never happen in copy_binary branch
+            };
+
             upload_via_channel(
                 &mut upload_channel,
                 local,
                 &actual_remote_path,
+                &part_for_upload,
                 &hostname,
                 upload_pb,
             )
