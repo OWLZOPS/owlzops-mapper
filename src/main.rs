@@ -358,6 +358,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         let pass = sudo_pass.clone();
                         let host_for_log = host.clone();
                         let upload_pb = upload_bar.clone();
+                        let multi = multi.clone();
 
                         join_set.spawn(async move {
                             // R13-03: explicit permit error handling.
@@ -404,9 +405,15 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 )
                                 .await
                                 {
-                                    Ok(stdout) => {
+                                    Ok((stdout, coverage)) => {
                                         match serde_json::from_slice::<AgentReport>(&stdout) {
-                                            Ok(report) => Some(report),
+                                            Ok(mut report) => {
+                                                // R25-14: remote coverage belongs
+                                                // in this host's report, not in
+                                                // orchestrator's local sink.
+                                                report.coverage_warnings.extend(coverage.notes);
+                                                Some(report)
+                                            }
                                             Err(e) => {
                                                 let raw_preview: String =
                                                     String::from_utf8_lossy(&stdout)
@@ -426,7 +433,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         }
                                     }
                                     Err(e) => {
-                                        warn!(host = %host, error = %e, "russh scan failed");
+                                        // Progress bars continuously redraw stderr.
+                                        // Suspend them to ensure the error stays visible.
+                                        multi.suspend(|| {
+                                            eprintln!("[error] russh scan failed for {host}: {e}");
+                                        });
                                         None
                                     }
                                 }

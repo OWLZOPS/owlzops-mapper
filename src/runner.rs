@@ -394,7 +394,7 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
 async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentReport, String> {
     let ssh_key_expanded = shellexpand::tilde(&args.ssh_key).to_string();
 
-    let stdout = crate::ssh_engine::run_remote_scan_russh(
+    let (stdout, coverage) = crate::ssh_engine::run_remote_scan_russh(
         host,
         &args.ssh_user,
         &ssh_key_expanded,
@@ -410,8 +410,10 @@ async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentRepo
     .await
     .map_err(|e| format!("russh scan failed: {e}"))?;
 
-    serde_json::from_slice::<AgentReport>(&stdout)
-        .map_err(|e| format!("remote output is not a valid AgentReport: {e}"))
+    let mut report = serde_json::from_slice::<AgentReport>(&stdout)
+        .map_err(|e| format!("remote output is not a valid AgentReport: {e}"))?;
+    report.coverage_warnings.extend(coverage.notes);
+    Ok(report)
 }
 
 fn read_user_home(username: &str) -> Option<String> {

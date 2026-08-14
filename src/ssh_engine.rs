@@ -5,7 +5,6 @@ use std::io::{IsTerminal, Read};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -78,6 +77,28 @@ pub(crate) fn classify_sudo_stderr(se: &str) -> SudoOutcome {
     }
 }
 
+/// Maps a sudo failure to the kind of error that should be raised by the main
+/// exec path. Pure and exhaustive: adding a variant to `SudoOutcome` breaks the
+/// build here instead of silently falling through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SudoErrorKind {
+    Auth,
+    Tty,
+    NotPermitted,
+}
+
+pub(crate) fn sudo_error_kind(use_sudo: bool, se: &str) -> Option<SudoErrorKind> {
+    if !use_sudo {
+        return None;
+    }
+    match classify_sudo_stderr(se) {
+        SudoOutcome::BadPassword | SudoOutcome::PasswordRequired => Some(SudoErrorKind::Auth),
+        SudoOutcome::NeedsTty => Some(SudoErrorKind::Tty),
+        SudoOutcome::NotPermitted => Some(SudoErrorKind::NotPermitted),
+        SudoOutcome::Ok | SudoOutcome::Unknown => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Remote errors
 // ---------------------------------------------------------------------------
@@ -108,6 +129,12 @@ pub enum RemoteError {
     Auth { host: String, user: String },
     #[error("sudo authentication failed on {host}: {detail}")]
     SudoAuth { host: String, detail: String },
+    #[error("sudo not permitted for {host}: {detail}")]
+    SudoNotPermitted {
+        host: String,
+        path: Option<String>,
+        detail: String,
+    },
     /// `Defaults requiretty` is a deliberate host policy. We refuse to defeat
     /// it by allocating a PTY; instead we tell the operator how to install the
     /// binary at a fixed path and grant NOPASSWD for that path. Recommending a
@@ -118,9 +145,11 @@ pub enum RemoteError {
          Install the binary at a fixed, non-world-writable path (e.g. \
          /usr/local/bin/owlzops-mapper), grant NOPASSWD for THAT path, and pass it via \
          --remote-path. A rule naming a staging path under /tmp is `NOPASSWD: ALL` in \
-         disguise and this scanner reports it as a finding (see docs/DEPLOY.md)."
+         disguise and this scanner reports it as a finding (see docs/DEPLOY.md). \
+         Attempted target: {}",
+        path.as_deref().unwrap_or("<not determined — failed at pre-flight>")
     )]
-    SudoRequiresTty { host: String, path: String },
+    SudoRequiresTty { host: String, path: Option<String> },
     #[error("timeout on {host}")]
     Timeout { host: String },
     /// Not a timeout: the channel closed without ever reporting an exit
@@ -307,7 +336,7 @@ fn harden_tcp(_stream: &tokio::net::TcpStream) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Short probe helpers (mktemp, sudo -n)
+// Short probe helpers
 // ---------------------------------------------------------------------------
 
 /// Append `data` to `buf` up to `PROBE_OUTPUT_CAP`. Returns whether all data
@@ -377,31 +406,105 @@ async fn exec_capture(
 }
 
 // ---------------------------------------------------------------------------
-// Remote staging (temporary until R25-04/R25-07)
+// Remote artifact (staging ownership)
 // ---------------------------------------------------------------------------
 
-/// Create a private staging directory on the remote host.
-///
-/// `mktemp -d` gives mode 0700 and an unpredictable name in one atomic step —
-/// no pre-created inode to inherit, no sticky-directory race (R24-41/R24-96).
-///
-/// TODO R25-04: choose root (`/var/tmp` first, fallback `/tmp`) based on
-/// `/proc/mounts` to avoid `noexec`.
-/// TODO R25-07: replace the ad-hoc validation with `staging_dir_is_sane`.
+/// What WE put on the remote host and are therefore obliged to remove.
+/// Recorded at the moment of creation, never re-derived from a path prefix
+/// (RC-1) and never inferred from "did the upload finish" (R25-17): a
+/// directory made by `mktemp -d` outlives a failed transfer.
+#[derive(Debug, Clone)]
+pub(crate) enum RemoteArtifact {
+    /// `mktemp -d` created this directory for us: the whole subtree is ours.
+    OwnedDir { dir: String, bin: String },
+    /// We wrote a file into an operator-supplied directory. Only that file.
+    UploadedFile { bin: String },
+}
+
+impl RemoteArtifact {
+    pub(crate) fn bin(&self) -> &str {
+        match self {
+            Self::OwnedDir { bin, .. } | Self::UploadedFile { bin } => bin,
+        }
+    }
+
+    pub(crate) fn teardown_cmd(&self) -> String {
+        match self {
+            Self::OwnedDir { dir, .. } => format!("rm -rf -- {dir}"),
+            Self::UploadedFile { bin } => format!("rm -f -- {bin} {bin}.part"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote staging
+// ---------------------------------------------------------------------------
+
+/// Candidate staging roots, best first. The binary is *executed* here under
+/// sudo, so a `noexec` mount disqualifies the root outright (CIS 1.1.2.x).
+const STAGING_ROOTS: [&str; 2] = ["/var/tmp", "/tmp"];
+
+/// Longest-prefix match of `dir` against the mount table.
+pub(crate) fn mount_is_noexec(mounts: &str, dir: &str) -> bool {
+    let mut best = 0usize;
+    let mut noexec = false;
+    for line in mounts.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(_dev), Some(mp), Some(_fs), Some(opts)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let covers = mp == "/"
+            || dir == mp
+            || (dir.starts_with(mp) && dir.as_bytes().get(mp.len()) == Some(&b'/'));
+        if covers && mp.len() >= best {
+            best = mp.len();
+            noexec = opts.split(',').any(|o| o == "noexec");
+        }
+    }
+    noexec
+}
+
+/// `dir` is interpolated into shell commands and becomes the argument of an
+/// `rm -rf`. It must be exactly `{root}/owlzops-XXXXXXXX`: one component, no
+/// traversal, no metacharacters.
+pub(crate) fn staging_dir_is_sane(dir: &str, root: &str) -> bool {
+    let Some(leaf) = dir.strip_prefix(root).and_then(|r| r.strip_prefix('/')) else {
+        return false;
+    };
+    let Some(rand) = leaf.strip_prefix("owlzops-") else {
+        return false;
+    };
+    !rand.is_empty() && rand.len() <= 32 && rand.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 async fn make_remote_staging(
     session: &client::Handle<ClientHandler>,
     host: &str,
-) -> Result<String, RemoteError> {
-    let out = exec_capture(session, host, "LC_ALL=C mktemp -d /tmp/owlzops-XXXXXXXX").await?;
+) -> Result<RemoteArtifact, RemoteError> {
+    let mounts = exec_capture(session, host, "LC_ALL=C cat /proc/mounts").await?;
+    let root = STAGING_ROOTS
+        .iter()
+        .copied()
+        .find(|r| !mount_is_noexec(&mounts, r))
+        .ok_or_else(|| RemoteError::UploadFailed {
+            host: host.to_string(),
+            detail: "every candidate staging root is mounted noexec (CIS 1.1.2.x): \
+                     pass --remote-path pointing at an exec-capable directory whose \
+                     parent is not group/world-writable"
+                .into(),
+        })?;
+
+    let out = exec_capture(
+        session,
+        host,
+        &format!("LC_ALL=C mktemp -d {root}/owlzops-XXXXXXXX"),
+    )
+    .await?;
     let dir = out.trim();
 
-    // Temporary validation; will be replaced by staging_dir_is_sane.
-    let ok = dir.starts_with("/tmp/owlzops-")
-        && dir.len() < 128
-        && dir
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
-    if !ok {
+    if !staging_dir_is_sane(dir, root) {
         return Err(RemoteError::UploadFailed {
             host: host.to_string(),
             detail: format!(
@@ -410,7 +513,11 @@ async fn make_remote_staging(
             ),
         });
     }
-    Ok(format!("{dir}/owlzops-mapper"))
+
+    Ok(RemoteArtifact::OwnedDir {
+        dir: dir.to_string(),
+        bin: format!("{dir}/owlzops-mapper"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -419,20 +526,19 @@ async fn make_remote_staging(
 
 /// Validate sudo credentials **before** uploading anything.
 ///
-/// Runs `sudo -k -S -p '' -- true` and feeds the password via stdin. If the
-/// password is wrong, we return early and do not create a staging directory or
-/// transfer a 10 MB binary.
+/// Runs `sudo -k -S -p '' -v` and feeds the password via stdin. `-v` validates
+/// the user's credentials without coupling to sudoers' command list (R25-09b).
+/// If the password is wrong, we return early and create no staging directory.
 ///
-/// R25-02: remote stderr is sanitized ONCE, here, and the sanitized `detail`
-/// flows to the caller. We deliberately do NOT emit a raw `tracing::error!`
-/// here; the caller logs the final `RemoteError` once.
+/// R25-16: stderr from the remote sudo is capped; a malicious host cannot OOM
+/// the orchestrator before upload.
 async fn validate_sudo_password(
     session: &client::Handle<ClientHandler>,
     sudo_pass: &Zeroizing<String>,
     host: &str,
 ) -> Result<(), RemoteError> {
     let mut ch = session.channel_open_session().await?;
-    ch.exec(true, "LC_ALL=C sudo -k -S -p '' -- true").await?;
+    ch.exec(true, "LC_ALL=C sudo -k -S -p '' -v").await?;
 
     let mut line = Zeroizing::new(sudo_pass.to_string());
     line.push('\n');
@@ -441,13 +547,21 @@ async fn validate_sudo_password(
 
     let mut stderr = Vec::new();
     let mut exit_code = None;
+    let mut truncated = false;
     while let Some(msg) = ch.wait().await {
         match msg {
-            ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                truncated |= !push_capped(&mut stderr, &data);
+            }
             ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
             ChannelMsg::Close => break,
             _ => {}
         }
+    }
+    if truncated {
+        crate::coverage::record(format!(
+            "remote {host}: sudo pre-flight stderr exceeded {PROBE_OUTPUT_CAP} bytes"
+        ));
     }
 
     let se = String::from_utf8_lossy(&stderr);
@@ -457,16 +571,25 @@ async fn validate_sudo_password(
     } else {
         classify_sudo_stderr(&se)
     };
+
     if outcome != SudoOutcome::Ok {
         return Err(match outcome {
             SudoOutcome::NeedsTty => RemoteError::SudoRequiresTty {
                 host: host.to_string(),
-                path: String::new(), // Path not known yet; filled by caller if needed
+                path: None,
             },
-            _ => RemoteError::SudoAuth {
+            SudoOutcome::NotPermitted => RemoteError::SudoNotPermitted {
                 host: host.to_string(),
+                path: None,
                 detail,
             },
+            SudoOutcome::BadPassword | SudoOutcome::PasswordRequired | SudoOutcome::Unknown => {
+                RemoteError::SudoAuth {
+                    host: host.to_string(),
+                    detail,
+                }
+            }
+            SudoOutcome::Ok => unreachable!("guarded by the enclosing if"),
         });
     }
     Ok(())
@@ -580,29 +703,14 @@ async fn upload_via_channel(
     res
 }
 
-// ---------------------------------------------------------------------------
-// Cleanup
-// ---------------------------------------------------------------------------
-
-/// Best-effort removal of the uploaded binary.
-///
-/// TODO R25-06: This currently decides `rm -rf` based on a string prefix
-/// (`/tmp/owlzops-`). That is unsafe: an operator-provided path like
-/// `/tmp/owlzops-mine/mapper` would also match and be recursively deleted.
-/// Replace with `Staging` enum that records ownership at creation time.
-async fn cleanup_remote_binary(
+async fn cleanup_remote_artifact(
     session: &client::Handle<ClientHandler>,
-    remote_path: &str,
+    artifact: &RemoteArtifact,
     host: &str,
 ) {
+    let cmd = artifact.teardown_cmd();
     let fut = async {
         let mut ch = session.channel_open_session().await?;
-        let dir = remote_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let cmd = if dir.starts_with("/tmp/owlzops-") {
-            format!("rm -rf -- {dir}")
-        } else {
-            format!("rm -f -- {remote_path} {remote_path}.part")
-        };
         ch.exec(true, cmd).await?;
         ch.eof().await?;
         let mut exit: Option<u32> = None;
@@ -616,17 +724,29 @@ async fn cleanup_remote_binary(
         Ok::<Option<u32>, russh::Error>(exit)
     };
     match tokio::time::timeout(Duration::from_secs(10), fut).await {
-        Ok(Ok(Some(0))) => tracing::debug!(host = %host, "remote binary removed"),
+        Ok(Ok(Some(0))) => tracing::debug!(host = %host, "remote artifact removed"),
         Ok(Ok(code)) => tracing::warn!(
             host = %host,
             exit = ?code,
-            "cleanup did not confirm success — binary may be left on host"
+            "cleanup did not confirm success — artifact may be left on host"
         ),
         Ok(Err(e)) => {
-            tracing::warn!(host = %host, error = %e, "cleanup failed — binary left on host")
+            tracing::warn!(host = %host, error = %e, "cleanup failed — artifact left on host")
         }
-        Err(_) => tracing::warn!(host = %host, "cleanup timed out — binary left on host"),
+        Err(_) => tracing::warn!(host = %host, "cleanup timed out — artifact left on host"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Facts learned by orchestrator about remote host
+// ---------------------------------------------------------------------------
+
+/// Facts the orchestrator learned about a host that the remote binary could not
+/// know about itself. They belong in THAT host's report.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteCoverage {
+    pub notes: Vec<String>,
+    pub privileged: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +766,7 @@ pub async fn run_remote_scan_russh(
     deep: bool,
     remote_timeout_secs: u64,
     upload_pb: Option<ProgressBar>,
-) -> Result<Vec<u8>, RemoteError> {
+) -> Result<(Vec<u8>, RemoteCoverage), RemoteError> {
     let (hostname, port) = split_host_port(host);
 
     let stream = tokio::time::timeout(
@@ -737,25 +857,32 @@ pub async fn run_remote_scan_russh(
 
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
     let uploaded = AtomicBool::new(false);
-
-    // Store the actual staging path so teardown can know it even after the
-    // overall timeout. Mutex is used because the async block may be dropped by
-    // `timeout` while teardown still needs the value.
-    let staging_path: Mutex<Option<String>> = Mutex::new(None);
+    // Written exactly once, read after the timeout. `OnceLock` encodes that
+    // invariant: no poisoning, no PoisonError dance.
+    let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
+    let mut remote_coverage = RemoteCoverage::default();
 
     let result = tokio::time::timeout(overall, async {
-        // Pre-flight sudo password check (R25-03: inside overall budget)
+        // Pre-flight sudo password check (inside budget)
         if let Some(pass) = sudo_pass {
             validate_sudo_password(&session, pass, &hostname).await?;
         }
 
-        // Determine actual remote path
+        // Determine actual remote path and record artifact obligation
         let actual_remote_path: String;
         if copy_binary {
             if let Some(p) = remote_path {
                 actual_remote_path = p.to_string();
+                // We will upload a file into an operator-supplied directory.
+                let a = RemoteArtifact::UploadedFile {
+                    bin: actual_remote_path.clone(),
+                };
+                let _ = artifact.set(a);
             } else {
-                actual_remote_path = make_remote_staging(&session, &hostname).await?;
+                let a = make_remote_staging(&session, &hostname).await?;
+                actual_remote_path = a.bin().to_string();
+                // Obligation starts HERE, not after upload.
+                let _ = artifact.set(a);
             }
         } else {
             match remote_path {
@@ -768,11 +895,7 @@ pub async fn run_remote_scan_russh(
                 }
             }
         }
-        *staging_path
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(actual_remote_path.clone());
 
-        // Upload binary if requested
         if copy_binary {
             let default_exe = std::path::PathBuf::from("./owlzops-mapper");
             let current_exe = std::env::current_exe().unwrap_or(default_exe);
@@ -798,14 +921,7 @@ pub async fn run_remote_scan_russh(
             .await
             .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
-        // Decide whether to use sudo.
-        //
-        // If sudo_pass is provided, we use -S. If not, but NOPASSWD is
-        // available, we use sudo -n automatically. If sudo is unavailable,
-        // we record a coverage warning (degraded scan) but DO NOT silently
-        // fall back to an unprivileged scan without telling the report.
-        //
-        // R25-05: classify the probe result, never collapse to bool.
+        // Determine whether to use sudo
         let use_sudo = if sudo_pass.is_some() {
             true
         } else {
@@ -818,20 +934,31 @@ pub async fn run_remote_scan_russh(
             {
                 Ok(_) => true,
                 Err(RemoteError::NonZeroExit { stderr, .. }) => {
-                    let outcome = classify_sudo_stderr(&stderr);
-                    match outcome {
-                        SudoOutcome::Ok => true,
+                    match classify_sudo_stderr(&stderr) {
+                        // A non-zero exit with empty stderr is not evidence
+                        // that passwordless sudo works (R25-20).
+                        SudoOutcome::Ok => {
+                            return Err(RemoteError::UploadFailed {
+                                host: hostname.clone(),
+                                detail: format!(
+                                    "`sudo -n -- {actual_remote_path} --version` exited \
+                                     non-zero with no diagnostic output; refusing to guess \
+                                     whether the scan would run privileged"
+                                ),
+                            });
+                        }
                         SudoOutcome::PasswordRequired | SudoOutcome::NotPermitted => {
-                            crate::coverage::record(format!(
+                            remote_coverage.notes.push(format!(
                                 "remote {hostname}: scanned WITHOUT root — sudo unavailable; \
                                  privileged surfaces were not read"
                             ));
+                            remote_coverage.privileged = Some(false);
                             false
                         }
                         SudoOutcome::NeedsTty => {
                             return Err(RemoteError::SudoRequiresTty {
                                 host: hostname.clone(),
-                                path: actual_remote_path.clone(),
+                                path: Some(actual_remote_path.clone()),
                             });
                         }
                         SudoOutcome::BadPassword => {
@@ -840,9 +967,6 @@ pub async fn run_remote_scan_russh(
                                 detail: crate::utils::sanitize_for_log(&stderr),
                             });
                         }
-                        // The binary itself did not start (noexec, wrong arch,
-                        // truncated upload). Silently dropping to unprivileged
-                        // scan would hand back a clean-looking report.
                         SudoOutcome::Unknown => {
                             return Err(RemoteError::UploadFailed {
                                 host: hostname.clone(),
@@ -855,12 +979,8 @@ pub async fn run_remote_scan_russh(
                         }
                     }
                 }
-                Err(e) => {
-                    return Err(RemoteError::UploadFailed {
-                        host: hostname.clone(),
-                        detail: format!("sudo probe failed: {e}"),
-                    });
-                }
+                // Preserve original error: it is not an upload failure.
+                Err(e) => return Err(e),
             }
         };
 
@@ -883,7 +1003,6 @@ pub async fn run_remote_scan_russh(
                 actual_remote_path, deep_arg
             )
         };
-        // Keep a copy for ChannelClosedEarly error (cmd is moved into exec).
         let cmd_for_error = cmd.clone();
         exec_channel
             .exec(true, cmd)
@@ -967,29 +1086,30 @@ pub async fn run_remote_scan_russh(
         match exit_code {
             Some(code) => {
                 let se = String::from_utf8_lossy(&stderr);
-                let outcome = classify_sudo_stderr(&se);
-                if use_sudo && outcome == SudoOutcome::BadPassword {
-                    Err(RemoteError::SudoAuth {
+                match sudo_error_kind(use_sudo, &se) {
+                    Some(SudoErrorKind::Auth) => Err(RemoteError::SudoAuth {
                         host: hostname.clone(),
                         detail: crate::utils::sanitize_for_log(se.trim()),
-                    })
-                } else if use_sudo && outcome == SudoOutcome::NeedsTty {
-                    Err(RemoteError::SudoRequiresTty {
+                    }),
+                    Some(SudoErrorKind::Tty) => Err(RemoteError::SudoRequiresTty {
                         host: hostname.clone(),
-                        path: actual_remote_path.clone(),
-                    })
-                } else if !stdout.is_empty() && stdout.starts_with(b"{") {
-                    Ok(stdout)
-                } else if code != 0 {
-                    let raw_trimmed: String = se.trim().chars().take(300).collect();
-                    let trimmed = crate::utils::sanitize_for_log(&raw_trimmed);
-                    Err(RemoteError::NonZeroExit {
+                        path: Some(actual_remote_path.clone()),
+                    }),
+                    Some(SudoErrorKind::NotPermitted) => Err(RemoteError::SudoNotPermitted {
                         host: hostname.clone(),
-                        code,
-                        stderr: trimmed,
-                    })
-                } else {
-                    Ok(stdout)
+                        path: Some(actual_remote_path.clone()),
+                        detail: crate::utils::sanitize_for_log(se.trim()),
+                    }),
+                    None if !stdout.is_empty() && stdout.starts_with(b"{") => Ok(stdout),
+                    None => {
+                        let raw_trimmed: String = se.trim().chars().take(300).collect();
+                        let trimmed = crate::utils::sanitize_for_log(&raw_trimmed);
+                        Err(RemoteError::NonZeroExit {
+                            host: hostname.clone(),
+                            code,
+                            stderr: trimmed,
+                        })
+                    }
                 }
             }
             None => Err(RemoteError::ChannelClosedEarly {
@@ -1001,24 +1121,18 @@ pub async fn run_remote_scan_russh(
     .await;
 
     // Teardown always executes, even after Elapsed.
-    //
-    // We must not hold a MutexGuard across .await; clone the Option<String>
-    // and drop the guard immediately. This preserves Send for the outer task.
-    if uploaded.load(Ordering::Relaxed) {
-        let maybe_path = staging_path
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(path) = maybe_path {
-            if !keep_binary {
-                cleanup_remote_binary(&session, &path, &hostname).await;
-            } else {
-                tracing::warn!(
-                    host = %hostname,
-                    path = %path,
-                    "binary kept on remote host (--keep-binary); remove it manually if needed"
-                );
-            }
+    // Installed mode never sets `artifact`, so the operator's binary is
+    // structurally unreachable from here.
+    if let Some(a) = artifact.get() {
+        if keep_binary && uploaded.load(Ordering::Relaxed) {
+            tracing::warn!(
+                host = %hostname,
+                path = %a.bin(),
+                teardown = %a.teardown_cmd(),
+                "binary kept on remote host (--keep-binary)"
+            );
+        } else {
+            cleanup_remote_artifact(&session, a, &hostname).await;
         }
     }
 
@@ -1029,7 +1143,8 @@ pub async fn run_remote_scan_russh(
     .await;
 
     match result {
-        Ok(inner) => inner,
+        Ok(Ok(stdout)) => Ok((stdout, remote_coverage)),
+        Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
     }
 }
