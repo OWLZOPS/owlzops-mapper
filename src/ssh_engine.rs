@@ -37,6 +37,11 @@ const SUDO_PROBE_BUDGET: Duration = Duration::from_secs(5);
 /// coverage (Raw Truth), not silently dropped.
 const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 
+/// Hard cap for the whole binary upload. A remote target that cannot be
+/// written (or a stalled network) must not hold the scan forever; this is
+/// separate from the overall per-host budget.
+const UPLOAD_BUDGET: Duration = Duration::from_secs(120);
+
 // ---------------------------------------------------------------------------
 // Sudo outcome classification
 // ---------------------------------------------------------------------------
@@ -653,7 +658,7 @@ async fn upload_via_channel(
         ProgressBar::hidden()
     };
 
-    let res = async {
+    let upload_fut = async {
         channel
             .exec(
                 true,
@@ -693,16 +698,32 @@ async fn upload_via_channel(
 
         let mut stderr = Vec::new();
         let mut exit: Option<u32> = None;
+        let mut stderr_truncated = false;
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    let room = PROBE_OUTPUT_CAP.saturating_sub(stderr.len());
+                    if room > 0 {
+                        let take = data.len().min(room);
+                        stderr.extend_from_slice(&data[..take]);
+                        if data.len() > room {
+                            stderr_truncated = true;
+                        }
+                    }
+                }
                 ChannelMsg::ExitStatus { exit_status } => {
                     exit = Some(exit_status);
-                    break; // do not wait for Close after exit status
+                    break;
                 }
                 ChannelMsg::Close => break,
                 _ => {}
             }
+        }
+
+        if stderr_truncated {
+            crate::coverage::record(format!(
+                "remote {host}: upload stderr exceeded {PROBE_OUTPUT_CAP} bytes and was capped"
+            ));
         }
 
         match exit {
@@ -727,8 +748,14 @@ async fn upload_via_channel(
                 detail: "channel closed without exit status".into(),
             }),
         }
-    }
-    .await;
+    };
+
+    let res = match tokio::time::timeout(UPLOAD_BUDGET, upload_fut).await {
+        Ok(inner) => inner,
+        Err(_) => Err(RemoteError::Timeout {
+            host: host.to_string(),
+        }),
+    };
 
     pb.finish_and_clear();
 
@@ -892,16 +919,31 @@ pub async fn run_remote_scan_russh(
     let mut remote_coverage = RemoteCoverage::default();
 
     let result = tokio::time::timeout(overall, async {
-        // Pre-flight sudo password check (inside budget)
         if let Some(pass) = sudo_pass {
             validate_sudo_password(&session, pass, &hostname).await?;
         }
 
-        // Determine actual remote path and record artifact obligation
         let actual_remote_path: String;
         if copy_binary {
             if let Some(p) = remote_path {
                 actual_remote_path = p.to_string();
+                // Pre-flight writability check to catch permission errors early.
+                let parent = std::path::Path::new(p)
+                    .parent()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let test = exec_capture(
+                    &session,
+                    &hostname,
+                    &format!("LC_ALL=C test -w -- '{}'", parent),
+                )
+                .await;
+                if test.is_err() {
+                    return Err(RemoteError::UploadFailed {
+                        host: hostname.clone(),
+                        detail: format!("parent directory '{}' is not writable", parent),
+                    });
+                }
                 let a = RemoteArtifact::UploadedFile {
                     bin: actual_remote_path.clone(),
                 };
@@ -1004,9 +1046,6 @@ pub async fn run_remote_scan_russh(
                         }
                     }
                 }
-                // Timeout / channel closed / transport error: sudo did not
-                // answer. We must NOT guess "no root is fine" — abort this host
-                // with a clear diagnostic.
                 Err(e) => return Err(e),
             }
         };
@@ -1147,9 +1186,6 @@ pub async fn run_remote_scan_russh(
     })
     .await;
 
-    // Teardown always executes, even after Elapsed.
-    // Installed mode never sets `artifact`, so the operator's binary is
-    // structurally unreachable from here.
     if let Some(a) = artifact.get() {
         if keep_binary && uploaded.load(Ordering::Relaxed) {
             tracing::warn!(
