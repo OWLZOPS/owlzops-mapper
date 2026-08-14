@@ -691,20 +691,37 @@ async fn upload_via_channel(
             .await
             .map_err(|e| RemoteError::from_russh(e, host))?;
 
+        let mut stderr = Vec::new();
         let mut exit: Option<u32> = None;
         while let Some(msg) = channel.wait().await {
             match msg {
-                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                ChannelMsg::ExtendedData { data, ext: 1 } => stderr.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status } => {
+                    exit = Some(exit_status);
+                    break; // do not wait for Close after exit status
+                }
                 ChannelMsg::Close => break,
                 _ => {}
             }
         }
+
         match exit {
             Some(0) => Ok(()),
-            Some(code) => Err(RemoteError::UploadFailed {
-                host: host.to_string(),
-                detail: format!("remote command exited {code} (disk full / permissions?)"),
-            }),
+            Some(code) => {
+                let se = String::from_utf8_lossy(&stderr);
+                let detail = if se.trim().is_empty() {
+                    format!("remote command exited {code}")
+                } else {
+                    format!(
+                        "remote command exited {code}: {}",
+                        crate::utils::sanitize_for_log(se.trim())
+                    )
+                };
+                Err(RemoteError::UploadFailed {
+                    host: host.to_string(),
+                    detail,
+                })
+            }
             None => Err(RemoteError::UploadFailed {
                 host: host.to_string(),
                 detail: "channel closed without exit status".into(),
