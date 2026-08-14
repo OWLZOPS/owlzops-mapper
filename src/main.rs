@@ -55,32 +55,46 @@ fn is_running_as_root() -> bool {
 }
 
 fn compute_exit_code(report: &AgentReport) -> i32 {
-    let flags = CriticalFlags::from_report(report);
+    let findings = scoring::evaluate(report);
+    let verdict = scoring::verdict_from_findings(&findings, &report.failed_scanners);
 
-    if flags.compromised_host {
-        warn!(
-            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
-        );
-        return 3;
-    }
-
-    if !report.is_root_execution {
-        if flags.has_critical() {
+    match verdict {
+        Verdict::Compromised => {
             warn!(
-                "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
+                "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
             );
-        } else {
-            warn!("not running as root – results may be incomplete.");
+            3
         }
-        return 2;
+        Verdict::Incomplete => {
+            if report.failed_scanners.is_empty() {
+                warn!("scan incomplete; exiting 2");
+            } else {
+                warn!(
+                    failed = ?report.failed_scanners,
+                    "one or more scanners failed — verdict incomplete, exiting 2"
+                );
+            }
+            2
+        }
+        Verdict::Critical => {
+            if !report.is_root_execution {
+                warn!(
+                    "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
+                );
+                2
+            } else {
+                1
+            }
+        }
+        Verdict::Clean => {
+            if !report.is_root_execution {
+                warn!("not running as root – results may be incomplete.");
+                2
+            } else {
+                0
+            }
+        }
     }
-
-    if !report.scan_warnings.is_empty() {
-        warn!(warnings = ?report.scan_warnings, "one or more scanners failed – report may be incomplete");
-        return 2;
-    }
-
-    if flags.has_critical() { 1 } else { 0 }
 }
 
 fn raise_nofile_limit() {

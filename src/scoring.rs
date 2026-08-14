@@ -2533,6 +2533,23 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     // A panic means Default values, not observations.
     findings.retain(|f| !finding_from_failed_scanner(f.id, report));
 
+    // R25-26: a failed scanner means the surfaces it owned were never observed.
+    // Record that fact in the findings; verdict is Incomplete, not clean.
+    for scanner in &report.failed_scanners {
+        findings.push(Finding {
+            id: "COV-001",
+            title: "Scanner panicked; verdict incomplete".to_string(),
+            category: Category::Hygiene,
+            weight: 0,
+            evidence: format!(
+                "scanner `{scanner}` panicked; findings derived from it were withheld — \
+                 this host's verdict is INCOMPLETE, not clean"
+            ),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
     findings
 }
 
@@ -2545,6 +2562,27 @@ pub struct ScoredReport {
     pub reliability: u8,
     pub hygiene: u8,
     pub findings: Vec<Finding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Clean,
+    Critical,
+    Compromised,
+    Incomplete,
+}
+
+pub fn verdict_from_findings(findings: &[Finding], failed_scanners: &[String]) -> Verdict {
+    let flags = CriticalFlags::from_findings(findings);
+    if flags.compromised_host {
+        Verdict::Compromised
+    } else if flags.has_critical() {
+        Verdict::Critical
+    } else if !failed_scanners.is_empty() {
+        Verdict::Incomplete
+    } else {
+        Verdict::Clean
+    }
 }
 
 #[allow(dead_code)]
@@ -2589,6 +2627,7 @@ pub struct CriticalFlags {
 }
 
 impl CriticalFlags {
+    #[allow(dead_code)] // used by tests; main binary now uses verdict_from_findings
     pub fn from_report(report: &AgentReport) -> Self {
         let findings = evaluate(report);
         Self::from_findings(&findings)
@@ -3798,5 +3837,40 @@ mod tests {
         let findings = evaluate(&r);
         assert!(findings.iter().any(|f| f.id == "SEC-003"));
         assert!(!findings.iter().any(|f| f.id == "SEC-002"));
+    }
+
+    #[test]
+    fn failed_scanner_yields_incomplete_verdict() {
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.security.ssh_root_login_enabled = false;
+        r.host.backup_tools = vec!["restic".to_string()];
+        r.host.ntp_synchronized = true;
+        r.failed_scanners = vec!["security".to_string()];
+
+        let findings = evaluate(&r);
+        let verdict = verdict_from_findings(&findings, &r.failed_scanners);
+
+        assert_eq!(verdict, Verdict::Incomplete);
+        assert!(findings.iter().any(|f| f.id == "COV-001"));
+    }
+
+    #[test]
+    fn known_ioc_from_healthy_scanner_dominates_incomplete() {
+        use crate::models::SuspiciousProcess;
+
+        let mut r = minimal_report();
+        r.failed_scanners = vec!["docker".to_string()];
+        r.security.suspicious_processes = vec![SuspiciousProcess {
+            pid: 1337,
+            name: "xmrig".into(),
+            exe_path: Some("/tmp/xmrig".into()),
+            ..Default::default()
+        }];
+
+        let findings = evaluate(&r);
+        let verdict = verdict_from_findings(&findings, &r.failed_scanners);
+
+        assert_eq!(verdict, Verdict::Compromised);
     }
 }
