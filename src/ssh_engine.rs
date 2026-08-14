@@ -452,9 +452,12 @@ impl RemoteArtifact {
         }
     }
 
-    pub(crate) fn teardown_cmd(&self) -> String {
+    /// `replaced` — did the atomic `mv` complete? Before it lands, the file at
+    /// `bin` is still the operator's; only our `.part` may be removed (R25-24).
+    pub(crate) fn teardown_cmd(&self, replaced: bool) -> String {
         match self {
             Self::OwnedDir { dir, .. } => format!("rm -rf -- {dir}"),
+            Self::UploadedFile { bin } if !replaced => format!("rm -f -- {bin}.part"),
             Self::UploadedFile { bin } => format!("rm -f -- {bin} {bin}.part"),
         }
     }
@@ -498,6 +501,19 @@ pub(crate) fn staging_dir_is_sane(dir: &str, root: &str) -> bool {
         return false;
     };
     let Some(rand) = leaf.strip_prefix("owlzops-") else {
+        return false;
+    };
+    !rand.is_empty() && rand.len() <= 32 && rand.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// A path we are about to interpolate into a shell command. Construction is
+/// the only place validation can be skipped, so it cannot be skipped by
+/// accident at a call site (R25-07/R25-25).
+pub(crate) fn probe_temp_is_sane(tmp: &str, parent: &str) -> bool {
+    let Some(leaf) = tmp.strip_prefix(parent).and_then(|r| r.strip_prefix('/')) else {
+        return false;
+    };
+    let Some(rand) = leaf.strip_prefix(".owlzops-write-test-") else {
         return false;
     };
     !rand.is_empty() && rand.len() <= 32 && rand.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -659,11 +675,15 @@ async fn upload_via_channel(
     };
 
     let upload_fut = async {
+        // `set -C` makes `>` use O_CREAT|O_EXCL: an attacker cannot pre-create
+        // the inode or a symlink, and there is no window between a check and
+        // the open. This is what R24-96 asked for; `rm -f` before `cat >` only
+        // narrows the race.
         channel
             .exec(
                 true,
                 format!(
-                    "rm -f -- {p}.part && umask 077 && cat > {p}.part && chmod 700 -- {p}.part && mv -f -- {p}.part {p}",
+                    "set -C; umask 077; cat > {p}.part && chmod 700 -- {p}.part && mv -f -- {p}.part {p}",
                     p = remote_path
                 ),
             )
@@ -711,10 +731,10 @@ async fn upload_via_channel(
                         }
                     }
                 }
-                ChannelMsg::ExitStatus { exit_status } => {
-                    exit = Some(exit_status);
-                    break;
-                }
+                // Do NOT break here: extended data may still be in flight, and
+                // it is the diagnostic this branch exists to surface. The loop
+                // is bounded by UPLOAD_BUDGET, so waiting for Close is safe.
+                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
                 ChannelMsg::Close => break,
                 _ => {}
             }
@@ -769,9 +789,10 @@ async fn upload_via_channel(
 async fn cleanup_remote_artifact(
     session: &client::Handle<ClientHandler>,
     artifact: &RemoteArtifact,
+    replaced: bool,
     host: &str,
 ) {
-    let cmd = artifact.teardown_cmd();
+    let cmd = artifact.teardown_cmd(replaced);
     let fut = async {
         let mut ch = session.channel_open_session().await?;
         ch.exec(true, cmd).await?;
@@ -942,12 +963,21 @@ pub async fn run_remote_scan_russh(
                 match probe {
                     Ok(tmp) => {
                         let tmp = tmp.trim();
-                        let _ = exec_capture(
-                            &session,
-                            &hostname,
-                            &format!("LC_ALL=C rm -f -- '{}'", tmp),
-                        )
-                        .await;
+                        if probe_temp_is_sane(tmp, &parent) {
+                            let _ = exec_capture(
+                                &session,
+                                &hostname,
+                                &format!("LC_ALL=C rm -f -- {tmp}"),
+                            )
+                            .await;
+                        } else {
+                            // Do NOT rm a path we cannot account for. Leaving a
+                            // zero-byte probe file behind is the cheap failure.
+                            crate::coverage::record(format!(
+                                "remote {hostname}: write probe returned an unaccountable \
+                                 path; probe file not removed"
+                            ));
+                        }
                     }
                     Err(_) => {
                         return Err(RemoteError::UploadFailed {
@@ -986,7 +1016,6 @@ pub async fn run_remote_scan_russh(
                 .channel_open_session()
                 .await
                 .map_err(|e| RemoteError::from_russh(e, &hostname))?;
-            uploaded.store(true, Ordering::Relaxed);
             upload_via_channel(
                 &mut upload_channel,
                 local,
@@ -995,6 +1024,7 @@ pub async fn run_remote_scan_russh(
                 upload_pb,
             )
             .await?;
+            uploaded.store(true, Ordering::Relaxed);
         }
 
         let mut exec_channel = session
@@ -1199,15 +1229,16 @@ pub async fn run_remote_scan_russh(
     .await;
 
     if let Some(a) = artifact.get() {
-        if keep_binary && uploaded.load(Ordering::Relaxed) {
+        let replaced = uploaded.load(Ordering::Relaxed);
+        if keep_binary && replaced {
             tracing::warn!(
                 host = %hostname,
                 path = %a.bin(),
-                teardown = %a.teardown_cmd(),
+                teardown = %a.teardown_cmd(replaced),
                 "binary kept on remote host (--keep-binary)"
             );
         } else {
-            cleanup_remote_artifact(&session, a, &hostname).await;
+            cleanup_remote_artifact(&session, a, replaced, &hostname).await;
         }
     }
 
