@@ -1097,7 +1097,10 @@ pub async fn run_remote_scan_russh(
 
             let part_for_upload = match artifact.get() {
                 Some(RemoteArtifact::UploadedFile { part, .. }) => part.clone(),
-                _ => String::new(), // should never happen in copy_binary branch
+                Some(RemoteArtifact::OwnedDir { dir, .. }) => {
+                    format!("{dir}/.owlzops-upload-{}.part", random_part_suffix())
+                }
+                _ => String::new(),
             };
 
             upload_via_channel(
