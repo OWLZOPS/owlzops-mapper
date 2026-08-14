@@ -364,7 +364,6 @@ fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
     };
 
     let mut owned = HashMap::new();
-    let mut queried = 0usize;
     let mut not_owned = 0usize;
     let mut failed = 0usize;
 
@@ -375,7 +374,6 @@ fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
             10,
         ) {
             Some(output) => {
-                queried += 1;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let exit_code = output.status.code().unwrap_or(-1);
                 match parse_rpm_qf_output(&stdout, exit_code) {
@@ -400,7 +398,7 @@ fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
         crate::coverage::record(format!(
             "provenance: {failed} of {} rpm queries failed or timed out — \
              those files will be reported as unpackaged",
-            queried + failed
+            owned.len() + not_owned + failed
         ));
     }
     if not_owned > 0 {
@@ -409,10 +407,11 @@ fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
         ));
     }
 
-    // If at least one query ran (success, not-owned, or even error), we have
-    // usable RPM data. Only if EVERY query failed at the process level do we
-    // return None and fall back to Unavailable.
-    (queried > 0).then_some(owned)
+    // Usable data = a definite answer, positive or negative. An `Error` result
+    // is not an answer: counting it here would present "we could not ask" as
+    // "not owned by any package" for every candidate (R25-29).
+    let answered = owned.len() + not_owned;
+    (answered > 0).then_some(owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +455,16 @@ mod tests {
         assert_eq!(
             parse_rpm_qf_output("weird output", 42),
             RpmQueryResult::Error
+        );
+    }
+
+    #[test]
+    fn every_query_erroring_is_not_usable_rpm_data() {
+        assert_eq!(parse_rpm_qf_output("", 42), RpmQueryResult::Error);
+        assert_eq!(
+            parse_rpm_qf_output("", 0),
+            RpmQueryResult::Error,
+            "exit 0 with no package name is malformed output, not an empty answer"
         );
     }
 }
