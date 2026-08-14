@@ -2793,6 +2793,7 @@ mod tests {
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
             failed_scanners: Vec::new(),
+            remote_privileged: None,
             scoring_version: 1,
             self_integrity: None,
             host: HostInfo::default(),

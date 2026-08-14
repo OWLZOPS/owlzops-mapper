@@ -446,6 +446,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                 // in this host's report, not in
                                                 // orchestrator's local sink.
                                                 report.coverage_warnings.extend(coverage.notes);
+                                                report.remote_privileged = coverage.privileged;
                                                 Some(report)
                                             }
                                             Err(e) => {
@@ -1039,6 +1040,7 @@ mod tests {
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
             failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 

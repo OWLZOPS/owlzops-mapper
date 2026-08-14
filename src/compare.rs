@@ -151,6 +151,34 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         false
     );
 
+    // Remote privilege level is a coverage fact, not a host setting.
+    // Losing root visibility makes low scores incomparable (R25-31).
+    if before.remote_privileged != after.remote_privileged {
+        let (before_s, after_s, severity) =
+            match (before.remote_privileged, after.remote_privileged) {
+                (Some(true), Some(false)) => (
+                    Some("true".to_string()),
+                    Some("false".to_string()),
+                    Severity::Degraded,
+                ),
+                (Some(false), Some(true)) => (
+                    Some("false".to_string()),
+                    Some("true".to_string()),
+                    Severity::Improved,
+                ),
+                (None, Some(v)) => (None, Some(v.to_string()), Severity::Changed),
+                (Some(v), None) => (Some(v.to_string()), None, Severity::Changed),
+                _ => unreachable!(),
+            };
+
+        changes.push(Change {
+            field: "remote_privileged".into(),
+            before: before_s,
+            after: after_s,
+            severity,
+        });
+    }
+
     // OS / kernel changes (unexpected downgrades)
     if before.host.os_version != after.host.os_version {
         changes.push(Change {
@@ -1434,6 +1462,7 @@ mod tests {
             packages: PackagesInfo::default(),
             self_integrity: None,
             failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 
@@ -1856,5 +1885,24 @@ mod tests {
         assert_eq!(c.before.as_deref(), Some("1"));
         assert_eq!(c.after.as_deref(), Some("absent"));
         assert_eq!(c.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn remote_privileged_lost_is_degraded() {
+        let mut before = test_report();
+        before.remote_privileged = Some(true);
+
+        let mut after = test_report();
+        after.remote_privileged = Some(false);
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "remote_privileged")
+            .expect("privilege loss not detected");
+
+        assert_eq!(c.severity, Severity::Degraded);
+        assert_eq!(c.before.as_deref(), Some("true"));
+        assert_eq!(c.after.as_deref(), Some("false"));
     }
 }

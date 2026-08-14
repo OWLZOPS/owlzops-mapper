@@ -1900,6 +1900,7 @@ mod tests {
             },
             self_integrity: None,
             failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 

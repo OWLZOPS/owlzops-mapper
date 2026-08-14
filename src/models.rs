@@ -28,6 +28,11 @@ pub struct AgentReport {
     pub coverage_warnings: Vec<String>,
     #[serde(default)]
     pub failed_scanners: Vec<String>,
+    /// How the scan was executed. `None` = local scan or legacy snapshot;
+    /// `Some(false)` = remote scan that ran WITHOUT root — privileged surfaces
+    /// were not read and a low score is not evidence of health.
+    #[serde(default)]
+    pub remote_privileged: Option<bool>,
     #[serde(default = "default_scoring_version")]
     pub scoring_version: u8,
     /// Self‑integrity preflight result. None = check not performed or legacy snapshot.
@@ -63,6 +68,7 @@ impl Default for AgentReport {
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
             failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 }

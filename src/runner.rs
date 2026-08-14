@@ -260,6 +260,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             scan_warnings,
             coverage_warnings,
             failed_scanners,
+            remote_privileged: None,
             host: host_info,
             databases: dbs,
             network: network_info,

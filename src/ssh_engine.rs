@@ -1180,6 +1180,13 @@ pub async fn run_remote_scan_russh(
             }
         };
 
+        // Persist how the scan was actually executed. `Some(false)` is already
+        // set by the sudo-unavailable branch; otherwise reflect the resolved
+        // privilege level (R25-31).
+        if remote_coverage.privileged.is_none() {
+            remote_coverage.privileged = Some(use_sudo);
+        }
+
         let deep_arg = if deep { " --deep" } else { "" };
         let cmd = if use_sudo {
             if sudo_pass.is_some() {
