@@ -25,6 +25,13 @@ const CAP_REMOTE_STDERR: usize = 256 * 1024; // 256 KiB
 /// channel can no longer outlive it.
 const PROBE_BUDGET: Duration = Duration::from_secs(20);
 
+/// A much shorter deadline dedicated to the sudo NOPASSWD probe. A wedged
+/// sudo on a host with broken PAM/LDAP must not stall the scan for the full
+/// `PROBE_BUDGET`: we need to find out quickly, then either degrade to an
+/// unprivileged scan (with a recorded fact) or abort the host with a clear
+/// error.
+const SUDO_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
 /// Cap for stdout/stderr of a short probe. A hostile host replacing `mktemp`
 /// with `/dev/zero` must not OOM the scanner. Truncation is recorded in
 /// coverage (Raw Truth), not silently dropped.
@@ -398,7 +405,19 @@ async fn exec_capture(
     host: &str,
     cmd: &str,
 ) -> Result<String, RemoteError> {
-    tokio::time::timeout(PROBE_BUDGET, exec_capture_inner(session, host, cmd))
+    exec_capture_with_budget(session, host, cmd, PROBE_BUDGET).await
+}
+
+/// Execute a short command with an explicit deadline. Used when the default
+/// `PROBE_BUDGET` is not appropriate, e.g. sudo NOPASSWD probe where a wedged
+/// PAM stack must not stall the whole scan.
+async fn exec_capture_with_budget(
+    session: &client::Handle<ClientHandler>,
+    host: &str,
+    cmd: &str,
+    budget: Duration,
+) -> Result<String, RemoteError> {
+    tokio::time::timeout(budget, exec_capture_inner(session, host, cmd))
         .await
         .map_err(|_| RemoteError::Timeout {
             host: host.to_string(),
@@ -790,7 +809,6 @@ pub async fn run_remote_scan_russh(
         );
     }
 
-    // Kernel-level dead-transport detection; best-effort
     if let Err(e) = harden_tcp(&stream) {
         tracing::warn!(
             host = %hostname,
@@ -799,8 +817,6 @@ pub async fn run_remote_scan_russh(
         );
     }
 
-    // Internal SSH timers removed – duration is entirely controlled
-    // by external tokio deadlines (connect / handshake+auth / overall).
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: None,
@@ -816,8 +832,6 @@ pub async fn run_remote_scan_russh(
         })?,
     };
 
-    // Wrap handshake + auth in a 30-second deadline; load key
-    // before the deadline so local disk I/O does not count against it.
     let ssh_key_path = ssh_key_path.to_string();
     let key = tokio::task::spawn_blocking(move || load_secret_key(&ssh_key_path, None))
         .await
@@ -857,8 +871,6 @@ pub async fn run_remote_scan_russh(
 
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
     let uploaded = AtomicBool::new(false);
-    // Written exactly once, read after the timeout. `OnceLock` encodes that
-    // invariant: no poisoning, no PoisonError dance.
     let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
     let mut remote_coverage = RemoteCoverage::default();
 
@@ -873,7 +885,6 @@ pub async fn run_remote_scan_russh(
         if copy_binary {
             if let Some(p) = remote_path {
                 actual_remote_path = p.to_string();
-                // We will upload a file into an operator-supplied directory.
                 let a = RemoteArtifact::UploadedFile {
                     bin: actual_remote_path.clone(),
                 };
@@ -881,7 +892,6 @@ pub async fn run_remote_scan_russh(
             } else {
                 let a = make_remote_staging(&session, &hostname).await?;
                 actual_remote_path = a.bin().to_string();
-                // Obligation starts HERE, not after upload.
                 let _ = artifact.set(a);
             }
         } else {
@@ -921,22 +931,20 @@ pub async fn run_remote_scan_russh(
             .await
             .map_err(|e| RemoteError::from_russh(e, &hostname))?;
 
-        // Determine whether to use sudo
         let use_sudo = if sudo_pass.is_some() {
             true
         } else {
-            match exec_capture(
+            match exec_capture_with_budget(
                 &session,
                 &hostname,
                 &format!("LC_ALL=C sudo -n -- {actual_remote_path} --version"),
+                SUDO_PROBE_BUDGET,
             )
             .await
             {
                 Ok(_) => true,
                 Err(RemoteError::NonZeroExit { stderr, .. }) => {
                     match classify_sudo_stderr(&stderr) {
-                        // A non-zero exit with empty stderr is not evidence
-                        // that passwordless sudo works (R25-20).
                         SudoOutcome::Ok => {
                             return Err(RemoteError::UploadFailed {
                                 host: hostname.clone(),
@@ -979,7 +987,9 @@ pub async fn run_remote_scan_russh(
                         }
                     }
                 }
-                // Preserve original error: it is not an upload failure.
+                // Timeout / channel closed / transport error: sudo did not
+                // answer. We must NOT guess "no root is fine" — abort this host
+                // with a clear diagnostic.
                 Err(e) => return Err(e),
             }
         };
