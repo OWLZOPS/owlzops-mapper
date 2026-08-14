@@ -74,8 +74,14 @@ pub(crate) fn classify_hook(attribution: &str) -> HookSource {
         return HookSource::Unresolved;
     };
 
-    // Order matters: BPF trampolines, livepatch handlers, and kprobe handlers
-    // have well-known callback prefixes. Module attribution is the fallback.
+    // A callback carrying a `[module]` tag came from a loaded module, and its
+    // SYMBOL name is as attacker-chosen as the module name. Genuine BPF /
+    // livepatch / kprobe ftrace handlers are built into vmlinux and are never
+    // tagged. Structural fact first, name second (RC-1, R25-28).
+    if let Some(m) = module {
+        return HookSource::Module(m.to_string());
+    }
+
     if cb.starts_with("bpf_trampoline") || cb.starts_with("bpf_ftrace") {
         return HookSource::Bpf;
     }
@@ -86,10 +92,7 @@ pub(crate) fn classify_hook(attribution: &str) -> HookSource {
         return HookSource::Kprobe;
     }
 
-    match module {
-        Some(m) => HookSource::Module(m.to_string()),
-        None => HookSource::KernelBuiltin,
-    }
+    HookSource::KernelBuiltin
 }
 
 /// Parse enabled_functions into (function, ops_count, attribution_tail).
@@ -294,6 +297,25 @@ mod tests {
         assert_eq!(
             classify_hook("R I ->not_a_bpf_callback [diamorphine]"),
             HookSource::Module("diamorphine".to_string())
+        );
+    }
+
+    #[test]
+    fn module_callback_never_classifies_as_kernel_builtin_source() {
+        // A module-provided callback may be named bpf_trampoline_* or klp_*,
+        // but kallsyms resolves module symbols too. The module tag is the
+        // structural attribution and must win over symbol prefixes.
+        assert_eq!(
+            classify_hook("R I ->bpf_trampoline_evil [rootkit]"),
+            HookSource::Module("rootkit".to_string())
+        );
+        assert_eq!(
+            classify_hook("R I ->klp_ftrace_handler [rootkit]"),
+            HookSource::Module("rootkit".to_string())
+        );
+        assert_eq!(
+            classify_hook("R I ->kprobe_ftrace_handler [rootkit]"),
+            HookSource::Module("rootkit".to_string())
         );
     }
 
