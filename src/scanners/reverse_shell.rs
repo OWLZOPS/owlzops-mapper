@@ -278,9 +278,12 @@ fn correlate_with_processes(
                 stdio_fd,
             };
 
-            // Prefer the first stdio fd found; there is usually just one.
-            if best.is_none() {
-                best = Some(candidate);
+            // Deterministic: lowest stdio fd wins. readdir order is arbitrary,
+            // and arbitrary evidence produces phantom drift in compare.rs.
+            match &best {
+                None => best = Some(candidate),
+                Some(b) if candidate.stdio_fd < b.stdio_fd => best = Some(candidate),
+                Some(_) => {}
             }
         }
 
@@ -457,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn stdio_fd_preferred_over_high_fd() {
+    fn lowest_stdio_fd_wins_deterministically() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("1340");
         std::fs::create_dir_all(base.join("fd")).unwrap();
