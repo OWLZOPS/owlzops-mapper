@@ -53,6 +53,11 @@ pub(crate) const JSONL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Exit code for invalid CLI usage. Outside the 0..=3 verdict band (R25-36).
 const EXIT_USAGE: i32 = 64; // sysexits.h EX_USAGE
 
+/// Exit code for an incomplete scan: one or more scanners failed.
+/// Distinct from non-root degradation (2) so CI can tell "no verdict"
+/// from "verdict degraded by privileges" (R25-26 tail).
+const EXIT_INCOMPLETE: i32 = 4;
+
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
@@ -70,14 +75,14 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
         }
         Verdict::Incomplete => {
             if report.failed_scanners.is_empty() {
-                warn!("scan incomplete; exiting 2");
+                warn!("scan incomplete; exiting 4");
             } else {
                 warn!(
                     failed = ?report.failed_scanners,
-                    "one or more scanners failed — verdict incomplete, exiting 2"
+                    "one or more scanners failed — verdict incomplete, exiting 4"
                 );
             }
-            2
+            EXIT_INCOMPLETE
         }
         Verdict::Critical => {
             if !report.is_root_execution {
@@ -1105,6 +1110,18 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(compute_exit_code(&r), 3);
+    }
+
+    #[test]
+    fn exit_code_4_when_scanner_failed() {
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.security.ssh_root_login_enabled = false;
+        r.host.backup_tools = vec!["restic".to_string()];
+        r.host.ntp_synchronized = true;
+        r.failed_scanners = vec!["security".to_string()];
+
+        assert_eq!(compute_exit_code(&r), EXIT_INCOMPLETE);
     }
 
     #[test]
