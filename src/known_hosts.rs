@@ -81,11 +81,13 @@ impl KnownHostsChecker {
     /// Verify the presented server key.
     ///
     /// Logic:
-    /// 1. Collect all lines from both known_hosts files that match the host.
-    /// 2. Filter those lines to only the ones with the same key type (`ptype`).
-    /// 3. If any of those match exactly → `Ok(true)`.
-    /// 4. If there are lines of the same type but none matched → `HostKeyChanged`.
-    /// 5. If no lines of this type exist at all → TOFU (pin the new key type).
+    /// 1. Collect all matching host entries from both trust stores.
+    /// 2. If any entry matches the presented key exactly (type AND data) →
+    ///    `Ok(true)`.
+    /// 3. If there is at least one entry for the host but none matched →
+    ///    `HostKeyChanged`. This is independent of the key algorithm: a
+    ///    change from Ed25519 to RSA is a change, not a new TOFU pin.
+    /// 4. Only if the host is completely unknown → TOFU and pin the key.
     pub fn verify(
         &self,
         key: &russh::keys::ssh_key::PublicKey,
@@ -104,9 +106,10 @@ impl KnownHostsChecker {
             });
         };
 
-        // Collect all matching host entries, keeping track of same-type matches
-        // alongside the file they came from so the error message can be precise.
-        let mut same_type_conflict: Option<(String, PathBuf)> = None;
+        // `Some` means the host already has a known key that does NOT match
+        // the presented one. The algorithm type is deliberately ignored here:
+        // any mismatch is a security event.
+        let mut conflict: Option<(String, PathBuf)> = None;
 
         for path in [&self.system_file, &self.pin_file] {
             let Ok(content) = std::fs::read_to_string(path) else {
@@ -124,21 +127,20 @@ impl KnownHostsChecker {
                 if !self.line_host_matches(hf) {
                     continue;
                 }
-                // Only consider lines with the same key type.
-                if kt != ptype {
-                    continue;
+
+                // Exact match: host, key type, and key data all agree.
+                if kt == ptype && kd == pdata {
+                    return Ok(true);
                 }
-                if kd == pdata {
-                    return Ok(true); // exact match found
-                }
-                // Same type but different data – record conflict, but keep scanning
-                // because there might be another line of the same type that matches.
-                same_type_conflict.get_or_insert_with(|| (line.to_string(), path.clone()));
+
+                // Record the first mismatching entry for this host. We do not
+                // filter by `kt != ptype`, so an algorithm change cannot be
+                // mistaken for an unknown host.
+                conflict.get_or_insert_with(|| (line.to_string(), path.clone()));
             }
         }
 
-        // If we found any same-type entry but none matched exactly → key has changed.
-        if let Some((conflict_line, conflict_file)) = same_type_conflict {
+        if let Some((conflict_line, conflict_file)) = conflict {
             return Err(crate::ssh_engine::RemoteError::HostKeyChanged {
                 host: self.host.clone(),
                 file: conflict_file.display().to_string(),
@@ -146,7 +148,7 @@ impl KnownHostsChecker {
             });
         }
 
-        // No entry for this host+type combination → TOFU: pin new key.
+        // No entry for this host at all → TOFU.
         let entry = format!("{} {} {}\n", self.host_candidates()[0], ptype, pdata);
         if let Some(dir) = self.pin_file.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
@@ -220,6 +222,45 @@ mod tests {
         };
         assert!(matches!(
             checker_bad.verify(pub_key),
+            Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
+        ));
+    }
+
+    /// Regression test for R24-20: changing the key algorithm must be treated
+    /// as a key change, not as a new unknown host.
+    #[test]
+    fn algorithm_change_is_host_key_changed_not_tofu() {
+        let rsa_key = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Rsa {
+                hash: Some(russh::keys::ssh_key::HashAlg::Sha512),
+            },
+        )
+        .unwrap();
+        let ed_key = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        std::fs::write(
+            &kh_path,
+            format!("localhost {}\n", rsa_key.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+
+        let checker = KnownHostsChecker {
+            host: "localhost".into(),
+            port: 22,
+            system_file: kh_path,
+            pin_file: tmp_dir.path().join("pin"),
+        };
+
+        // Present Ed25519 while trust store has RSA: must be HostKeyChanged.
+        assert!(matches!(
+            checker.verify(ed_key.public_key()),
             Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
         ));
     }
