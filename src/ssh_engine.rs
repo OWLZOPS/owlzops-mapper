@@ -1016,7 +1016,19 @@ pub async fn run_remote_scan_russh(
 
     let result = tokio::time::timeout(overall, async {
         if let Some(pass) = sudo_pass {
-            validate_sudo_password(&session, pass, &hostname).await?;
+            // Pre-flight sudo validation performs a real authentication round
+            // trip. A wedged PAM/LDAP stack here must not consume the whole
+            // per-host budget; this probe gets its own short deadline, just
+            // like the NOPASSWD probe (R25-34b).
+            let sudo_check = tokio::time::timeout(
+                SUDO_PROBE_BUDGET,
+                validate_sudo_password(&session, pass, &hostname),
+            )
+            .await
+            .map_err(|_| RemoteError::Timeout {
+                host: hostname.clone(),
+            })?;
+            sudo_check?;
         }
 
         let actual_remote_path: String;
