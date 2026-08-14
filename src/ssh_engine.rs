@@ -663,7 +663,7 @@ async fn upload_via_channel(
             .exec(
                 true,
                 format!(
-                    "umask 077 && cat > {p}.part && chmod 700 -- {p}.part && mv -f -- {p}.part {p}",
+                    "rm -f -- {p}.part && umask 077 && cat > {p}.part && chmod 700 -- {p}.part && mv -f -- {p}.part {p}",
                     p = remote_path
                 ),
             )
@@ -932,17 +932,29 @@ pub async fn run_remote_scan_russh(
                     .parent()
                     .map(|d| d.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let test = exec_capture(
+                // Use a real create/remove probe: `test -w` is unreliable under ACLs.
+                let probe = exec_capture(
                     &session,
                     &hostname,
-                    &format!("LC_ALL=C test -w -- '{}'", parent),
+                    &format!("LC_ALL=C mktemp -- '{parent}/.owlzops-write-test-XXXXXXXX'"),
                 )
                 .await;
-                if test.is_err() {
-                    return Err(RemoteError::UploadFailed {
-                        host: hostname.clone(),
-                        detail: format!("parent directory '{}' is not writable", parent),
-                    });
+                match probe {
+                    Ok(tmp) => {
+                        let tmp = tmp.trim();
+                        let _ = exec_capture(
+                            &session,
+                            &hostname,
+                            &format!("LC_ALL=C rm -f -- '{}'", tmp),
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        return Err(RemoteError::UploadFailed {
+                            host: hostname.clone(),
+                            detail: format!("parent directory '{}' is not writable", parent),
+                        });
+                    }
                 }
                 let a = RemoteArtifact::UploadedFile {
                     bin: actual_remote_path.clone(),
