@@ -62,13 +62,62 @@ const EXIT_INCOMPLETE: i32 = 4;
 /// Exit code for a scan interrupted by SIGINT/SIGTERM.
 const EXIT_INTERRUPT: i32 = 130;
 
+// R25-56: Fleet aggregation compares verdicts, not numeric exit codes.
+/// Numeric exit codes are a PUBLIC CONTRACT and are NOT ordered by severity:
+/// 4 (incomplete) is less severe than 3 (compromise). Fleet aggregation must
+/// therefore compare verdicts and map to a code once, never `max()` the codes.
+fn verdict_rank(v: Verdict) -> u8 {
+    match v {
+        Verdict::Clean => 0,
+        Verdict::Critical => 1,
+        Verdict::Incomplete => 2,
+        Verdict::Compromised => 3,
+    }
+}
+
+/// Return the more severe of two verdicts.
+fn worse_of(a: Verdict, b: Verdict) -> Verdict {
+    if verdict_rank(a) >= verdict_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Extract the verdict for a single report without mapping to an exit code.
+/// This is the function fleet aggregation uses; it calls `evaluate` once.
+fn compute_verdict(report: &AgentReport) -> Verdict {
+    let findings = scoring::evaluate(report);
+    scoring::verdict_from_findings(&findings, &report.failed_scanners)
+}
+
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
+fn exit_code_for_verdict(verdict: Verdict, is_root: bool, warnings_present: bool) -> i32 {
+    match verdict {
+        Verdict::Compromised => 3,
+        Verdict::Incomplete => EXIT_INCOMPLETE,
+        Verdict::Critical => {
+            if !is_root {
+                2
+            } else {
+                1
+            }
+        }
+        Verdict::Clean => {
+            if !is_root || warnings_present {
+                2
+            } else {
+                0
+            }
+        }
+    }
+}
+
 fn compute_exit_code(report: &AgentReport) -> i32 {
-    let findings = scoring::evaluate(report);
-    let verdict = scoring::verdict_from_findings(&findings, &report.failed_scanners);
+    let verdict = compute_verdict(report);
 
     match verdict {
         Verdict::Compromised => {
@@ -246,9 +295,18 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         let mut rx = rx;
                         let mut written = 0usize;
                         let mut io_errors = 0usize;
-                        let mut worst = 0i32;
+                        let mut worst_verdict: Option<Verdict> = None;
+                        let mut any_non_root = false;
+                        let mut any_warnings = false;
                         while let Some(report) = rx.blocking_recv() {
-                            worst = worst.max(compute_exit_code(&report));
+                            let verdict = compute_verdict(&report);
+                            worst_verdict = Some(match worst_verdict {
+                                None => verdict,
+                                Some(current) => worse_of(current, verdict),
+                            });
+                            any_non_root |= !report.is_root_execution;
+                            any_warnings |= !report.scan_warnings.is_empty();
+
                             match serde_json::to_string(&report) {
                                 Ok(json) => match writeln!(file, "{json}") {
                                     Ok(()) => written += 1,
@@ -264,7 +322,11 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             io_errors += 1;
                             warn!(error = %e, "JSONL flush failed — tail records may be lost");
                         }
-                        (written, worst, io_errors)
+                        let exit_code = match worst_verdict {
+                            Some(v) => exit_code_for_verdict(v, any_non_root, any_warnings),
+                            None => 2, // no reports written
+                        };
+                        (written, exit_code, io_errors)
                     }))
                 } else {
                     None
@@ -599,7 +661,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         writer.await
                     };
                     match joined {
-                        Ok((written, worst, io_errors)) => {
+                        Ok((written, exit_code, io_errors)) => {
                             if io_errors > 0 {
                                 warn!(
                                     written,
@@ -611,7 +673,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             if interrupted {
                                 return EXIT_INTERRUPT;
                             }
-                            return if written == 0 { 2 } else { worst };
+                            return if written == 0 { 2 } else { exit_code };
                         }
                         Err(_) => {
                             warn!("JSONL writer task failed");
@@ -640,6 +702,23 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     return 2;
                 }
 
+                let mut worst_verdict: Option<Verdict> = None;
+                let mut any_non_root = false;
+                let mut any_warnings = false;
+                for report in &reports {
+                    let verdict = compute_verdict(report);
+                    worst_verdict = Some(match worst_verdict {
+                        None => verdict,
+                        Some(current) => worse_of(current, verdict),
+                    });
+                    any_non_root |= !report.is_root_execution;
+                    any_warnings |= !report.scan_warnings.is_empty();
+                }
+                let exit_code = match worst_verdict {
+                    Some(v) => exit_code_for_verdict(v, any_non_root, any_warnings),
+                    None => 2,
+                };
+
                 if let Err(e) = output::output_multi(
                     &reports,
                     &args.format,
@@ -650,8 +729,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     return 2;
                 }
 
-                let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
-                return worst;
+                return exit_code;
             }
 
             // Single local scan (no hosts file or empty hosts)
