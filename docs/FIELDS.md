@@ -16,7 +16,18 @@ Use it to build integrations, dashboards, or alerting rules.
 | `is_root_execution` | boolean | Whether the scan ran as root |
 | `scan_warnings` | array of strings | Warnings about scan failures or incomplete data |
 | `coverage_warnings` | array of strings | Coverage warnings (truncated files, unreadable /proc entries, etc.) |
+| `failed_scanners` | array of strings | Scanners that failed or panicked during this scan. Non‑empty means the verdict is incomplete |
+| `remote_privileged` | boolean \| null | For remote scans: `true` = executed with root/sudo, `false` = executed without root, `null` = local scan or legacy snapshot |
 | `scoring_version` | integer | Internal scoring engine version (used for drift comparison) |
+| `self_integrity` | object \| null | Self‑integrity preflight result; `null` = check not performed or legacy snapshot |
+| `databases` | array of objects | Detected databases; see `## databases` |
+
+### `self_integrity`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `self_integrity.compromised` | boolean | Whether the self‑integrity preflight found a compromise indicator |
+| `self_integrity.warnings` | array of strings | Warnings produced by the self‑integrity preflight |
 
 ---
 
