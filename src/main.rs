@@ -62,6 +62,10 @@ const EXIT_INCOMPLETE: i32 = 4;
 /// Exit code for a scan interrupted by SIGINT/SIGTERM.
 const EXIT_INTERRUPT: i32 = 130;
 
+// R25-60: a panic is not an interrupt; use EX_SOFTWARE instead of 130.
+/// Exit code for an internal error (panic), distinct from SIGINT (130).
+const EXIT_INTERNAL_ERROR: i32 = 70; // sysexits.h EX_SOFTWARE
+
 // R25-56: Fleet aggregation compares verdicts, not numeric exit codes.
 /// Numeric exit codes are a PUBLIC CONTRACT and are NOT ordered by severity:
 /// 4 (incomplete) is less severe than 3 (compromise). Fleet aggregation must
@@ -115,6 +119,7 @@ fn exit_code_for_verdict(verdict: Verdict, is_root: bool, warnings_present: bool
         }
     }
 }
+
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let verdict = compute_verdict(report);
@@ -1098,7 +1103,7 @@ async fn main() {
     let exit_code = cmd_handle.await.unwrap_or_else(|join_err| {
         if join_err.is_panic() {
             eprintln!("Main task panicked");
-            EXIT_INTERRUPT
+            EXIT_INTERNAL_ERROR
         } else {
             1
         }
