@@ -32,6 +32,12 @@ const PROBE_BUDGET: Duration = Duration::from_secs(20);
 /// error.
 const SUDO_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
+/// Pre-flight sudo validation is a REAL authentication round trip: pam_unix
+/// applies ~2 s FAIL_DELAY on a wrong password and pam_sss/pam_ldap reach a
+/// directory server. `SUDO_PROBE_BUDGET` is for `sudo -n`, which never
+/// authenticates, and is far too short here (R25-43).
+const SUDO_AUTH_BUDGET: Duration = Duration::from_secs(30);
+
 /// Cap for stdout/stderr of a short probe. A hostile host replacing `mktemp`
 /// with `/dev/zero` must not OOM the scanner. Truncation is recorded in
 /// coverage (Raw Truth), not silently dropped.
@@ -151,6 +157,14 @@ pub enum RemoteError {
         path: Option<String>,
         detail: String,
     },
+    /// The PAM stack did not answer. Distinct from a transport timeout: the
+    /// fix is a directory/PAM problem on the host, not --remote-timeout.
+    #[error(
+        "sudo authentication on {host} did not complete within {}s — the PAM stack \
+         (pam_sss/pam_ldap/pam_krb5) may be waiting on an unreachable directory server",
+        SUDO_AUTH_BUDGET.as_secs()
+    )]
+    SudoAuthTimeout { host: String },
     /// `Defaults requiretty` is a deliberate host policy. We refuse to defeat
     /// it by allocating a PTY; instead we tell the operator how to install the
     /// binary at a fixed path and grant NOPASSWD for that path. Recommending a
@@ -667,15 +681,18 @@ async fn upload_via_channel(
     };
 
     let upload_fut = async {
-        // `set -C` makes `>` use O_CREAT|O_EXCL: an attacker cannot pre-create
-        // the inode or a symlink, and there is no window between a check and
-        // the open. This is what R24-96 asked for; `rm -f` before `cat >` only
-        // narrows the race.
+        // `rm -f` reclaims a stale .part from an earlier crash; `set -C`
+        // (O_CREAT|O_EXCL) then refuses anything that reappears in the gap,
+        // so the worst case is a failed upload, never a write through an
+        // attacker's symlink (R24-96/R25-32/R25-47).
+        // Chained with `&&`: a shell that does not support `set -C` must
+        // abort, not continue unprotected (R25-48).
         channel
             .exec(
                 true,
                 format!(
-                    "set -C; umask 077; cat > {part} && chmod 700 -- {part} && mv -f -- {part} {bin}",
+                    "rm -f -- {part} && set -C && umask 077 && cat > {part} \
+                     && chmod 700 -- {part} && mv -f -- {part} {bin}",
                     part = part_path,
                     bin = remote_path,
                 ),
@@ -694,9 +711,10 @@ async fn upload_via_channel(
         let mut exit: Option<u32> = None;
         let mut stderr_truncated = false;
         let mut eof_sent = false;
+        let mut closed = false;
 
         loop {
-            if exit.is_some() {
+            if closed {
                 break;
             }
 
@@ -714,27 +732,33 @@ async fn upload_via_channel(
                             }
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            // Do NOT stop here: extended data may still be in
+                            // flight and it is the diagnostic this code exists
+                            // to surface. Close (or channel end) is the
+                            // terminator; UPLOAD_BUDGET bounds the wait
+                            // (R25-34a/R25-41).
                             exit = Some(exit_status);
                         }
-                        Some(ChannelMsg::Close) => break,
-                        Some(_) => {}
-                        None => break,
+                        Some(ChannelMsg::Close) | None => closed = true,
+                        _ => {}
                     }
                 }
-                read = file.read(&mut buf) => {
+                read = file.read(&mut buf), if !eof_sent => {
                     let n = read.map_err(|e| RemoteError::Io {
                         host: host.to_string(),
                         source: e,
                     })?;
+
                     if n == 0 {
-                        // EOF: close stdin, then continue to drain exit status/close.
-                        if !eof_sent {
-                            channel
-                                .eof()
-                                .await
-                                .map_err(|e| RemoteError::from_russh(e, host))?;
-                            eof_sent = true;
-                        }
+                        // EOF: close our stdin exactly once. From now on only
+                        // the channel branch remains active, which prevents a
+                        // busy-spin on an immediately-ready Ok(0) read
+                        // (R25-39).
+                        channel
+                            .eof()
+                            .await
+                            .map_err(|e| RemoteError::from_russh(e, host))?;
+                        eof_sent = true;
                         continue;
                     }
 
@@ -758,23 +782,19 @@ async fn upload_via_channel(
             }
         }
 
-        // Drain any remaining stderr/exit if not already done.
-        while exit.is_none() {
-            match channel.wait().await {
-                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                    let room = PROBE_OUTPUT_CAP.saturating_sub(stderr.len());
-                    if room > 0 {
-                        let take = data.len().min(room);
-                        stderr.extend_from_slice(&data[..take]);
-                        if data.len() > room {
-                            stderr_truncated = true;
-                        }
+        // Drain any remaining stderr after Close as well.
+        while let Some(msg) = channel.wait().await {
+            if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                let room = PROBE_OUTPUT_CAP.saturating_sub(stderr.len());
+                if room > 0 {
+                    let take = data.len().min(room);
+                    stderr.extend_from_slice(&data[..take]);
+                    if data.len() > room {
+                        stderr_truncated = true;
                     }
                 }
-                Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
-                Some(ChannelMsg::Close) => break,
-                Some(_) => {}
-                None => break,
+            } else if let ChannelMsg::ExitStatus { exit_status } = msg {
+                exit = Some(exit_status);
             }
         }
 
@@ -874,30 +894,6 @@ pub struct RemoteCoverage {
 // ---------------------------------------------------------------------------
 // Main remote scan
 // ---------------------------------------------------------------------------
-
-fn random_part_suffix() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u64(std::process::id() as u64);
-    hasher.write_u128(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    );
-    let mut h = hasher.finish();
-    let mut out = String::with_capacity(8);
-    for _ in 0..8 {
-        out.push(char::from(b'a' + (h % 26) as u8));
-        h = h
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-    }
-    out
-}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_remote_scan_russh(
@@ -1020,16 +1016,12 @@ pub async fn run_remote_scan_russh(
 
     let result = tokio::time::timeout(overall, async {
         if let Some(pass) = sudo_pass {
-            // Pre-flight sudo validation performs a real authentication round
-            // trip. A wedged PAM/LDAP stack here must not consume the whole
-            // per-host budget; this probe gets its own short deadline, just
-            // like the NOPASSWD probe (R25-34b).
             let sudo_check = tokio::time::timeout(
-                SUDO_PROBE_BUDGET,
+                SUDO_AUTH_BUDGET,
                 validate_sudo_password(&session, pass, &hostname),
             )
             .await
-            .map_err(|_| RemoteError::Timeout {
+            .map_err(|_| RemoteError::SudoAuthTimeout {
                 host: hostname.clone(),
             })?;
             sudo_check?;
@@ -1040,7 +1032,11 @@ pub async fn run_remote_scan_russh(
             if let Some(p) = remote_path {
                 actual_remote_path = p.to_string();
 
-                let part = format!("{}.owlzops-{}.part", p, random_part_suffix());
+                // Deterministic: a crash-orphaned `.part` must be reclaimable
+                // by the NEXT run. `set -C` already closes the symlink race,
+                // so an unpredictable name buys nothing and costs cleanup
+                // (R25-47).
+                let part = format!("{p}.part");
                 let a = RemoteArtifact::UploadedFile {
                     bin: actual_remote_path.clone(),
                     part: part.clone(),
@@ -1076,7 +1072,7 @@ pub async fn run_remote_scan_russh(
             let part_for_upload = match artifact.get() {
                 Some(RemoteArtifact::UploadedFile { part, .. }) => part.clone(),
                 Some(RemoteArtifact::OwnedDir { dir, .. }) => {
-                    format!("{dir}/.owlzops-upload-{}.part", random_part_suffix())
+                    format!("{dir}/.owlzops-upload.part")
                 }
                 _ => String::new(),
             };
