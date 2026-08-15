@@ -61,9 +61,11 @@ pub enum Category {
 pub enum Scanner {
     Host,
     Network,
+    Storage,
     Security,
     Persistence,
     Packages,
+    Databases,
     Docker,
     /// Added by the orchestrator, not produced by a host scanner.
     Orchestrator,
@@ -74,9 +76,11 @@ impl Scanner {
         match name {
             "host" => Some(Self::Host),
             "network" => Some(Self::Network),
+            "storage" => Some(Self::Storage),
             "security" => Some(Self::Security),
             "persistence" => Some(Self::Persistence),
             "packages" => Some(Self::Packages),
+            "databases" => Some(Self::Databases),
             "docker" => Some(Self::Docker),
             _ => None,
         }
@@ -153,6 +157,17 @@ fn finding_from_failed_scanner(f: &Finding, report: &AgentReport) -> bool {
 /// This is a pure function – no side effects.
 pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
+
+    // Fail-open guard: an unmapped name silently disables the whole R24-92
+    // filter for that scanner. Say so once, not per finding (R25-46).
+    for name in &report.failed_scanners {
+        if Scanner::from_name(name).is_none() {
+            coverage::record(format!(
+                "scoring: failed scanner `{name}` has no Scanner variant — findings \
+                 derived from it were NOT withheld from the verdict"
+            ));
+        }
+    }
 
     // ── Security ────────────────────────────────────────
 
@@ -2584,12 +2599,16 @@ pub enum Verdict {
 
 pub fn verdict_from_findings(findings: &[Finding], failed_scanners: &[String]) -> Verdict {
     let flags = CriticalFlags::from_findings(findings);
+
     if flags.compromised_host {
+        // An IoC raised by a scanner that DID run is definitive.
         Verdict::Compromised
+    } else if !failed_scanners.is_empty() {
+        // Incomplete outranks Critical: a critical count from a partial scan
+        // is a LOWER BOUND, and exit 1 tells CI "this is the whole list".
+        Verdict::Incomplete
     } else if flags.has_critical() {
         Verdict::Critical
-    } else if !failed_scanners.is_empty() {
-        Verdict::Incomplete
     } else {
         Verdict::Clean
     }
@@ -3884,6 +3903,7 @@ mod tests {
 
         assert_eq!(verdict, Verdict::Compromised);
     }
+
     #[test]
     fn pam_findings_belong_to_persistence_scanner() {
         let mut r = minimal_report();
@@ -3905,6 +3925,43 @@ mod tests {
         let findings = evaluate(&r);
         for f in findings.iter().filter(|f| f.id == "SEC-055") {
             assert_eq!(f.source, Scanner::Persistence);
+        }
+    }
+
+    #[test]
+    fn a_critical_finding_does_not_hide_an_incomplete_scan() {
+        let mut r = minimal_report();
+        r.network.firewall_active = false; // SEC-001, network is healthy
+        r.failed_scanners = vec!["security".to_string()];
+
+        let findings = evaluate(&r);
+        assert_eq!(
+            verdict_from_findings(&findings, &r.failed_scanners),
+            Verdict::Incomplete
+        );
+        assert!(findings.iter().any(|f| f.id == "COV-001"));
+        assert!(
+            findings.iter().any(|f| f.id == "SEC-001"),
+            "the critical is still reported"
+        );
+    }
+
+    #[test]
+    fn every_runner_scanner_name_maps_to_a_variant() {
+        for name in [
+            "host",
+            "databases",
+            "network",
+            "storage",
+            "security",
+            "packages",
+            "docker",
+            "persistence",
+        ] {
+            assert!(
+                Scanner::from_name(name).is_some(),
+                "`{name}` has no Scanner variant"
+            );
         }
     }
 }
