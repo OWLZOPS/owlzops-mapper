@@ -297,12 +297,33 @@ fn strip_ansi(s: &str) -> String {
     String::from_utf8_lossy(&result).into_owned()
 }
 
+/// Unicode format characters (Cf) and bidi override/isolate controls are
+/// not visible themselves but can alter how terminals render surrounding
+/// text. Treat them like control characters and replace with spaces.
+fn is_unicode_format_control(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD                    // SOFT HYPHEN
+        | 0x061C                  // ARABIC LETTER MARK
+        | 0x200B..=0x200F         // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | 0x202A..=0x202E         // LRE, RLE, LRO, RLO, PDF
+        | 0x2060..=0x2064         // WORD JOINER, INVISIBLE OPS
+        | 0x2066..=0x2069         // LRI, RLI, FSI, PDI
+        | 0xFEFF                  // ZERO WIDTH NO-BREAK SPACE / BOM
+    )
+}
+
 /// Replace all control characters with spaces, then truncate to `max_chars`.
 fn sanitize_and_truncate(s: &str, max_chars: usize) -> String {
     let stripped = strip_ansi(s);
     let sanitized: String = stripped
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_unicode_format_control(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     sanitized.chars().take(max_chars).collect()
 }
@@ -1070,5 +1091,21 @@ mod tests {
     fn sanitize_for_log_truncates_to_300_chars() {
         let input = "a".repeat(500);
         assert_eq!(sanitize_for_log(&input).chars().count(), 300);
+    }
+
+    #[test]
+    fn sanitize_for_log_removes_unicode_bidi_controls() {
+        let out = sanitize_for_log("safe\u{202E}evil\u{2066}text\u{202C}");
+        assert!(!out.contains('\u{202E}'));
+        assert!(!out.contains('\u{2066}'));
+        assert!(!out.contains('\u{202C}'));
+    }
+
+    #[test]
+    fn sanitize_for_log_removes_zero_width_format_chars() {
+        let out = sanitize_for_log("a\u{200B}b\u{FEFF}c");
+        assert!(!out.contains('\u{200B}'));
+        assert!(!out.contains('\u{FEFF}'));
+        assert!(out.chars().all(|c| !is_unicode_format_control(c)));
     }
 }
