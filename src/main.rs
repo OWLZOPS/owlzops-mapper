@@ -28,6 +28,7 @@ use runner::snapshot_run;
 use runner::{is_local_host, run_local_scan_async};
 use scoring::*;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -470,9 +471,14 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     Err(e) => {
                                         // Progress bars continuously redraw stderr.
                                         // Suspend them to ensure the error stays visible.
+                                        // R25-18: never panic on EPIPE when stderr is closed early.
                                         multi.suspend(|| {
-                                            eprintln!("[error] russh scan failed for {host}: {e}");
+                                            let _ = writeln!(
+                                                std::io::stderr(),
+                                                "[error] russh scan failed for {host}: {e}"
+                                            );
                                         });
+                                        warn!(host = %host, error = %e, "russh scan failed");
                                         None
                                     }
                                 }
