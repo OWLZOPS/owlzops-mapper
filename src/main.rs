@@ -115,7 +115,7 @@ fn exit_code_for_verdict(verdict: Verdict, is_root: bool, warnings_present: bool
         }
     }
 }
-
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let verdict = compute_verdict(report);
 
