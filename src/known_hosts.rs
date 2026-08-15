@@ -246,6 +246,16 @@ impl KnownHostsChecker {
         }
     }
 
+    // R25-55: known_hosts records the KEY type; a session may negotiate a SHA-2
+    // signature over the same key. Compare on the key type, never on the
+    // signature algorithm.
+    fn canonical_key_type(t: &str) -> &str {
+        match t {
+            "rsa-sha2-256" | "rsa-sha2-512" => "ssh-rsa",
+            other => other,
+        }
+    }
+
     /// Verify the presented server key.
     ///
     /// Logic:
@@ -273,11 +283,12 @@ impl KnownHostsChecker {
                 detail: "invalid key format".into(),
             });
         };
+        let ptype_canon = Self::canonical_key_type(ptype);
 
         let mut conflict: Option<(String, PathBuf)> = None;
 
         for entry in &self.entries {
-            if entry.key_type == ptype && entry.key_data == pdata {
+            if Self::canonical_key_type(&entry.key_type) == ptype_canon && entry.key_data == pdata {
                 return Ok(true);
             }
 
@@ -301,7 +312,7 @@ impl KnownHostsChecker {
 
         // No entry for this host at all → TOFU.
         let candidate = &Self::host_candidates(&self.host, self.port)[0];
-        let entry = format!("{} {} {}\n", candidate, ptype, pdata);
+        let entry = format!("{} {} {}\n", candidate, ptype_canon, pdata);
         if let Some(dir) = self.pin_file.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
@@ -441,5 +452,59 @@ mod tests {
 
         let algs = checker.pinned_algorithms();
         assert!(algs.len() >= 2);
+    }
+
+    #[test]
+    fn an_ssh_rsa_entry_offers_sha2_signature_algorithms() {
+        use russh::keys::ssh_key::{Algorithm, HashAlg};
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        std::fs::write(&kh_path, "localhost ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB\n").unwrap();
+
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin"),
+        );
+
+        let algs = checker.pinned_algorithms();
+        assert!(algs.contains(&Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512)
+        }));
+        assert!(algs.contains(&Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256)
+        }));
+    }
+
+    #[test]
+    fn an_rsa_key_verifies_against_an_ssh_rsa_known_hosts_line() {
+        use russh::keys::ssh_key::{Algorithm, HashAlg, PrivateKey};
+
+        let rsa = PrivateKey::random(
+            &mut rand::rng(),
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+        )
+        .unwrap();
+        let pub_key = rsa.public_key();
+        let line = pub_key.to_openssh().unwrap();
+
+        // The line may be `ssh-rsa ...` or `rsa-sha2-512 ...`; our
+        // canonical_key_type must make verification succeed either way.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        std::fs::write(&kh_path, format!("localhost {line}\n")).unwrap();
+
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin"),
+        );
+
+        assert!(matches!(checker.verify(pub_key), Ok(true)));
     }
 }
