@@ -6,18 +6,37 @@ use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
 
+/// A trust store larger than this is not a trust store.
+const CAP_KNOWN_HOSTS: usize = 4 * 1024 * 1024;
+// R25-54: unreadable trust store is an error, not silent TOFU.
+// R25-57: entries are filtered by host during load to bound memory.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustStore {
+    System,
+    Pin,
+}
+
 #[derive(Debug, Clone)]
 struct KnownHostEntry {
     host_field: String,
     key_type: String,
     key_data: String,
-    source_file: PathBuf,
-    raw_line: String,
+    store: TrustStore,
+}
+
+impl KnownHostEntry {
+    /// Reconstructed for the HostKeyChanged message; storing the raw line as
+    /// well would duplicate every field a second time.
+    fn as_line(&self) -> String {
+        format!("{} {} {}", self.host_field, self.key_type, self.key_data)
+    }
 }
 
 pub struct KnownHostsChecker {
     host: String,
     port: u16,
+    system_file: PathBuf,
     pin_file: PathBuf, // ~/.owlzops/known_hosts (our TOFU store)
     entries: Vec<KnownHostEntry>,
 }
@@ -37,22 +56,47 @@ impl KnownHostsChecker {
 
         let system_file = home.join(".ssh/known_hosts");
         let pin_file = home.join(".owlzops/known_hosts");
-        let entries = Self::load_entries(&system_file, &pin_file);
+        let candidates = Self::host_candidates(&host, port);
+        let entries =
+            Self::load_entries(&system_file, &pin_file, &candidates).map_err(|(path, e)| {
+                crate::ssh_engine::RemoteError::HostKeyCheck {
+                    host: host.clone(),
+                    detail: format!(
+                        "trust store {} is unreadable ({e}) — refusing to fall back to \
+                     trust-on-first-use, which would pin whatever the server presents",
+                        path.display()
+                    ),
+                }
+            })?;
 
         Ok(Self {
             host,
             port,
+            system_file,
             pin_file,
             entries,
         })
     }
 
-    fn load_entries(system_file: &Path, pin_file: &Path) -> Vec<KnownHostEntry> {
+    fn load_entries(
+        system_file: &Path,
+        pin_file: &Path,
+        candidates: &[String],
+    ) -> Result<Vec<KnownHostEntry>, (PathBuf, std::io::Error)> {
         let mut out = Vec::new();
 
-        for path in [system_file, pin_file] {
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
+        for (path, store) in [
+            (system_file, TrustStore::System),
+            (pin_file, TrustStore::Pin),
+        ] {
+            let (content, _is_regular) = match crate::safe_io::read_file_capped_regular(
+                &path.to_string_lossy(),
+                CAP_KNOWN_HOSTS,
+            ) {
+                Ok(tuple) => tuple,
+                // A missing store is the first-run case and is legitimate.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err((path.to_path_buf(), e)),
             };
 
             for line in content.lines() {
@@ -66,35 +110,45 @@ impl KnownHostsChecker {
                     continue;
                 };
 
+                // Keep only entries for THIS host. The checker lives for the
+                // whole session; a fleet operator's known_hosts holds
+                // thousands of lines we will never look at (R25-57).
+                if !Self::host_field_matches(hf, candidates) {
+                    continue;
+                }
+
                 out.push(KnownHostEntry {
                     host_field: hf.to_string(),
                     key_type: kt.to_string(),
                     key_data: kd.to_string(),
-                    source_file: path.to_path_buf(),
-                    raw_line: line.to_string(),
+                    store,
                 });
             }
         }
 
-        out
+        Ok(out)
     }
 
     #[cfg(test)]
     fn from_files(host: String, port: u16, system_file: PathBuf, pin_file: PathBuf) -> Self {
-        let entries = Self::load_entries(&system_file, &pin_file);
+        let candidates = Self::host_candidates(&host, port);
+        let entries = Self::load_entries(&system_file, &pin_file, &candidates)
+            .unwrap_or_else(|_| panic!("test trust store must be readable"));
+
         Self {
             host,
             port,
+            system_file,
             pin_file,
             entries,
         }
     }
 
-    fn host_candidates(&self) -> Vec<String> {
-        if self.port == 22 {
-            vec![self.host.clone()]
+    fn host_candidates(host: &str, port: u16) -> Vec<String> {
+        if port == 22 {
+            vec![host.to_string()]
         } else {
-            vec![format!("[{}]:{}", self.host, self.port)]
+            vec![format!("[{}]:{}", host, port)]
         }
     }
 
@@ -116,8 +170,7 @@ impl KnownHostsChecker {
             .into()
     }
 
-    fn line_host_matches(&self, host_field: &str) -> bool {
-        let candidates = self.host_candidates();
+    fn host_field_matches(host_field: &str, candidates: &[String]) -> bool {
         if let Some(rest) = host_field.strip_prefix("|1|") {
             // Hashed entry: |1|salt|mac
             let mut parts = rest.splitn(2, '|');
@@ -143,10 +196,8 @@ impl KnownHostsChecker {
         let mut out = Vec::new();
 
         for entry in &self.entries {
-            if !self.line_host_matches(&entry.host_field) {
-                continue;
-            }
-
+            // Entries are already filtered by host during load_entries,
+            // so no further filtering is needed here.
             for alg in Self::algorithms_from_openssh_name(&entry.key_type) {
                 if !out.contains(&alg) {
                     out.push(alg);
@@ -226,15 +277,18 @@ impl KnownHostsChecker {
         let mut conflict: Option<(String, PathBuf)> = None;
 
         for entry in &self.entries {
-            if !self.line_host_matches(&entry.host_field) {
-                continue;
-            }
-
             if entry.key_type == ptype && entry.key_data == pdata {
                 return Ok(true);
             }
 
-            conflict.get_or_insert_with(|| (entry.raw_line.clone(), entry.source_file.clone()));
+            // Store the first conflicting entry for error reporting.
+            conflict.get_or_insert_with(|| {
+                let file = match entry.store {
+                    TrustStore::System => self.system_file.clone(),
+                    TrustStore::Pin => self.pin_file.clone(),
+                };
+                (entry.as_line(), file)
+            });
         }
 
         if let Some((conflict_line, conflict_file)) = conflict {
@@ -246,7 +300,8 @@ impl KnownHostsChecker {
         }
 
         // No entry for this host at all → TOFU.
-        let entry = format!("{} {} {}\n", self.host_candidates()[0], ptype, pdata);
+        let candidate = &Self::host_candidates(&self.host, self.port)[0];
+        let entry = format!("{} {} {}\n", candidate, ptype, pdata);
         if let Some(dir) = self.pin_file.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
@@ -278,9 +333,15 @@ mod tests {
 
     #[test]
     fn plain_host_matches() {
-        let checker = KnownHostsChecker::new("example.com".into(), 22).expect("HOME must be set");
-        assert!(checker.line_host_matches("example.com,other.example.com"));
-        assert!(!checker.line_host_matches("evil.com"));
+        let candidates = KnownHostsChecker::host_candidates("example.com", 22);
+        assert!(KnownHostsChecker::host_field_matches(
+            "example.com,other.example.com",
+            &candidates
+        ));
+        assert!(!KnownHostsChecker::host_field_matches(
+            "evil.com",
+            &candidates
+        ));
     }
 
     #[test]
