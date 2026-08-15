@@ -99,6 +99,11 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
             if !report.is_root_execution {
                 warn!("not running as root – results may be incomplete.");
                 2
+            } else if !report.scan_warnings.is_empty() {
+                // Superset of failed_scanners: a warning without a panic still
+                // means the report is not a complete observation (R25-45).
+                warn!(warnings = ?report.scan_warnings, "scan produced warnings — degraded");
+                2
             } else {
                 0
             }
