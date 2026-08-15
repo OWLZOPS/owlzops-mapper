@@ -43,11 +43,6 @@ const SUDO_AUTH_BUDGET: Duration = Duration::from_secs(30);
 /// coverage (Raw Truth), not silently dropped.
 const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 
-/// Hard cap for the whole binary upload. A remote target that cannot be
-/// written (or a stalled network) must not hold the scan forever; this is
-/// separate from the overall per-host budget.
-const UPLOAD_BUDGET: Duration = Duration::from_secs(120);
-
 /// No progress for this long during a single write means the transfer is dead.
 /// A slow link is not a dead link; bounding stall punishes only actual hangs.
 const UPLOAD_STALL_BUDGET: Duration = Duration::from_secs(30);
@@ -735,8 +730,8 @@ async fn upload_via_channel(
                             // Do NOT stop here: extended data may still be in
                             // flight and it is the diagnostic this code exists
                             // to surface. Close (or channel end) is the
-                            // terminator; UPLOAD_BUDGET bounds the wait
-                            // (R25-34a/R25-41).
+                            // terminator; the outer host budget bounds the
+                            // overall wait.
                             exit = Some(exit_status);
                         }
                         Some(ChannelMsg::Close) | None => closed = true,
@@ -828,12 +823,7 @@ async fn upload_via_channel(
         }
     };
 
-    let res = match tokio::time::timeout(UPLOAD_BUDGET, upload_fut).await {
-        Ok(inner) => inner,
-        Err(_) => Err(RemoteError::Timeout {
-            host: host.to_string(),
-        }),
-    };
+    let res = upload_fut.await;
 
     pb.finish_and_clear();
 

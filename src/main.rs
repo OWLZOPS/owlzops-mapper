@@ -59,6 +59,9 @@ const EXIT_USAGE: i32 = 64; // sysexits.h EX_USAGE
 /// from "verdict degraded by privileges" (R25-26 tail).
 const EXIT_INCOMPLETE: i32 = 4;
 
+/// Exit code for a scan interrupted by SIGINT/SIGTERM.
+const EXIT_INTERRUPT: i32 = 130;
+
 fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
@@ -606,7 +609,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 return 2;
                             }
                             if interrupted {
-                                return 130;
+                                return EXIT_INTERRUPT;
                             }
                             return if written == 0 { 2 } else { worst };
                         }
@@ -620,7 +623,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 // R19V5-04: honour interruption when local scan was cancelled
                 // in a streaming-less run.
                 if interrupted {
-                    return 130;
+                    return EXIT_INTERRUPT;
                 }
 
                 // Fallback to legacy multi-host output
@@ -683,7 +686,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         for w in crate::coverage::drain_scoped("local-interrupted") {
                             warn!("{w}");
                         }
-                        return 130;
+                        return EXIT_INTERRUPT;
                     }
                 };
 
@@ -997,7 +1000,7 @@ async fn main() {
                         eprintln!("Graceful shutdown timed out, forcing exit.");
                         // Kill any remaining helpers so they don't become orphans.
                         crate::utils::terminate_registered_children();
-                        std::process::exit(130);
+                        std::process::exit(EXIT_INTERRUPT);
                     });
                 }
                 2 => {
@@ -1008,7 +1011,7 @@ async fn main() {
                 _ => {
                     crate::utils::terminate_registered_children();
                     eprintln!("Third interrupt — forcing exit");
-                    std::process::exit(130);
+                    std::process::exit(EXIT_INTERRUPT);
                 }
             }
         }
@@ -1017,7 +1020,7 @@ async fn main() {
     let exit_code = cmd_handle.await.unwrap_or_else(|join_err| {
         if join_err.is_panic() {
             eprintln!("Main task panicked");
-            130
+            EXIT_INTERRUPT
         } else {
             1
         }
