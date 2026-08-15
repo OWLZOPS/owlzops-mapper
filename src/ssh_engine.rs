@@ -510,19 +510,6 @@ pub(crate) fn staging_dir_is_sane(dir: &str, root: &str) -> bool {
     !rand.is_empty() && rand.len() <= 32 && rand.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// A path we are about to interpolate into a shell command. Construction is
-/// the only place validation can be skipped, so it cannot be skipped by
-/// accident at a call site (R25-07/R25-25).
-pub(crate) fn probe_temp_is_sane(tmp: &str, parent: &str) -> bool {
-    let Some(leaf) = tmp.strip_prefix(parent).and_then(|r| r.strip_prefix('/')) else {
-        return false;
-    };
-    let Some(rand) = leaf.strip_prefix(".owlzops-write-test-") else {
-        return false;
-    };
-    !rand.is_empty() && rand.len() <= 32 && rand.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
 async fn make_remote_staging(
     session: &client::Handle<ClientHandler>,
     host: &str,
@@ -1052,44 +1039,6 @@ pub async fn run_remote_scan_russh(
         if copy_binary {
             if let Some(p) = remote_path {
                 actual_remote_path = p.to_string();
-                // Pre-flight writability check to catch permission errors early.
-                let parent = std::path::Path::new(p)
-                    .parent()
-                    .map(|d| d.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                // Use a real create/remove probe: `test -w` is unreliable under ACLs.
-                let probe = exec_capture(
-                    &session,
-                    &hostname,
-                    &format!("LC_ALL=C mktemp -- '{parent}/.owlzops-write-test-XXXXXXXX'"),
-                )
-                .await;
-                match probe {
-                    Ok(tmp) => {
-                        let tmp = tmp.trim();
-                        if probe_temp_is_sane(tmp, &parent) {
-                            let _ = exec_capture(
-                                &session,
-                                &hostname,
-                                &format!("LC_ALL=C rm -f -- {tmp}"),
-                            )
-                            .await;
-                        } else {
-                            // Do NOT rm a path we cannot account for. Leaving a
-                            // zero-byte probe file behind is the cheap failure.
-                            crate::coverage::record(format!(
-                                "remote {hostname}: write probe returned an unaccountable \
-                                 path; probe file not removed"
-                            ));
-                        }
-                    }
-                    Err(_) => {
-                        return Err(RemoteError::UploadFailed {
-                            host: hostname.clone(),
-                            detail: format!("parent directory '{}' is not writable", parent),
-                        });
-                    }
-                }
 
                 let part = format!("{}.owlzops-{}.part", p, random_part_suffix());
                 let a = RemoteArtifact::UploadedFile {
