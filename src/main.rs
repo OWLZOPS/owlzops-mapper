@@ -112,6 +112,10 @@ struct Coverage {
     scanners_failed: bool,
     non_root: bool,
     warnings: bool,
+    /// The scan finished but the operator could not be shown the result.
+    /// A delivery failure is a COVERAGE fact — it must never replace the
+    /// verdict, or a compromise silently degrades to 2 (R25-83).
+    output_failed: bool,
 }
 
 impl Coverage {
@@ -121,6 +125,7 @@ impl Coverage {
             && !self.scanners_failed
             && !self.non_root
             && !self.warnings
+            && !self.output_failed
     }
 }
 
@@ -207,27 +212,38 @@ fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
             }
         }
         None => {
-            if report.failed_scanners.is_empty() {
-                warn!("scan incomplete; exiting {}", EXIT_INCOMPLETE);
-            } else {
-                warn!(
-                    failed = ?report.failed_scanners,
-                    "one or more scanners failed — verdict incomplete, exiting {}",
-                    EXIT_INCOMPLETE
-                );
-            }
+            // `add()` always yields Some for a real report; the None arm exists
+            // only because coverage used to live inside the verdict.
+            warn!("no report produced; exiting {}", EXIT_INCOMPLETE);
         }
+    }
+
+    // Coverage is an independent axis and must be reported independently, or
+    // the operator sees code 2 with nothing explaining it.
+    let c = &outcome.coverage;
+    if c.scanners_failed {
+        warn!(
+            failed = ?report.failed_scanners,
+            "one or more scanners failed — coverage incomplete, findings are a LOWER BOUND"
+        );
+    }
+    if !report.is_root_execution {
+        warn!("not running as root — privileged surfaces were not read");
+    }
+    if c.records_lost > 0 || c.output_failed {
+        warn!(
+            records_lost = c.records_lost,
+            output_failed = c.output_failed,
+            "some results did not reach the output"
+        );
     }
 }
 
-#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
-fn compute_exit_code(report: &AgentReport, fail_on_incomplete: bool) -> i32 {
-    // Literally the fleet path with n = 1, so the two cannot diverge.
+/// Build an Outcome for a single report (local path n=1).
+fn outcome_for(report: &AgentReport) -> Outcome {
     let mut agg = OutcomeBuilder::default();
     agg.add(report);
-    let outcome = agg.finish(1, 0);
-    warn_for_outcome(&outcome, report);
-    exit_code(&outcome, fail_on_incomplete)
+    agg.finish(1, 0)
 }
 
 /// Used by runner and scanner modules to adapt coverage hints. Keep here as
@@ -389,7 +405,12 @@ async fn run_command(
                                         warn!(error = %e, "JSONL write failed — report lost");
                                     }
                                 },
-                                Err(e) => warn!(error = %e, "skipping unserializable report"),
+                                Err(e) => {
+                                    // The verdict is already in `agg`, but the consumer
+                                    // will never see this host. That is a lost record.
+                                    io_errors += 1;
+                                    warn!(error = %e, "report could not be serialized — dropped from JSONL");
+                                }
                             }
                         }
                         if let Err(e) = file.flush() {
@@ -785,8 +806,7 @@ async fn run_command(
                 for report in &reports {
                     agg.add(report);
                 }
-                let outcome = agg.finish(hosts_requested, 0);
-                let exit_code = exit_code(&outcome, fail_on_incomplete);
+                let mut outcome = agg.finish(hosts_requested, 0);
 
                 if let Err(e) = output::output_multi(
                     &reports,
@@ -795,14 +815,12 @@ async fn run_command(
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return if fail_on_incomplete {
-                        EXIT_INCOMPLETE
-                    } else {
-                        EXIT_DEGRADED
-                    };
+                    outcome.coverage.output_failed = true;
                 }
 
-                return exit_code;
+                // Computed AFTER delivery, so a render failure degrades the
+                // code without ever outranking Compromised.
+                return exit_code(&outcome, fail_on_incomplete);
             }
 
             // Single local scan (no hosts file or empty hosts)
@@ -850,7 +868,9 @@ async fn run_command(
 
                 local_spinner.finish_and_clear();
 
-                let exit_code = compute_exit_code(&report, fail_on_incomplete);
+                let mut outcome = outcome_for(&report);
+                warn_for_outcome(&outcome, &report);
+
                 if let Err(e) = output::output_single(
                     &report,
                     &args.format,
@@ -858,13 +878,10 @@ async fn run_command(
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return if fail_on_incomplete {
-                        EXIT_INCOMPLETE
-                    } else {
-                        EXIT_DEGRADED
-                    };
+                    outcome.coverage.output_failed = true;
                 }
-                exit_code
+
+                exit_code(&outcome, fail_on_incomplete)
             }
             #[cfg(not(feature = "local-scan"))]
             {
@@ -1326,7 +1343,7 @@ mod tests {
         report.network.firewall_active = false;
         report.is_root_execution = false;
 
-        let local_code = compute_exit_code(&report, false);
+        let local_code = exit_code(&outcome_for(&report), false);
 
         let mut agg = OutcomeBuilder::default();
         agg.add(&report);
@@ -1334,6 +1351,29 @@ mod tests {
         let fleet_code = exit_code(&outcome, false);
 
         assert_eq!(local_code, fleet_code);
+    }
+
+    #[test]
+    fn a_render_failure_never_downgrades_a_compromise() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Compromised),
+            coverage: Coverage {
+                output_failed: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_COMPROMISED);
+        assert_eq!(exit_code(&outcome, true), EXIT_COMPROMISED);
+    }
+
+    #[test]
+    fn a_failed_scanner_does_not_hide_a_critical_finding() {
+        let mut r = minimal_report();
+        r.network.firewall_active = false; // SEC-001, network healthy
+        r.failed_scanners = vec!["security".to_string()];
+        // Critical is reported; coverage degrades the code but does not erase it.
+        assert_eq!(exit_code(&outcome_for(&r), false), EXIT_DEGRADED);
+        assert_eq!(exit_code(&outcome_for(&r), true), EXIT_INCOMPLETE);
     }
 
     #[test]
