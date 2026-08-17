@@ -154,20 +154,11 @@ fn finding_from_failed_scanner(f: &Finding, report: &AgentReport) -> bool {
 }
 
 /// Evaluate a full agent report into a list of findings.
-/// This is a pure function – no side effects.
+/// This is a pure function – no side effects. Coverage warnings about
+/// unknown scanner names are emitted by `verdict_from_findings`, once per
+/// verdict computation (R25-59).
 pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
-
-    // Fail-open guard: an unmapped name silently disables the whole R24-92
-    // filter for that scanner. Say so once, not per finding (R25-46).
-    for name in &report.failed_scanners {
-        if Scanner::from_name(name).is_none() {
-            coverage::record(format!(
-                "scoring: failed scanner `{name}` has no Scanner variant — findings \
-                 derived from it were NOT withheld from the verdict"
-            ));
-        }
-    }
 
     // ── Security ────────────────────────────────────────
 
@@ -2599,6 +2590,18 @@ pub enum Verdict {
 
 pub fn verdict_from_findings(findings: &[Finding], failed_scanners: &[String]) -> Verdict {
     let flags = CriticalFlags::from_findings(findings);
+
+    // Fail-open guard: an unmapped name silently disables the whole R24-92
+    // filter for that scanner. Say so once per report, not per evaluate call
+    // (R25-46/R25-59). `evaluate` must stay pure.
+    for name in failed_scanners {
+        if Scanner::from_name(name).is_none() {
+            coverage::record(format!(
+                "scoring: failed scanner `{name}` has no Scanner variant — findings \
+                 derived from it were NOT withheld from the verdict"
+            ));
+        }
+    }
 
     if flags.compromised_host {
         // An IoC raised by a scanner that DID run is definitive.
