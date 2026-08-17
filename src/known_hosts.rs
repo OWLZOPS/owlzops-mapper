@@ -327,9 +327,17 @@ impl KnownHostsChecker {
         }
     }
 
-    // R25-55: known_hosts records the KEY type; a session may negotiate a SHA-2
-    // signature over the same key. Compare on the key type, never on the
-    // signature algorithm.
+    /// Normalises a key type string for comparison.
+    ///
+    /// R25-55: known_hosts records the KEY type; a session may negotiate a SHA-2
+    /// signature over the same key. Compare on the key type, never on the
+    /// signature algorithm.
+    ///
+    /// The SSH wire format repeats the algorithm name inside the key blob as
+    /// `ssh-rsa` regardless of the signature hash, so this normalises only the
+    /// TYPE FIELD. The blob itself is already hash-independent.
+    /// R25-64: test `the_openssh_blob_encodes_the_base_algorithm_name` proves
+    /// this; R25-78: resolved by the same test and this doc.
     fn canonical_key_type(t: &str) -> &str {
         match t {
             "rsa-sha2-256" | "rsa-sha2-512" => "ssh-rsa",
@@ -613,5 +621,39 @@ mod tests {
         );
 
         assert!(matches!(checker.verify(pub_key), Ok(true)));
+    }
+
+    #[test]
+    fn the_openssh_blob_encodes_the_base_algorithm_name() {
+        // `canonical_key_type` normalises only the TYPE FIELD. The SSH wire
+        // format repeats the algorithm name as the first length-prefixed
+        // string INSIDE the blob. If that varies with the signature hash,
+        // `entry.key_data == pdata` still fails and every RSA host becomes
+        // HostKeyChanged — R25-55 would not be closed (R25-78).
+        use russh::keys::ssh_key::{Algorithm, HashAlg, PrivateKey};
+
+        let k = PrivateKey::random(
+            &mut rand::rng(),
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+        )
+            .unwrap();
+
+        let line = k.public_key().to_openssh().unwrap();
+        let mut parts = line.split_whitespace();
+        let ptype = parts.next().unwrap();
+        let blob = data_encoding::BASE64
+            .decode(parts.next().unwrap().as_bytes())
+            .unwrap();
+
+        let n = u32::from_be_bytes(blob[..4].try_into().unwrap()) as usize;
+        let name = std::str::from_utf8(&blob[4..4 + n]).unwrap();
+
+        assert_eq!(
+            name, "ssh-rsa",
+            "blob carries the signature algorithm ({ptype}); normalise KeyData, \
+             not just the type field"
+        );
     }
 }
