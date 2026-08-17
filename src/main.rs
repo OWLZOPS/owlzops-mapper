@@ -98,8 +98,11 @@ impl Write for BarAwareStderr {
 fn verdict_rank(v: Verdict) -> u8 {
     match v {
         Verdict::Clean => 0,
-        Verdict::Critical => 1,
-        Verdict::Incomplete => 2,
+        // R25-72: for fleet aggregation a confirmed Critical on one host
+        // outranks an Incomplete scan on another. Incomplete is uncertainty,
+        // not a verdict; the operator must see the confirmed finding first.
+        Verdict::Incomplete => 1,
+        Verdict::Critical => 2,
         Verdict::Compromised => 3,
     }
 }
@@ -1297,5 +1300,12 @@ mod tests {
             FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN > FLEET_TEARDOWN_GRACE + JSONL_DRAIN_TIMEOUT,
             "watchdog must not fire before the JSONL writer has drained"
         );
+    }
+
+    #[test]
+    fn fleet_aggregation_prefers_critical_over_incomplete() {
+        use Verdict::*;
+        assert_eq!(worse_of(Critical, Incomplete), Critical);
+        assert_eq!(worse_of(Incomplete, Critical), Critical);
     }
 }
