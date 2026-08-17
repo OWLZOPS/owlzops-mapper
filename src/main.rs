@@ -555,8 +555,8 @@ async fn run_command(
                                                 // R25-14: remote coverage belongs
                                                 // in this host's report, not in
                                                 // orchestrator's local sink.
-                                                report.coverage_warnings.extend(coverage.notes);
-                                                report.remote_privileged = coverage.privileged;
+                                                // R25-72: centralized via RemoteCoverage::apply_to
+                                                coverage.apply_to(&mut report);
                                                 Some(report)
                                             }
                                             Err(e) => {
@@ -1295,17 +1295,17 @@ mod tests {
     }
 
     #[test]
+    fn fleet_aggregation_prefers_critical_over_incomplete() {
+        use Verdict::*;
+        assert_eq!(worse_of(Critical, Incomplete), Critical);
+        assert_eq!(worse_of(Incomplete, Critical), Critical);
+    }
+
+    #[test]
     fn hard_exit_ceiling_covers_grace_plus_drain() {
         assert!(
             FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN > FLEET_TEARDOWN_GRACE + JSONL_DRAIN_TIMEOUT,
             "watchdog must not fire before the JSONL writer has drained"
         );
-    }
-
-    #[test]
-    fn fleet_aggregation_prefers_critical_over_incomplete() {
-        use Verdict::*;
-        assert_eq!(worse_of(Critical, Incomplete), Critical);
-        assert_eq!(worse_of(Incomplete, Critical), Critical);
     }
 }

@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
+use crate::models::AgentReport;
 use crate::safe_io;
 
 // ---------------------------------------------------------------------------
@@ -930,6 +931,18 @@ async fn cleanup_remote_artifact(
 pub struct RemoteCoverage {
     pub notes: Vec<String>,
     pub privileged: Option<bool>,
+}
+
+impl RemoteCoverage {
+    /// Apply facts learned by the orchestrator to a host report.
+    ///
+    /// Kept in one place so the set of remote facts cannot diverge between the
+    /// streaming fleet path and the snapshot path. Adding a fourth field will
+    /// break this function first, not silently drift (R25-72).
+    pub fn apply_to(self, report: &mut AgentReport) {
+        report.coverage_warnings.extend(self.notes);
+        report.remote_privileged = self.privileged;
+    }
 }
 
 // ---------------------------------------------------------------------------
