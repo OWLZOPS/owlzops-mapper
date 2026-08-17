@@ -47,6 +47,14 @@ const PROBE_OUTPUT_CAP: usize = 64 * 1024;
 /// A slow link is not a dead link; bounding stall punishes only actual hangs.
 const UPLOAD_STALL_BUDGET: Duration = Duration::from_secs(30);
 
+/// Floor on acceptable throughput. A slow link must never be the reason we
+/// give up; only a dead one.
+const MIN_UPLOAD_BYTES_PER_SEC: u64 = 16 * 1024;
+
+/// Tail allowance: after EOF the remote is only running chmod/mv, and that
+/// wait is covered by no other bound (R25-58).
+const UPLOAD_TAIL_BUDGET: Duration = Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // Sudo outcome classification
 // ---------------------------------------------------------------------------
@@ -823,7 +831,21 @@ async fn upload_via_channel(
         }
     };
 
-    let res = upload_fut.await;
+    // Not a fixed 120 s cap on throughput (R25-35): the transfer itself is
+    // bounded per write by UPLOAD_STALL_BUDGET; this bounds the tail and
+    // scales the rest with the payload.
+    let budget =
+        UPLOAD_TAIL_BUDGET + Duration::from_secs(file_size / MIN_UPLOAD_BYTES_PER_SEC.max(1));
+    let res = match tokio::time::timeout(budget, upload_fut).await {
+        Ok(inner) => inner,
+        Err(_) => Err(RemoteError::UploadFailed {
+            host: host.to_string(),
+            detail: format!(
+                "upload of {file_size} bytes did not complete within {}s",
+                budget.as_secs()
+            ),
+        }),
+    };
 
     pb.finish_and_clear();
 
