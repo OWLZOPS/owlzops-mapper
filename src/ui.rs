@@ -123,6 +123,7 @@ pub fn sanitize_terminal(s: &str) -> String {
             | '\u{200B}'..='\u{200D}' // zero-width chars
             | '\u{2060}'             // word joiner
             | '\u{FEFF}'             // BOM
+            | '\u{E0000}'..='\u{E007F}' // Unicode TAG block
             => out.push('\u{FFFD}'),
             c => out.push(c),
         }
@@ -2023,4 +2024,19 @@ fn render_footer() {
     outln!(
         "\x1b[3mRun `owlzops-mapper --format json` to export full payload for Blueprint Engine.\x1b[0m\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_terminal_removes_unicode_tag_block() {
+        // U+E0061 is TAG LATIN SMALL LETTER A; if not filtered it can be used
+        // to hide malicious text in terminals that render it as zero-width.
+        let input = "trusted\u{E0061}host";
+        let output = sanitize_terminal(input);
+        assert_eq!(output, "trusted\u{FFFD}host");
+        assert!(!output.contains('\u{E0061}'));
+    }
 }
