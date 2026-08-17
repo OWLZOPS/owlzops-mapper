@@ -382,6 +382,21 @@ fn push_capped(buf: &mut Vec<u8>, data: &[u8]) -> bool {
     room >= data.len()
 }
 
+/// Payload-free label for a channel message.
+///
+/// Debug-formatting the whole message would print unbounded host-controlled
+/// bytes from `Data` / `ExtendedData` (R25-68).
+fn channel_msg_kind(msg: &ChannelMsg) -> &'static str {
+    match msg {
+        ChannelMsg::Data { .. } => "Data",
+        ChannelMsg::ExtendedData { .. } => "ExtendedData",
+        ChannelMsg::Eof => "Eof",
+        ChannelMsg::Close => "Close",
+        ChannelMsg::ExitStatus { .. } => "ExitStatus",
+        _ => "Other",
+    }
+}
+
 /// Execute a short command on the remote host, returning trimmed stdout.
 /// The caller is responsible for any timeout — this inner function has none.
 async fn exec_capture_inner(
@@ -746,11 +761,18 @@ async fn upload_via_channel(
                         }
                         Some(ChannelMsg::Close) | None => closed = true,
                         other => {
-                            // Intentionally ignored during upload: window
-                            // adjustments, open success/failure, signals, and
-                            // EOF from the remote. Log them so the wildcard
-                            // is never silent.
-                            tracing::debug!(?other, "ignoring channel message during upload");
+                            match other {
+                                Some(ChannelMsg::Data { data }) => {
+                                    tracing::debug!(bytes = data.len(), "unexpected stdout during upload");
+                                }
+                                Some(ChannelMsg::ExtendedData { data, ext }) => {
+                                    tracing::debug!(ext, bytes = data.len(), "unexpected extended data during upload");
+                                }
+                                Some(other) => {
+                                    tracing::debug!(kind = %channel_msg_kind(&other), "ignored");
+                                }
+                                None => {}
+                            }
                         }
                     }
                 }
@@ -1276,11 +1298,15 @@ pub async fn run_remote_scan_russh(
                 ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
                 ChannelMsg::Close => break,
                 ChannelMsg::Eof => {}
+                ChannelMsg::ExtendedData { data, ext } => {
+                    tracing::debug!(
+                        ext,
+                        bytes = data.len(),
+                        "unexpected extended data during remote exec"
+                    );
+                }
                 other => {
-                    // Intentionally ignored during remote exec: window
-                    // adjustments, open success/failure, signals. Log them so
-                    // the wildcard is never silent (R25-61d).
-                    tracing::debug!(?other, "ignoring channel message during remote exec");
+                    tracing::debug!(kind = %channel_msg_kind(&other), "ignored");
                 }
             }
         }
