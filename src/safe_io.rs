@@ -107,6 +107,17 @@ pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(Str
 /// HostKeyChanged (R25-72).
 pub fn read_file_capped_regular_strict(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
     let (buf, truncated) = read_regular_capped(path, max_bytes)?;
+
+    // R25-80: report truncation BEFORE attempting UTF-8 conversion. The cut
+    // lands on a byte boundary and can split a multi-byte sequence, so a
+    // truncated trust store would otherwise be misreported as corrupt.
+    if truncated {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} bytes and was truncated"),
+        ));
+    }
+
     let text = String::from_utf8(buf).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,

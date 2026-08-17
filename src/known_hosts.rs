@@ -110,7 +110,7 @@ impl KnownHostsChecker {
             // would silently replace a corrupted byte with U+FFFD and could
             // turn a valid key into a different one, causing false TOFU or
             // HostKeyChanged.
-            let (content, truncated) = match crate::safe_io::read_file_capped_regular_strict(
+            let (content, _truncated) = match crate::safe_io::read_file_capped_regular_strict(
                 &path.to_string_lossy(),
                 CAP_KNOWN_HOSTS,
             ) {
@@ -120,21 +120,8 @@ impl KnownHostsChecker {
                 Err(e) => return Err((path.to_path_buf(), e)),
             };
 
-            // Entries past the cap are invisible, so a host whose key lives in
-            // the tail looks UNKNOWN and gets TOFU-pinned to whatever the
-            // server presents — the exact failure R25-54 closed (R25-63).
-            if truncated {
-                return Err((
-                    path.to_path_buf(),
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "trust store exceeds {CAP_KNOWN_HOSTS} bytes and was truncated; \
-                             refusing to treat a partial store as complete"
-                        ),
-                    ),
-                ));
-            }
+            // Truncation is already reported by read_file_capped_regular_strict
+            // before UTF-8 conversion (R25-80); no second check here.
 
             for (idx, raw_line) in content.lines().enumerate() {
                 let line_number = idx + 1;
