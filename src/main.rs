@@ -533,7 +533,6 @@ async fn run_command(
                         let pass = sudo_pass.clone();
                         let host_for_log = host.clone();
                         let upload_pb = upload_bar.clone();
-                        let multi = multi.clone();
 
                         join_set.spawn(async move {
                             // R13-03: explicit permit error handling.
@@ -609,16 +608,10 @@ async fn run_command(
                                         }
                                     }
                                     Err(e) => {
-                                        // Progress bars continuously redraw stderr.
-                                        // Suspend them to ensure the direct write
-                                        // stays visible. The following warn! is
-                                        // automatically safe via BarAwareStderr.
-                                        multi.suspend(|| {
-                                            let _ = writeln!(
-                                                std::io::stderr(),
-                                                "[error] russh scan failed for {host}: {e}"
-                                            );
-                                        });
+                                        // BarAwareStderr suspends the progress
+                                        // bars for every tracing record; a
+                                        // direct write here would duplicate the
+                                        // warning (R25-82).
                                         warn!(host = %host, error = %e, "russh scan failed");
                                         None
                                     }
