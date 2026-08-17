@@ -198,7 +198,15 @@ impl KnownHostsChecker {
         for entry in &self.entries {
             // Entries are already filtered by host during load_entries,
             // so no further filtering is needed here.
-            for alg in Self::algorithms_from_openssh_name(&entry.key_type) {
+            let (algs, unknown) = Self::algorithms_from_openssh_name(&entry.key_type);
+            if let Some(unknown) = unknown {
+                crate::coverage::record(format!(
+                    "known_hosts: unmapped host key type `{}` for host {} — offer not pinned",
+                    crate::utils::sanitize_for_log(unknown),
+                    self.host
+                ));
+            }
+            for alg in algs {
                 if !out.contains(&alg) {
                     out.push(alg);
                 }
@@ -213,36 +221,44 @@ impl KnownHostsChecker {
     /// algorithm (`rsa-sha2-*`); pinning `Rsa { hash: None }` alone offers
     /// SHA-1 only, which OpenSSH >= 8.8 refuses by default — the connection
     /// then fails outright instead of being pinned (R25-40).
-    fn algorithms_from_openssh_name(name: &str) -> Vec<russh::keys::ssh_key::Algorithm> {
+    fn algorithms_from_openssh_name(
+        name: &str,
+    ) -> (Vec<russh::keys::ssh_key::Algorithm>, Option<&str>) {
         use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
 
         match name {
-            "ssh-ed25519" => vec![Algorithm::Ed25519],
-            "ssh-rsa" => vec![
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha512),
-                },
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256),
-                },
-                Algorithm::Rsa { hash: None },
-            ],
-            "ecdsa-sha2-nistp256" => vec![Algorithm::Ecdsa {
-                curve: EcdsaCurve::NistP256,
-            }],
-            "ecdsa-sha2-nistp384" => vec![Algorithm::Ecdsa {
-                curve: EcdsaCurve::NistP384,
-            }],
-            "ecdsa-sha2-nistp521" => vec![Algorithm::Ecdsa {
-                curve: EcdsaCurve::NistP521,
-            }],
-            other => {
-                crate::coverage::record(format!(
-                    "known_hosts: unmapped host key type `{}` for this host — offer not pinned",
-                    crate::utils::sanitize_for_log(other)
-                ));
-                Vec::new()
-            }
+            "ssh-ed25519" => (vec![Algorithm::Ed25519], None),
+            "ssh-rsa" => (
+                vec![
+                    Algorithm::Rsa {
+                        hash: Some(HashAlg::Sha512),
+                    },
+                    Algorithm::Rsa {
+                        hash: Some(HashAlg::Sha256),
+                    },
+                    Algorithm::Rsa { hash: None },
+                ],
+                None,
+            ),
+            "ecdsa-sha2-nistp256" => (
+                vec![Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256,
+                }],
+                None,
+            ),
+            "ecdsa-sha2-nistp384" => (
+                vec![Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384,
+                }],
+                None,
+            ),
+            "ecdsa-sha2-nistp521" => (
+                vec![Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP521,
+                }],
+                None,
+            ),
+            other => (Vec::new(), Some(other)),
         }
     }
 
@@ -257,6 +273,12 @@ impl KnownHostsChecker {
     }
 
     /// Verify the presented server key.
+    ///
+    /// The `entries` slice is captured once in `new()`/`from_files()` and is
+    /// deliberately NOT refreshed after a successful TOFU write to `pin_file`.
+    /// A repeated `verify()` on the same `KnownHostsChecker` after the first
+    /// TOFU must therefore not be used to re-check the same connection: create
+    /// a new checker for a new session/rekey.
     ///
     /// Logic:
     /// 1. Collect all matching host entries from both trust stores.
@@ -437,6 +459,8 @@ mod tests {
     fn pinned_algorithms_reads_host_key_types() {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let kh_path = tmp_dir.path().join("known_hosts");
+        // Synthetic key blobs: pinned_algorithms reads only the key type field,
+        // so the truncated base64 payloads are intentionally not real keys.
         std::fs::write(
             &kh_path,
             "localhost ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAI\nlocalhost ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB\n",

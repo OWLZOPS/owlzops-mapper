@@ -743,7 +743,13 @@ async fn upload_via_channel(
                             exit = Some(exit_status);
                         }
                         Some(ChannelMsg::Close) | None => closed = true,
-                        _ => {}
+                        other => {
+                            // Intentionally ignored during upload: window
+                            // adjustments, open success/failure, signals, and
+                            // EOF from the remote. Log them so the wildcard
+                            // is never silent.
+                            tracing::debug!(?other, "ignoring channel message during upload");
+                        }
                     }
                 }
                 read = file.read(&mut buf), if !eof_sent => {
@@ -1268,7 +1274,12 @@ pub async fn run_remote_scan_russh(
                 ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
                 ChannelMsg::Close => break,
                 ChannelMsg::Eof => {}
-                _ => {}
+                other => {
+                    // Intentionally ignored during remote exec: window
+                    // adjustments, open success/failure, signals. Log them so
+                    // the wildcard is never silent (R25-61d).
+                    tracing::debug!(?other, "ignoring channel message during remote exec");
+                }
             }
         }
 
