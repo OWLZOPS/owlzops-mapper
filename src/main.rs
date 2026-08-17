@@ -54,6 +54,13 @@ pub(crate) const JSONL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Exit code for invalid CLI usage. Outside the 0..=3 verdict band (R25-36).
 const EXIT_USAGE: i32 = 64; // sysexits.h EX_USAGE
 
+/// Exit codes 0..=3 are a PUBLIC CONTRACT: pipelines key their pager on 3 and
+/// their build gate on 1. A number in this band NEVER changes meaning between
+/// versions; new states get new numbers (R25-56/R25-74).
+const EXIT_CLEAN: i32 = 0;
+const EXIT_CRITICAL: i32 = 1;
+const EXIT_COMPROMISED: i32 = 3;
+
 /// Exit code for an incomplete scan: one or more scanners failed.
 /// Distinct from non-root degradation (2) so CI can tell "no verdict"
 /// from "verdict degraded by privileges" (R25-26 tail).
@@ -91,110 +98,140 @@ impl Write for BarAwareStderr {
     }
 }
 
-// R25-56: Fleet aggregation compares verdicts, not numeric exit codes.
-// Numeric exit codes are a PUBLIC CONTRACT and are NOT ordered by severity:
-// 4 (incomplete) is less severe than 3 (compromise). Fleet aggregation must
-// therefore compare verdicts and map to a code once, never `max()` the codes.
-//
-// R25-72: fleet rank is Clean < Incomplete < Critical < Compromised.
-// A confirmed Critical on one host outranks scan uncertainty on another.
-fn verdict_rank(v: Verdict) -> u8 {
-    match v {
-        Verdict::Clean => 0,
-        Verdict::Incomplete => 1,
-        Verdict::Critical => 2,
-        Verdict::Compromised => 3,
+// ── Two-axis outcome model (R25-74) ───────────────────────────────
+// SecurityVerdict describes what the scan FOUND.
+// Coverage describes what the scan could SEE.
+// They are never collapsed until the final exit code mapping.
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Coverage {
+    /// Hosts asked for that produced no report at all.
+    hosts_missing: usize,
+    /// Reports received but not written to JSONL.
+    records_lost: usize,
+    scanners_failed: bool,
+    non_root: bool,
+    warnings: bool,
+}
+
+impl Coverage {
+    fn is_full(&self) -> bool {
+        self.hosts_missing == 0
+            && self.records_lost == 0
+            && !self.scanners_failed
+            && !self.non_root
+            && !self.warnings
     }
 }
 
-/// Return the more severe of two verdicts.
-fn worse_of(a: Verdict, b: Verdict) -> Verdict {
-    if verdict_rank(a) >= verdict_rank(b) {
-        a
-    } else {
-        b
+struct Outcome {
+    /// `None` = not a single host produced a verdict.
+    verdict: Option<SecurityVerdict>,
+    coverage: Coverage,
+}
+
+#[derive(Debug, Default)]
+struct OutcomeBuilder {
+    verdict: Option<SecurityVerdict>,
+    coverage: Coverage,
+    reports_seen: usize,
+}
+
+impl OutcomeBuilder {
+    fn add(&mut self, report: &AgentReport) {
+        scoring::warn_unmapped_scanners(&report.failed_scanners);
+        let findings = scoring::evaluate(report);
+        let v = scoring::security_verdict_from_findings(&findings);
+        self.verdict = Some(match self.verdict {
+            None => v,
+            Some(cur) => cur.worse(v),
+        });
+        self.coverage.scanners_failed |= !report.failed_scanners.is_empty();
+        self.coverage.non_root |= !report.is_root_execution;
+        self.coverage.warnings |= !report.scan_warnings.is_empty();
+        self.reports_seen += 1;
     }
-}
 
-/// Extract the verdict for a single report without mapping to an exit code.
-/// This is the function fleet aggregation uses; it calls `evaluate` once.
-fn compute_verdict(report: &AgentReport) -> Verdict {
-    let findings = scoring::evaluate(report);
-    scoring::verdict_from_findings(&findings, &report.failed_scanners)
-}
-
-fn is_running_as_root() -> bool {
-    unsafe { libc::getuid() == 0 }
-}
-
-/// `any_non_root` and `any_warnings` are AGGREGATE flags: in fleet mode they
-/// are ORed across hosts. Naming the first `is_root` inverted it at both call
-/// sites, so a fully privileged clean fleet returned 2 (R25-62).
-fn exit_code_for_verdict(verdict: Verdict, any_non_root: bool, any_warnings: bool) -> i32 {
-    match verdict {
-        Verdict::Compromised => 3,
-        Verdict::Incomplete => EXIT_INCOMPLETE,
-        Verdict::Critical => {
-            if any_non_root {
-                EXIT_DEGRADED
-            } else {
-                1
-            }
+    fn finish(mut self, hosts_requested: usize, records_lost: usize) -> Outcome {
+        self.coverage.hosts_missing = hosts_requested.saturating_sub(self.reports_seen);
+        self.coverage.records_lost = records_lost;
+        Outcome {
+            verdict: self.verdict,
+            coverage: self.coverage,
         }
-        Verdict::Clean => {
-            if any_non_root || any_warnings {
-                EXIT_DEGRADED
-            } else {
-                0
-            }
-        }
     }
 }
 
-#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
-fn compute_exit_code(report: &AgentReport) -> i32 {
-    let verdict = compute_verdict(report);
+/// SINGLE source of truth for the exit code. Exhaustive without a panic arm.
+fn exit_code(outcome: &Outcome, fail_on_incomplete: bool) -> i32 {
+    let Some(verdict) = outcome.verdict else {
+        // No data is not a clean bill of health, flag or no flag.
+        return EXIT_INCOMPLETE;
+    };
+    let full = outcome.coverage.is_full();
 
-    // Preserve the local warning side effects, but leave the numeric mapping
-    // to the single source of truth. A second parallel match here is exactly
-    // how R25-62 stayed invisible (R25-67).
     match verdict {
-        Verdict::Compromised => {
+        // Terminal: a confirmed compromise is never masked by uncertainty.
+        SecurityVerdict::Compromised => EXIT_COMPROMISED,
+        _ if fail_on_incomplete && !full => EXIT_INCOMPLETE,
+        // Incomplete coverage IS degradation – code 2 already means exactly
+        // "the scan ran but could not see everything". No opt-in required, so
+        // an unpatched pipeline stays fail-closed.
+        _ if !full => EXIT_DEGRADED,
+        SecurityVerdict::Critical => EXIT_CRITICAL,
+        SecurityVerdict::Clean => EXIT_CLEAN,
+    }
+}
+
+/// Preserve the local warning side effects; used only for single-host path.
+fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
+    match outcome.verdict {
+        Some(SecurityVerdict::Compromised) => {
             warn!(
-                "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
+                "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting {}",
+                EXIT_COMPROMISED
             );
         }
-        Verdict::Incomplete => {
-            if report.failed_scanners.is_empty() {
-                warn!("scan incomplete; exiting 4");
-            } else {
-                warn!(
-                    failed = ?report.failed_scanners,
-                    "one or more scanners failed — verdict incomplete, exiting 4"
-                );
-            }
-        }
-        Verdict::Critical => {
+        Some(SecurityVerdict::Critical) => {
             if !report.is_root_execution {
                 warn!(
                     "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
                 );
             }
         }
-        Verdict::Clean => {
+        Some(SecurityVerdict::Clean) => {
             if !report.is_root_execution {
                 warn!("not running as root – results may be incomplete.");
             } else if !report.scan_warnings.is_empty() {
                 warn!(warnings = ?report.scan_warnings, "scan produced warnings — degraded");
             }
         }
+        None => {
+            if report.failed_scanners.is_empty() {
+                warn!("scan incomplete; exiting {}", EXIT_INCOMPLETE);
+            } else {
+                warn!(
+                    failed = ?report.failed_scanners,
+                    "one or more scanners failed — verdict incomplete, exiting {}",
+                    EXIT_INCOMPLETE
+                );
+            }
+        }
     }
+}
 
-    exit_code_for_verdict(
-        verdict,
-        !report.is_root_execution,
-        !report.scan_warnings.is_empty(),
-    )
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+fn compute_exit_code(report: &AgentReport, fail_on_incomplete: bool) -> i32 {
+    // Literally the fleet path with n = 1, so the two cannot diverge.
+    let mut agg = OutcomeBuilder::default();
+    agg.add(report);
+    let outcome = agg.finish(1, 0);
+    warn_for_outcome(&outcome, report);
+    exit_code(&outcome, fail_on_incomplete)
+}
+
+fn is_running_as_root() -> bool {
+    unsafe { libc::getuid() == 0 }
 }
 
 fn raise_nofile_limit() {
@@ -271,6 +308,10 @@ async fn run_command(
             let mut seen = HashSet::new();
             hosts.retain(|h| seen.insert(h.clone()));
 
+            // Two-axis input: total requested hosts and fail_on_incomplete flag.
+            let hosts_requested = hosts.len();
+            let fail_on_incomplete = args.fail_on_incomplete;
+
             // If local-scan is disabled (non-Linux), reject local-only audits early.
             if !hosts.is_empty() {
                 let mut remote = Vec::new();
@@ -334,17 +375,9 @@ async fn run_command(
                         let mut rx = rx;
                         let mut written = 0usize;
                         let mut io_errors = 0usize;
-                        let mut worst_verdict: Option<Verdict> = None;
-                        let mut any_non_root = false;
-                        let mut any_warnings = false;
+                        let mut agg = OutcomeBuilder::default();
                         while let Some(report) = rx.blocking_recv() {
-                            let verdict = compute_verdict(&report);
-                            worst_verdict = Some(match worst_verdict {
-                                None => verdict,
-                                Some(current) => worse_of(current, verdict),
-                            });
-                            any_non_root |= !report.is_root_execution;
-                            any_warnings |= !report.scan_warnings.is_empty();
+                            agg.add(&report);
 
                             match serde_json::to_string(&report) {
                                 Ok(json) => match writeln!(file, "{json}") {
@@ -361,11 +394,7 @@ async fn run_command(
                             io_errors += 1;
                             warn!(error = %e, "JSONL flush failed — tail records may be lost");
                         }
-                        let exit_code = match worst_verdict {
-                            Some(v) => exit_code_for_verdict(v, any_non_root, any_warnings),
-                            None => 2, // no reports written
-                        };
-                        (written, exit_code, io_errors)
+                        (written, agg, io_errors)
                     }))
                 } else {
                     None
@@ -702,30 +731,30 @@ async fn run_command(
                                 warn!(
                                     "JSONL writer timed out during shutdown, output may be incomplete"
                                 );
-                                return 2;
+                                return EXIT_DEGRADED;
                             }
                         }
                     } else {
                         writer.await
                     };
                     match joined {
-                        Ok((written, exit_code, io_errors)) => {
+                        Ok((_written, agg, io_errors)) => {
                             if io_errors > 0 {
                                 warn!(
-                                    written,
+                                    written = _written,
                                     io_errors,
                                     "JSONL output incomplete — returning degraded exit code"
                                 );
-                                return 2;
                             }
                             if interrupted {
                                 return EXIT_INTERRUPT;
                             }
-                            return if written == 0 { 2 } else { exit_code };
+                            let outcome = agg.finish(hosts_requested, io_errors);
+                            return exit_code(&outcome, fail_on_incomplete);
                         }
                         Err(_) => {
                             warn!("JSONL writer task failed");
-                            return 2;
+                            return EXIT_DEGRADED;
                         }
                     }
                 }
@@ -747,25 +776,22 @@ async fn run_command(
                     ) {
                         warn!("output error: {e}");
                     }
-                    return 2;
+                    let outcome = Outcome {
+                        verdict: None,
+                        coverage: Coverage {
+                            hosts_missing: hosts_requested,
+                            ..Default::default()
+                        },
+                    };
+                    return exit_code(&outcome, fail_on_incomplete);
                 }
 
-                let mut worst_verdict: Option<Verdict> = None;
-                let mut any_non_root = false;
-                let mut any_warnings = false;
+                let mut agg = OutcomeBuilder::default();
                 for report in &reports {
-                    let verdict = compute_verdict(report);
-                    worst_verdict = Some(match worst_verdict {
-                        None => verdict,
-                        Some(current) => worse_of(current, verdict),
-                    });
-                    any_non_root |= !report.is_root_execution;
-                    any_warnings |= !report.scan_warnings.is_empty();
+                    agg.add(report);
                 }
-                let exit_code = match worst_verdict {
-                    Some(v) => exit_code_for_verdict(v, any_non_root, any_warnings),
-                    None => 2,
-                };
+                let outcome = agg.finish(hosts_requested, 0);
+                let exit_code = exit_code(&outcome, fail_on_incomplete);
 
                 if let Err(e) = output::output_multi(
                     &reports,
@@ -774,7 +800,7 @@ async fn run_command(
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return 2;
+                    return EXIT_DEGRADED;
                 }
 
                 return exit_code;
@@ -825,7 +851,7 @@ async fn run_command(
 
                 local_spinner.finish_and_clear();
 
-                let exit_code = compute_exit_code(&report);
+                let exit_code = compute_exit_code(&report, fail_on_incomplete);
                 if let Err(e) = output::output_single(
                     &report,
                     &args.format,
@@ -833,7 +859,7 @@ async fn run_command(
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return 2;
+                    return EXIT_DEGRADED;
                 }
                 exit_code
             }
@@ -1219,86 +1245,92 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_2_when_not_root() {
-        let mut r = minimal_report();
-        r.is_root_execution = false;
-        assert_eq!(compute_exit_code(&r), 2);
+    fn exit_code_full_coverage_contract() {
+        let clean = Outcome {
+            verdict: Some(SecurityVerdict::Clean),
+            coverage: Coverage::default(),
+        };
+        assert_eq!(exit_code(&clean, false), EXIT_CLEAN);
+
+        let critical = Outcome {
+            verdict: Some(SecurityVerdict::Critical),
+            coverage: Coverage::default(),
+        };
+        assert_eq!(exit_code(&critical, false), EXIT_CRITICAL);
+
+        let compromised = Outcome {
+            verdict: Some(SecurityVerdict::Compromised),
+            coverage: Coverage::default(),
+        };
+        assert_eq!(exit_code(&compromised, false), EXIT_COMPROMISED);
     }
 
     #[test]
-    fn exit_code_0_when_clean() {
-        let mut r = minimal_report();
-        r.network.firewall_active = true;
-        r.security.ssh_root_login_enabled = false;
-        r.host.backup_tools = vec!["restic".to_string()];
-        r.host.ntp_synchronized = true;
-        assert_eq!(compute_exit_code(&r), 0);
+    fn incomplete_coverage_is_never_clean() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Clean),
+            coverage: Coverage {
+                non_root: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_DEGRADED);
+        assert_eq!(exit_code(&outcome, true), EXIT_INCOMPLETE);
     }
 
     #[test]
-    fn exit_code_1_on_missing_firewall() {
-        let mut r = minimal_report();
-        r.network.firewall_active = false;
-        r.host.backup_tools = vec!["restic".to_string()];
-        r.host.ntp_synchronized = true;
-        assert_eq!(compute_exit_code(&r), 1);
+    fn compromise_is_never_masked_by_incompleteness() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Compromised),
+            coverage: Coverage {
+                hosts_missing: 199,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_COMPROMISED);
+        assert_eq!(exit_code(&outcome, true), EXIT_COMPROMISED);
     }
 
     #[test]
-    fn exit_code_1_on_missing_backup() {
-        let mut r = minimal_report();
-        r.network.firewall_active = true;
-        r.host.backup_tools = vec![];
-        r.host.ntp_synchronized = true;
-        assert_eq!(compute_exit_code(&r), 1);
+    fn no_verdict_is_incomplete_regardless_of_flag() {
+        let outcome = Outcome {
+            verdict: None,
+            coverage: Coverage {
+                hosts_missing: 5,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_INCOMPLETE);
+        assert_eq!(exit_code(&outcome, true), EXIT_INCOMPLETE);
     }
 
     #[test]
-    fn exit_code_3_on_compromise() {
-        use crate::models::SuspiciousProcess;
-        let mut r = minimal_report();
-        r.security.suspicious_processes = vec![SuspiciousProcess {
-            pid: 1337,
-            name: "xmrig".into(),
-            exe_path: Some("/tmp/xmrig".into()),
-            ..Default::default()
-        }];
-        assert_eq!(compute_exit_code(&r), 3);
+    fn fleet_where_almost_nothing_was_scanned_is_not_clean() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Clean),
+            coverage: Coverage {
+                hosts_missing: 199,
+                ..Default::default()
+            },
+        };
+        assert_ne!(exit_code(&outcome, false), EXIT_CLEAN);
+        assert_eq!(exit_code(&outcome, false), EXIT_DEGRADED);
     }
 
     #[test]
-    fn exit_code_4_when_scanner_failed() {
-        let mut r = minimal_report();
-        r.network.firewall_active = true;
-        r.security.ssh_root_login_enabled = false;
-        r.host.backup_tools = vec!["restic".to_string()];
-        r.host.ntp_synchronized = true;
-        r.failed_scanners = vec!["security".to_string()];
+    fn one_host_via_fleet_path_matches_local_path() {
+        let mut report = minimal_report();
+        report.network.firewall_active = false;
+        report.is_root_execution = false;
 
-        assert_eq!(compute_exit_code(&r), EXIT_INCOMPLETE);
-    }
+        let local_code = compute_exit_code(&report, false);
 
-    #[test]
-    fn exit_codes_follow_the_documented_band() {
-        use Verdict::*;
+        let mut agg = OutcomeBuilder::default();
+        agg.add(&report);
+        let outcome = agg.finish(1, 0);
+        let fleet_code = exit_code(&outcome, false);
 
-        assert_eq!(exit_code_for_verdict(Clean, false, false), 0);
-        assert_eq!(exit_code_for_verdict(Clean, true, false), EXIT_DEGRADED);
-        assert_eq!(exit_code_for_verdict(Clean, false, true), EXIT_DEGRADED);
-        assert_eq!(exit_code_for_verdict(Critical, false, false), 1);
-        assert_eq!(exit_code_for_verdict(Critical, true, false), EXIT_DEGRADED);
-        assert_eq!(
-            exit_code_for_verdict(Incomplete, false, false),
-            EXIT_INCOMPLETE
-        );
-        assert_eq!(exit_code_for_verdict(Compromised, true, true), 3);
-    }
-
-    #[test]
-    fn fleet_aggregation_prefers_critical_over_incomplete() {
-        use Verdict::*;
-        assert_eq!(worse_of(Critical, Incomplete), Critical);
-        assert_eq!(worse_of(Incomplete, Critical), Critical);
+        assert_eq!(local_code, fleet_code);
     }
 
     #[test]

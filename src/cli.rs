@@ -83,6 +83,12 @@ pub struct AuditArgs {
     #[arg(long, default_value_t = 50)]
     pub max_concurrent: usize,
 
+    /// Exit 4 when coverage was incomplete (a scanner failed, a host did not
+    /// report, or the scan ran without root). Without this flag incomplete
+    /// coverage still yields the degraded code 2 — it is never invisible.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_incomplete: bool,
+
     /// Keep the binary on the remote host after the scan (skip cleanup).
     #[arg(long, default_value_t = false)]
     pub keep_binary: bool,

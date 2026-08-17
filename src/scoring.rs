@@ -155,7 +155,7 @@ fn finding_from_failed_scanner(f: &Finding, report: &AgentReport) -> bool {
 
 /// Evaluate a full agent report into a list of findings.
 /// This is a pure function – no side effects. Coverage warnings about
-/// unknown scanner names are emitted by `verdict_from_findings`, once per
+/// unknown scanner names are emitted by `warn_unmapped_scanners`, once per
 /// verdict computation (R25-59).
 pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -2580,20 +2580,52 @@ pub struct ScoredReport {
     pub findings: Vec<Finding>,
 }
 
+/// The security axis alone: what the scan FOUND.
+/// Completeness — what the scan could SEE — lives in `Coverage` and is never
+/// collapsed into this value: a host whose scanner panicked can still hold a
+/// confirmed Critical, and folding the two axes into one enum hid it
+/// (R25-44/R25-74).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
+pub enum SecurityVerdict {
     Clean,
     Critical,
     Compromised,
-    Incomplete,
 }
 
-pub fn verdict_from_findings(findings: &[Finding], failed_scanners: &[String]) -> Verdict {
-    let flags = CriticalFlags::from_findings(findings);
+impl SecurityVerdict {
+    /// Explicit, not `derive(Ord)`: with a derive, reordering the declaration
+    /// silently changes fleet aggregation and nothing fails to compile.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Clean => 0,
+            Self::Critical => 1,
+            Self::Compromised => 2,
+        }
+    }
 
-    // Fail-open guard: an unmapped name silently disables the whole R24-92
-    // filter for that scanner. Say so once per report, not per evaluate call
-    // (R25-46/R25-59). `evaluate` must stay pure.
+    pub fn worse(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+pub fn security_verdict_from_findings(findings: &[Finding]) -> SecurityVerdict {
+    let flags = CriticalFlags::from_findings(findings);
+    if flags.compromised_host {
+        SecurityVerdict::Compromised
+    } else if flags.has_critical() {
+        SecurityVerdict::Critical
+    } else {
+        SecurityVerdict::Clean
+    }
+}
+
+/// Fail-open guard for the R24-92 filter, previously inside
+/// `verdict_from_findings` (R25-46/R25-59). Called once per report.
+pub fn warn_unmapped_scanners(failed_scanners: &[String]) {
     for name in failed_scanners {
         if Scanner::from_name(name).is_none() {
             coverage::record(format!(
@@ -2601,19 +2633,6 @@ pub fn verdict_from_findings(findings: &[Finding], failed_scanners: &[String]) -
                  derived from it were NOT withheld from the verdict"
             ));
         }
-    }
-
-    if flags.compromised_host {
-        // An IoC raised by a scanner that DID run is definitive.
-        Verdict::Compromised
-    } else if !failed_scanners.is_empty() {
-        // Incomplete outranks Critical: a critical count from a partial scan
-        // is a LOWER BOUND, and exit 1 tells CI "this is the whole list".
-        Verdict::Incomplete
-    } else if flags.has_critical() {
-        Verdict::Critical
-    } else {
-        Verdict::Clean
     }
 }
 
@@ -2659,7 +2678,7 @@ pub struct CriticalFlags {
 }
 
 impl CriticalFlags {
-    #[allow(dead_code)] // used by tests; main binary now uses verdict_from_findings
+    #[allow(dead_code)] // used by tests; main binary now uses security_verdict_from_findings
     pub fn from_report(report: &AgentReport) -> Self {
         let findings = evaluate(report);
         Self::from_findings(&findings)
@@ -2809,7 +2828,7 @@ pub(crate) fn classify_setuid(
 
 // ── Tests ─────────────────────────────────────────────────
 // R25-53(e): IoC tests now go through evaluate + CriticalFlags::from_findings,
-// matching the production path (evaluate -> from_findings -> verdict_from_findings).
+// matching the production path (evaluate -> from_findings -> security_verdict_from_findings).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3889,9 +3908,9 @@ mod tests {
         r.failed_scanners = vec!["security".to_string()];
 
         let findings = evaluate(&r);
-        let verdict = verdict_from_findings(&findings, &r.failed_scanners);
+        let verdict = security_verdict_from_findings(&findings);
 
-        assert_eq!(verdict, Verdict::Incomplete);
+        assert_eq!(verdict, SecurityVerdict::Clean);
         assert!(findings.iter().any(|f| f.id == "COV-001"));
     }
 
@@ -3909,9 +3928,9 @@ mod tests {
         }];
 
         let findings = evaluate(&r);
-        let verdict = verdict_from_findings(&findings, &r.failed_scanners);
+        let verdict = security_verdict_from_findings(&findings);
 
-        assert_eq!(verdict, Verdict::Compromised);
+        assert_eq!(verdict, SecurityVerdict::Compromised);
     }
 
     #[test]
@@ -3946,8 +3965,8 @@ mod tests {
 
         let findings = evaluate(&r);
         assert_eq!(
-            verdict_from_findings(&findings, &r.failed_scanners),
-            Verdict::Incomplete
+            security_verdict_from_findings(&findings),
+            SecurityVerdict::Critical
         );
         assert!(findings.iter().any(|f| f.id == "COV-001"));
         assert!(
