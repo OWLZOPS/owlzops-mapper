@@ -109,22 +109,17 @@ impl Theme {
 // Sanitisation helper
 // ---------------------------------------------------------------------------
 
-/// Replace control characters, bidi overrides, and zero-width characters
-/// with the Unicode replacement character (U+FFFD).
-/// Tabs (\t) are converted to 4 spaces to fix comfy_table border alignment calculations.
+/// Replace terminal-unsafe codepoints (control chars, bidi controls,
+/// zero-width and TAG characters) with U+FFFD using the shared
+/// `utils::is_terminal_unsafe` classifier (R25-65).
+/// Tabs (`\t`) are expanded to four spaces to keep comfy_table
+/// column alignment stable.
 pub fn sanitize_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\t' => out.push_str("    "),
-            c if c.is_control() => out.push('\u{FFFD}'),
-            '\u{202A}'..='\u{202E}'   // bidi overrides
-            | '\u{2066}'..='\u{2069}' // bidi isolates
-            | '\u{200B}'..='\u{200D}' // zero-width chars
-            | '\u{2060}'             // word joiner
-            | '\u{FEFF}'             // BOM
-            | '\u{E0000}'..='\u{E007F}' // Unicode TAG block
-            => out.push('\u{FFFD}'),
+            c if crate::utils::is_terminal_unsafe(c) => out.push('\u{FFFD}'),
             c => out.push(c),
         }
     }

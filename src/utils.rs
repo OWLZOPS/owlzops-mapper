@@ -297,19 +297,28 @@ fn strip_ansi(s: &str) -> String {
     String::from_utf8_lossy(&result).into_owned()
 }
 
-/// Unicode format characters (Cf) and bidi override/isolate controls are
-/// not visible themselves but can alter how terminals render surrounding
-/// text. Treat them like control characters and replace with spaces.
-fn is_unicode_format_control(c: char) -> bool {
-    matches!(c as u32,
-        0x00AD                    // SOFT HYPHEN
-        | 0x061C                  // ARABIC LETTER MARK
-        | 0x200B..=0x200F         // ZWSP, ZWNJ, ZWJ, LRM, RLM
-        | 0x202A..=0x202E         // LRE, RLE, LRO, RLO, PDF
-        | 0x2060..=0x2064         // WORD JOINER, INVISIBLE OPS
-        | 0x2066..=0x2069         // LRI, RLI, FSI, PDI
-        | 0xFEFF                  // ZERO WIDTH NO-BREAK SPACE / BOM
-    )
+/// Single source of truth for "this codepoint changes how a terminal renders
+/// its neighbours or can be used to hide/override text".
+///
+/// Two hand-maintained lists in `utils.rs` and `ui.rs` previously diverged:
+/// one caught bidi overrides and the other TAG characters (R25-65). Use this
+/// predicate in BOTH sanitizers.
+pub(crate) fn is_terminal_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c as u32,
+            0x00AD                    // SOFT HYPHEN
+            | 0x061C                  // ARABIC LETTER MARK
+            | 0x180E                  // MONGOLIAN VOWEL SEPARATOR
+            | 0x115F                  // HANGUL CHOSEONG FILLER
+            | 0x1160                  // HANGUL JUNGSEONG FILLER
+            | 0x3164                  // HANGUL FILLER
+            | 0xFFA0                  // HALFWIDTH HANGUL FILLER
+            | 0x200B..=0x200F         // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | 0x202A..=0x202E         // bidi overrides
+            | 0x2060..=0x206F         // word joiner, invisible operators, isolates
+            | 0xFEFF                  // BOM / ZERO WIDTH NO-BREAK SPACE
+            | 0xE0000..=0xE007F       // Unicode TAG block
+        )
 }
 
 /// Replace all control characters with spaces, then truncate to `max_chars`.
@@ -317,13 +326,7 @@ fn sanitize_and_truncate(s: &str, max_chars: usize) -> String {
     let stripped = strip_ansi(s);
     let sanitized: String = stripped
         .chars()
-        .map(|c| {
-            if c.is_control() || is_unicode_format_control(c) {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_terminal_unsafe(c) { ' ' } else { c })
         .collect();
     sanitized.chars().take(max_chars).collect()
 }
@@ -1106,6 +1109,18 @@ mod tests {
         let out = sanitize_for_log("a\u{200B}b\u{FEFF}c");
         assert!(!out.contains('\u{200B}'));
         assert!(!out.contains('\u{FEFF}'));
-        assert!(out.chars().all(|c| !is_unicode_format_control(c)));
+        assert!(out.chars().all(|c| !is_terminal_unsafe(c)));
+    }
+
+    #[test]
+    fn terminal_unsafe_predicate_catches_tag_block() {
+        // U+E0061 is TAG LATIN SMALL LETTER A, used for spoofing.
+        assert!(is_terminal_unsafe('\u{E0061}'));
+        assert!(is_terminal_unsafe('\u{200F}')); // RLM
+        assert!(is_terminal_unsafe('\u{1B}')); // ESC
+        assert!(!is_terminal_unsafe('a'));
+        assert!(!is_terminal_unsafe('1'));
+        // Newline is a control char and must be neutralized by sanitizers.
+        assert!(is_terminal_unsafe('\n'));
     }
 }
