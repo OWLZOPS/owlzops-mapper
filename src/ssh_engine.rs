@@ -947,11 +947,13 @@ impl RemoteCoverage {
     /// streaming fleet path and the snapshot path. Adding a fourth field will
     /// break this function first, not silently drift (R25-72).
     pub fn apply_to(self, report: &mut AgentReport) {
+        // R25-81(e): preserve existing remote_privileged when coverage is None.
         report.coverage_warnings.extend(self.notes);
-        report.remote_privileged = self.privileged;
+        if let Some(p) = self.privileged {
+            report.remote_privileged = Some(p);
+        }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Main remote scan
 // ---------------------------------------------------------------------------

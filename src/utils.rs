@@ -315,6 +315,8 @@ pub(crate) fn is_terminal_unsafe(c: char) -> bool {
             | 0xFFA0                  // HALFWIDTH HANGUL FILLER
             | 0x200B..=0x200F         // ZWSP, ZWNJ, ZWJ, LRM, RLM
             | 0x202A..=0x202E         // bidi overrides
+            | 0x2028                  // LINE SEPARATOR
+            | 0x2029                  // PARAGRAPH SEPARATOR
             | 0x2060..=0x206F         // word joiner, invisible operators, isolates
             | 0xFEFF                  // BOM / ZERO WIDTH NO-BREAK SPACE
             | 0xE0000..=0xE007F       // Unicode TAG block

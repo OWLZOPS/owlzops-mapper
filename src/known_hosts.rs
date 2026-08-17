@@ -421,7 +421,7 @@ impl KnownHostsChecker {
             return Err(crate::ssh_engine::RemoteError::HostKeyChanged {
                 host: self.host.clone(),
                 file: conflict_file.display().to_string(),
-                line: conflict_line,
+                line: crate::utils::sanitize_for_log(&conflict_line),
                 line_number: conflict_line_number,
             });
         }

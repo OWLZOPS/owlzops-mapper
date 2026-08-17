@@ -1185,11 +1185,11 @@ async fn main() {
     });
 
     let exit_code = cmd_handle.await.unwrap_or_else(|join_err| {
-        if join_err.is_panic() {
-            eprintln!("Main task panicked");
+        let _ = if join_err.is_panic() {
+            writeln!(std::io::stderr(), "Main task panicked")
         } else {
-            eprintln!("Main task was cancelled without a panic");
-        }
+            writeln!(std::io::stderr(), "Main task was cancelled without a panic")
+        };
         EXIT_INTERNAL_ERROR
     });
 
