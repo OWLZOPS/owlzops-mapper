@@ -70,6 +70,27 @@ const EXIT_INTERRUPT: i32 = 130;
 /// Exit code for an internal error (panic), distinct from SIGINT (130).
 const EXIT_INTERNAL_ERROR: i32 = 70; // sysexits.h EX_SOFTWARE
 
+/// A `MakeWriter` that suspends the progress bars for the duration of each
+/// log record. With this installed, no call site needs `multi.suspend`, and
+/// the three different treatments in this file collapse into zero (R25-71).
+struct BarAwareStderr(MultiProgress);
+
+impl Write for BarAwareStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `suspend` holds indicatif's draw lock; keep the closure tiny and
+        // never let it panic — an unwind here would poison the lock for every
+        // other bar (R25-18).
+        self.0.suspend(|| {
+            let _ = std::io::stderr().write_all(buf);
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // R25-56: Fleet aggregation compares verdicts, not numeric exit codes.
 /// Numeric exit codes are a PUBLIC CONTRACT and are NOT ordered by severity:
 /// 4 (incomplete) is less severe than 3 (compromise). Fleet aggregation must
@@ -193,7 +214,12 @@ fn raise_nofile_limit() {
     }
 }
 
-async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> i32 {
+async fn run_command(
+    cli: Cli,
+    multi: MultiProgress,
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+) -> i32 {
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
         Commands::Audit(args) => {
@@ -422,7 +448,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 // Process remote hosts with JoinSet + Semaphore + global timeout
                 if !remote.is_empty() {
                     // ========== MULTIPROGRESS SETUP ==========
-                    let multi = MultiProgress::new();
+                    // Use the shared MultiProgress passed from main (R25-71).
 
                     // 1. Upload progress bar (only when we copy a binary)
                     let upload_bar = if sudo_pass.is_some() && args.copy_binary {
@@ -550,8 +576,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     }
                                     Err(e) => {
                                         // Progress bars continuously redraw stderr.
-                                        // Suspend them to ensure the error stays visible.
-                                        // R25-18: never panic on EPIPE when stderr is closed early.
+                                        // Suspend them to ensure the direct write
+                                        // stays visible. The following warn! is
+                                        // automatically safe via BarAwareStderr.
                                         multi.suspend(|| {
                                             let _ = writeln!(
                                                 std::io::stderr(),
@@ -609,12 +636,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                     }
                                                 }
                                                 Some(Ok(None)) => {}
-                                                Some(Err(e)) if e.is_panic() => multi.suspend(|| {
+                                                Some(Err(e)) if e.is_panic() => {
                                                     warn!("scan task panicked during teardown: {e}");
-                                                }),
-                                                Some(Err(e)) => multi.suspend(|| {
+                                                }
+                                                Some(Err(e)) => {
                                                     warn!("scan task failed during teardown: {e}");
-                                                }),
+                                                }
                                                 None => break, // All tasks finished cleanly
                                             }
                                         }
@@ -636,12 +663,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                 }
                                             }
                                             Ok(None) => {}
-                                            Err(e) if e.is_panic() => multi.suspend(|| {
+                                            Err(e) if e.is_panic() => {
                                                 warn!("scan task panicked: {e}");
-                                            }),
-                                            Err(e) => multi.suspend(|| {
+                                            }
+                                            Err(e) => {
                                                 warn!("scan task failed: {e}");
-                                            }),
+                                            }
                                         }
                                     }
                                     None => {
@@ -1035,13 +1062,20 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 async fn main() {
     raise_nofile_limit();
 
+    // Shared progress bar handle. Installed before the tracing subscriber so
+    // every structured log record can suspend bars automatically (R25-71).
+    let multi = MultiProgress::new();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer({
+            let m = multi.clone();
+            move || BarAwareStderr(m.clone())
+        })
         .init();
 
     let matches = match Cli::command().try_get_matches() {
@@ -1065,7 +1099,12 @@ async fn main() {
     let shutdown_clone = shutdown.clone();
     let shutdown_notify_clone = shutdown_notify.clone();
 
-    let cmd_handle = tokio::spawn(run_command(cli, shutdown_clone, shutdown_notify_clone));
+    let cmd_handle = tokio::spawn(run_command(
+        cli,
+        multi,
+        shutdown_clone,
+        shutdown_notify_clone,
+    ));
 
     // ---- Signal handler (runs for the entire lifetime) ----
     let notify_sig = shutdown_notify.clone();
