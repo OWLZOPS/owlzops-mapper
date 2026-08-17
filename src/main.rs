@@ -131,12 +131,14 @@ fn exit_code_for_verdict(verdict: Verdict, any_non_root: bool, any_warnings: boo
 fn compute_exit_code(report: &AgentReport) -> i32 {
     let verdict = compute_verdict(report);
 
+    // Preserve the local warning side effects, but leave the numeric mapping
+    // to the single source of truth. A second parallel match here is exactly
+    // how R25-62 stayed invisible (R25-67).
     match verdict {
         Verdict::Compromised => {
             warn!(
                 "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
             );
-            3
         }
         Verdict::Incomplete => {
             if report.failed_scanners.is_empty() {
@@ -147,32 +149,28 @@ fn compute_exit_code(report: &AgentReport) -> i32 {
                     "one or more scanners failed — verdict incomplete, exiting 4"
                 );
             }
-            EXIT_INCOMPLETE
         }
         Verdict::Critical => {
             if !report.is_root_execution {
                 warn!(
                     "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
                 );
-                2
-            } else {
-                1
             }
         }
         Verdict::Clean => {
             if !report.is_root_execution {
                 warn!("not running as root – results may be incomplete.");
-                2
             } else if !report.scan_warnings.is_empty() {
-                // Superset of failed_scanners: a warning without a panic still
-                // means the report is not a complete observation (R25-45).
                 warn!(warnings = ?report.scan_warnings, "scan produced warnings — degraded");
-                2
-            } else {
-                0
             }
         }
     }
+
+    exit_code_for_verdict(
+        verdict,
+        !report.is_root_execution,
+        !report.scan_warnings.is_empty(),
+    )
 }
 
 fn raise_nofile_limit() {
