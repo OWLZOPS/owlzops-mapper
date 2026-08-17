@@ -25,15 +25,10 @@ fi
 
 failing=0
 for id in $ids; do
-  found=""
-  for file in $changed_files; do
-    if git show "$commit:$file" 2>/dev/null | grep -Fq -- "$id"; then
-      found=1
-      break
-    fi
-  done
-
-  if [ -z "$found" ]; then
+  # R25-49: check only lines added/modified in this commit, not the entire file.
+  # Otherwise a stale comment from an earlier commit lets a false remediation
+  # claim pass.
+  if ! git diff --unified=0 "$commit~1" "$commit" 2>/dev/null | grep -E '^\+[^+]' | grep -Fq -- "$id"; then
     echo "::error::commit claims $id but no changed file mentions it"
     failing=1
   fi
