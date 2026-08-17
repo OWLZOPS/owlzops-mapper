@@ -202,6 +202,13 @@ pub enum RemoteError {
     UploadFailed { host: String, detail: String },
     #[error("host key for {host} has been explicitly revoked in known_hosts")]
     HostKeyRevoked { host: String },
+    #[error(
+        "host {host} is configured in known_hosts with an unsupported `@{marker}` \
+         trust model; owlzops-mapper cannot verify it and will not fall back to \
+         trust-on-first-use. Add a plain known_hosts entry for this host, or \
+         exclude it from the scan."
+    )]
+    HostKeyUnsupportedTrust { host: String, marker: String },
 }
 
 // Required by russh::client::Handler::Error bound

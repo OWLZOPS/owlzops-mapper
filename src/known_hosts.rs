@@ -47,6 +47,13 @@ pub struct KnownHostsChecker {
     system_file: PathBuf,
     pin_file: PathBuf, // ~/.owlzops/known_hosts (our TOFU store)
     entries: Vec<KnownHostEntry>,
+    /// Non-empty when the trust store contains an entry for this host with a
+    /// marker we recognise but cannot evaluate. Presence is a fact: falling
+    /// through to TOFU would silently replace the operator's trust model.
+    ///
+    /// R25-76: `@cert-authority` and unknown `@marker` lines must fail closed,
+    /// not turn into trust-on-first-use.
+    unsupported_marker: Option<String>,
 }
 
 impl KnownHostsChecker {
@@ -65,7 +72,7 @@ impl KnownHostsChecker {
         let system_file = home.join(".ssh/known_hosts");
         let pin_file = home.join(".owlzops/known_hosts");
         let candidates = Self::host_candidates(&host, port);
-        let entries =
+        let (entries, unsupported_marker) =
             Self::load_entries(&system_file, &pin_file, &candidates).map_err(|(path, e)| {
                 crate::ssh_engine::RemoteError::HostKeyCheck {
                     host: host.clone(),
@@ -83,6 +90,7 @@ impl KnownHostsChecker {
             system_file,
             pin_file,
             entries,
+            unsupported_marker,
         })
     }
 
@@ -90,8 +98,9 @@ impl KnownHostsChecker {
         system_file: &Path,
         pin_file: &Path,
         candidates: &[String],
-    ) -> Result<Vec<KnownHostEntry>, (PathBuf, std::io::Error)> {
+    ) -> Result<(Vec<KnownHostEntry>, Option<String>), (PathBuf, std::io::Error)> {
         let mut out = Vec::new();
+        let mut unsupported_marker: Option<String> = None;
 
         for (path, store) in [
             (system_file, TrustStore::System),
@@ -147,22 +156,20 @@ impl KnownHostsChecker {
                 };
 
                 match marker {
-                    // A CA-signed host key is a trust model we do not implement.
-                    // Refusing is correct; silently ignoring is not.
+                    // R25-76: the operator explicitly configured a CA trust
+                    // model. We do not implement it, so the host is NOT
+                    // unknown: it has an unsupported trust decision.
                     Some("cert-authority") => {
-                        crate::coverage::record(format!(
-                            "known_hosts: @cert-authority entry for {} ignored — \
-                             certificate host keys are not supported",
-                            candidates.first().map(String::as_str).unwrap_or("?")
-                        ));
+                        unsupported_marker.get_or_insert_with(|| "cert-authority".to_string());
                         continue;
                     }
                     Some("revoked") => {}
                     Some(other) => {
-                        crate::coverage::record(format!(
-                            "known_hosts: unknown marker `@{}` — entry ignored",
-                            crate::utils::sanitize_for_log(other)
-                        ));
+                        // R25-76: any other marker is also an explicit decision
+                        // we cannot evaluate. Do not fall through to TOFU.
+                        unsupported_marker.get_or_insert_with(|| {
+                            crate::utils::sanitize_for_log(other).to_string()
+                        });
                         continue;
                     }
                     None => {}
@@ -191,14 +198,15 @@ impl KnownHostsChecker {
             }
         }
 
-        Ok(out)
+        Ok((out, unsupported_marker))
     }
 
     #[cfg(test)]
     fn from_files(host: String, port: u16, system_file: PathBuf, pin_file: PathBuf) -> Self {
         let candidates = Self::host_candidates(&host, port);
-        let entries = Self::load_entries(&system_file, &pin_file, &candidates)
-            .expect("test trust store must be readable");
+        let (entries, unsupported_marker) =
+            Self::load_entries(&system_file, &pin_file, &candidates)
+                .expect("test trust store must be readable");
 
         Self {
             host,
@@ -206,6 +214,7 @@ impl KnownHostsChecker {
             system_file,
             pin_file,
             entries,
+            unsupported_marker,
         }
     }
 
@@ -260,9 +269,10 @@ impl KnownHostsChecker {
     pub fn pinned_algorithms(&self) -> Vec<russh::keys::ssh_key::Algorithm> {
         let mut out = Vec::new();
 
-        for entry in &self.entries {
-            // Entries are already filtered by host during load_entries,
-            // so no further filtering is needed here.
+        for entry in self.entries.iter().filter(|e| !e.revoked) {
+            // Entries are already filtered by host during load_entries.
+            // A revoked key is a denylist, not a record of the host's current
+            // key: it must never shape the algorithm offer (R25-77).
             let (algs, unknown) = Self::algorithms_from_openssh_name(&entry.key_type);
             if let Some(unknown) = unknown {
                 crate::coverage::record(format!(
@@ -383,6 +393,16 @@ impl KnownHostsChecker {
         };
         let ptype_canon = Self::canonical_key_type(ptype);
 
+        // R25-76: entries exist for this host but we could not evaluate them.
+        // Pinning the presented key here would overwrite an explicit operator
+        // trust decision with our own TOFU decision.
+        if let Some(marker) = &self.unsupported_marker {
+            return Err(crate::ssh_engine::RemoteError::HostKeyUnsupportedTrust {
+                host: self.host.clone(),
+                marker: marker.clone(),
+            });
+        }
+
         // A revoked key is an explicit operator decision and outranks both an
         // exact match and TOFU.
         for entry in self.entries.iter().filter(|e| e.revoked) {
@@ -395,7 +415,7 @@ impl KnownHostsChecker {
 
         let mut conflict: Option<(String, PathBuf, usize)> = None;
 
-        for entry in &self.entries {
+        for entry in self.entries.iter().filter(|e| !e.revoked) {
             if Self::canonical_key_type(&entry.key_type) == ptype_canon && entry.key_data == pdata {
                 return Ok(true);
             }
