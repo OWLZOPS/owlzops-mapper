@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn an_rsa_key_verifies_against_an_ssh_rsa_known_hosts_line() {
+    fn an_rsa_key_verifies_against_an_rsa_sha2_known_hosts_line() {
         use russh::keys::ssh_key::{Algorithm, HashAlg, PrivateKey};
 
         let rsa = PrivateKey::random(
@@ -584,13 +584,17 @@ mod tests {
         )
         .unwrap();
         let pub_key = rsa.public_key();
-        let line = pub_key.to_openssh().unwrap();
+        let openssh = pub_key.to_openssh().unwrap();
+        let mut parts = openssh.split_whitespace();
+        let _ptype = parts.next().unwrap();
+        let pdata = parts.next().unwrap();
 
-        // The line may be `ssh-rsa ...` or `rsa-sha2-512 ...`; our
-        // canonical_key_type must make verification succeed either way.
+        // The file records the SIGNATURE algorithm, while our key material is
+        // the same. canonical_key_type must treat rsa-sha2-512 as ssh-rsa for
+        // the comparison (R25-64).
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let kh_path = tmp_dir.path().join("known_hosts");
-        std::fs::write(&kh_path, format!("localhost {line}\n")).unwrap();
+        std::fs::write(&kh_path, format!("localhost rsa-sha2-512 {pdata}\n")).unwrap();
 
         let checker = KnownHostsChecker::from_files(
             "localhost".into(),
