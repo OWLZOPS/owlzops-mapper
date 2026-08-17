@@ -23,13 +23,19 @@ struct KnownHostEntry {
     key_type: String,
     key_data: String,
     store: TrustStore,
+    /// `true` if this entry came from an OpenSSH `@revoked` marker line.
+    revoked: bool,
 }
 
 impl KnownHostEntry {
     /// Reconstructed for the HostKeyChanged message; storing the raw line as
     /// well would duplicate every field a second time.
     fn as_line(&self) -> String {
-        format!("{} {} {}", self.host_field, self.key_type, self.key_data)
+        let prefix = if self.revoked { "@revoked " } else { "" };
+        format!(
+            "{}{} {} {}",
+            prefix, self.host_field, self.key_type, self.key_data
+        )
     }
 }
 
@@ -121,7 +127,41 @@ impl KnownHostsChecker {
                     continue;
                 }
 
-                let mut f = line.split_whitespace();
+                // OpenSSH marker lines start with `@revoked` / `@cert-authority`.
+                // Positional parsing silently drops them, so an explicitly
+                // REVOKED key looks like an unknown host and gets TOFU-pinned
+                // (R25-66).
+                let (marker, rest) = match line.strip_prefix('@') {
+                    Some(r) => match r.split_once(char::is_whitespace) {
+                        Some((m, rest)) => (Some(m), rest.trim_start()),
+                        None => continue,
+                    },
+                    None => (None, line),
+                };
+
+                match marker {
+                    // A CA-signed host key is a trust model we do not implement.
+                    // Refusing is correct; silently ignoring is not.
+                    Some("cert-authority") => {
+                        crate::coverage::record(format!(
+                            "known_hosts: @cert-authority entry for {} ignored — \
+                             certificate host keys are not supported",
+                            candidates.first().map(String::as_str).unwrap_or("?")
+                        ));
+                        continue;
+                    }
+                    Some("revoked") => {}
+                    Some(other) => {
+                        crate::coverage::record(format!(
+                            "known_hosts: unknown marker `@{}` — entry ignored",
+                            crate::utils::sanitize_for_log(other)
+                        ));
+                        continue;
+                    }
+                    None => {}
+                }
+
+                let mut f = rest.split_whitespace();
                 let (Some(hf), Some(kt), Some(kd)) = (f.next(), f.next(), f.next()) else {
                     continue;
                 };
@@ -138,6 +178,7 @@ impl KnownHostsChecker {
                     key_type: kt.to_string(),
                     key_data: kd.to_string(),
                     store,
+                    revoked: marker == Some("revoked"),
                 });
             }
         }
@@ -297,6 +338,9 @@ impl KnownHostsChecker {
     /// a new checker for a new session/rekey.
     ///
     /// Logic:
+    /// 0. If the presented key matches an entry flagged `@revoked`, return
+    ///    `HostKeyRevoked` immediately — explicit operator decision outranks
+    ///    both exact match and TOFU (R25-66).
     /// 1. Collect all matching host entries from both trust stores.
     /// 2. If any entry matches the presented key exactly (type AND data) →
     ///    `Ok(true)`.
@@ -322,6 +366,16 @@ impl KnownHostsChecker {
             });
         };
         let ptype_canon = Self::canonical_key_type(ptype);
+
+        // A revoked key is an explicit operator decision and outranks both an
+        // exact match and TOFU.
+        for entry in self.entries.iter().filter(|e| e.revoked) {
+            if Self::canonical_key_type(&entry.key_type) == ptype_canon && entry.key_data == pdata {
+                return Err(crate::ssh_engine::RemoteError::HostKeyRevoked {
+                    host: self.host.clone(),
+                });
+            }
+        }
 
         let mut conflict: Option<(String, PathBuf)> = None;
 

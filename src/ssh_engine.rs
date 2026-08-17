@@ -197,6 +197,8 @@ pub enum RemoteError {
     },
     #[error("binary upload to {host} failed: {detail}")]
     UploadFailed { host: String, detail: String },
+    #[error("host key for {host} has been explicitly revoked in known_hosts")]
+    HostKeyRevoked { host: String },
 }
 
 // Required by russh::client::Handler::Error bound
