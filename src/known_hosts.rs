@@ -89,7 +89,7 @@ impl KnownHostsChecker {
             (system_file, TrustStore::System),
             (pin_file, TrustStore::Pin),
         ] {
-            let (content, _is_regular) = match crate::safe_io::read_file_capped_regular(
+            let (content, truncated) = match crate::safe_io::read_file_capped_regular(
                 &path.to_string_lossy(),
                 CAP_KNOWN_HOSTS,
             ) {
@@ -98,6 +98,22 @@ impl KnownHostsChecker {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err((path.to_path_buf(), e)),
             };
+
+            // Entries past the cap are invisible, so a host whose key lives in
+            // the tail looks UNKNOWN and gets TOFU-pinned to whatever the
+            // server presents — the exact failure R25-54 closed (R25-63).
+            if truncated {
+                return Err((
+                    path.to_path_buf(),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "trust store exceeds {CAP_KNOWN_HOSTS} bytes and was truncated; \
+                             refusing to treat a partial store as complete"
+                        ),
+                    ),
+                ));
+            }
 
             for line in content.lines() {
                 let line = line.trim();

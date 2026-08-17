@@ -59,6 +59,10 @@ const EXIT_USAGE: i32 = 64; // sysexits.h EX_USAGE
 /// from "verdict degraded by privileges" (R25-26 tail).
 const EXIT_INCOMPLETE: i32 = 4;
 
+/// Exit code for a degraded scan: not running as root or warnings present,
+/// but no missing scanners and no compromised hosts. Distinct from incomplete (4).
+const EXIT_DEGRADED: i32 = 2;
+
 /// Exit code for a scan interrupted by SIGINT/SIGTERM.
 const EXIT_INTERRUPT: i32 = 130;
 
@@ -99,20 +103,23 @@ fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
-fn exit_code_for_verdict(verdict: Verdict, is_root: bool, warnings_present: bool) -> i32 {
+/// `any_non_root` and `any_warnings` are AGGREGATE flags: in fleet mode they
+/// are ORed across hosts. Naming the first `is_root` inverted it at both call
+/// sites, so a fully privileged clean fleet returned 2 (R25-62).
+fn exit_code_for_verdict(verdict: Verdict, any_non_root: bool, any_warnings: bool) -> i32 {
     match verdict {
         Verdict::Compromised => 3,
         Verdict::Incomplete => EXIT_INCOMPLETE,
         Verdict::Critical => {
-            if !is_root {
-                2
+            if any_non_root {
+                EXIT_DEGRADED
             } else {
                 1
             }
         }
         Verdict::Clean => {
-            if !is_root || warnings_present {
-                2
+            if any_non_root || any_warnings {
+                EXIT_DEGRADED
             } else {
                 0
             }
@@ -1229,6 +1236,22 @@ mod tests {
         r.failed_scanners = vec!["security".to_string()];
 
         assert_eq!(compute_exit_code(&r), EXIT_INCOMPLETE);
+    }
+
+    #[test]
+    fn exit_codes_follow_the_documented_band() {
+        use Verdict::*;
+
+        assert_eq!(exit_code_for_verdict(Clean, false, false), 0);
+        assert_eq!(exit_code_for_verdict(Clean, true, false), EXIT_DEGRADED);
+        assert_eq!(exit_code_for_verdict(Clean, false, true), EXIT_DEGRADED);
+        assert_eq!(exit_code_for_verdict(Critical, false, false), 1);
+        assert_eq!(exit_code_for_verdict(Critical, true, false), EXIT_DEGRADED);
+        assert_eq!(
+            exit_code_for_verdict(Incomplete, false, false),
+            EXIT_INCOMPLETE
+        );
+        assert_eq!(exit_code_for_verdict(Compromised, true, true), 3);
     }
 
     #[test]
