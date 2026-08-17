@@ -154,22 +154,13 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     // Remote privilege level is a coverage fact, not a host setting.
     // Losing root visibility makes low scores incomparable (R25-31).
     if before.remote_privileged != after.remote_privileged {
-        let (before_s, after_s, severity) =
-            match (before.remote_privileged, after.remote_privileged) {
-                (Some(true), Some(false)) => (
-                    Some("true".to_string()),
-                    Some("false".to_string()),
-                    Severity::Degraded,
-                ),
-                (Some(false), Some(true)) => (
-                    Some("false".to_string()),
-                    Some("true".to_string()),
-                    Severity::Improved,
-                ),
-                (None, Some(v)) => (None, Some(v.to_string()), Severity::Changed),
-                (Some(v), None) => (Some(v.to_string()), None, Severity::Changed),
-                _ => unreachable!(),
-            };
+        let before_s = before.remote_privileged.map(|v| v.to_string());
+        let after_s = after.remote_privileged.map(|v| v.to_string());
+        let severity = match (before.remote_privileged, after.remote_privileged) {
+            (Some(true), Some(false)) => Severity::Degraded,
+            (Some(false), Some(true)) => Severity::Improved,
+            _ => Severity::Changed,
+        };
 
         changes.push(Change {
             field: "remote_privileged".into(),
@@ -1319,7 +1310,11 @@ pub fn compare_multi(before: &[AgentReport], after: &[AgentReport]) -> Vec<Multi
                     }],
                 },
             }),
-            (None, None) => unreachable!(),
+            (None, None) => {
+                // Hostname is derived from the union of both maps, so this arm
+                // is logically unreachable; skip instead of panicking (R25-51).
+                continue;
+            }
         }
     }
     diffs
