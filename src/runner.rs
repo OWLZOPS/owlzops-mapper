@@ -424,6 +424,11 @@ async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentRepo
     let mut report = serde_json::from_slice::<AgentReport>(&stdout)
         .map_err(|e| format!("remote output is not a valid AgentReport: {e}"))?;
     report.coverage_warnings.extend(coverage.notes);
+
+    // R25-42: persist the privilege fact from the remote scan. Without this,
+    // snapshot comparison cannot see that a scan degraded to non-root.
+    report.remote_privileged = coverage.privileged;
+
     Ok(report)
 }
 
