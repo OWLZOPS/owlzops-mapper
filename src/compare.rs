@@ -159,7 +159,13 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         let severity = match (before.remote_privileged, after.remote_privileged) {
             (Some(true), Some(false)) => Severity::Degraded,
             (Some(false), Some(true)) => Severity::Improved,
-            _ => Severity::Changed,
+            // `None` means UNKNOWN. Losing a known privilege level, or learning
+            // that a scan ran unprivileged, are both coverage losses (R25-69).
+            (Some(true), None) | (None, Some(false)) => Severity::Degraded,
+            (Some(false), None) | (None, Some(true)) => Severity::Changed,
+            (None, None) | (Some(true), Some(true)) | (Some(false), Some(false)) => {
+                Severity::Changed
+            }
         };
 
         changes.push(Change {
@@ -1898,6 +1904,45 @@ mod tests {
 
         assert_eq!(c.severity, Severity::Degraded);
         assert_eq!(c.before.as_deref(), Some("true"));
+        assert_eq!(c.after.as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn remote_privileged_known_true_to_unknown_is_degraded() {
+        // We knew it was root; now unknown means coverage loss (R25-69).
+        let mut before = test_report();
+        before.remote_privileged = Some(true);
+
+        let after = test_report(); // None
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "remote_privileged")
+            .expect("true -> unknown must surface");
+
+        assert_eq!(c.severity, Severity::Degraded);
+        assert_eq!(c.before.as_deref(), Some("true"));
+        assert_eq!(c.after, None);
+    }
+
+    #[test]
+    fn remote_privileged_unknown_to_false_is_degraded() {
+        // We did not know; now learned it ran unprivileged — coverage loss
+        // relative to an assumed full observation (R25-69).
+        let before = test_report(); // None
+
+        let mut after = test_report();
+        after.remote_privileged = Some(false);
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "remote_privileged")
+            .expect("unknown -> false must surface");
+
+        assert_eq!(c.severity, Severity::Degraded);
+        assert_eq!(c.before, None);
         assert_eq!(c.after.as_deref(), Some("false"));
     }
 }
