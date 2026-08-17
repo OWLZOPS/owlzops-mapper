@@ -190,7 +190,7 @@ impl KnownHostsChecker {
     fn from_files(host: String, port: u16, system_file: PathBuf, pin_file: PathBuf) -> Self {
         let candidates = Self::host_candidates(&host, port);
         let entries = Self::load_entries(&system_file, &pin_file, &candidates)
-            .unwrap_or_else(|_| panic!("test trust store must be readable"));
+            .expect("test trust store must be readable");
 
         Self {
             host,

@@ -864,8 +864,8 @@ async fn upload_via_channel(
     // Not a fixed 120 s cap on throughput (R25-35): the transfer itself is
     // bounded per write by UPLOAD_STALL_BUDGET; this bounds the tail and
     // scales the rest with the payload.
-    let budget =
-        UPLOAD_TAIL_BUDGET + Duration::from_secs(file_size / MIN_UPLOAD_BYTES_PER_SEC.max(1));
+    // R25-72: MIN_UPLOAD_BYTES_PER_SEC is already a nonzero constant; .max(1) is dead.
+    let budget = UPLOAD_TAIL_BUDGET + Duration::from_secs(file_size / MIN_UPLOAD_BYTES_PER_SEC);
     let res = match tokio::time::timeout(budget, upload_fut).await {
         Ok(inner) => inner,
         Err(_) => Err(RemoteError::UploadFailed {

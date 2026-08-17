@@ -1155,10 +1155,10 @@ async fn main() {
     let exit_code = cmd_handle.await.unwrap_or_else(|join_err| {
         if join_err.is_panic() {
             eprintln!("Main task panicked");
-            EXIT_INTERNAL_ERROR
         } else {
-            1
+            eprintln!("Main task was cancelled without a panic");
         }
+        EXIT_INTERNAL_ERROR
     });
 
     std::process::exit(exit_code);
