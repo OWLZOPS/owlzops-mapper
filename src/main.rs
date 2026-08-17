@@ -92,15 +92,15 @@ impl Write for BarAwareStderr {
 }
 
 // R25-56: Fleet aggregation compares verdicts, not numeric exit codes.
-/// Numeric exit codes are a PUBLIC CONTRACT and are NOT ordered by severity:
-/// 4 (incomplete) is less severe than 3 (compromise). Fleet aggregation must
-/// therefore compare verdicts and map to a code once, never `max()` the codes.
+// Numeric exit codes are a PUBLIC CONTRACT and are NOT ordered by severity:
+// 4 (incomplete) is less severe than 3 (compromise). Fleet aggregation must
+// therefore compare verdicts and map to a code once, never `max()` the codes.
+//
+// R25-72: fleet rank is Clean < Incomplete < Critical < Compromised.
+// A confirmed Critical on one host outranks scan uncertainty on another.
 fn verdict_rank(v: Verdict) -> u8 {
     match v {
         Verdict::Clean => 0,
-        // R25-72: for fleet aggregation a confirmed Critical on one host
-        // outranks an Incomplete scan on another. Incomplete is uncertainty,
-        // not a verdict; the operator must see the confirmed finding first.
         Verdict::Incomplete => 1,
         Verdict::Critical => 2,
         Verdict::Compromised => 3,
