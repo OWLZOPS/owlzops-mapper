@@ -47,6 +47,17 @@ pub struct AgentReport {
     pub packages: PackagesInfo,
 }
 
+impl AgentReport {
+    /// Whether this scan was able to read privileged surfaces.
+    ///
+    /// Local scans answer via `is_root_execution`; remote scans answer via
+    /// `remote_privileged`. Comparing the raw remote field instead conflates
+    /// "how the scan was delivered" with "what it could see" (R25-79).
+    pub fn scan_was_privileged(&self) -> bool {
+        self.remote_privileged.unwrap_or(self.is_root_execution)
+    }
+}
+
 impl Default for AgentReport {
     fn default() -> Self {
         Self {

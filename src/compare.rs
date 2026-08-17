@@ -152,26 +152,23 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
     );
 
     // Remote privilege level is a coverage fact, not a host setting.
-    // Losing root visibility makes low scores incomparable (R25-31).
-    if before.remote_privileged != after.remote_privileged {
-        let before_s = before.remote_privileged.map(|v| v.to_string());
-        let after_s = after.remote_privileged.map(|v| v.to_string());
-        let severity = match (before.remote_privileged, after.remote_privileged) {
-            (Some(true), Some(false)) => Severity::Degraded,
-            (Some(false), Some(true)) => Severity::Improved,
-            // `None` means UNKNOWN. Losing a known privilege level, or learning
-            // that a scan ran unprivileged, are both coverage losses (R25-69).
-            (Some(true), None) | (None, Some(false)) => Severity::Degraded,
-            (Some(false), None) | (None, Some(true)) => Severity::Changed,
-            (None, None) | (Some(true), Some(true)) | (Some(false), Some(false)) => {
-                Severity::Changed
-            }
+    // Compare the DERIVED privilege fact, not the raw delivery field:
+    // a local scan answers via is_root_execution, a remote scan via
+    // remote_privileged. This avoids treating "local root vs remote root"
+    // as a change (R25-79). Losing root visibility makes low scores
+    // incomparable (R25-31).
+    let before_priv = before.scan_was_privileged();
+    let after_priv = after.scan_was_privileged();
+    if before_priv != after_priv {
+        let severity = if after_priv {
+            Severity::Improved
+        } else {
+            Severity::Degraded
         };
-
         changes.push(Change {
             field: "remote_privileged".into(),
-            before: before_s,
-            after: after_s,
+            before: Some(before_priv.to_string()),
+            after: Some(after_priv.to_string()),
             severity,
         });
     }
@@ -1908,41 +1905,50 @@ mod tests {
     }
 
     #[test]
-    fn remote_privileged_known_true_to_unknown_is_degraded() {
-        // We knew it was root; now unknown means coverage loss (R25-69).
-        let mut before = test_report();
-        before.remote_privileged = Some(true);
+    fn local_root_and_remote_root_do_not_drift() {
+        // Local root scan uses is_root_execution, remote root uses
+        // remote_privileged=Some(true). Derived privilege must be equal
+        // (R25-79).
+        let local = test_report(); // is_root_execution=true, remote_privileged=None
+        let mut remote = test_report();
+        remote.remote_privileged = Some(true);
 
-        let after = test_report(); // None
-
-        let c = compare_reports(&before, &after)
-            .changes
-            .into_iter()
-            .find(|c| c.field == "remote_privileged")
-            .expect("true -> unknown must surface");
-
-        assert_eq!(c.severity, Severity::Degraded);
-        assert_eq!(c.before.as_deref(), Some("true"));
-        assert_eq!(c.after, None);
+        assert!(
+            compare_reports(&local, &remote).changes.is_empty(),
+            "local root and remote root are the same privilege fact"
+        );
     }
 
     #[test]
-    fn remote_privileged_unknown_to_false_is_degraded() {
-        // We did not know; now learned it ran unprivileged — coverage loss
-        // relative to an assumed full observation (R25-69).
-        let before = test_report(); // None
+    fn local_non_root_and_remote_non_root_do_not_drift() {
+        let mut local = test_report();
+        local.is_root_execution = false;
 
-        let mut after = test_report();
-        after.remote_privileged = Some(false);
+        let mut remote = test_report();
+        remote.is_root_execution = false;
+        remote.remote_privileged = Some(false);
 
-        let c = compare_reports(&before, &after)
+        assert!(
+            compare_reports(&local, &remote).changes.is_empty(),
+            "local non-root and remote non-root are the same privilege fact"
+        );
+    }
+
+    #[test]
+    fn local_non_root_vs_remote_root_is_improved() {
+        let mut local = test_report();
+        local.is_root_execution = false;
+
+        let mut remote = test_report();
+        remote.remote_privileged = Some(true);
+
+        let c = compare_reports(&local, &remote)
             .changes
             .into_iter()
             .find(|c| c.field == "remote_privileged")
-            .expect("unknown -> false must surface");
-
-        assert_eq!(c.severity, Severity::Degraded);
-        assert_eq!(c.before, None);
-        assert_eq!(c.after.as_deref(), Some("false"));
+            .expect("privilege gain must surface");
+        assert_eq!(c.severity, Severity::Improved);
+        assert_eq!(c.before.as_deref(), Some("false"));
+        assert_eq!(c.after.as_deref(), Some("true"));
     }
 }
