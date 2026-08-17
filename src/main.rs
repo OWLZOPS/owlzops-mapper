@@ -604,8 +604,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                     }
                                                 }
                                                 Some(Ok(None)) => {}
-                                                Some(Err(e)) if e.is_panic() => warn!("scan task panicked during teardown: {e}"),
-                                                Some(Err(e)) => warn!("scan task failed during teardown: {e}"),
+                                                Some(Err(e)) if e.is_panic() => multi.suspend(|| {
+                                                    warn!("scan task panicked during teardown: {e}");
+                                                }),
+                                                Some(Err(e)) => multi.suspend(|| {
+                                                    warn!("scan task failed during teardown: {e}");
+                                                }),
                                                 None => break, // All tasks finished cleanly
                                             }
                                         }
@@ -627,8 +631,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                 }
                                             }
                                             Ok(None) => {}
-                                            Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
-                                            Err(e) => warn!("scan task failed: {e}"),
+                                            Err(e) if e.is_panic() => multi.suspend(|| {
+                                                warn!("scan task panicked: {e}");
+                                            }),
+                                            Err(e) => multi.suspend(|| {
+                                                warn!("scan task failed: {e}");
+                                            }),
                                         }
                                     }
                                     None => {
