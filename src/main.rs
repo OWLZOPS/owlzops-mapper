@@ -230,7 +230,9 @@ fn compute_exit_code(report: &AgentReport, fail_on_incomplete: bool) -> i32 {
     exit_code(&outcome, fail_on_incomplete)
 }
 
-fn is_running_as_root() -> bool {
+/// Used by runner and scanner modules to adapt coverage hints. Keep here as
+/// the crate-root helper shared across the binary.
+pub(crate) fn is_running_as_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
@@ -800,7 +802,11 @@ async fn run_command(
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return EXIT_DEGRADED;
+                    return if fail_on_incomplete {
+                        EXIT_INCOMPLETE
+                    } else {
+                        EXIT_DEGRADED
+                    };
                 }
 
                 return exit_code;
@@ -859,7 +865,11 @@ async fn run_command(
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return EXIT_DEGRADED;
+                    return if fail_on_incomplete {
+                        EXIT_INCOMPLETE
+                    } else {
+                        EXIT_DEGRADED
+                    };
                 }
                 exit_code
             }
