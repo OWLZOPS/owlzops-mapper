@@ -638,7 +638,7 @@ mod tests {
                 hash: Some(HashAlg::Sha512),
             },
         )
-            .unwrap();
+        .unwrap();
 
         let line = k.public_key().to_openssh().unwrap();
         let mut parts = line.split_whitespace();
