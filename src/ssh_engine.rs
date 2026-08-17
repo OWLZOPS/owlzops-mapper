@@ -132,12 +132,14 @@ pub(crate) fn sudo_error_kind(use_sudo: bool, se: &str) -> Option<SudoErrorKind>
 #[allow(dead_code)]
 pub enum RemoteError {
     #[error(
-        "host key for {host} in {file} has changed! possible MITM attack. Run: ssh-keygen -R {host} -f {file}"
+        "host key for {host} in {file} has changed! possible MITM attack. Run: \
+         ssh-keygen -R {host} -f {file}. Conflicting line {line_number}: {line}"
     )]
     HostKeyChanged {
         host: String,
         file: String,
         line: String,
+        line_number: usize,
     },
     #[error("host key for {host} is unknown and not in known_hosts")]
     HostKeyUnknown { host: String },
@@ -861,9 +863,6 @@ async fn upload_via_channel(
         }
     };
 
-    // Not a fixed 120 s cap on throughput (R25-35): the transfer itself is
-    // bounded per write by UPLOAD_STALL_BUDGET; this bounds the tail and
-    // scales the rest with the payload.
     // R25-72: MIN_UPLOAD_BYTES_PER_SEC is already a nonzero constant; .max(1) is dead.
     let budget = UPLOAD_TAIL_BUDGET + Duration::from_secs(file_size / MIN_UPLOAD_BYTES_PER_SEC);
     let res = match tokio::time::timeout(budget, upload_fut).await {

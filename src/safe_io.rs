@@ -49,23 +49,11 @@ pub fn read_reader_capped<R: Read>(mut reader: R, max_bytes: usize) -> (Vec<u8>,
     (buf, truncated)
 }
 
-// ── R23-10: safe open for host-controlled paths (FIFO/device resistant) ──
-
-/// Like `read_file_capped`, but opens the file with `O_NONBLOCK | O_NOCTTY`
-/// and verifies that the resulting file descriptor is a regular file.
+/// Shared implementation for regular-file capped reads.
 ///
-/// Paths under scanner control (`/etc/ld.so.preload`, unit files, cron files)
-/// are writable by root.  An attacker can replace any of them with a FIFO or
-/// device node; `File::open` on a FIFO blocks until a writer appears, hanging
-/// the scanner forever.  `O_NONBLOCK` makes the open non‑blocking, and the
-/// subsequent `fstat` check ensures we only read regular files.  Other errors
-/// (e.g. `ENOENT`, `EACCES`) are returned normally so the caller can decide
-/// whether to record a coverage warning.
-///
-/// This function MUST be used for every scanner path that lives on a host‑
-/// controlled filesystem (i.e. not `/proc`, `/sys`, or `/dev`).
-#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
-pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
+/// Opens with `O_NONBLOCK | O_NOCTTY`, verifies the file is regular, reads up
+/// to `max_bytes + 1` bytes, and returns `(bytes, truncated)`.
+fn read_regular_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
@@ -87,8 +75,44 @@ pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(Str
     if truncated {
         buf.truncate(max_bytes);
     }
+    Ok((buf, truncated))
+}
+
+// ── R23-10: safe open for host-controlled paths (FIFO/device resistant) ──
+
+/// Like `read_file_capped`, but opens the file with `O_NONBLOCK | O_NOCTTY`
+/// and verifies that the resulting file descriptor is a regular file.
+///
+/// Paths under scanner control (`/etc/ld.so.preload`, unit files, cron files)
+/// are writable by root.  An attacker can replace any of them with a FIFO or
+/// device node; `File::open` on a FIFO blocks until a writer appears, hanging
+/// the scanner forever.  `O_NONBLOCK` makes the open non‑blocking, and the
+/// subsequent `fstat` check ensures we only read regular files.  Other errors
+/// (e.g. `ENOENT`, `EACCES`) are returned normally so the caller can decide
+/// whether to record a coverage warning.
+///
+/// This function MUST be used for every scanner path that lives on a host‑
+/// controlled filesystem (i.e. not `/proc`, `/sys`, or `/dev`).
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
+    let (buf, truncated) = read_regular_capped(path, max_bytes)?;
     let text = String::from_utf8(buf)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, truncated))
+}
+
+/// Like `read_file_capped_regular`, but rejects invalid UTF-8 instead of
+/// replacing it with U+FFFD. Trust stores must fail closed: a corrupted byte
+/// silently turns into a different key and can cause TOFU or a false
+/// HostKeyChanged (R25-72).
+pub fn read_file_capped_regular_strict(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
+    let (buf, truncated) = read_regular_capped(path, max_bytes)?;
+    let text = String::from_utf8(buf).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file contains invalid UTF-8: {e}"),
+        )
+    })?;
     Ok((text, truncated))
 }
 

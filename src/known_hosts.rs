@@ -25,6 +25,8 @@ struct KnownHostEntry {
     store: TrustStore,
     /// `true` if this entry came from an OpenSSH `@revoked` marker line.
     revoked: bool,
+    /// 1-based line number in the source file, for `HostKeyChanged` diagnostics.
+    line_number: usize,
 }
 
 impl KnownHostEntry {
@@ -95,7 +97,11 @@ impl KnownHostsChecker {
             (system_file, TrustStore::System),
             (pin_file, TrustStore::Pin),
         ] {
-            let (content, truncated) = match crate::safe_io::read_file_capped_regular(
+            // R25-72: trust store must be strict UTF-8. A lossy conversion
+            // would silently replace a corrupted byte with U+FFFD and could
+            // turn a valid key into a different one, causing false TOFU or
+            // HostKeyChanged.
+            let (content, truncated) = match crate::safe_io::read_file_capped_regular_strict(
                 &path.to_string_lossy(),
                 CAP_KNOWN_HOSTS,
             ) {
@@ -121,8 +127,9 @@ impl KnownHostsChecker {
                 ));
             }
 
-            for line in content.lines() {
-                let line = line.trim();
+            for (idx, raw_line) in content.lines().enumerate() {
+                let line_number = idx + 1;
+                let line = raw_line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
@@ -179,6 +186,7 @@ impl KnownHostsChecker {
                     key_data: kd.to_string(),
                     store,
                     revoked: marker == Some("revoked"),
+                    line_number,
                 });
             }
         }
@@ -377,7 +385,7 @@ impl KnownHostsChecker {
             }
         }
 
-        let mut conflict: Option<(String, PathBuf)> = None;
+        let mut conflict: Option<(String, PathBuf, usize)> = None;
 
         for entry in &self.entries {
             if Self::canonical_key_type(&entry.key_type) == ptype_canon && entry.key_data == pdata {
@@ -390,15 +398,16 @@ impl KnownHostsChecker {
                     TrustStore::System => self.system_file.clone(),
                     TrustStore::Pin => self.pin_file.clone(),
                 };
-                (entry.as_line(), file)
+                (entry.as_line(), file, entry.line_number)
             });
         }
 
-        if let Some((conflict_line, conflict_file)) = conflict {
+        if let Some((conflict_line, conflict_file, conflict_line_number)) = conflict {
             return Err(crate::ssh_engine::RemoteError::HostKeyChanged {
                 host: self.host.clone(),
                 file: conflict_file.display().to_string(),
                 line: conflict_line,
+                line_number: conflict_line_number,
             });
         }
 
