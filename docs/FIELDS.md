@@ -16,7 +16,7 @@ Use it to build integrations, dashboards, or alerting rules.
 | `is_root_execution` | boolean | Whether the scan ran as root |
 | `scan_warnings` | array of strings | Warnings about scan failures or incomplete data |
 | `coverage_warnings` | array of strings | Coverage warnings (truncated files, unreadable /proc entries, etc.) |
-| `failed_scanners` | array of strings | Scanners that failed or panicked during this scan. Non‑empty means the verdict is incomplete |
+| `failed_scanners` | array of strings | Scanners that failed or panicked during this scan. Non‑empty means coverage was incomplete. In exit codes, incomplete coverage now degrades to `2`; use `--fail-on-incomplete` to make it exit `4`. No longer automatically forces exit `4`. |
 | `remote_privileged` | boolean \| null | For remote scans: `true` = executed with root/sudo, `false` = executed without root, `null` = local scan or legacy snapshot |
 | `scoring_version` | integer | Internal scoring engine version (used for drift comparison) |
 | `self_integrity` | object \| null | Self‑integrity preflight result; `null` = check not performed or legacy snapshot |
