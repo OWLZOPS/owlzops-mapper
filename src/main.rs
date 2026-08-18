@@ -242,6 +242,34 @@ fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
     }
 }
 
+/// Explain why the FLEET aggregate is degraded. The fleet has many reports and
+/// no single `report` to blame, so this reports coverage facts generically.
+fn warn_for_coverage(outcome: &Outcome) {
+    let c = &outcome.coverage;
+    if c.scanners_failed {
+        warn!(
+            "one or more reports had failed scanners — coverage incomplete, \
+             findings are a LOWER BOUND"
+        );
+    }
+    if c.non_root {
+        warn!("at least one host was scanned without root — privileged surfaces were not read");
+    }
+    if c.hosts_missing > 0 {
+        warn!(
+            hosts_missing = c.hosts_missing,
+            "hosts did not produce a report"
+        );
+    }
+    if c.records_lost > 0 || c.output_failed {
+        warn!(
+            records_lost = c.records_lost,
+            output_failed = c.output_failed,
+            "some results did not reach the output"
+        );
+    }
+}
+
 /// Build an Outcome for a single report (local path n=1).
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 fn outcome_for(report: &AgentReport) -> Outcome {
@@ -770,6 +798,7 @@ async fn run_command(
                                 return EXIT_INTERRUPT;
                             }
                             let outcome = agg.finish(hosts_requested, io_errors);
+                            warn_for_coverage(&outcome);
                             return exit_code(&outcome, fail_on_incomplete);
                         }
                         Err(_) => {
@@ -803,6 +832,7 @@ async fn run_command(
                             ..Default::default()
                         },
                     };
+                    warn_for_coverage(&outcome);
                     return exit_code(&outcome, fail_on_incomplete);
                 }
 
@@ -822,6 +852,7 @@ async fn run_command(
                     outcome.coverage.output_failed = true;
                 }
 
+                warn_for_coverage(&outcome);
                 // Computed AFTER delivery, so a render failure degrades the
                 // code without ever outranking Compromised.
                 return exit_code(&outcome, fail_on_incomplete);
