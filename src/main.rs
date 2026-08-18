@@ -189,6 +189,9 @@ fn exit_code(outcome: &Outcome, fail_on_incomplete: bool) -> i32 {
 }
 
 /// Preserve the local warning side effects; used only for single-host path.
+// macOS / --no-default-features builds without `local-scan` compile this out of
+// production and see the remaining test-only call sites as dead code.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
     match outcome.verdict {
         Some(SecurityVerdict::Compromised) => {
@@ -240,6 +243,7 @@ fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
 }
 
 /// Build an Outcome for a single report (local path n=1).
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 fn outcome_for(report: &AgentReport) -> Outcome {
     let mut agg = OutcomeBuilder::default();
     agg.add(report);
