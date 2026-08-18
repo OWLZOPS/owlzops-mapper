@@ -3899,7 +3899,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_scanner_yields_incomplete_verdict() {
+    fn a_failed_scanner_does_not_change_the_security_verdict() {
         let mut r = minimal_report();
         r.network.firewall_active = true;
         r.security.ssh_root_login_enabled = false;
@@ -3958,7 +3958,7 @@ mod tests {
     }
 
     #[test]
-    fn a_critical_finding_does_not_hide_an_incomplete_scan() {
+    fn a_critical_survives_the_failed_scanner_filter() {
         let mut r = minimal_report();
         r.network.firewall_active = false; // SEC-001, network is healthy
         r.failed_scanners = vec!["security".to_string()];

@@ -758,10 +758,10 @@ async fn run_command(
                         writer.await
                     };
                     match joined {
-                        Ok((_written, agg, io_errors)) => {
+                        Ok((written, agg, io_errors)) => {
                             if io_errors > 0 {
                                 warn!(
-                                    written = _written,
+                                    written,
                                     io_errors,
                                     "JSONL output incomplete — returning degraded exit code"
                                 );

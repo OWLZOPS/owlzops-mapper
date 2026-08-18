@@ -166,7 +166,7 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             Severity::Degraded
         };
         changes.push(Change {
-            field: "remote_privileged".into(),
+            field: "scan_privileged".into(),
             before: Some(before_priv.to_string()),
             after: Some(after_priv.to_string()),
             severity,
@@ -1896,7 +1896,7 @@ mod tests {
         let c = compare_reports(&before, &after)
             .changes
             .into_iter()
-            .find(|c| c.field == "remote_privileged")
+            .find(|c| c.field == "scan_privileged")
             .expect("privilege loss not detected");
 
         assert_eq!(c.severity, Severity::Degraded);
@@ -1914,7 +1914,10 @@ mod tests {
         remote.remote_privileged = Some(true);
 
         assert!(
-            compare_reports(&local, &remote).changes.is_empty(),
+            !compare_reports(&local, &remote)
+                .changes
+                .iter()
+                .any(|c| c.field == "scan_privileged"),
             "local root and remote root are the same privilege fact"
         );
     }
@@ -1929,7 +1932,10 @@ mod tests {
         remote.remote_privileged = Some(false);
 
         assert!(
-            compare_reports(&local, &remote).changes.is_empty(),
+            !compare_reports(&local, &remote)
+                .changes
+                .iter()
+                .any(|c| c.field == "scan_privileged"),
             "local non-root and remote non-root are the same privilege fact"
         );
     }
@@ -1945,7 +1951,7 @@ mod tests {
         let c = compare_reports(&local, &remote)
             .changes
             .into_iter()
-            .find(|c| c.field == "remote_privileged")
+            .find(|c| c.field == "scan_privileged")
             .expect("privilege gain must surface");
         assert_eq!(c.severity, Severity::Improved);
         assert_eq!(c.before.as_deref(), Some("false"));

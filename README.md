@@ -256,8 +256,13 @@ Full list: `owlzops-mapper --help`.
 | 64 | Usage error: invalid CLI arguments or input files |
 | 130 | Interrupted by SIGINT/SIGTERM |
 
-Codes **0–3 are a stable public contract**. Their meaning does not change between releases.  
+Codes **0–3 are a stable public contract from v0.6.0**.  
+Their meaning does not change between releases from v0.6.0 onwards.  
 New failure modes get new codes; they never override the existing band.
+
+In fleet mode, `hosts_missing` is counted but not listed in the exit code.
+To identify which hosts produced no report, diff the input host list against
+the `host.hostname` values present in the JSONL output.
 
 ```bash
 sudo owlzops-mapper audit || echo "Security scan failed — check the report"

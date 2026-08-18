@@ -151,9 +151,8 @@ impl KnownHostsChecker {
                     Some(other) => {
                         // R25-76: any other marker is also an explicit decision
                         // we cannot evaluate. Do not fall through to TOFU.
-                        unsupported_marker.get_or_insert_with(|| {
-                            crate::utils::sanitize_for_log(other).to_string()
-                        });
+                        unsupported_marker
+                            .get_or_insert_with(|| crate::utils::sanitize_for_log(other));
                         continue;
                     }
                     None => {}
