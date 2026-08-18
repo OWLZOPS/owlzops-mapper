@@ -105,7 +105,10 @@ pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(Str
 /// replacing it with U+FFFD. Trust stores must fail closed: a corrupted byte
 /// silently turns into a different key and can cause TOFU or a false
 /// HostKeyChanged (R25-72).
-pub fn read_file_capped_regular_strict(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
+///
+/// Returns the file contents directly; truncation is an ERROR, so there is
+/// no `truncated` boolean that could only ever be `false` (R25-90).
+pub fn read_file_capped_regular_strict(path: &str, max_bytes: usize) -> io::Result<String> {
     let (buf, truncated) = read_regular_capped(path, max_bytes)?;
 
     // R25-80: report truncation BEFORE attempting UTF-8 conversion. The cut
@@ -118,13 +121,12 @@ pub fn read_file_capped_regular_strict(path: &str, max_bytes: usize) -> io::Resu
         ));
     }
 
-    let text = String::from_utf8(buf).map_err(|e| {
+    String::from_utf8(buf).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("file contains invalid UTF-8: {e}"),
         )
-    })?;
-    Ok((text, truncated))
+    })
 }
 
 #[cfg(feature = "local-scan")]

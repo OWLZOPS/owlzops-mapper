@@ -110,18 +110,15 @@ impl KnownHostsChecker {
             // would silently replace a corrupted byte with U+FFFD and could
             // turn a valid key into a different one, causing false TOFU or
             // HostKeyChanged.
-            let (content, _truncated) = match crate::safe_io::read_file_capped_regular_strict(
+            let content = match crate::safe_io::read_file_capped_regular_strict(
                 &path.to_string_lossy(),
                 CAP_KNOWN_HOSTS,
             ) {
-                Ok(tuple) => tuple,
+                Ok(text) => text,
                 // A missing store is the first-run case and is legitimate.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err((path.to_path_buf(), e)),
             };
-
-            // Truncation is already reported by read_file_capped_regular_strict
-            // before UTF-8 conversion (R25-80); no second check here.
 
             for (idx, raw_line) in content.lines().enumerate() {
                 let line_number = idx + 1;
