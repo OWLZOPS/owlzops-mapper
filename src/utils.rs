@@ -424,6 +424,26 @@ pub fn exit_reader_gone() -> ! {
 // Child helpers
 // ---------------------------------------------------------------------------
 
+/// Non-reaping exit check. `try_wait()` reaps the child, freeing its PID —
+/// and with it the PGID, since the child is its own group leader (setsid).
+/// A group kill issued after that can land on a freshly recycled group
+/// (R24-34/R25-98). WNOWAIT leaves the zombie in place so the PGID stays
+/// reserved until we explicitly reap.
+fn peek_exited(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is zeroed and lives for the call; WNOHANG makes this
+    // non-blocking and WNOWAIT leaves the child unreaped.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    rc == 0 && unsafe { info.si_pid() } == pid as libc::pid_t
+}
+
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
@@ -485,26 +505,32 @@ pub fn run_child_with_timeout(
     let mut backoff = POLL_MIN;
 
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < deadline => {
-                thread::sleep(backoff);
-                backoff = (backoff * 2).min(POLL_MAX);
+        if peek_exited(child_pid) {
+            // Group killed BEFORE the reap: the PGID is still ours.
+            unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
+            match child.wait() {
+                Ok(status) => break status,
+                Err(_) => {
+                    drop(out_handle);
+                    drop(err_handle);
+                    unregister_child(child_pid);
+                    return None;
+                }
             }
-            _ => {
-                kill_group_and_reap(&mut child);
-                drop(out_handle);
-                drop(err_handle);
-                unregister_child(child_pid);
-                return None;
-            }
+        }
+
+        if start.elapsed() < deadline {
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(POLL_MAX);
+        } else {
+            kill_group_and_reap(&mut child);
+            drop(out_handle);
+            drop(err_handle);
+            unregister_child(child_pid);
+            return None;
         }
     };
 
-    // The direct child exited. Anything still holding the stdout pipe is an
-    // orphaned grandchild — kill the group so the reader threads see EOF
-    // instead of blocking join() on a tokio blocking-pool thread forever.
-    unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
     unregister_child(child_pid);
     Some(std::process::Output {
         status,

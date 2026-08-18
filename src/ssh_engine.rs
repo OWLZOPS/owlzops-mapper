@@ -956,11 +956,14 @@ impl RemoteCoverage {
         // R25-86: the orchestrator may have intended sudo, but the host's
         // getuid() is the ground truth. If they disagree, say so explicitly.
         if report.privilege_claim_disagrees() {
-            report.coverage_warnings.push(
+            let msg = if report.remote_privileged == Some(true) {
                 "sudo exited 0 but the scan did not run as root — the sudoers rule \
                  for this path does not grant root"
-                    .into(),
-            );
+            } else {
+                "sudo was reported unavailable but the scan ran as root — the sudo \
+                 probe returned a false negative"
+            };
+            report.coverage_warnings.push(msg.into());
         }
     }
 }

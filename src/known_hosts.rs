@@ -139,25 +139,6 @@ impl KnownHostsChecker {
                     None => (None, line),
                 };
 
-                match marker {
-                    // R25-76: the operator explicitly configured a CA trust
-                    // model. We do not implement it, so the host is NOT
-                    // unknown: it has an unsupported trust decision.
-                    Some("cert-authority") => {
-                        unsupported_marker.get_or_insert_with(|| "cert-authority".to_string());
-                        continue;
-                    }
-                    Some("revoked") => {}
-                    Some(other) => {
-                        // R25-76: any other marker is also an explicit decision
-                        // we cannot evaluate. Do not fall through to TOFU.
-                        unsupported_marker
-                            .get_or_insert_with(|| crate::utils::sanitize_for_log(other));
-                        continue;
-                    }
-                    None => {}
-                }
-
                 let mut f = rest.split_whitespace();
                 let (Some(hf), Some(kt), Some(kd)) = (f.next(), f.next(), f.next()) else {
                     continue;
@@ -168,6 +149,23 @@ impl KnownHostsChecker {
                 // thousands of lines we will never look at (R25-57).
                 if !Self::host_field_matches(hf, candidates) {
                     continue;
+                }
+
+                match marker {
+                    // R25-76/R25-85: only a CA/unknown marker FOR THIS HOST
+                    // fails closed. A CA entry for another host must not make
+                    // unrelated scans fail.
+                    Some("cert-authority") => {
+                        unsupported_marker.get_or_insert_with(|| "cert-authority".to_string());
+                        continue;
+                    }
+                    Some("revoked") => {}
+                    Some(other) => {
+                        unsupported_marker
+                            .get_or_insert_with(|| crate::utils::sanitize_for_log(other));
+                        continue;
+                    }
+                    None => {}
                 }
 
                 out.push(KnownHostEntry {
@@ -227,6 +225,39 @@ impl KnownHostsChecker {
             .into()
     }
 
+    /// Minimal OpenSSH host-pattern match: `*` and `?`, applied against the
+    /// full candidate string. CA lines are typically `*.corp.example.com`;
+    /// without this they are never loaded and R25-76 silently falls back to
+    /// TOFU for the normal corporate case (R25-85).
+    fn glob_match(pattern: &str, text: &str) -> bool {
+        let p = pattern.as_bytes();
+        let t = text.as_bytes();
+        let (mut pi, mut ti) = (0usize, 0usize);
+        let (mut star_p, mut star_t) = (None, 0usize);
+
+        while ti < t.len() {
+            if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+                pi += 1;
+                ti += 1;
+            } else if pi < p.len() && p[pi] == b'*' {
+                star_p = Some(pi);
+                pi += 1;
+                star_t = ti;
+            } else if let Some(sp) = star_p {
+                pi = sp + 1;
+                star_t += 1;
+                ti = star_t;
+            } else {
+                return false;
+            }
+        }
+
+        while pi < p.len() && p[pi] == b'*' {
+            pi += 1;
+        }
+        pi == p.len()
+    }
+
     fn host_field_matches(host_field: &str, candidates: &[String]) -> bool {
         if let Some(rest) = host_field.strip_prefix("|1|") {
             // Hashed entry: |1|salt|mac
@@ -241,7 +272,7 @@ impl KnownHostsChecker {
             // Plain entry: host1,host2,...
             host_field
                 .split(',')
-                .any(|h| candidates.iter().any(|c| c == h))
+                .any(|pattern| candidates.iter().any(|c| Self::glob_match(pattern, c)))
         }
     }
 
@@ -376,16 +407,6 @@ impl KnownHostsChecker {
         };
         let ptype_canon = Self::canonical_key_type(ptype);
 
-        // R25-76: entries exist for this host but we could not evaluate them.
-        // Pinning the presented key here would overwrite an explicit operator
-        // trust decision with our own TOFU decision.
-        if let Some(marker) = &self.unsupported_marker {
-            return Err(crate::ssh_engine::RemoteError::HostKeyUnsupportedTrust {
-                host: self.host.clone(),
-                marker: marker.clone(),
-            });
-        }
-
         // A revoked key is an explicit operator decision and outranks both an
         // exact match and TOFU.
         for entry in self.entries.iter().filter(|e| e.revoked) {
@@ -419,6 +440,17 @@ impl KnownHostsChecker {
                 file: conflict_file.display().to_string(),
                 line: crate::utils::sanitize_for_log(&conflict_line),
                 line_number: conflict_line_number,
+            });
+        }
+
+        // Nothing usable matched. The marker only matters HERE: it is the
+        // difference between "unknown host, TOFU is fine" and "the operator
+        // configured a trust model we cannot evaluate". Checking it earlier
+        // rejected hosts that also had a perfectly good plain entry (R25-85).
+        if let Some(marker) = &self.unsupported_marker {
+            return Err(crate::ssh_engine::RemoteError::HostKeyUnsupportedTrust {
+                host: self.host.clone(),
+                marker: marker.clone(),
             });
         }
 
@@ -463,6 +495,23 @@ mod tests {
         ));
         assert!(!KnownHostsChecker::host_field_matches(
             "evil.com",
+            &candidates
+        ));
+    }
+
+    #[test]
+    fn wildcard_host_pattern_matches() {
+        let candidates = KnownHostsChecker::host_candidates("db01.corp.example.com", 22);
+        assert!(KnownHostsChecker::host_field_matches(
+            "*.corp.example.com",
+            &candidates
+        ));
+        assert!(!KnownHostsChecker::host_field_matches(
+            "*.other.example.com",
+            &candidates
+        ));
+        assert!(KnownHostsChecker::host_field_matches(
+            "db??.corp.example.com",
             &candidates
         ));
     }
@@ -658,5 +707,62 @@ mod tests {
             "blob carries the signature algorithm ({ptype}); normalise KeyData, \
              not just the type field"
         );
+    }
+
+    #[test]
+    fn ca_entry_does_not_block_a_plain_match() {
+        let key = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pub_key = key.public_key();
+        let pub_line = pub_key.to_openssh().unwrap();
+        let parts: Vec<_> = pub_line.split_whitespace().collect();
+        let key_type = parts[0];
+        let key_data = parts[1];
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        let ca_line = "@cert-authority localhost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAABOGUS";
+        let plain_line = format!("localhost {} {}", key_type, key_data);
+        std::fs::write(&kh_path, format!("{ca_line}\n{plain_line}\n")).unwrap();
+
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin"),
+        );
+
+        assert!(checker.verify(pub_key).is_ok());
+    }
+
+    #[test]
+    fn ca_entry_for_another_host_does_not_block() {
+        let key = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pub_key = key.public_key();
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let kh_path = tmp_dir.path().join("known_hosts");
+        std::fs::write(
+            &kh_path,
+            "@cert-authority other.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAABOGUS\n",
+        )
+        .unwrap();
+
+        let checker = KnownHostsChecker::from_files(
+            "localhost".into(),
+            22,
+            kh_path,
+            tmp_dir.path().join("pin"),
+        );
+
+        // CA entry for another host must not set unsupported_marker for localhost.
+        assert!(checker.verify(pub_key).is_ok());
     }
 }
