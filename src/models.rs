@@ -50,11 +50,20 @@ pub struct AgentReport {
 impl AgentReport {
     /// Whether this scan was able to read privileged surfaces.
     ///
-    /// Local scans answer via `is_root_execution`; remote scans answer via
-    /// `remote_privileged`. Comparing the raw remote field instead conflates
-    /// "how the scan was delivered" with "what it could see" (R25-79).
+    /// The host's `is_root_execution` is ground truth. `remote_privileged`
+    /// is what the orchestrator intended to run. Where they disagree, the
+    /// host wins: sudo can exit 0 and still not yield root (sudoers wrapper,
+    /// `Defaults targetpw`, `runas`). Preferring intent would mark an
+    /// unprivileged scan as full coverage (R25-86).
     pub fn scan_was_privileged(&self) -> bool {
-        self.remote_privileged.unwrap_or(self.is_root_execution)
+        self.is_root_execution && self.remote_privileged.unwrap_or(true)
+    }
+
+    /// The orchestrator believed sudo worked but the host says otherwise.
+    /// This is the signature of a sudoers rule that does not do what it
+    /// looks like it does.
+    pub fn privilege_claim_disagrees(&self) -> bool {
+        self.remote_privileged == Some(true) && !self.is_root_execution
     }
 }
 
