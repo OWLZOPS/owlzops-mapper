@@ -2635,6 +2635,9 @@ pub fn warn_unmapped_scanners(failed_scanners: &[String]) {
 /// findings but still reduce confidence. Extracted out so `evaluate` remains a
 /// pure function and the side effect happens exactly once per report
 /// (R25-95).
+// macOS / --no-default-features builds without `local-scan` compile this out of
+// production and see only the call site under `cfg(feature = "local-scan")`.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 pub fn warn_evaluate_side_effects(exec_start_injections: &[crate::models::ExecStartFinding]) {
     let unknown = exec_start_injections
         .iter()
