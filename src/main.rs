@@ -109,8 +109,14 @@ struct Coverage {
     hosts_missing: usize,
     /// Reports received but not written to JSONL.
     records_lost: usize,
+    /// True when at least one report explicitly listed failed scanners.
+    /// Distinct from `warnings`: legacy remote reports may carry scan_warnings
+    /// /// Distinct from `warnings`: legacy remote reports may carry scan_warnings
     scanners_failed: bool,
     non_root: bool,
+    /// True when at least one report carries scan_warnings. Not redundant with
+    /// `scanners_failed`; legacy reports only fill this field, so collapsing
+    /// the two would mark incomplete scans as full (R25-99).
     warnings: bool,
     /// The scan finished but the operator could not be shown the result.
     /// A delivery failure is a COVERAGE fact — it must never replace the

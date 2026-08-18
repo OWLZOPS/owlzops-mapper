@@ -59,11 +59,17 @@ impl AgentReport {
         self.is_root_execution && self.remote_privileged.unwrap_or(true)
     }
 
-    /// The orchestrator believed sudo worked but the host says otherwise.
-    /// This is the signature of a sudoers rule that does not do what it
-    /// looks like it does.
+    /// The orchestrator's belief about privilege disagrees with the host's
+    /// ground truth (`is_root_execution`). True in BOTH directions:
+    /// - orchestrator thought sudo worked but the scan was not root;
+    /// - orchestrator thought sudo was unavailable but the scan WAS root
+    ///   (false-negative sudo probe, R25-99).
     pub fn privilege_claim_disagrees(&self) -> bool {
-        self.remote_privileged == Some(true) && !self.is_root_execution
+        match self.remote_privileged {
+            Some(true) => !self.is_root_execution,
+            Some(false) => self.is_root_execution,
+            None => false,
+        }
     }
 }
 
