@@ -244,6 +244,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             PersistenceScan::default()
         });
 
+        crate::scoring::warn_evaluate_side_effects(&p.exec_start);
         // Drain coverage after all scanners finished – scope is attached here,
         // not in the scanners, because they run on arbitrary blocking threads.
         let coverage_warnings = crate::coverage::drain_scoped(&scan_id);

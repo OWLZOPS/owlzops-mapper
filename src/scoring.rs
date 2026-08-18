@@ -155,8 +155,9 @@ fn finding_from_failed_scanner(f: &Finding, report: &AgentReport) -> bool {
 
 /// Evaluate a full agent report into a list of findings.
 /// This is a pure function – no side effects. Coverage warnings about
-/// unknown scanner names are emitted by `warn_unmapped_scanners`, once per
-/// verdict computation (R25-59).
+/// unknown scanner names are emitted by `warn_unmapped_scanners`, and
+/// other coverage side effects by `warn_evaluate_side_effects`, both once
+/// per report (R25-59/R25-95).
 pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -1902,14 +1903,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        let unknown = inj.iter().filter(|f| f.writability == W::Unknown).count();
-        if unknown > 0 {
-            coverage::record(format!(
-                "exec_provenance: {unknown} target(s) could not be stat'ed (EACCES) — \
-                 writability UNVERIFIED, not assumed safe"
-            ));
-        }
-
+        // Побочный эффект удалён; перенесён в warn_evaluate_side_effects.
+        // Здесь только формирование finding SEC-045.
         let unpackaged =
             sel(&|f| !f.volatile && f.writability == W::RootOnly && f.package.is_none());
         if !unpackaged.is_empty() {
@@ -2636,6 +2631,23 @@ pub fn warn_unmapped_scanners(failed_scanners: &[String]) {
     }
 }
 
+/// Emit coverage warnings for facts discovered during `evaluate` that are not
+/// findings but still reduce confidence. Extracted out so `evaluate` remains a
+/// pure function and the side effect happens exactly once per report
+/// (R25-95).
+pub fn warn_evaluate_side_effects(exec_start_injections: &[crate::models::ExecStartFinding]) {
+    let unknown = exec_start_injections
+        .iter()
+        .filter(|f| f.writability == crate::models::ExecWritability::Unknown)
+        .count();
+
+    if unknown > 0 {
+        coverage::record(format!(
+            "exec_provenance: {unknown} target(s) could not be stat'ed (EACCES) — \
+             writability UNVERIFIED, not assumed safe"
+        ));
+    }
+}
 #[allow(dead_code)]
 pub fn score(findings: Vec<Finding>) -> ScoredReport {
     let mut sec = 0u8;
