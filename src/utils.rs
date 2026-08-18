@@ -475,11 +475,21 @@ pub fn run_child_with_timeout(
 
     let deadline = Duration::from_secs(timeout_secs);
     let start = Instant::now();
+
+    // Exponential backoff, NOT a flat tick. `rpm -qf` answers in ~10 ms, so a
+    // fixed 50 ms poll made every one of the 434 per-file queries cost 50 ms —
+    // roughly 22 s of pure sleeping on Fedora while dpkg hosts were unaffected
+    // because they spawn no per-file child (R25-93).
+    const POLL_MIN: Duration = Duration::from_micros(200);
+    const POLL_MAX: Duration = Duration::from_millis(50);
+    let mut backoff = POLL_MIN;
+
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() < deadline => {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(POLL_MAX);
             }
             _ => {
                 kill_group_and_reap(&mut child);
