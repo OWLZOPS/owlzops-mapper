@@ -29,8 +29,8 @@
 //! * Tier‑B (io_uring): full 1..=pid_max batched statx, sub‑second on healthy
 //!   hosts even under `--deep`.  No allocator‑wrap blind spot.
 //! * Tier‑C (sync fallback): bounded by `ns_last_pid`, records a coverage note
-//!   when any high‑PID range is skipped.  Used when io_uring is unavailable or
-//!   for tempdir‑based tests.
+//!   once per invocation when any high‑PID range is skipped.  Used when
+//!   io_uring is unavailable or for tempdir‑based tests.
 
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -108,6 +108,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
     }
 
     let mut stable: Option<BTreeSet<u32>> = None;
+    let mut sync_skip_recorded = false;
 
     for cycle in 0..PROBE_CYCLES {
         // "readdir sandwich": snapshot readdir BEFORE and AFTER the slow live
@@ -116,8 +117,27 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // manufacture transient candidates that defeat the clean-host early
         // exit. A genuinely hidden PID is in neither readdir and survives.
         let listed_before = readdir_pids(proc_root);
-        let live = probe_live_set(proc_root);
+        let (live, used_sync) = probe_live_set(proc_root);
         let listed_after = readdir_pids(proc_root);
+
+        // The sync fallback bounds the scan to ns_last_pid. Record that gap
+        // ONCE per ghost-pid invocation, not once per probe cycle (R25-94).
+        if used_sync && !sync_skip_recorded {
+            let (upper, tail) = pid_scan_bounds();
+            let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
+            if tail.is_none() && upper < pid_max {
+                coverage::record(format!(
+                    "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
+                     probed (bounded by ns_last_pid={}); a hidden PID above the \
+                     allocator cursor after a wrap could be missed. Enable io_uring \
+                     for a full-range scan.",
+                    upper + 1,
+                    pid_max,
+                    upper
+                ));
+            }
+            sync_skip_recorded = true;
+        }
 
         // R11-09 + R11-10: filter out threads AT CANDIDATE CONSTRUCTION so the
         // early-exit below actually fires on a clean host. ENOENT on
@@ -306,13 +326,13 @@ fn candidate_diff(
 
 // ── live-set probe (Tier-B io_uring, Tier-C sync fallback) ────────────────
 
-fn probe_live_set(proc_root: &Path) -> BTreeSet<u32> {
+fn probe_live_set(proc_root: &Path) -> (BTreeSet<u32>, bool) {
     if proc_root == Path::new("/proc")
         && let Some(set) = probe_live_set_iouring(proc_root)
     {
-        return set;
+        return (set, false);
     }
-    probe_live_set_sync(proc_root)
+    (probe_live_set_sync(proc_root), true)
 }
 
 // Full io_uring implementation is only available on glibc Linux.
@@ -458,22 +478,6 @@ fn pid_scan_bounds() -> (u32, Option<(u32, u32)>) {
     } else {
         None
     };
-
-    // Raw-Truth: only reachable on the Tier-C sync path (Tier-B scans the full
-    // range). If the allocator has wrapped and the cursor sits below still-live
-    // high PIDs, (upper, pid_max] is not exhaustively probed unless the wrap
-    // tail covers it — record the gap rather than hide it.
-    if tail.is_none() && upper < pid_max {
-        coverage::record(format!(
-            "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
-             probed (bounded by ns_last_pid={}); a hidden PID above the \
-             allocator cursor after a wrap could be missed. Enable io_uring \
-             for a full-range scan.",
-            upper + 1,
-            pid_max,
-            upper
-        ));
-    }
 
     (upper, tail)
 }
