@@ -220,37 +220,24 @@ fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
             warn!("no report produced; exiting {}", EXIT_INCOMPLETE);
         }
     }
-
-    // Coverage is an independent axis and must be reported independently, or
-    // the operator sees code 2 with nothing explaining it.
-    let c = &outcome.coverage;
-    if c.scanners_failed {
-        warn!(
-            failed = ?report.failed_scanners,
-            "one or more scanners failed — coverage incomplete, findings are a LOWER BOUND"
-        );
-    }
-    if !report.is_root_execution {
-        warn!("not running as root — privileged surfaces were not read");
-    }
-    if c.records_lost > 0 || c.output_failed {
-        warn!(
-            records_lost = c.records_lost,
-            output_failed = c.output_failed,
-            "some results did not reach the output"
-        );
-    }
 }
 
-/// Explain why the FLEET aggregate is degraded. The fleet has many reports and
-/// no single `report` to blame, so this reports coverage facts generically.
-fn warn_for_coverage(outcome: &Outcome) {
-    let c = &outcome.coverage;
+/// Explain EVERY field that can make `Coverage::is_full()` false. A field that
+/// degrades the exit code with no log line leaves the operator with code 2 and
+/// nothing to act on (R25-87/R25-96). Reads only `Coverage`, so the local and
+/// fleet paths cannot diverge on the source of a fact.
+fn warn_for_coverage(c: &Coverage) {
     if c.scanners_failed {
         warn!(
             "one or more reports had failed scanners — coverage incomplete, \
              findings are a LOWER BOUND"
         );
+    }
+    if c.warnings {
+        // Set by `scan_warnings` on reports whose producer predates
+        // `failed_scanners` (serde default). Without this arm a mixed-version
+        // fleet returns 2 with an empty log.
+        warn!("one or more reports carried scan warnings — coverage incomplete");
     }
     if c.non_root {
         warn!("at least one host was scanned without root — privileged surfaces were not read");
@@ -798,7 +785,7 @@ async fn run_command(
                                 return EXIT_INTERRUPT;
                             }
                             let outcome = agg.finish(hosts_requested, io_errors);
-                            warn_for_coverage(&outcome);
+                            warn_for_coverage(&outcome.coverage);
                             return exit_code(&outcome, fail_on_incomplete);
                         }
                         Err(_) => {
@@ -832,7 +819,7 @@ async fn run_command(
                             ..Default::default()
                         },
                     };
-                    warn_for_coverage(&outcome);
+                    warn_for_coverage(&outcome.coverage);
                     return exit_code(&outcome, fail_on_incomplete);
                 }
 
@@ -852,7 +839,7 @@ async fn run_command(
                     outcome.coverage.output_failed = true;
                 }
 
-                warn_for_coverage(&outcome);
+                warn_for_coverage(&outcome.coverage);
                 // Computed AFTER delivery, so a render failure degrades the
                 // code without ever outranking Compromised.
                 return exit_code(&outcome, fail_on_incomplete);
@@ -904,7 +891,6 @@ async fn run_command(
                 local_spinner.finish_and_clear();
 
                 let mut outcome = outcome_for(&report);
-                warn_for_outcome(&outcome, &report);
 
                 if let Err(e) = output::output_single(
                     &report,
@@ -916,6 +902,9 @@ async fn run_command(
                     outcome.coverage.output_failed = true;
                 }
 
+                // Both axes reported after coverage is final.
+                warn_for_outcome(&outcome, &report);
+                warn_for_coverage(&outcome.coverage);
                 exit_code(&outcome, fail_on_incomplete)
             }
             #[cfg(not(feature = "local-scan"))]
@@ -1409,6 +1398,43 @@ mod tests {
         // Critical is reported; coverage degrades the code but does not erase it.
         assert_eq!(exit_code(&outcome_for(&r), false), EXIT_DEGRADED);
         assert_eq!(exit_code(&outcome_for(&r), true), EXIT_INCOMPLETE);
+    }
+
+    #[test]
+    fn every_coverage_field_has_an_explanation() {
+        let full = Coverage::default();
+        assert!(full.is_full());
+        for c in [
+            Coverage {
+                scanners_failed: true,
+                ..Default::default()
+            },
+            Coverage {
+                warnings: true,
+                ..Default::default()
+            },
+            Coverage {
+                non_root: true,
+                ..Default::default()
+            },
+            Coverage {
+                hosts_missing: 1,
+                ..Default::default()
+            },
+            Coverage {
+                records_lost: 1,
+                ..Default::default()
+            },
+            Coverage {
+                output_failed: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !c.is_full(),
+                "field degrades but is_full() ignores it: {c:?}"
+            );
+        }
     }
 
     #[test]
