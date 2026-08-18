@@ -281,6 +281,14 @@ fn outcome_for(report: &AgentReport) -> Outcome {
     agg.finish(1, 0)
 }
 
+/// Build an Outcome for a failed writer. The aggregate is already collected;
+/// only the delivery of the final report failed, which is coverage.
+fn outcome_for_writer_failure(agg: OutcomeBuilder, hosts_requested: usize) -> Outcome {
+    let mut outcome = agg.finish(hosts_requested, 0);
+    outcome.coverage.output_failed = true;
+    outcome
+}
+
 /// Used by runner and scanner modules to adapt coverage hints. Keep here as
 /// the crate-root helper shared across the binary.
 pub(crate) fn is_running_as_root() -> bool {
@@ -407,6 +415,10 @@ async fn run_command(
                     (None, None)
                 };
 
+                // Aggregator lives in the main task from this point on, so
+                // writer failure can never erase a recorded verdict.
+                let mut agg = OutcomeBuilder::default();
+
                 // Fail-fast: create the output file before launching any scan
                 let output_path = args.output.clone();
                 let mut jsonl_file = if use_streaming {
@@ -414,7 +426,7 @@ async fn run_command(
                         Ok(f) => Some(f),
                         Err(e) => {
                             eprintln!("Cannot create output file: {e}");
-                            return 2;
+                            return EXIT_DEGRADED;
                         }
                     }
                 } else {
@@ -428,10 +440,7 @@ async fn run_command(
                         let mut rx = rx;
                         let mut written = 0usize;
                         let mut io_errors = 0usize;
-                        let mut agg = OutcomeBuilder::default();
                         while let Some(report) = rx.blocking_recv() {
-                            agg.add(&report);
-
                             match serde_json::to_string(&report) {
                                 Ok(json) => match writeln!(file, "{json}") {
                                     Ok(()) => written += 1,
@@ -441,8 +450,6 @@ async fn run_command(
                                     }
                                 },
                                 Err(e) => {
-                                    // The verdict is already in `agg`, but the consumer
-                                    // will never see this host. That is a lost record.
                                     io_errors += 1;
                                     warn!(error = %e, "report could not be serialized — dropped from JSONL");
                                 }
@@ -452,7 +459,7 @@ async fn run_command(
                             io_errors += 1;
                             warn!(error = %e, "JSONL flush failed — tail records may be lost");
                         }
-                        (written, agg, io_errors)
+                        (written, io_errors)
                     }))
                 } else {
                     None
@@ -533,6 +540,7 @@ async fn run_command(
 
                     local_spinner.finish_and_clear();
 
+                    agg.add(&local_report);
                     successful_hosts.insert(host.clone());
 
                     if let Some(tx) = &tx {
@@ -719,6 +727,7 @@ async fn run_command(
                                         res = join_set.join_next() => {
                                             match res {
                                                 Some(Ok(Some((host, report)))) => {
+                                                    agg.add(&report);
                                                     successful_hosts.insert(host);
                                                     if let Some(s) = &tx {
                                                         let _ = s.send(report).await;
@@ -747,6 +756,7 @@ async fn run_command(
                                     Some(result) => {
                                         match result {
                                             Ok(Some((host, report))) => {
+                                                agg.add(&report);
                                                 successful_hosts.insert(host);
                                                 if let Some(sender) = &tx {
                                                     let _ = sender.send(report).await;
@@ -791,14 +801,35 @@ async fn run_command(
                                 warn!(
                                     "JSONL writer timed out during shutdown, output may be incomplete"
                                 );
-                                return EXIT_DEGRADED;
+                                let outcome = outcome_for_writer_failure(agg, hosts_requested);
+                                if interrupted
+                                    && outcome.verdict == Some(SecurityVerdict::Compromised)
+                                {
+                                    let missing_hosts: Vec<String> = hosts
+                                        .iter()
+                                        .filter(|h| !successful_hosts.contains(*h))
+                                        .cloned()
+                                        .collect();
+                                    warn_for_coverage(&outcome.coverage, &missing_hosts);
+                                    return EXIT_COMPROMISED;
+                                }
+                                if interrupted {
+                                    return EXIT_INTERRUPT;
+                                }
+                                let missing_hosts: Vec<String> = hosts
+                                    .iter()
+                                    .filter(|h| !successful_hosts.contains(*h))
+                                    .cloned()
+                                    .collect();
+                                warn_for_coverage(&outcome.coverage, &missing_hosts);
+                                return exit_code(&outcome, fail_on_incomplete);
                             }
                         }
                     } else {
                         writer.await
                     };
                     match joined {
-                        Ok((written, agg, io_errors)) => {
+                        Ok((written, io_errors)) => {
                             if io_errors > 0 {
                                 warn!(
                                     written,
@@ -808,8 +839,6 @@ async fn run_command(
                             }
                             let outcome = agg.finish(hosts_requested, io_errors);
 
-                            // R25-99(d)/R25-92(e): a recorded Compromised
-                            // verdict outranks Ctrl-C. Otherwise keep 130.
                             if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
                             {
                                 let missing_hosts: Vec<String> = hosts
@@ -834,16 +863,32 @@ async fn run_command(
                         }
                         Err(_) => {
                             warn!("JSONL writer task failed");
-                            return EXIT_DEGRADED;
+                            let outcome = outcome_for_writer_failure(agg, hosts_requested);
+                            if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
+                            {
+                                let missing_hosts: Vec<String> = hosts
+                                    .iter()
+                                    .filter(|h| !successful_hosts.contains(*h))
+                                    .cloned()
+                                    .collect();
+                                warn_for_coverage(&outcome.coverage, &missing_hosts);
+                                return EXIT_COMPROMISED;
+                            }
+                            if interrupted {
+                                return EXIT_INTERRUPT;
+                            }
+                            let missing_hosts: Vec<String> = hosts
+                                .iter()
+                                .filter(|h| !successful_hosts.contains(*h))
+                                .cloned()
+                                .collect();
+                            warn_for_coverage(&outcome.coverage, &missing_hosts);
+                            return exit_code(&outcome, fail_on_incomplete);
                         }
                     }
                 }
 
-                // For non-streaming fleet, aggregate before honouring interrupt.
-                let mut agg = OutcomeBuilder::default();
-                for report in &reports {
-                    agg.add(report);
-                }
+                // Non-streaming fleet path: aggregate once.
                 let mut outcome = agg.finish(hosts_requested, 0);
 
                 if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised) {
@@ -856,13 +901,10 @@ async fn run_command(
                     return EXIT_COMPROMISED;
                 }
 
-                // R19V5-04: honour interruption when local scan was cancelled
-                // in a streaming-less run.
                 if interrupted {
                     return EXIT_INTERRUPT;
                 }
 
-                // Fallback to legacy multi-host output
                 if reports.is_empty() {
                     warn!("fleet scan produced no reports — all hosts failed");
                     if let Err(e) = output::output_multi(
