@@ -221,10 +221,10 @@ automation:
 | 2 | Degraded — incomplete coverage: not root, warnings, failed scanner(s), missing host(s), or JSONL write errors |
 | 3 | Active compromise detected — regardless of coverage |
 
-Exit code `130` is reserved for SIGINT/SIGTERM. If a compromise was already
-recorded before the interrupt, the process may still exit `130`; consumers that
-must never miss a confirmed compromise should check JSONL/exit-code pairing in
-their wrapper or treat `130` as "inspect output before ignoring".
+Exit code `130` is reserved for SIGINT/SIGTERM. If a confirmed compromise
+was already recorded before the interrupt, the process exits `3` instead;
+`130` therefore never overrides a terminal security verdict. Consumers can
+treat `130` as "no confirmed compromise was recorded before interrupt".
 
 New failure modes are assigned **new** codes (e.g. `4`, `64`, `130`); they never
 reuse or override the `0–3` band. Breaking this contract is a vulnerability, not a

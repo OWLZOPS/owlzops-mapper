@@ -111,7 +111,6 @@ struct Coverage {
     records_lost: usize,
     /// True when at least one report explicitly listed failed scanners.
     /// Distinct from `warnings`: legacy remote reports may carry scan_warnings
-    /// /// Distinct from `warnings`: legacy remote reports may carry scan_warnings
     scanners_failed: bool,
     non_root: bool,
     /// True when at least one report carries scan_warnings. Not redundant with
@@ -807,10 +806,24 @@ async fn run_command(
                                     "JSONL output incomplete — returning degraded exit code"
                                 );
                             }
+                            let outcome = agg.finish(hosts_requested, io_errors);
+
+                            // R25-99(d)/R25-92(e): a recorded Compromised
+                            // verdict outranks Ctrl-C. Otherwise keep 130.
+                            if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
+                            {
+                                let missing_hosts: Vec<String> = hosts
+                                    .iter()
+                                    .filter(|h| !successful_hosts.contains(*h))
+                                    .cloned()
+                                    .collect();
+                                warn_for_coverage(&outcome.coverage, &missing_hosts);
+                                return EXIT_COMPROMISED;
+                            }
                             if interrupted {
                                 return EXIT_INTERRUPT;
                             }
-                            let outcome = agg.finish(hosts_requested, io_errors);
+
                             let missing_hosts: Vec<String> = hosts
                                 .iter()
                                 .filter(|h| !successful_hosts.contains(*h))
@@ -824,6 +837,23 @@ async fn run_command(
                             return EXIT_DEGRADED;
                         }
                     }
+                }
+
+                // For non-streaming fleet, aggregate before honouring interrupt.
+                let mut agg = OutcomeBuilder::default();
+                for report in &reports {
+                    agg.add(report);
+                }
+                let mut outcome = agg.finish(hosts_requested, 0);
+
+                if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised) {
+                    let missing_hosts: Vec<String> = hosts
+                        .iter()
+                        .filter(|h| !successful_hosts.contains(*h))
+                        .cloned()
+                        .collect();
+                    warn_for_coverage(&outcome.coverage, &missing_hosts);
+                    return EXIT_COMPROMISED;
                 }
 
                 // R19V5-04: honour interruption when local scan was cancelled
@@ -843,22 +873,9 @@ async fn run_command(
                     ) {
                         warn!("output error: {e}");
                     }
-                    let outcome = Outcome {
-                        verdict: None,
-                        coverage: Coverage {
-                            hosts_missing: hosts_requested,
-                            ..Default::default()
-                        },
-                    };
                     warn_for_coverage(&outcome.coverage, &hosts);
                     return exit_code(&outcome, fail_on_incomplete);
                 }
-
-                let mut agg = OutcomeBuilder::default();
-                for report in &reports {
-                    agg.add(report);
-                }
-                let mut outcome = agg.finish(hosts_requested, 0);
 
                 if let Err(e) = output::output_multi(
                     &reports,
