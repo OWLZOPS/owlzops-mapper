@@ -260,9 +260,9 @@ Codes **0–3 are a stable public contract from v0.6.0**.
 Their meaning does not change between releases from v0.6.0 onwards.  
 New failure modes get new codes; they never override the existing band.
 
-In fleet mode, `hosts_missing` is counted but not listed in the exit code.
-To identify which hosts produced no report, diff the input host list against
-the `host.hostname` values present in the JSONL output.
+In fleet mode, hosts that produced no report are listed by address in stderr.
+`hosts_missing` in the exit-code path remains a count; the stderr line carries
+the actual address list for operator follow-up.
 
 ```bash
 sudo owlzops-mapper audit || echo "Security scan failed — check the report"

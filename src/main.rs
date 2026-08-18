@@ -226,7 +226,10 @@ fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
 /// degrades the exit code with no log line leaves the operator with code 2 and
 /// nothing to act on (R25-87/R25-96). Reads only `Coverage`, so the local and
 /// fleet paths cannot diverge on the source of a fact.
-fn warn_for_coverage(c: &Coverage) {
+/// `missing_hosts` carries the actual input addresses that produced no report,
+/// because `report.host.hostname` is the machine's own name and cannot be
+/// diffed against the CLI list (R25-97).
+fn warn_for_coverage(c: &Coverage, missing_hosts: &[String]) {
     if c.scanners_failed {
         warn!(
             "one or more reports had failed scanners — coverage incomplete, \
@@ -243,10 +246,18 @@ fn warn_for_coverage(c: &Coverage) {
         warn!("at least one host was scanned without root — privileged surfaces were not read");
     }
     if c.hosts_missing > 0 {
-        warn!(
-            hosts_missing = c.hosts_missing,
-            "hosts did not produce a report"
-        );
+        if missing_hosts.is_empty() {
+            warn!(
+                hosts_missing = c.hosts_missing,
+                "hosts did not produce a report"
+            );
+        } else {
+            warn!(
+                count = c.hosts_missing,
+                hosts = %missing_hosts.join(", "),
+                "hosts did not produce a report"
+            );
+        }
     }
     if c.records_lost > 0 || c.output_failed {
         warn!(
@@ -356,16 +367,16 @@ async fn run_command(
                 let mut local = Vec::new();
                 #[cfg(feature = "local-scan")]
                 let mut local_seen = false;
-                for h in hosts {
+                for h in &hosts {
                     #[cfg(feature = "local-scan")]
-                    if is_local_host(&h) {
+                    if is_local_host(h) {
                         if !local_seen {
-                            local.push(h);
+                            local.push(h.clone());
                             local_seen = true;
                         }
                         continue;
                     }
-                    remote.push(h);
+                    remote.push(h.clone());
                 }
 
                 // Resolve sudo password once (before any progress bars)
@@ -449,9 +460,14 @@ async fn run_command(
                 #[cfg_attr(not(feature = "local-scan"), allow(unused_mut))]
                 let mut interrupted = false;
 
+                // Input addresses for which we received a report. `report.host.hostname`
+                // is the machine's own name and cannot be diffed against the CLI list
+                // (R25-97).
+                let mut successful_hosts: HashSet<String> = HashSet::new();
+
                 // Process local hosts synchronously (no SSH needed)
                 #[cfg(feature = "local-scan")]
-                for _host in local {
+                for host in local {
                     if shutdown.load(Ordering::Relaxed) {
                         break;
                     }
@@ -511,6 +527,8 @@ async fn run_command(
                     });
 
                     local_spinner.finish_and_clear();
+
+                    successful_hosts.insert(host.clone());
 
                     if let Some(tx) = &tx {
                         let _ = tx.send(local_report).await;
@@ -660,7 +678,7 @@ async fn run_command(
                             .await;
 
                             match result {
-                                Ok(Some(report)) => Some(report),
+                                Ok(Some(report)) => Some((host.clone(), report)),
                                 Ok(None) => None,
                                 Err(_elapsed) => {
                                     warn!(host = %host_for_log, "global timeout for host");
@@ -695,7 +713,8 @@ async fn run_command(
                                         }
                                         res = join_set.join_next() => {
                                             match res {
-                                                Some(Ok(Some(report))) => {
+                                                Some(Ok(Some((host, report)))) => {
+                                                    successful_hosts.insert(host);
                                                     if let Some(s) = &tx {
                                                         let _ = s.send(report).await;
                                                     } else {
@@ -722,7 +741,8 @@ async fn run_command(
                                 match res {
                                     Some(result) => {
                                         match result {
-                                            Ok(Some(report)) => {
+                                            Ok(Some((host, report))) => {
+                                                successful_hosts.insert(host);
                                                 if let Some(sender) = &tx {
                                                     let _ = sender.send(report).await;
                                                 } else {
@@ -785,7 +805,12 @@ async fn run_command(
                                 return EXIT_INTERRUPT;
                             }
                             let outcome = agg.finish(hosts_requested, io_errors);
-                            warn_for_coverage(&outcome.coverage);
+                            let missing_hosts: Vec<String> = hosts
+                                .iter()
+                                .filter(|h| !successful_hosts.contains(*h))
+                                .cloned()
+                                .collect();
+                            warn_for_coverage(&outcome.coverage, &missing_hosts);
                             return exit_code(&outcome, fail_on_incomplete);
                         }
                         Err(_) => {
@@ -819,7 +844,7 @@ async fn run_command(
                             ..Default::default()
                         },
                     };
-                    warn_for_coverage(&outcome.coverage);
+                    warn_for_coverage(&outcome.coverage, &hosts);
                     return exit_code(&outcome, fail_on_incomplete);
                 }
 
@@ -839,7 +864,12 @@ async fn run_command(
                     outcome.coverage.output_failed = true;
                 }
 
-                warn_for_coverage(&outcome.coverage);
+                let missing_hosts: Vec<String> = hosts
+                    .iter()
+                    .filter(|h| !successful_hosts.contains(*h))
+                    .cloned()
+                    .collect();
+                warn_for_coverage(&outcome.coverage, &missing_hosts);
                 // Computed AFTER delivery, so a render failure degrades the
                 // code without ever outranking Compromised.
                 return exit_code(&outcome, fail_on_incomplete);
@@ -904,7 +934,7 @@ async fn run_command(
 
                 // Both axes reported after coverage is final.
                 warn_for_outcome(&outcome, &report);
-                warn_for_coverage(&outcome.coverage);
+                warn_for_coverage(&outcome.coverage, &[]);
                 exit_code(&outcome, fail_on_incomplete)
             }
             #[cfg(not(feature = "local-scan"))]
