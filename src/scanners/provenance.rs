@@ -307,13 +307,43 @@ fn resolve_apk(candidates: &HashSet<String>) -> Option<(HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
-// RPM backend – one file per invocation (R20-01, R20-02)
+// RPM backend – one file per invocation (R20-01, R20-02, R24-56)
 // ---------------------------------------------------------------------------
+
+/// Result of a single `rpm -qf` query.
+#[derive(Debug, PartialEq)]
+enum RpmQueryResult {
+    /// Package name found.
+    Owned(String),
+    /// rpm says the file is not owned by any package (exit code 1).
+    NotOwned,
+    /// Real error or unexpected output.
+    Error,
+}
+
+/// Parse stdout of `rpm -qf --queryformat "%{NAME}\n"` together with its exit
+/// code. Exit code 1 means "file is not owned by any package" and is a valid
+/// negative result, not an error (R24-56).
+fn parse_rpm_qf_output(stdout: &str, exit_code: i32) -> RpmQueryResult {
+    match exit_code {
+        0 => {
+            let pkg = stdout
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("file ") && !l.starts_with("error:"));
+            match pkg {
+                Some(p) => RpmQueryResult::Owned(p.to_string()),
+                None => RpmQueryResult::Error,
+            }
+        }
+        1 => RpmQueryResult::NotOwned,
+        _ => RpmQueryResult::Error,
+    }
+}
 
 /// Resolve file ownership via `rpm -qf`.  Each candidate is queried
 /// individually – no positional coupling between arguments and output lines.
-/// Uses the hardened helper infrastructure (`resolve_tool` + `run_with_timeout`)
-/// to avoid inheriting caller environment and to enforce a per‑query timeout.
+/// Uses `run_child_with_timeout` to get both stdout and exit status.
 fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> {
     if candidates.is_empty() {
         return Some(HashMap::new());
@@ -334,29 +364,33 @@ fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
     };
 
     let mut owned = HashMap::new();
-    let mut queried = 0usize;
+    let mut not_owned = 0usize;
     let mut failed = 0usize;
 
     for path in candidates {
-        // One query per file: the response is tied only to this path.
-        match crate::utils::run_with_timeout(
+        match crate::utils::run_child_with_timeout(
             &rpm_bin,
             &["-qf", "--queryformat", "%{NAME}\n", "--", path],
             10,
         ) {
-            Some(out) => {
-                queried += 1;
-                // Take the first non-empty line that does not start with
-                // "file " (the "not owned" message) or "error:".
-                if let Some(pkg) = out
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty() && !l.starts_with("file ") && !l.starts_with("error:"))
-                {
-                    owned.insert(path.clone(), pkg.to_string());
+            Some(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let exit_code = output.status.code().unwrap_or(-1);
+                match parse_rpm_qf_output(&stdout, exit_code) {
+                    RpmQueryResult::Owned(pkg) => {
+                        owned.insert(path.clone(), pkg);
+                    }
+                    RpmQueryResult::NotOwned => {
+                        not_owned += 1;
+                    }
+                    RpmQueryResult::Error => {
+                        failed += 1;
+                    }
                 }
             }
-            None => failed += 1,
+            None => {
+                failed += 1;
+            }
         }
     }
 
@@ -364,13 +398,20 @@ fn resolve_rpm(candidates: &HashSet<String>) -> Option<HashMap<String, String>> 
         crate::coverage::record(format!(
             "provenance: {failed} of {} rpm queries failed or timed out — \
              those files will be reported as unpackaged",
-            queried + failed
+            owned.len() + not_owned + failed
+        ));
+    }
+    if not_owned > 0 {
+        crate::coverage::record(format!(
+            "provenance: {not_owned} file(s) confirmed not owned by any rpm package"
         ));
     }
 
-    // Exactly the same gate as `lists_read > 0` in dpkg: if *every* query
-    // failed we have no usable data and must return `None` → `Unavailable`.
-    (queried > 0).then_some(owned)
+    // Usable data = a definite answer, positive or negative. An `Error` result
+    // is not an answer: counting it here would present "we could not ask" as
+    // "not owned by any package" for every candidate (R25-29).
+    let answered = owned.len() + not_owned;
+    (answered > 0).then_some(owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -391,5 +432,39 @@ mod tests {
             let ls_pkg = idx.lookup("/bin/ls").or_else(|| idx.lookup("/usr/bin/ls"));
             assert!(ls_pkg.is_some(), "ls must belong to a package");
         }
+    }
+
+    #[test]
+    fn rpm_exit_1_is_not_owned_not_error() {
+        assert_eq!(
+            parse_rpm_qf_output("file /usr/bin/foo is not owned by any package\n", 1),
+            RpmQueryResult::NotOwned
+        );
+    }
+
+    #[test]
+    fn rpm_exit_0_extracts_package_name() {
+        assert_eq!(
+            parse_rpm_qf_output("bash\n", 0),
+            RpmQueryResult::Owned("bash".to_string())
+        );
+    }
+
+    #[test]
+    fn rpm_non_specific_error_is_error() {
+        assert_eq!(
+            parse_rpm_qf_output("weird output", 42),
+            RpmQueryResult::Error
+        );
+    }
+
+    #[test]
+    fn every_query_erroring_is_not_usable_rpm_data() {
+        assert_eq!(parse_rpm_qf_output("", 42), RpmQueryResult::Error);
+        assert_eq!(
+            parse_rpm_qf_output("", 0),
+            RpmQueryResult::Error,
+            "exit 0 with no package name is malformed output, not an empty answer"
+        );
     }
 }

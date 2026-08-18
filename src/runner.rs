@@ -11,6 +11,12 @@ use tracing::{Instrument, info, warn};
 // ── Validation helpers (public – also used in main) ────────
 
 /// Validate that a remote path looks safe to pass to SSH exec.
+///
+/// Rejects:
+/// - unexpected characters
+/// - relative paths
+/// - paths containing `..`
+/// - paths under world-writable directories (`/tmp`, `/var/tmp`, `/dev/shm`)
 pub fn validate_remote_path(path: &str) -> Result<(), String> {
     if path.contains(|c: char| !c.is_ascii_alphanumeric() && !"-_./".contains(c)) {
         return Err(format!(
@@ -19,6 +25,18 @@ pub fn validate_remote_path(path: &str) -> Result<(), String> {
     }
     if !path.starts_with('/') {
         return Err("remote path must be absolute".to_string());
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        return Err("remote path must not contain '..'".to_string());
+    }
+    let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    for bad in ["/tmp", "/var/tmp", "/dev/shm"] {
+        if dir == bad || dir.starts_with(&format!("{bad}/")) {
+            return Err(format!(
+                "--remote-path {path} lives under {bad} (mode 1777): anyone on the target \
+                 could replace the binary between upload and the sudo exec"
+            ));
+        }
     }
     Ok(())
 }
@@ -166,10 +184,12 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         );
 
         let mut scan_warnings = Vec::new();
+        let mut failed_scanners = Vec::new();
 
         let host_info = host_res.unwrap_or_else(|e| {
             warn!(scanner = "host", error = ?e, "scanner panicked");
             scan_warnings.push("host scanner panicked".to_string());
+            failed_scanners.push("host".to_string());
             crate::models::HostInfo {
                 hostname: "unknown".to_string(),
                 ..Default::default()
@@ -178,16 +198,19 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         let dbs = dbs_res.unwrap_or_else(|e| {
             warn!(scanner = "databases", error = ?e, "scanner panicked");
             scan_warnings.push("databases scanner panicked".to_string());
+            failed_scanners.push("databases".to_string());
             vec![]
         });
         let network_info = network_res.unwrap_or_else(|e| {
             warn!(scanner = "network", error = ?e, "scanner panicked");
             scan_warnings.push("network scanner panicked".to_string());
+            failed_scanners.push("network".to_string());
             crate::models::NetworkInfo::default()
         });
         let storage_info = storage_res.unwrap_or_else(|e| {
             warn!(scanner = "storage", error = ?e, "scanner panicked");
             scan_warnings.push("storage scanner panicked".to_string());
+            failed_scanners.push("storage".to_string());
             crate::models::StorageInfo::default()
         });
         let security_info = security_res.unwrap_or_else(|e| {
@@ -195,17 +218,20 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             scan_warnings.push(
                 "security scanner panicked — SSH/sudo/sysctl fields NOT verified".to_string(),
             );
+            failed_scanners.push("security".to_string());
             crate::models::SecurityInfo::default()
         });
         let packages_info = packages_res.unwrap_or_else(|e| {
             warn!(scanner = "packages", error = ?e, "scanner panicked");
             scan_warnings.push("packages scanner panicked".to_string());
+            failed_scanners.push("packages".to_string());
             crate::models::PackagesInfo::default()
         });
 
         let topology_info = topology_info.unwrap_or_else(|e| {
             warn!(scanner = "docker", error = ?e, "docker scanner panicked");
             scan_warnings.push("docker scanner panicked".to_string());
+            failed_scanners.push("docker".to_string());
             crate::models::TopologyInfo::default()
         });
 
@@ -214,6 +240,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             scan_warnings.push(format!(
                 "persistence scanner panicked — {PERSISTENCE_IDS} NOT verified"
             ));
+            failed_scanners.push("persistence".to_string());
             PersistenceScan::default()
         });
 
@@ -232,6 +259,8 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             is_root_execution: is_root,
             scan_warnings,
             coverage_warnings,
+            failed_scanners,
+            remote_privileged: None,
             host: host_info,
             databases: dbs,
             network: network_info,
@@ -376,11 +405,11 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
 async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentReport, String> {
     let ssh_key_expanded = shellexpand::tilde(&args.ssh_key).to_string();
 
-    let stdout = crate::ssh_engine::run_remote_scan_russh(
+    let (stdout, coverage) = crate::ssh_engine::run_remote_scan_russh(
         host,
         &args.ssh_user,
         &ssh_key_expanded,
-        &args.remote_path,
+        args.remote_path.as_deref(),
         None, // sudo_pass
         args.copy_binary,
         args.keep_binary,
@@ -392,8 +421,14 @@ async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentRepo
     .await
     .map_err(|e| format!("russh scan failed: {e}"))?;
 
-    serde_json::from_slice::<AgentReport>(&stdout)
-        .map_err(|e| format!("remote output is not a valid AgentReport: {e}"))
+    let mut report = serde_json::from_slice::<AgentReport>(&stdout)
+        .map_err(|e| format!("remote output is not a valid AgentReport: {e}"))?;
+
+    // R25-42: persist remote coverage facts (notes + privilege) onto the host
+    // report. Centralized in RemoteCoverage::apply_to (R25-72).
+    coverage.apply_to(&mut report);
+
+    Ok(report)
 }
 
 fn read_user_home(username: &str) -> Option<String> {

@@ -11,6 +11,10 @@
 //! Internal targets (RFC1918/loopback/CGNAT/ULA) are intentionally NOT flagged
 //! to keep the exit(3) signal near-zero-FP, at the cost of missing LAN-local C2.
 //!
+//! R24-115: the stdio-fd leg of the funnel is now mandatory. Previously a
+//! socket on a HIGH fd (e.g. a python agent making an ordinary HTTPS API call)
+//! still produced a finding, causing exit(3) false positives.
+//!
 //! `/proc/net/tcp` line 4 (0-based 3) is `st`; 0x01 = ESTABLISHED. Field 2 is
 //! the remote `addr:port` in the same hex/LE encoding as the local field.
 
@@ -248,10 +252,15 @@ fn correlate_with_processes(
                 continue; // internal target — not flagged (FP control)
             }
 
+            // R24-115: the stdio-fd leg of the funnel is mandatory. A socket on
+            // a HIGH fd (e.g. python HTTPS agent) must NOT produce a finding.
             let stdio_fd = match fd_num {
                 Some(n @ 0..=2) => Some(n),
                 _ => None,
             };
+            if stdio_fd.is_none() {
+                continue;
+            }
 
             let exe_path = exe_cache
                 .get_or_insert_with(|| {
@@ -269,11 +278,12 @@ fn correlate_with_processes(
                 stdio_fd,
             };
 
-            // Prefer a stdio-fd hit; otherwise keep the first non-stdio hit.
-            match (&best, stdio_fd) {
-                (None, _) => best = Some(candidate),
-                (Some(b), Some(_)) if b.stdio_fd.is_none() => best = Some(candidate),
-                _ => {}
+            // Deterministic: lowest stdio fd wins. readdir order is arbitrary,
+            // and arbitrary evidence produces phantom drift in compare.rs.
+            match &best {
+                None => best = Some(candidate),
+                Some(b) if candidate.stdio_fd < b.stdio_fd => best = Some(candidate),
+                Some(_) => {}
             }
         }
 
@@ -335,14 +345,10 @@ mod tests {
 
     #[test]
     fn v4_mapped_ipv6_classification() {
-        // public IPv4 mapped into IPv6
         assert!(is_public_addr("::ffff:8.8.8.8"));
-        // internal IPv4 mapped into IPv6 (10.0.0.1, 192.168.1.1) → not public
         assert!(!is_public_addr("::ffff:10.0.0.1"));
         assert!(!is_public_addr("::ffff:192.168.1.1"));
-        // pure IPv6 remains unchanged (public)
         assert!(is_public_addr("2001:4860:4860::8888"));
-        // link-local always false
         assert!(!is_public_addr("fe80::1"));
     }
 
@@ -371,8 +377,6 @@ mod tests {
     #[test]
     fn parses_established_remote_and_inode() {
         let tmp = tempfile::tempdir().unwrap();
-        // remote 8.8.8.8:443 → hex LE: 08080808:01BB ; st 01 = ESTABLISHED.
-        // inode 555555 in the standard column.
         let line = "  0: 0100007F:8000 08080808:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 555555 1 0000 0 0 0 0 0";
         write(
             tmp.path(),
@@ -388,7 +392,6 @@ mod tests {
     #[test]
     fn skips_non_established() {
         let tmp = tempfile::tempdir().unwrap();
-        // st 0A = LISTEN, must be ignored.
         let line = "  0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 111 1 0000 0 0 0 0 0";
         write(tmp.path(), "net/tcp", &format!("sl ...\n{line}\n"));
         let map = collect_established(tmp.path().join("net/tcp").to_str().unwrap(), false);
@@ -397,14 +400,11 @@ mod tests {
 
     // ── End-to-end correlation over a fake /proc ────────────
 
-    /// Build a fake proc with one pid: given comm, and one fd symlinked to a
-    /// socket inode. Returns the temp proc root path.
     fn fake_proc(pid: u32, comm: &str, fd: &str, inode: u64) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join(pid.to_string());
         std::fs::create_dir_all(base.join("fd")).unwrap();
         std::fs::write(base.join("comm"), format!("{comm}\n")).unwrap();
-        // exe link (optional target need not exist for read_link).
         let _ = symlink("/bin/bash", base.join("exe"));
         symlink(format!("socket:[{inode}]"), base.join("fd").join(fd)).unwrap();
         tmp
@@ -460,8 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn stdio_fd_preferred_over_high_fd() {
-        // Same pid, socket on both fd 9 and fd 2 → stdio (2) must win.
+    fn lowest_stdio_fd_wins_deterministically() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("1340");
         std::fs::create_dir_all(base.join("fd")).unwrap();
@@ -479,6 +478,23 @@ mod tests {
         let out = correlate_with_processes(&est, tmp.path().to_str().unwrap());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].stdio_fd, Some(2));
+    }
+
+    #[test]
+    fn non_stdio_socket_is_not_flagged() {
+        // R24-115 regression: a python HTTPS agent with the socket on fd 9
+        // must NOT be flagged as a reverse shell.
+        let proc = fake_proc(4242, "python3", "9", 123123);
+        let mut est = HashMap::new();
+        est.insert(
+            123123,
+            EstSocket {
+                remote: "8.8.8.8:443".into(),
+                public: true,
+            },
+        );
+        let out = correlate_with_processes(&est, proc.path().to_str().unwrap());
+        assert!(out.is_empty(), "non-stdio socket must not fire SEC-022");
     }
 
     #[test]

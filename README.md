@@ -214,7 +214,7 @@ owlzops-mapper compare before.json after.json --format excel -o drift.xlsx
 - Single static musl binary, zero runtime dependencies
 - Read-only, zero permanent footprint, no telemetry
 - GPG-signed releases + SHA256 checksums + SBOM
-- CI pins every GitHub Action by commit SHA, runs `cargo audit` and `cargo deny`
+- CI pins every GitHub Action by commit SHA, runs `cargo audit` and `cargo deny`, and checks that remediation IDs in commit messages are reflected in the changed files
 - Source-available under Apache 2.0 with Commons Clause
 
 The design commitments above are stated as testable properties in [SECURITY.md](SECURITY.md). A violation of any of them is treated as a vulnerability, not a bug.
@@ -234,7 +234,8 @@ The design commitments above are stated as testable properties in [SECURITY.md](
 | `--copy-binary` | Upload the static binary automatically |
 | `--local-binary` | Path to the static binary to upload instead of the running one |
 | `--ask-sudo-pass` | Prompt for sudo password, forwarded over SSH |
-| `--keep-binary` | Skip cleanup, leave the binary on the remote host |
+| `--keep-binary` | Skip cleanup, leave the binary on the remote host. Requires `--remote-path` when used with `--copy-binary` |
+| `--fail-on-incomplete` | Exit with code 4 when coverage is incomplete (failed scanner, missing host, non-root, warnings) |
 | `--external-ip` | Opt-in public IP lookup |
 | `-v, --verbose` | Full per-region memory detail |
 
@@ -247,10 +248,21 @@ Full list: `owlzops-mapper --help`.
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean |
-| 1 | Critical findings present |
-| 2 | Not running as root / scan warnings / fleet produced zero reports |
-| 3 | **Active compromise detected** (IoC / ghost PID / critical memory findings) |
+| 0 | Clean — full coverage, no critical or compromised findings |
+| 1 | Critical findings present — full coverage |
+| 2 | Degraded — incomplete coverage: not running as root, warnings, failed scanner(s), missing host(s), or JSONL write errors |
+| 3 | **Active compromise detected** — regardless of coverage |
+| 4 | No verdict at all, **or** `--fail-on-incomplete` was used and coverage was incomplete |
+| 64 | Usage error: invalid CLI arguments or input files |
+| 130 | Interrupted by SIGINT/SIGTERM |
+
+Codes **0–3 are a stable public contract from v0.6.0**.  
+Their meaning does not change between releases from v0.6.0 onwards.  
+New failure modes get new codes; they never override the existing band.
+
+In fleet mode, `hosts_missing` is counted but not listed in the exit code.
+To identify which hosts produced no report, diff the input host list against
+the `host.hostname` values present in the JSONL output.
 
 ```bash
 sudo owlzops-mapper audit || echo "Security scan failed — check the report"

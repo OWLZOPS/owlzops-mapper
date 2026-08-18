@@ -54,6 +54,10 @@ pub fn output_multi(
 ) -> Result<(), String> {
     match format {
         OutputFormat::Text => {
+            if reports.is_empty() {
+                eprintln!("No reports to display.");
+                return Ok(());
+            }
             if reports.len() == 1 {
                 ui::render_dashboard(&reports[0], verbose);
             } else {

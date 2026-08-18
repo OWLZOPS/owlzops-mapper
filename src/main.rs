@@ -17,7 +17,7 @@ mod utils;
 mod verdict_cache;
 
 use crate::utils::host_budget_secs;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[cfg(feature = "local-scan")]
@@ -28,6 +28,7 @@ use runner::snapshot_run;
 use runner::{is_local_host, run_local_scan_async};
 use scoring::*;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,37 +51,237 @@ const HARD_EXIT_MARGIN: Duration = Duration::from_secs(5);
 /// Time allowed for the JSONL writer to drain after the scan loop finishes.
 pub(crate) const JSONL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn is_running_as_root() -> bool {
-    unsafe { libc::getuid() == 0 }
+/// Exit code for invalid CLI usage. Outside the 0..=3 verdict band (R25-36).
+const EXIT_USAGE: i32 = 64; // sysexits.h EX_USAGE
+
+/// Exit codes 0..=3 are a PUBLIC CONTRACT: pipelines key their pager on 3 and
+/// their build gate on 1. A number in this band NEVER changes meaning between
+/// versions; new states get new numbers (R25-56/R25-74).
+const EXIT_CLEAN: i32 = 0;
+const EXIT_CRITICAL: i32 = 1;
+const EXIT_COMPROMISED: i32 = 3;
+
+/// Exit code for an incomplete scan: one or more scanners failed.
+/// Distinct from non-root degradation (2) so CI can tell "no verdict"
+/// from "verdict degraded by privileges" (R25-26 tail).
+const EXIT_INCOMPLETE: i32 = 4;
+
+/// Exit code for a degraded scan: not running as root or warnings present,
+/// but no missing scanners and no compromised hosts. Distinct from incomplete (4).
+const EXIT_DEGRADED: i32 = 2;
+
+/// Exit code for a scan interrupted by SIGINT/SIGTERM.
+const EXIT_INTERRUPT: i32 = 130;
+
+// R25-60: a panic is not an interrupt; use EX_SOFTWARE instead of 130.
+/// Exit code for an internal error (panic), distinct from SIGINT (130).
+const EXIT_INTERNAL_ERROR: i32 = 70; // sysexits.h EX_SOFTWARE
+
+/// A `MakeWriter` that suspends the progress bars for the duration of each
+/// log record. With this installed, no call site needs `multi.suspend`, and
+/// the three different treatments in this file collapse into zero (R25-71).
+struct BarAwareStderr(MultiProgress);
+
+impl Write for BarAwareStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `suspend` holds indicatif's draw lock; keep the closure tiny and
+        // never let it panic — an unwind here would poison the lock for every
+        // other bar (R25-18).
+        self.0.suspend(|| {
+            let _ = std::io::stderr().write_all(buf);
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-fn compute_exit_code(report: &AgentReport) -> i32 {
-    let flags = CriticalFlags::from_report(report);
+// ── Two-axis outcome model (R25-74) ───────────────────────────────
+// SecurityVerdict describes what the scan FOUND.
+// Coverage describes what the scan could SEE.
+// They are never collapsed until the final exit code mapping.
 
-    if flags.compromised_host {
-        warn!(
-            "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting 3"
-        );
-        return 3;
+#[derive(Debug, Default, Clone, Copy)]
+struct Coverage {
+    /// Hosts asked for that produced no report at all.
+    hosts_missing: usize,
+    /// Reports received but not written to JSONL.
+    records_lost: usize,
+    scanners_failed: bool,
+    non_root: bool,
+    warnings: bool,
+    /// The scan finished but the operator could not be shown the result.
+    /// A delivery failure is a COVERAGE fact — it must never replace the
+    /// verdict, or a compromise silently degrades to 2 (R25-83).
+    output_failed: bool,
+}
+
+impl Coverage {
+    fn is_full(&self) -> bool {
+        self.hosts_missing == 0
+            && self.records_lost == 0
+            && !self.scanners_failed
+            && !self.non_root
+            && !self.warnings
+            && !self.output_failed
+    }
+}
+
+struct Outcome {
+    /// `None` = not a single host produced a verdict.
+    verdict: Option<SecurityVerdict>,
+    coverage: Coverage,
+}
+
+#[derive(Debug, Default)]
+struct OutcomeBuilder {
+    verdict: Option<SecurityVerdict>,
+    coverage: Coverage,
+    reports_seen: usize,
+}
+
+impl OutcomeBuilder {
+    fn add(&mut self, report: &AgentReport) {
+        scoring::warn_unmapped_scanners(&report.failed_scanners);
+        let findings = scoring::evaluate(report);
+        let v = scoring::security_verdict_from_findings(&findings);
+        self.verdict = Some(match self.verdict {
+            None => v,
+            Some(cur) => cur.worse(v),
+        });
+        self.coverage.scanners_failed |= !report.failed_scanners.is_empty();
+        self.coverage.non_root |= !report.is_root_execution;
+        self.coverage.warnings |= !report.scan_warnings.is_empty();
+        self.reports_seen += 1;
     }
 
-    if !report.is_root_execution {
-        if flags.has_critical() {
-            warn!(
-                "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
-            );
-        } else {
-            warn!("not running as root – results may be incomplete.");
+    fn finish(mut self, hosts_requested: usize, records_lost: usize) -> Outcome {
+        self.coverage.hosts_missing = hosts_requested.saturating_sub(self.reports_seen);
+        self.coverage.records_lost = records_lost;
+        Outcome {
+            verdict: self.verdict,
+            coverage: self.coverage,
         }
-        return 2;
+    }
+}
+
+/// SINGLE source of truth for the exit code. Exhaustive without a panic arm.
+fn exit_code(outcome: &Outcome, fail_on_incomplete: bool) -> i32 {
+    let Some(verdict) = outcome.verdict else {
+        // No data is not a clean bill of health, flag or no flag.
+        return EXIT_INCOMPLETE;
+    };
+    let full = outcome.coverage.is_full();
+
+    match verdict {
+        // Terminal: a confirmed compromise is never masked by uncertainty.
+        SecurityVerdict::Compromised => EXIT_COMPROMISED,
+        _ if fail_on_incomplete && !full => EXIT_INCOMPLETE,
+        // Incomplete coverage IS degradation – code 2 already means exactly
+        // "the scan ran but could not see everything". No opt-in required, so
+        // an unpatched pipeline stays fail-closed.
+        _ if !full => EXIT_DEGRADED,
+        SecurityVerdict::Critical => EXIT_CRITICAL,
+        SecurityVerdict::Clean => EXIT_CLEAN,
+    }
+}
+
+/// Preserve the local warning side effects; used only for single-host path.
+// macOS / --no-default-features builds without `local-scan` compile this out of
+// production and see the remaining test-only call sites as dead code.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+fn warn_for_outcome(outcome: &Outcome, report: &AgentReport) {
+    match outcome.verdict {
+        Some(SecurityVerdict::Compromised) => {
+            warn!(
+                "ACTIVE COMPROMISE indicators detected — see SEC-015/016/017/019/020/021/022/023/024 or DOCK-010; exiting {}",
+                EXIT_COMPROMISED
+            );
+        }
+        Some(SecurityVerdict::Critical) => {
+            if !report.is_root_execution {
+                warn!(
+                    "not running as root AND critical issues detected – results may be incomplete, re-run with sudo."
+                );
+            }
+        }
+        Some(SecurityVerdict::Clean) => {
+            if !report.is_root_execution {
+                warn!("not running as root – results may be incomplete.");
+            } else if !report.scan_warnings.is_empty() {
+                warn!(warnings = ?report.scan_warnings, "scan produced warnings — degraded");
+            }
+        }
+        None => {
+            // `add()` always yields Some for a real report; the None arm exists
+            // only because coverage used to live inside the verdict.
+            warn!("no report produced; exiting {}", EXIT_INCOMPLETE);
+        }
     }
 
-    if !report.scan_warnings.is_empty() {
-        warn!(warnings = ?report.scan_warnings, "one or more scanners failed – report may be incomplete");
-        return 2;
+    // Coverage is an independent axis and must be reported independently, or
+    // the operator sees code 2 with nothing explaining it.
+    let c = &outcome.coverage;
+    if c.scanners_failed {
+        warn!(
+            failed = ?report.failed_scanners,
+            "one or more scanners failed — coverage incomplete, findings are a LOWER BOUND"
+        );
     }
+    if !report.is_root_execution {
+        warn!("not running as root — privileged surfaces were not read");
+    }
+    if c.records_lost > 0 || c.output_failed {
+        warn!(
+            records_lost = c.records_lost,
+            output_failed = c.output_failed,
+            "some results did not reach the output"
+        );
+    }
+}
 
-    if flags.has_critical() { 1 } else { 0 }
+/// Explain why the FLEET aggregate is degraded. The fleet has many reports and
+/// no single `report` to blame, so this reports coverage facts generically.
+fn warn_for_coverage(outcome: &Outcome) {
+    let c = &outcome.coverage;
+    if c.scanners_failed {
+        warn!(
+            "one or more reports had failed scanners — coverage incomplete, \
+             findings are a LOWER BOUND"
+        );
+    }
+    if c.non_root {
+        warn!("at least one host was scanned without root — privileged surfaces were not read");
+    }
+    if c.hosts_missing > 0 {
+        warn!(
+            hosts_missing = c.hosts_missing,
+            "hosts did not produce a report"
+        );
+    }
+    if c.records_lost > 0 || c.output_failed {
+        warn!(
+            records_lost = c.records_lost,
+            output_failed = c.output_failed,
+            "some results did not reach the output"
+        );
+    }
+}
+
+/// Build an Outcome for a single report (local path n=1).
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+fn outcome_for(report: &AgentReport) -> Outcome {
+    let mut agg = OutcomeBuilder::default();
+    agg.add(report);
+    agg.finish(1, 0)
+}
+
+/// Used by runner and scanner modules to adapt coverage hints. Keep here as
+/// the crate-root helper shared across the binary.
+pub(crate) fn is_running_as_root() -> bool {
+    unsafe { libc::getuid() == 0 }
 }
 
 fn raise_nofile_limit() {
@@ -103,10 +304,27 @@ fn raise_nofile_limit() {
     }
 }
 
-async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<Notify>) -> i32 {
+async fn run_command(
+    cli: Cli,
+    multi: MultiProgress,
+    shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
+) -> i32 {
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
         Commands::Audit(args) => {
+            // R25-12: --keep-binary exists to avoid re-uploading. With mktemp
+            // staging the next run picks a fresh random directory, so nothing
+            // is ever reused: the flag only accumulates leftovers. Refuse the
+            // combination up front.
+            if args.keep_binary && args.copy_binary && args.remote_path.is_none() {
+                eprintln!(
+                    "--keep-binary requires an explicit --remote-path: with the default \
+                     mktemp staging the kept binary can never be reused, only left behind"
+                );
+                return EXIT_USAGE;
+            }
+
             let mut hosts: Vec<String> = Vec::new();
             for h in &args.host {
                 hosts.push(h.clone());
@@ -121,7 +339,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                             "Failed to read hosts file {:?}: {} — refusing to silently fall back to a LOCAL scan",
                             path, e
                         );
-                        return 2;
+                        return EXIT_USAGE;
                     }
                 };
                 let before = hosts.len();
@@ -133,12 +351,16 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 }
                 if hosts.len() == before && args.host.is_empty() {
                     eprintln!("hosts file {:?} contains no usable host entries", path);
-                    return 2;
+                    return EXIT_USAGE;
                 }
             }
 
             let mut seen = HashSet::new();
             hosts.retain(|h| seen.insert(h.clone()));
+
+            // Two-axis input: total requested hosts and fail_on_incomplete flag.
+            let hosts_requested = hosts.len();
+            let fail_on_incomplete = args.fail_on_incomplete;
 
             // If local-scan is disabled (non-Linux), reject local-only audits early.
             if !hosts.is_empty() {
@@ -165,7 +387,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         Ok(p) => Some(Arc::new(p)),
                         Err(e) => {
                             eprintln!("Error: {e}");
-                            return 2;
+                            return EXIT_USAGE;
                         }
                     }
                 } else {
@@ -203,9 +425,10 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         let mut rx = rx;
                         let mut written = 0usize;
                         let mut io_errors = 0usize;
-                        let mut worst = 0i32;
+                        let mut agg = OutcomeBuilder::default();
                         while let Some(report) = rx.blocking_recv() {
-                            worst = worst.max(compute_exit_code(&report));
+                            agg.add(&report);
+
                             match serde_json::to_string(&report) {
                                 Ok(json) => match writeln!(file, "{json}") {
                                     Ok(()) => written += 1,
@@ -214,14 +437,19 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         warn!(error = %e, "JSONL write failed — report lost");
                                     }
                                 },
-                                Err(e) => warn!(error = %e, "skipping unserializable report"),
+                                Err(e) => {
+                                    // The verdict is already in `agg`, but the consumer
+                                    // will never see this host. That is a lost record.
+                                    io_errors += 1;
+                                    warn!(error = %e, "report could not be serialized — dropped from JSONL");
+                                }
                             }
                         }
                         if let Err(e) = file.flush() {
                             io_errors += 1;
                             warn!(error = %e, "JSONL flush failed — tail records may be lost");
                         }
-                        (written, worst, io_errors)
+                        (written, agg, io_errors)
                     }))
                 } else {
                     None
@@ -261,7 +489,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         ssh_user: String::new(),
                         ssh_key: String::new(),
                         copy_binary: false,
-                        remote_path: String::new(),
+                        remote_path: None,
                         local_binary: None,
                         ..args.clone()
                     };
@@ -307,7 +535,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 // Process remote hosts with JoinSet + Semaphore + global timeout
                 if !remote.is_empty() {
                     // ========== MULTIPROGRESS SETUP ==========
-                    let multi = MultiProgress::new();
+                    // Use the shared MultiProgress passed from main (R25-71).
 
                     // 1. Upload progress bar (only when we copy a binary)
                     let upload_bar = if sudo_pass.is_some() && args.copy_binary {
@@ -375,7 +603,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 warn!("{e}");
                                 return None;
                             }
-                            if let Err(e) = runner::validate_remote_path(&a.remote_path) {
+                            if let Some(rp) = &a.remote_path
+                                && let Err(e) = runner::validate_remote_path(rp)
+                            {
                                 warn!("{e}");
                                 return None;
                             }
@@ -391,7 +621,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                     &host,
                                     &a.ssh_user,
                                     &ssh_key_expanded,
-                                    &a.remote_path,
+                                    a.remote_path.as_deref(),
                                     pass.as_deref(),
                                     a.copy_binary,
                                     a.keep_binary,
@@ -402,9 +632,16 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 )
                                 .await
                                 {
-                                    Ok(stdout) => {
+                                    Ok((stdout, coverage)) => {
                                         match serde_json::from_slice::<AgentReport>(&stdout) {
-                                            Ok(report) => Some(report),
+                                            Ok(mut report) => {
+                                                // R25-14: remote coverage belongs
+                                                // in this host's report, not in
+                                                // orchestrator's local sink.
+                                                // R25-72: centralized via RemoteCoverage::apply_to
+                                                coverage.apply_to(&mut report);
+                                                Some(report)
+                                            }
                                             Err(e) => {
                                                 let raw_preview: String =
                                                     String::from_utf8_lossy(&stdout)
@@ -424,6 +661,10 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                         }
                                     }
                                     Err(e) => {
+                                        // BarAwareStderr suspends the progress
+                                        // bars for every tracing record; a
+                                        // direct write here would duplicate the
+                                        // warning (R25-82).
                                         warn!(host = %host, error = %e, "russh scan failed");
                                         None
                                     }
@@ -475,8 +716,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                     }
                                                 }
                                                 Some(Ok(None)) => {}
-                                                Some(Err(e)) if e.is_panic() => warn!("scan task panicked during teardown: {e}"),
-                                                Some(Err(e)) => warn!("scan task failed during teardown: {e}"),
+                                                Some(Err(e)) if e.is_panic() => {
+                                                    warn!("scan task panicked during teardown: {e}");
+                                                }
+                                                Some(Err(e)) => {
+                                                    warn!("scan task failed during teardown: {e}");
+                                                }
                                                 None => break, // All tasks finished cleanly
                                             }
                                         }
@@ -498,8 +743,12 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                                 }
                                             }
                                             Ok(None) => {}
-                                            Err(e) if e.is_panic() => warn!("scan task panicked: {e}"),
-                                            Err(e) => warn!("scan task failed: {e}"),
+                                            Err(e) if e.is_panic() => {
+                                                warn!("scan task panicked: {e}");
+                                            }
+                                            Err(e) => {
+                                                warn!("scan task failed: {e}");
+                                            }
                                         }
                                     }
                                     None => {
@@ -530,30 +779,31 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                                 warn!(
                                     "JSONL writer timed out during shutdown, output may be incomplete"
                                 );
-                                return 2;
+                                return EXIT_DEGRADED;
                             }
                         }
                     } else {
                         writer.await
                     };
                     match joined {
-                        Ok((written, worst, io_errors)) => {
+                        Ok((written, agg, io_errors)) => {
                             if io_errors > 0 {
                                 warn!(
                                     written,
                                     io_errors,
                                     "JSONL output incomplete — returning degraded exit code"
                                 );
-                                return 2;
                             }
                             if interrupted {
-                                return 130;
+                                return EXIT_INTERRUPT;
                             }
-                            return if written == 0 { 2 } else { worst };
+                            let outcome = agg.finish(hosts_requested, io_errors);
+                            warn_for_coverage(&outcome);
+                            return exit_code(&outcome, fail_on_incomplete);
                         }
                         Err(_) => {
                             warn!("JSONL writer task failed");
-                            return 2;
+                            return EXIT_DEGRADED;
                         }
                     }
                 }
@@ -561,7 +811,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                 // R19V5-04: honour interruption when local scan was cancelled
                 // in a streaming-less run.
                 if interrupted {
-                    return 130;
+                    return EXIT_INTERRUPT;
                 }
 
                 // Fallback to legacy multi-host output
@@ -575,8 +825,22 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     ) {
                         warn!("output error: {e}");
                     }
-                    return 2;
+                    let outcome = Outcome {
+                        verdict: None,
+                        coverage: Coverage {
+                            hosts_missing: hosts_requested,
+                            ..Default::default()
+                        },
+                    };
+                    warn_for_coverage(&outcome);
+                    return exit_code(&outcome, fail_on_incomplete);
                 }
+
+                let mut agg = OutcomeBuilder::default();
+                for report in &reports {
+                    agg.add(report);
+                }
+                let mut outcome = agg.finish(hosts_requested, 0);
 
                 if let Err(e) = output::output_multi(
                     &reports,
@@ -585,11 +849,13 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return 2;
+                    outcome.coverage.output_failed = true;
                 }
 
-                let worst = reports.iter().map(compute_exit_code).max().unwrap_or(0);
-                return worst;
+                warn_for_coverage(&outcome);
+                // Computed AFTER delivery, so a render failure degrades the
+                // code without ever outranking Compromised.
+                return exit_code(&outcome, fail_on_incomplete);
             }
 
             // Single local scan (no hosts file or empty hosts)
@@ -624,7 +890,7 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                         for w in crate::coverage::drain_scoped("local-interrupted") {
                             warn!("{w}");
                         }
-                        return 130;
+                        return EXIT_INTERRUPT;
                     }
                 };
 
@@ -637,7 +903,9 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 
                 local_spinner.finish_and_clear();
 
-                let exit_code = compute_exit_code(&report);
+                let mut outcome = outcome_for(&report);
+                warn_for_outcome(&outcome, &report);
+
                 if let Err(e) = output::output_single(
                     &report,
                     &args.format,
@@ -645,16 +913,17 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
                     verbose,
                 ) {
                     warn!("output error: {e}");
-                    return 2;
+                    outcome.coverage.output_failed = true;
                 }
-                exit_code
+
+                exit_code(&outcome, fail_on_incomplete)
             }
             #[cfg(not(feature = "local-scan"))]
             {
                 eprintln!(
                     "Local audit is not supported on this platform. Use --host to scan a remote host."
                 );
-                2 // ← clippy: needless_return removed
+                EXIT_USAGE
             }
         }
 
@@ -877,22 +1146,49 @@ async fn run_command(cli: Cli, shutdown: Arc<AtomicBool>, shutdown_notify: Arc<N
 async fn main() {
     raise_nofile_limit();
 
+    // Shared progress bar handle. Installed before the tracing subscriber so
+    // every structured log record can suspend bars automatically (R25-71).
+    let multi = MultiProgress::new();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("owlzops_mapper=warn")),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer({
+            let m = multi.clone();
+            move || BarAwareStderr(m.clone())
+        })
         .init();
 
-    let cli = Cli::parse();
+    let matches = match Cli::command().try_get_matches() {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
     let shutdown_notify_clone = shutdown_notify.clone();
 
-    let cmd_handle = tokio::spawn(run_command(cli, shutdown_clone, shutdown_notify_clone));
+    let cmd_handle = tokio::spawn(run_command(
+        cli,
+        multi,
+        shutdown_clone,
+        shutdown_notify_clone,
+    ));
 
     // ---- Signal handler (runs for the entire lifetime) ----
     let notify_sig = shutdown_notify.clone();
@@ -923,7 +1219,7 @@ async fn main() {
                         eprintln!("Graceful shutdown timed out, forcing exit.");
                         // Kill any remaining helpers so they don't become orphans.
                         crate::utils::terminate_registered_children();
-                        std::process::exit(130);
+                        std::process::exit(EXIT_INTERRUPT);
                     });
                 }
                 2 => {
@@ -934,19 +1230,19 @@ async fn main() {
                 _ => {
                     crate::utils::terminate_registered_children();
                     eprintln!("Third interrupt — forcing exit");
-                    std::process::exit(130);
+                    std::process::exit(EXIT_INTERRUPT);
                 }
             }
         }
     });
 
     let exit_code = cmd_handle.await.unwrap_or_else(|join_err| {
-        if join_err.is_panic() {
-            eprintln!("Main task panicked");
-            130
+        let _ = if join_err.is_panic() {
+            writeln!(std::io::stderr(), "Main task panicked")
         } else {
-            1
-        }
+            writeln!(std::io::stderr(), "Main task was cancelled without a panic")
+        };
+        EXIT_INTERNAL_ERROR
     });
 
     std::process::exit(exit_code);
@@ -976,6 +1272,8 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 
@@ -1002,51 +1300,115 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_2_when_not_root() {
-        let mut r = minimal_report();
-        r.is_root_execution = false;
-        assert_eq!(compute_exit_code(&r), 2);
+    fn exit_code_full_coverage_contract() {
+        let clean = Outcome {
+            verdict: Some(SecurityVerdict::Clean),
+            coverage: Coverage::default(),
+        };
+        assert_eq!(exit_code(&clean, false), EXIT_CLEAN);
+
+        let critical = Outcome {
+            verdict: Some(SecurityVerdict::Critical),
+            coverage: Coverage::default(),
+        };
+        assert_eq!(exit_code(&critical, false), EXIT_CRITICAL);
+
+        let compromised = Outcome {
+            verdict: Some(SecurityVerdict::Compromised),
+            coverage: Coverage::default(),
+        };
+        assert_eq!(exit_code(&compromised, false), EXIT_COMPROMISED);
     }
 
     #[test]
-    fn exit_code_0_when_clean() {
-        let mut r = minimal_report();
-        r.network.firewall_active = true;
-        r.security.ssh_root_login_enabled = false;
-        r.host.backup_tools = vec!["restic".to_string()];
-        r.host.ntp_synchronized = true;
-        assert_eq!(compute_exit_code(&r), 0);
+    fn incomplete_coverage_is_never_clean() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Clean),
+            coverage: Coverage {
+                non_root: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_DEGRADED);
+        assert_eq!(exit_code(&outcome, true), EXIT_INCOMPLETE);
     }
 
     #[test]
-    fn exit_code_1_on_missing_firewall() {
-        let mut r = minimal_report();
-        r.network.firewall_active = false;
-        r.host.backup_tools = vec!["restic".to_string()];
-        r.host.ntp_synchronized = true;
-        assert_eq!(compute_exit_code(&r), 1);
+    fn compromise_is_never_masked_by_incompleteness() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Compromised),
+            coverage: Coverage {
+                hosts_missing: 199,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_COMPROMISED);
+        assert_eq!(exit_code(&outcome, true), EXIT_COMPROMISED);
     }
 
     #[test]
-    fn exit_code_1_on_missing_backup() {
-        let mut r = minimal_report();
-        r.network.firewall_active = true;
-        r.host.backup_tools = vec![];
-        r.host.ntp_synchronized = true;
-        assert_eq!(compute_exit_code(&r), 1);
+    fn no_verdict_is_incomplete_regardless_of_flag() {
+        let outcome = Outcome {
+            verdict: None,
+            coverage: Coverage {
+                hosts_missing: 5,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_INCOMPLETE);
+        assert_eq!(exit_code(&outcome, true), EXIT_INCOMPLETE);
     }
 
     #[test]
-    fn exit_code_3_on_compromise() {
-        use crate::models::SuspiciousProcess;
+    fn fleet_where_almost_nothing_was_scanned_is_not_clean() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Clean),
+            coverage: Coverage {
+                hosts_missing: 199,
+                ..Default::default()
+            },
+        };
+        assert_ne!(exit_code(&outcome, false), EXIT_CLEAN);
+        assert_eq!(exit_code(&outcome, false), EXIT_DEGRADED);
+    }
+
+    #[test]
+    fn one_host_via_fleet_path_matches_local_path() {
+        let mut report = minimal_report();
+        report.network.firewall_active = false;
+        report.is_root_execution = false;
+
+        let local_code = exit_code(&outcome_for(&report), false);
+
+        let mut agg = OutcomeBuilder::default();
+        agg.add(&report);
+        let outcome = agg.finish(1, 0);
+        let fleet_code = exit_code(&outcome, false);
+
+        assert_eq!(local_code, fleet_code);
+    }
+
+    #[test]
+    fn a_render_failure_never_downgrades_a_compromise() {
+        let outcome = Outcome {
+            verdict: Some(SecurityVerdict::Compromised),
+            coverage: Coverage {
+                output_failed: true,
+                ..Default::default()
+            },
+        };
+        assert_eq!(exit_code(&outcome, false), EXIT_COMPROMISED);
+        assert_eq!(exit_code(&outcome, true), EXIT_COMPROMISED);
+    }
+
+    #[test]
+    fn a_failed_scanner_does_not_hide_a_critical_finding() {
         let mut r = minimal_report();
-        r.security.suspicious_processes = vec![SuspiciousProcess {
-            pid: 1337,
-            name: "xmrig".into(),
-            exe_path: Some("/tmp/xmrig".into()),
-            ..Default::default()
-        }];
-        assert_eq!(compute_exit_code(&r), 3);
+        r.network.firewall_active = false; // SEC-001, network healthy
+        r.failed_scanners = vec!["security".to_string()];
+        // Critical is reported; coverage degrades the code but does not erase it.
+        assert_eq!(exit_code(&outcome_for(&r), false), EXIT_DEGRADED);
+        assert_eq!(exit_code(&outcome_for(&r), true), EXIT_INCOMPLETE);
     }
 
     #[test]

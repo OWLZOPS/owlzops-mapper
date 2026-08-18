@@ -68,6 +68,22 @@ jobs:
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  check-commit-refs:
+    name: Check remediation references
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # R25-70: need the PR merge-base, not just HEAD~1.
+          fetch-depth: 0
+
+      - name: Check commit references against diff
+        env:
+          # Empty outside pull_request; the script falls back to HEAD~1.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/check_commit_refs.sh
+
   build-macos-orchestrator:
     name: Build macOS orchestrator
     runs-on: macos-latest

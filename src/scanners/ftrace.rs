@@ -44,27 +44,54 @@ pub(crate) enum HookSource {
     Unresolved,
 }
 
+/// Split the attribution tail into (callback symbol, module name).
+///
+/// The module name is ATTACKER-CONTROLLED; only the callback symbol may
+/// establish legitimacy. A module named `[bpf]` must not classify the hook as
+/// BPF, because the module name can be chosen by the attacker.
+pub(crate) fn split_attribution(a: &str) -> (Option<&str>, Option<&str>) {
+    let module = a
+        .rfind('[')
+        .and_then(|o| a[o + 1..].find(']').map(|c| a[o + 1..o + 1 + c].trim()));
+    let callback = a.rfind("->").map(|i| {
+        let rest = &a[i + 2..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '[')
+            .unwrap_or(rest.len());
+        rest[..end].trim()
+    });
+    (callback, module)
+}
+
 /// Classify the attribution tail of an enabled_functions line (flags + callback).
+///
+/// The decision is based on the callback symbol, not on substrings anywhere in
+/// the whole line. An attacker can rename a module to contain `bpf`, `kprobe`
+/// etc., but cannot easily change the callback symbol resolved from kallsyms.
 pub(crate) fn classify_hook(attribution: &str) -> HookSource {
-    let a = attribution;
-    if a.contains("bpf") {
+    let (callback, module) = split_attribution(attribution);
+    let Some(cb) = callback.filter(|c| !c.is_empty() && !c.starts_with("0x00000000")) else {
+        return HookSource::Unresolved;
+    };
+
+    // A callback carrying a `[module]` tag came from a loaded module, and its
+    // SYMBOL name is as attacker-chosen as the module name. Genuine BPF /
+    // livepatch / kprobe ftrace handlers are built into vmlinux and are never
+    // tagged. Structural fact first, name second (RC-1, R25-28).
+    if let Some(m) = module {
+        return HookSource::Module(m.to_string());
+    }
+
+    if cb.starts_with("bpf_trampoline") || cb.starts_with("bpf_ftrace") {
         return HookSource::Bpf;
     }
-    if a.contains("klp_") || a.contains("livepatch") {
+    if cb.starts_with("klp_") {
         return HookSource::Livepatch;
     }
-    if a.contains("kprobe") {
+    if cb.starts_with("kprobe_ftrace") || cb.starts_with("kretprobe_") {
         return HookSource::Kprobe;
     }
-    if let Some(open) = a.rfind('[')
-        && let Some(close) = a[open + 1..].find(']')
-    {
-        return HookSource::Module(a[open + 1..open + 1 + close].to_string());
-    }
-    // No resolvable callback (kptr_restrict zeroes %pS) → cannot attribute.
-    if !a.contains("->") || a.contains("0x0000000000000000") {
-        return HookSource::Unresolved;
-    }
+
     HookSource::KernelBuiltin
 }
 
@@ -251,6 +278,52 @@ mod tests {
             classify_hook("->0x0000000000000000"),
             HookSource::Unresolved
         ); // kptr_restrict
+    }
+
+    #[test]
+    fn module_named_bpf_does_not_masquerade_as_bpf() {
+        // The module name is attacker-controlled. A legitimate BPF source must
+        // come from the callback symbol, not from a module called `bpf`.
+        assert_eq!(
+            classify_hook("R I ->rootkit_getdents64 [bpf]"),
+            HookSource::Module("bpf".to_string())
+        );
+    }
+
+    #[test]
+    fn callback_with_bpf_substring_is_not_auto_attributed() {
+        // A malicious callback may contain the substring "bpf" but must not be
+        // classified as BPF unless it has the known BPF trampoline prefix.
+        assert_eq!(
+            classify_hook("R I ->not_a_bpf_callback [diamorphine]"),
+            HookSource::Module("diamorphine".to_string())
+        );
+    }
+
+    #[test]
+    fn module_callback_never_classifies_as_kernel_builtin_source() {
+        // A module-provided callback may be named bpf_trampoline_* or klp_*,
+        // but kallsyms resolves module symbols too. The module tag is the
+        // structural attribution and must win over symbol prefixes.
+        assert_eq!(
+            classify_hook("R I ->bpf_trampoline_evil [rootkit]"),
+            HookSource::Module("rootkit".to_string())
+        );
+        assert_eq!(
+            classify_hook("R I ->klp_ftrace_handler [rootkit]"),
+            HookSource::Module("rootkit".to_string())
+        );
+        assert_eq!(
+            classify_hook("R I ->kprobe_ftrace_handler [rootkit]"),
+            HookSource::Module("rootkit".to_string())
+        );
+    }
+
+    #[test]
+    fn split_attribution_extracts_callback_and_module() {
+        let (cb, module) = split_attribution("R I ->hook_getdents64 [diamorphine]");
+        assert_eq!(cb, Some("hook_getdents64"));
+        assert_eq!(module, Some("diamorphine"));
     }
 
     #[test]

@@ -202,6 +202,34 @@ software, which fails the Open Source Definition — but the full scanning engin
 is readable, and free for your company to use forever. You can read every line of
 what will run as root on your servers before you run it. That's the point.
 
+**Stable exit-code contract (from v0.6.0).** Exit codes `0`, `1`, `2`, and `3`
+are part of the public interface and MUST NOT change meaning **from this release
+onwards**. They are relied upon by CI pipelines, paging systems, and downstream
+automation:
+
+> v0.5.x → v0.6.0 changed one meaning, deliberately and once: code `2` now also
+> covers a failed scanner, a host that produced no report, and results that did
+> not reach the output. Code `4` correspondingly narrowed to "no verdict at all,
+> or `--fail-on-incomplete` with incomplete coverage". Pipelines keyed on `4` for
+> failed scanners must switch to `2`, add `--fail-on-incomplete`, or read
+> `failed_scanners` from the JSONL.
+
+| Code | Meaning |
+|------|---------|
+| 0 | Clean — full coverage, no critical or compromised findings |
+| 1 | Critical findings present — full coverage |
+| 2 | Degraded — incomplete coverage: not root, warnings, failed scanner(s), missing host(s), or JSONL write errors |
+| 3 | Active compromise detected — regardless of coverage |
+
+Exit code `130` is reserved for SIGINT/SIGTERM. If a compromise was already
+recorded before the interrupt, the process may still exit `130`; consumers that
+must never miss a confirmed compromise should check JSONL/exit-code pairing in
+their wrapper or treat `130` as "inspect output before ignoring".
+
+New failure modes are assigned **new** codes (e.g. `4`, `64`, `130`); they never
+reuse or override the `0–3` band. Breaking this contract is a vulnerability, not a
+feature change.
+
 ---
 
 ## Disclosure
