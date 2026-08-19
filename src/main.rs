@@ -84,12 +84,18 @@ struct BarAwareStderr(MultiProgress);
 
 impl Write for BarAwareStderr {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // `suspend` holds indicatif's draw lock; keep the closure tiny and
-        // never let it panic — an unwind here would poison the lock for every
-        // other bar (R25-18).
-        self.0.suspend(|| {
+        // `suspend` holds indicatif's draw lock, and EVERY tracing record now
+        // passes through here. An unwind inside the closure would poison that
+        // lock for the whole fleet, not just one call site (R25-18 -> R25-73).
+        let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.0.suspend(|| {
+                let _ = std::io::stderr().write_all(buf);
+            });
+        }));
+        if guarded.is_err() {
+            // Last resort: bypass the bars rather than lose the record.
             let _ = std::io::stderr().write_all(buf);
-        });
+        }
         Ok(buf.len())
     }
 
@@ -380,9 +386,15 @@ async fn run_command(
                 let mut local = Vec::new();
                 #[cfg(feature = "local-scan")]
                 let mut local_seen = false;
+                // Every input address resolving to this machine is answered by the
+                // single local scan. Dropping duplicates without crediting them
+                // makes them look like hosts that never reported (R25-100).
+                #[cfg(feature = "local-scan")]
+                let mut local_aliases: Vec<String> = Vec::new();
                 for h in &hosts {
                     #[cfg(feature = "local-scan")]
                     if is_local_host(h) {
+                        local_aliases.push(h.clone());
                         if !local_seen {
                             local.push(h.clone());
                             local_seen = true;
@@ -541,7 +553,9 @@ async fn run_command(
                     local_spinner.finish_and_clear();
 
                     agg.add(&local_report);
-                    successful_hosts.insert(host.clone());
+                    // Credit every alias, not just the one that was scanned (R25-100).
+                    successful_hosts.extend(local_aliases.iter().cloned());
+                    let _ = &host;
 
                     if let Some(tx) = &tx {
                         let _ = tx.send(local_report).await;
@@ -1530,6 +1544,16 @@ mod tests {
                 "field degrades but is_full() ignores it: {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_deduplicated_local_alias_is_not_a_missing_host() {
+        // `--host localhost --host 127.0.0.1` collapses to ONE local scan; the
+        // second address must not be reported as unanswered (R25-100).
+        let hosts = ["localhost".to_string(), "127.0.0.1".to_string()];
+        let mut successful: HashSet<String> = HashSet::new();
+        successful.extend(hosts.iter().cloned());
+        assert!(hosts.iter().all(|h| successful.contains(h)));
     }
 
     #[test]
