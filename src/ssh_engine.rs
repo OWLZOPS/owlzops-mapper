@@ -73,6 +73,11 @@ pub(crate) enum SudoOutcome {
     NeedsTty,
     /// sudoers does not authorise this command for this user.
     NotPermitted,
+    /// `sudo` is not installed. Recognisable, not terminal: a minimal image or
+    /// a root SSH login needs no sudo, and aborting the host here reports a
+    /// healthy machine as a scan failure with a misleading arch/noexec hint
+    /// (R25-101).
+    NotInstalled,
     /// Recognised nothing. Never treated as success.
     Unknown,
 }
@@ -87,6 +92,12 @@ pub(crate) enum SudoOutcome {
 pub(crate) fn classify_sudo_stderr(se: &str) -> SudoOutcome {
     if se.contains("no tty present") || se.contains("you must have a tty") {
         SudoOutcome::NeedsTty
+    } else if se.contains("sudo: not found")           // dash / sh
+        || se.contains("sudo: command not found")      // bash
+        || se.contains("command not found: sudo")
+    // zsh
+    {
+        SudoOutcome::NotInstalled
     } else if se.contains("is not allowed to execute") || se.contains("is not in the sudoers file")
     {
         SudoOutcome::NotPermitted
@@ -121,7 +132,8 @@ pub(crate) fn sudo_error_kind(use_sudo: bool, se: &str) -> Option<SudoErrorKind>
         SudoOutcome::BadPassword | SudoOutcome::PasswordRequired => Some(SudoErrorKind::Auth),
         SudoOutcome::NeedsTty => Some(SudoErrorKind::Tty),
         SudoOutcome::NotPermitted => Some(SudoErrorKind::NotPermitted),
-        SudoOutcome::Ok | SudoOutcome::Unknown => None,
+        // NotInstalled cannot reach the main exec path: `use_sudo` is false.
+        SudoOutcome::Ok | SudoOutcome::NotInstalled | SudoOutcome::Unknown => None,
     }
 }
 
@@ -656,6 +668,10 @@ async fn validate_sudo_password(
             SudoOutcome::NotPermitted => RemoteError::SudoNotPermitted {
                 host: host.to_string(),
                 path: None,
+                detail,
+            },
+            SudoOutcome::NotInstalled => RemoteError::SudoAuth {
+                host: host.to_string(),
                 detail,
             },
             SudoOutcome::BadPassword | SudoOutcome::PasswordRequired | SudoOutcome::Unknown => {
@@ -1194,10 +1210,12 @@ pub async fn run_remote_scan_russh(
                                 ),
                             });
                         }
-                        SudoOutcome::PasswordRequired | SudoOutcome::NotPermitted => {
+                        SudoOutcome::PasswordRequired
+                        | SudoOutcome::NotPermitted
+                        | SudoOutcome::NotInstalled => {
                             remote_coverage.notes.push(format!(
-                                "remote {hostname}: scanned WITHOUT root — sudo unavailable; \
-                                 privileged surfaces were not read"
+                                "remote {hostname}: scanned WITHOUT sudo; unless the SSH user \
+                                 is already root, privileged surfaces were not read"
                             ));
                             remote_coverage.privileged = Some(false);
                             false
