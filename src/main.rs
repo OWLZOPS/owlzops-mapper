@@ -295,6 +295,60 @@ fn outcome_for_writer_failure(agg: OutcomeBuilder, hosts_requested: usize) -> Ou
     outcome
 }
 
+/// Strict JSONL parser for `compare --multi-host`.
+/// Accepts either a JSON array, a single JSON object, or newline-delimited
+/// JSON records. Unlike the previous permissive version, any unreadable line
+/// is an error: dropping a record silently would make a host appear as
+/// "removed" in the diff, which is worse than refusing to diff.
+///
+/// R26-05: refusing to diff on unreadable lines prevents a dropped record
+/// from being shown as "host removed".
+fn parse_jsonl_strict(data: &str, label: &str) -> Result<Vec<AgentReport>, String> {
+    // Try a full JSON array first (e.g. from a non-streaming fleet output).
+    if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
+        return Ok(reports);
+    }
+    // Then a single JSON object (legacy single-host snapshot).
+    if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
+        return Ok(vec![report]);
+    }
+
+    // JSONL mode: every non-empty line must be a valid AgentReport.
+    let mut jsonl = Vec::new();
+    let mut bad: Vec<(usize, String)> = Vec::new();
+    for (n, line) in data
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        match serde_json::from_str::<AgentReport>(line) {
+            Ok(r) => jsonl.push(r),
+            Err(e) => bad.push((n + 1, e.to_string())),
+        }
+    }
+
+    if !bad.is_empty() {
+        let mut msg = String::new();
+        for (n, e) in bad.iter().take(5) {
+            msg.push_str(&format!("'{label}' line {n}: {e}\n"));
+        }
+        msg.push_str(&format!(
+            "Error: {} of {} JSONL record(s) in '{label}' are unreadable. \
+             Refusing to diff — an unparsed host is indistinguishable from a \
+             decommissioned one. Re-run the scan or fix the file.",
+            bad.len(),
+            bad.len() + jsonl.len()
+        ));
+        return Err(msg);
+    }
+
+    if jsonl.is_empty() {
+        return Err(format!("No valid JSONL records found in '{label}'"));
+    }
+
+    Ok(jsonl)
+}
+
 /// Used by runner and scanner modules to adapt coverage hints. Keep here as
 /// the crate-root helper shared across the binary.
 pub(crate) fn is_running_as_root() -> bool {
@@ -1107,26 +1161,20 @@ async fn run_command(
             });
 
             if cmp_args.multi_host {
-                let parse_array = |data: &str, label: &str| -> Vec<AgentReport> {
-                    if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
-                        return reports;
+                let before = match parse_jsonl_strict(&before_data, "before") {
+                    Ok(reports) => reports,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(EXIT_INCOMPLETE);
                     }
-                    if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
-                        return vec![report];
-                    }
-                    let jsonl: Vec<AgentReport> = data
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .filter_map(|l| serde_json::from_str(l).ok())
-                        .collect();
-                    if !jsonl.is_empty() {
-                        return jsonl;
-                    }
-                    eprintln!("Invalid JSON in '{}' file", label);
-                    std::process::exit(1);
                 };
-                let before = parse_array(&before_data, "before");
-                let after = parse_array(&after_data, "after");
+                let after = match parse_jsonl_strict(&after_data, "after") {
+                    Ok(reports) => reports,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(EXIT_INCOMPLETE);
+                    }
+                };
                 let diffs = compare::compare_multi(&before, &after);
 
                 match cmp_args.format {
@@ -1562,5 +1610,22 @@ mod tests {
             FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN > FLEET_TEARDOWN_GRACE + JSONL_DRAIN_TIMEOUT,
             "watchdog must not fire before the JSONL writer has drained"
         );
+    }
+
+    #[test]
+    fn strict_jsonl_parse_rejects_unreadable_lines() {
+        let good = serde_json::to_string(&minimal_report()).unwrap();
+        // Corrupt JSON by dropping the final closing brace.
+        let bad = good[..good.len() - 1].to_string();
+        let input = format!("{good}\n{bad}\n");
+        assert!(parse_jsonl_strict(&input, "test").is_err());
+    }
+
+    #[test]
+    fn strict_jsonl_parse_accepts_valid_lines() {
+        let good = serde_json::to_string(&minimal_report()).unwrap();
+        let input = format!("{good}\n{good}\n");
+        let reports = parse_jsonl_strict(&input, "test").unwrap();
+        assert_eq!(reports.len(), 2);
     }
 }
