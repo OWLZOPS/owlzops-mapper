@@ -851,7 +851,7 @@ mod tests {
         let result = run_child_with_timeout("sleep", &["60"], 1);
         assert!(result.is_none());
     }
-
+    #[cfg(target_os = "linux")]
     #[test]
     fn wait_group_safe_reaps_and_returns_status() {
         let mut child = hardened_command("/bin/true", &[])
