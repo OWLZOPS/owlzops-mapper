@@ -102,17 +102,21 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
     })
 }
 
-/// Check whether an entry is a NOPASSWD: ALL rule.
-/// Uses the unified parser for consistency with security.rs.
-fn is_nopasswd_all(entry: &str) -> bool {
+/// Check whether an entry is a NOPASSWD: ALL rule, taking `Cmnd_Alias`
+/// definitions into account.
+///
+/// R26-06: `deploy ALL=(ALL) NOPASSWD: MAINTENANCE` with
+/// `Cmnd_Alias MAINTENANCE = ALL` is the same grant and must be detected.
+fn is_nopasswd_all(entry: &str, aliases: &sudoers::CmndAliases) -> bool {
     if !sudoers::entry_has_nopasswd(entry) {
         return false;
     }
-    // Look for an "ALL" token after a colon (the command list)
+    // Look for the command list after the last colon and expand aliases.
     if let Some(tail) = entry.rsplit(':').next() {
         tail.split([',', ' ', '\t'])
             .map(str::trim)
-            .any(|t| t == "ALL")
+            .filter(|t| !t.is_empty())
+            .any(|t| aliases.resolves_to_all(t, 0))
     } else {
         false
     }
@@ -178,10 +182,15 @@ pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
             .push("/etc/passwd unreadable — account enumeration incomplete".into());
     }
 
-    // Use the unified sudoers parser for NOPASSWD: ALL detection.
+    // First pass: collect Cmnd_Alias definitions from all sudoers files.
+    let mut cmnd_aliases = sudoers::CmndAliases::default();
+    sudoers::each_sudoers_entry(|_file, entry| {
+        cmnd_aliases.absorb(entry);
+    });
+
+    // Second pass: detect NOPASSWD: ALL with alias expansion.
     sudoers::each_sudoers_entry(|file, entry| {
-        if is_nopasswd_all(entry) {
-            // Extract the principal (first word) from the logical entry.
+        if is_nopasswd_all(entry, &cmnd_aliases) {
             let principal = entry.split_whitespace().next().unwrap_or("?").to_string();
             result.sudoers_nopasswd_all.push(SudoersEntry {
                 principal,
@@ -192,4 +201,24 @@ pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
     });
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmnd_alias_indirection_is_detected_as_nopasswd_all() {
+        let mut aliases = sudoers::CmndAliases::default();
+        aliases.absorb("Cmnd_Alias MAINTENANCE = ALL");
+        let entry = "deploy ALL=(ALL) NOPASSWD: MAINTENANCE";
+        assert!(is_nopasswd_all(entry, &aliases));
+    }
+
+    #[test]
+    fn non_alias_path_does_not_match() {
+        let aliases = sudoers::CmndAliases::default();
+        let entry = "deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl";
+        assert!(!is_nopasswd_all(entry, &aliases));
+    }
 }

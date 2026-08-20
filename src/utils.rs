@@ -340,6 +340,16 @@ pub fn sanitize_for_log(s: &str) -> String {
     sanitize_and_truncate(s, 300)
 }
 
+/// Neutralise codepoints that change how neighbouring text renders, for any
+/// document sink (XLSX cells, Typst report, CSV). Unlike `sanitize_for_log`
+/// this does NOT truncate: a report must not silently lose a long path.
+/// R26-07: the same predicate backs every sanitizer.
+pub fn sanitize_for_document(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_terminal_unsafe(c) { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Known malware / miner process names
 // ---------------------------------------------------------------------------
@@ -444,6 +454,33 @@ fn peek_exited(pid: u32) -> bool {
     rc == 0 && unsafe { info.si_pid() } == pid as libc::pid_t
 }
 
+/// Non-destructive wait: waits until the child has exited, then kills its
+/// process group BEFORE reaping, so the PGID cannot be recycled before the
+/// group kill (R24-34/R25-98/R26-01). Uses exponential backoff.
+fn wait_group_safe(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
+    let pid = child.id();
+    let start = Instant::now();
+    const POLL_MIN: Duration = Duration::from_micros(200);
+    const POLL_MAX: Duration = Duration::from_millis(50);
+    let mut backoff = POLL_MIN;
+
+    loop {
+        if peek_exited(pid) {
+            // Group killed BEFORE the reap: the PGID is still ours.
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            return child.wait().ok();
+        }
+        if start.elapsed() < deadline {
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(POLL_MAX);
+        } else {
+            // Timeout: kill group and reap, no status available.
+            kill_group_and_reap(child);
+            return None;
+        }
+    }
+}
+
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
@@ -494,36 +531,10 @@ pub fn run_child_with_timeout(
     });
 
     let deadline = Duration::from_secs(timeout_secs);
-    let start = Instant::now();
 
-    // Exponential backoff, NOT a flat tick. `rpm -qf` answers in ~10 ms, so a
-    // fixed 50 ms poll made every one of the 434 per-file queries cost 50 ms —
-    // roughly 22 s of pure sleeping on Fedora while dpkg hosts were unaffected
-    // because they spawn no per-file child (R25-93).
-    const POLL_MIN: Duration = Duration::from_micros(200);
-    const POLL_MAX: Duration = Duration::from_millis(50);
-    let mut backoff = POLL_MIN;
-
-    let status = loop {
-        if peek_exited(child_pid) {
-            // Group killed BEFORE the reap: the PGID is still ours.
-            unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
-            match child.wait() {
-                Ok(status) => break status,
-                Err(_) => {
-                    drop(out_handle);
-                    drop(err_handle);
-                    unregister_child(child_pid);
-                    return None;
-                }
-            }
-        }
-
-        if start.elapsed() < deadline {
-            thread::sleep(backoff);
-            backoff = (backoff * 2).min(POLL_MAX);
-        } else {
-            kill_group_and_reap(&mut child);
+    let status = match wait_group_safe(&mut child, deadline) {
+        Some(status) => status,
+        None => {
             drop(out_handle);
             drop(err_handle);
             unregister_child(child_pid);
@@ -537,30 +548,6 @@ pub fn run_child_with_timeout(
         stdout: out_handle.join().unwrap_or_default(),
         stderr: err_handle.join().unwrap_or_default(),
     })
-}
-
-/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
-/// R10-05: defensive reap in the `Err(_)` branch so no zombie escapes.
-/// R24-04: uses group kill to reach grandchildren.
-fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if start.elapsed() < deadline => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                kill_group_and_reap(child);
-                return child.wait().ok();
-            }
-            Err(_) => {
-                // try_wait failed (realistically ECHILD) – reap defensively
-                kill_group_and_reap(child);
-                return None;
-            }
-        }
-    }
 }
 
 pub fn run_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
@@ -620,11 +607,9 @@ fn run_with_timeout_inner(
 
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(stdout) => {
-            let status = poll_wait(&mut child, Duration::from_secs(2));
-            // The child exited (or was killed), but there might still be
-            // orphaned grandchildren writing to the pipe — ensure they are
-            // terminated so the reader thread does not deadlock.
-            unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
+            // R26-01: the group kill is issued INSIDE wait_group_safe, before
+            // the reap. Killing after wait() can land on a recycled PGID.
+            let status = wait_group_safe(&mut child, Duration::from_secs(2));
             let result = if require_success {
                 match status {
                     Some(s) if s.success() => Some(stdout),
@@ -875,6 +860,22 @@ mod tests {
     fn run_child_with_timeout_timeout_kills_child() {
         let result = run_child_with_timeout("sleep", &["60"], 1);
         assert!(result.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_group_safe_reaps_and_returns_status() {
+        let mut child = hardened_command("/bin/true", &[])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/true");
+        let st = wait_group_safe(&mut child, Duration::from_secs(2));
+        assert!(st.is_some_and(|s| s.success()));
+        assert!(
+            child.wait().is_ok(),
+            "second wait must use the cached status"
+        );
     }
 
     #[test]

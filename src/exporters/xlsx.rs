@@ -10,17 +10,24 @@ use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksh
 /// as a formula (`=`, `+`, `-`, `@`) by Excel / LibreOffice.  This prevents
 /// the trivial bypass where an attacker prepends a tab or space before the
 /// formula trigger.
-/// All attacker‑controlled strings written to a workbook MUST pass through
-/// this function (see PIVOT-2 in threat model).
+///
+/// R26-07: bidi/zero-width first. Excel honours them when rendering the cell,
+/// so `/tmp/\u{202E}gnp.sh` would display as `/tmp/hs.png`. All attacker‑
+/// controlled strings written to a workbook MUST pass through this function.
 fn sanitize_xlsx(s: &str) -> String {
-    let first = s
-        .trim_start_matches(|c: char| c.is_whitespace() || c.is_control())
-        .chars()
-        .next();
-    match first {
-        Some('=') | Some('+') | Some('-') | Some('@') => format!("'{}", s),
-        _ => s.to_string(),
-    }
+    // Formula guard must inspect the RAW string: leading whitespace/control
+    // is stripped only for deciding whether a formula trigger follows.
+    let formula_guard = {
+        let first = s
+            .trim_start_matches(|c: char| c.is_whitespace() || c.is_control())
+            .chars()
+            .next();
+        matches!(first, Some('=') | Some('+') | Some('-') | Some('@'))
+    };
+
+    let s = crate::utils::sanitize_for_document(s);
+
+    if formula_guard { format!("'{s}") } else { s }
 }
 
 // =====================================================================
@@ -1915,5 +1922,19 @@ mod tests {
         let metadata = std::fs::metadata(&tmp).unwrap();
         assert!(metadata.len() > 0);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn sanitize_xlsx_removes_bidi_override() {
+        let input = "/tmp/\u{202E}gnp.sh";
+        let out = sanitize_xlsx(input);
+        assert!(!out.contains('\u{202E}'));
+        assert!(out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn sanitize_xlsx_formula_guard_after_unicode_pass() {
+        assert!(sanitize_xlsx("=cmd|'/c calc'!A1").starts_with('\''));
+        assert!(sanitize_xlsx("\t@SUM(A1)").starts_with('\''));
     }
 }

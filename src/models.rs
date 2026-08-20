@@ -190,7 +190,9 @@ pub struct DatabaseInfo {
     pub size_mb: u64,
 }
 
+// R26-11: container-level serde(default) for backward-compatible JSON reads.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct NetworkInfo {
     pub firewall_active: bool,
     pub dns_resolvers: Vec<String>,
@@ -210,7 +212,8 @@ pub struct SslCertInfo {
     pub is_warning: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct PortInfo {
     pub protocol: String,
     pub port: String,
@@ -332,6 +335,7 @@ pub enum ProvenanceSource {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,

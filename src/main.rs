@@ -289,10 +289,69 @@ fn outcome_for(report: &AgentReport) -> Outcome {
 
 /// Build an Outcome for a failed writer. The aggregate is already collected;
 /// only the delivery of the final report failed, which is coverage.
-fn outcome_for_writer_failure(agg: OutcomeBuilder, hosts_requested: usize) -> Outcome {
-    let mut outcome = agg.finish(hosts_requested, 0);
+/// R26-09: `records_lost` must include failed channel sends as well.
+fn outcome_for_writer_failure(
+    agg: OutcomeBuilder,
+    hosts_requested: usize,
+    records_lost: usize,
+) -> Outcome {
+    let mut outcome = agg.finish(hosts_requested, records_lost);
     outcome.coverage.output_failed = true;
     outcome
+}
+
+/// Strict JSONL parser for `compare --multi-host`.
+/// Accepts either a JSON array, a single JSON object, or newline-delimited
+/// JSON records. Unlike the previous permissive version, any unreadable line
+/// is an error: dropping a record silently would make a host appear as
+/// "removed" in the diff, which is worse than refusing to diff.
+///
+/// R26-05: refusing to diff on unreadable lines prevents a dropped record
+/// from being shown as "host removed".
+fn parse_jsonl_strict(data: &str, label: &str) -> Result<Vec<AgentReport>, String> {
+    // Try a full JSON array first (e.g. from a non-streaming fleet output).
+    if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
+        return Ok(reports);
+    }
+    // Then a single JSON object (legacy single-host snapshot).
+    if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
+        return Ok(vec![report]);
+    }
+
+    // JSONL mode: every non-empty line must be a valid AgentReport.
+    let mut jsonl = Vec::new();
+    let mut bad: Vec<(usize, String)> = Vec::new();
+    for (n, line) in data
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        match serde_json::from_str::<AgentReport>(line) {
+            Ok(r) => jsonl.push(r),
+            Err(e) => bad.push((n + 1, e.to_string())),
+        }
+    }
+
+    if !bad.is_empty() {
+        let mut msg = String::new();
+        for (n, e) in bad.iter().take(5) {
+            msg.push_str(&format!("'{label}' line {n}: {e}\n"));
+        }
+        msg.push_str(&format!(
+            "Error: {} of {} JSONL record(s) in '{label}' are unreadable. \
+             Refusing to diff — an unparsed host is indistinguishable from a \
+             decommissioned one. Re-run the scan or fix the file.",
+            bad.len(),
+            bad.len() + jsonl.len()
+        ));
+        return Err(msg);
+    }
+
+    if jsonl.is_empty() {
+        return Err(format!("No valid JSONL records found in '{label}'"));
+    }
+
+    Ok(jsonl)
 }
 
 /// Used by runner and scanner modules to adapt coverage hints. Keep here as
@@ -430,6 +489,8 @@ async fn run_command(
                 // Aggregator lives in the main task from this point on, so
                 // writer failure can never erase a recorded verdict.
                 let mut agg = OutcomeBuilder::default();
+                // R26-09: failed sends to the JSONL channel are lost records.
+                let mut send_failures = 0usize;
 
                 // Fail-fast: create the output file before launching any scan
                 let output_path = args.output.clone();
@@ -558,7 +619,11 @@ async fn run_command(
                     let _ = &host;
 
                     if let Some(tx) = &tx {
-                        let _ = tx.send(local_report).await;
+                        // R26-09: a closed channel is a lost record.
+                        if tx.send(local_report).await.is_err() {
+                            send_failures += 1;
+                            warn!("JSONL channel closed — report dropped");
+                        }
                     } else {
                         reports.push(local_report);
                     }
@@ -744,7 +809,11 @@ async fn run_command(
                                                     agg.add(&report);
                                                     successful_hosts.insert(host);
                                                     if let Some(s) = &tx {
-                                                        let _ = s.send(report).await;
+                                                        // R26-09: count channel send failures.
+                                                        if s.send(report).await.is_err() {
+                                                            send_failures += 1;
+                                                            warn!("JSONL channel closed — report dropped");
+                                                        }
                                                     } else {
                                                         reports.push(report);
                                                     }
@@ -773,7 +842,11 @@ async fn run_command(
                                                 agg.add(&report);
                                                 successful_hosts.insert(host);
                                                 if let Some(sender) = &tx {
-                                                    let _ = sender.send(report).await;
+                                                    // R26-09: count channel send failures.
+                                                    if sender.send(report).await.is_err() {
+                                                        send_failures += 1;
+                                                        warn!("JSONL channel closed — report dropped");
+                                                    }
                                                 } else {
                                                     reports.push(report);
                                                 }
@@ -815,7 +888,8 @@ async fn run_command(
                                 warn!(
                                     "JSONL writer timed out during shutdown, output may be incomplete"
                                 );
-                                let outcome = outcome_for_writer_failure(agg, hosts_requested);
+                                let outcome =
+                                    outcome_for_writer_failure(agg, hosts_requested, send_failures);
                                 if interrupted
                                     && outcome.verdict == Some(SecurityVerdict::Compromised)
                                 {
@@ -844,14 +918,16 @@ async fn run_command(
                     };
                     match joined {
                         Ok((written, io_errors)) => {
-                            if io_errors > 0 {
+                            // R26-09: include channel send failures in total lost.
+                            let total_lost = io_errors + send_failures;
+                            if total_lost > 0 {
                                 warn!(
                                     written,
-                                    io_errors,
+                                    lost = total_lost,
                                     "JSONL output incomplete — returning degraded exit code"
                                 );
                             }
-                            let outcome = agg.finish(hosts_requested, io_errors);
+                            let outcome = agg.finish(hosts_requested, total_lost);
 
                             if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
                             {
@@ -877,7 +953,8 @@ async fn run_command(
                         }
                         Err(_) => {
                             warn!("JSONL writer task failed");
-                            let outcome = outcome_for_writer_failure(agg, hosts_requested);
+                            let outcome =
+                                outcome_for_writer_failure(agg, hosts_requested, send_failures);
                             if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
                             {
                                 let missing_hosts: Vec<String> = hosts
@@ -903,6 +980,7 @@ async fn run_command(
                 }
 
                 // Non-streaming fleet path: aggregate once.
+                // send_failures is zero here because no channel was used.
                 let mut outcome = agg.finish(hosts_requested, 0);
 
                 if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised) {
@@ -1107,26 +1185,20 @@ async fn run_command(
             });
 
             if cmp_args.multi_host {
-                let parse_array = |data: &str, label: &str| -> Vec<AgentReport> {
-                    if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
-                        return reports;
+                let before = match parse_jsonl_strict(&before_data, "before") {
+                    Ok(reports) => reports,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(EXIT_INCOMPLETE);
                     }
-                    if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
-                        return vec![report];
-                    }
-                    let jsonl: Vec<AgentReport> = data
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .filter_map(|l| serde_json::from_str(l).ok())
-                        .collect();
-                    if !jsonl.is_empty() {
-                        return jsonl;
-                    }
-                    eprintln!("Invalid JSON in '{}' file", label);
-                    std::process::exit(1);
                 };
-                let before = parse_array(&before_data, "before");
-                let after = parse_array(&after_data, "after");
+                let after = match parse_jsonl_strict(&after_data, "after") {
+                    Ok(reports) => reports,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(EXIT_INCOMPLETE);
+                    }
+                };
                 let diffs = compare::compare_multi(&before, &after);
 
                 match cmp_args.format {
@@ -1562,5 +1634,22 @@ mod tests {
             FLEET_TEARDOWN_GRACE + HARD_EXIT_MARGIN > FLEET_TEARDOWN_GRACE + JSONL_DRAIN_TIMEOUT,
             "watchdog must not fire before the JSONL writer has drained"
         );
+    }
+
+    #[test]
+    fn strict_jsonl_parse_rejects_unreadable_lines() {
+        let good = serde_json::to_string(&minimal_report()).unwrap();
+        // Corrupt JSON by dropping the final closing brace.
+        let bad = good[..good.len() - 1].to_string();
+        let input = format!("{good}\n{bad}\n");
+        assert!(parse_jsonl_strict(&input, "test").is_err());
+    }
+
+    #[test]
+    fn strict_jsonl_parse_accepts_valid_lines() {
+        let good = serde_json::to_string(&minimal_report()).unwrap();
+        let input = format!("{good}\n{good}\n");
+        let reports = parse_jsonl_strict(&input, "test").unwrap();
+        assert_eq!(reports.len(), 2);
     }
 }
