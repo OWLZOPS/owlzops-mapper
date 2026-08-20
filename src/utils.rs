@@ -340,6 +340,16 @@ pub fn sanitize_for_log(s: &str) -> String {
     sanitize_and_truncate(s, 300)
 }
 
+/// Neutralise codepoints that change how neighbouring text renders, for any
+/// document sink (XLSX cells, Typst report, CSV). Unlike `sanitize_for_log`
+/// this does NOT truncate: a report must not silently lose a long path.
+/// R26-07: the same predicate backs every sanitizer.
+pub fn sanitize_for_document(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_terminal_unsafe(c) { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Known malware / miner process names
 // ---------------------------------------------------------------------------
