@@ -33,6 +33,12 @@ pub fn logical_lines(content: &str) -> Vec<String> {
         continuation.push_str(line);
         if line.ends_with('\\') {
             continuation.truncate(continuation.len() - 1);
+            // R26-08: honour the documented "single space" contract. The
+            // physical line usually ends with " \", and the join above adds
+            // another space before the next line.
+            while continuation.ends_with(' ') {
+                continuation.pop();
+            }
         } else {
             result.push(std::mem::take(&mut continuation));
         }
@@ -297,6 +303,13 @@ mod tests {
         let lines = logical_lines(input);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "root ALL=(ALL) ALL");
+    }
+
+    #[test]
+    fn continuation_join_never_doubles_whitespace() {
+        let lines = logical_lines("deploy ALL=(ALL) NOPASSWD: \\\nALL\n");
+        assert_eq!(lines, vec!["deploy ALL=(ALL) NOPASSWD: ALL".to_string()]);
+        assert!(lines[0].to_lowercase().contains("nopasswd: all"));
     }
 
     #[test]
