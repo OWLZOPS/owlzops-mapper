@@ -229,8 +229,10 @@ fn detect_prologue(buf: &[u8]) -> Option<Prologue> {
 }
 
 fn scan_pointers(buf: &[u8], r: &PointerResolver) -> Vec<ResolvedPointer> {
-    buf.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+    buf.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .filter(|&v| (0x1_0000..0x0000_8000_0000_0000).contains(&v))
         .map(|v| {
             let (kind, label) = r.resolve(v);
