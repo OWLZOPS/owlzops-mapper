@@ -2,11 +2,16 @@
 //! handling line continuations, and providing logical entries.
 //! Used by both `security.rs` (NOPASSWD detection) and `access.rs` (NOPASSWD: ALL).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{coverage, safe_io};
+
+/// Maximum alias expansion depth. Mirrors the include-depth limit: a transitive
+/// `Cmnd_Alias A = B`, `B = C`, … chain longer than this is treated as
+/// unresolvable, exactly like sudo's own parser.
+const MAX_ALIAS_DEPTH: u8 = 16;
 
 /// Yield logical (continuation-joined) lines from sudoers content.
 /// Lines ending with a backslash are joined with the next line, preserving
@@ -75,6 +80,52 @@ fn include_target(line: &str) -> Option<(&str, bool)> {
 const MAX_SUDOERS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INCLUDE_DEPTH: u8 = 16;
 const MAX_SUDOERS_FILES: usize = 512;
+
+/// Collected `Cmnd_Alias NAME = a, b, c` definitions.
+/// Transitive by design: `Cmnd_Alias A = ALL` + `Cmnd_Alias B = A` must both
+/// resolve to ALL.
+#[derive(Default)]
+pub struct CmndAliases(HashMap<String, Vec<String>>);
+
+impl CmndAliases {
+    /// Absorb a `Cmnd_Alias` definition if `entry` is one.
+    /// Only the first `=` after the alias name is considered; the RHS is
+    /// split on commas exactly like sudo does.
+    pub fn absorb(&mut self, entry: &str) {
+        let Some(rest) = entry.strip_prefix("Cmnd_Alias") else {
+            return;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            return;
+        }
+        let Some((name, list)) = rest.trim().split_once('=') else {
+            return;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let members: Vec<String> = list
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        self.0.insert(name.to_string(), members);
+    }
+
+    /// True if `token` resolves — directly or through aliases — to `ALL`.
+    pub fn resolves_to_all(&self, token: &str, depth: u8) -> bool {
+        if token == "ALL" {
+            return true;
+        }
+        if depth >= MAX_ALIAS_DEPTH {
+            return false;
+        }
+        self.0
+            .get(token)
+            .is_some_and(|members| members.iter().any(|m| self.resolves_to_all(m, depth + 1)))
+    }
+}
 
 /// Canonical key for the visited set – always an absolute, cleaned path.
 fn canon_path_key(path: &str) -> String {
@@ -262,5 +313,17 @@ mod tests {
         assert!(entry_has_nopasswd("user ALL=(ALL) NOPASSWD : /bin/foo"));
         assert!(entry_has_nopasswd("user ALL=(ALL) NOPASSWD  : /bin/foo"));
         assert!(!entry_has_nopasswd("user ALL=(ALL) PASSWD: ALL"));
+    }
+
+    #[test]
+    fn cmnd_alias_indirection_is_still_nopasswd_all() {
+        let mut a = CmndAliases::default();
+        a.absorb("Cmnd_Alias MAINTENANCE = ALL");
+        a.absorb("Cmnd_Alias WRAPPER = MAINTENANCE");
+        assert!(
+            a.resolves_to_all("WRAPPER", 0),
+            "transitive alias must resolve"
+        );
+        assert!(!a.resolves_to_all("/usr/bin/systemctl", 0));
     }
 }
