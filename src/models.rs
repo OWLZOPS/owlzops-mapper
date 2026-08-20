@@ -190,6 +190,7 @@ pub struct DatabaseInfo {
     pub size_mb: u64,
 }
 
+// R26-11: container-level serde(default) for backward-compatible JSON reads.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct NetworkInfo {
