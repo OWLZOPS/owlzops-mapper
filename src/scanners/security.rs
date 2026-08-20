@@ -39,53 +39,81 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
 fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
     let mut config_lines = Vec::new();
 
-    // Read the main config file
-    if let Ok((contents, truncated)) =
-        safe_io::read_file_capped("/etc/ssh/sshd_config", 4 * 1024 * 1024)
-    {
-        if truncated {
-            coverage::record("/etc/ssh/sshd_config truncated".to_string());
-        }
-        for line in contents.lines() {
-            let clean = line.trim();
-            if clean.is_empty() || clean.starts_with('#') {
-                continue;
+    // Read the main config file.
+    // R26-02: host-controlled path MUST use read_file_capped_regular.
+    match safe_io::read_file_capped_regular("/etc/ssh/sshd_config", 4 * 1024 * 1024) {
+        Ok((contents, truncated)) => {
+            if truncated {
+                coverage::record("/etc/ssh/sshd_config truncated".to_string());
             }
-            if clean.starts_with("Include") {
-                let path_part = clean.strip_prefix("Include").unwrap_or("").trim();
-                if path_part.is_empty() {
+            for line in contents.lines() {
+                let clean = line.trim();
+                if clean.is_empty() || clean.starts_with('#') {
                     continue;
                 }
-                // Expand glob pattern if present
-                if path_part.contains('*') {
-                    if let Some(parent) = std::path::Path::new(path_part).parent()
-                        && let Some(_pattern) = std::path::Path::new(path_part).file_name()
-                        && let Ok(entries) = std::fs::read_dir(parent)
-                    {
-                        // R22-06: collect and sort paths to match sshd's lexicographic order
-                        let mut include_paths: Vec<PathBuf> = entries
-                            .flatten()
-                            .map(|e| e.path())
-                            .filter(|p| {
-                                p.file_name()
-                                    .map(|n| {
-                                        let n = n.to_string_lossy();
-                                        n.ends_with(".conf") && !n.starts_with('.')
-                                    })
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        include_paths.sort(); // sshd reads includes in alphabetical order
+                if clean.starts_with("Include") {
+                    let path_part = clean.strip_prefix("Include").unwrap_or("").trim();
+                    if path_part.is_empty() {
+                        continue;
+                    }
+                    // Expand glob pattern if present
+                    if path_part.contains('*') {
+                        if let Some(parent) = std::path::Path::new(path_part).parent()
+                            && let Some(_pattern) = std::path::Path::new(path_part).file_name()
+                            && let Ok(entries) = std::fs::read_dir(parent)
+                        {
+                            // R22-06: collect and sort paths to match sshd's lexicographic order
+                            let mut include_paths: Vec<PathBuf> = entries
+                                .flatten()
+                                .map(|e| e.path())
+                                .filter(|p| {
+                                    p.file_name()
+                                        .map(|n| {
+                                            let n = n.to_string_lossy();
+                                            n.ends_with(".conf") && !n.starts_with('.')
+                                        })
+                                        .unwrap_or(false)
+                                })
+                                .collect();
+                            include_paths.sort(); // sshd reads includes in alphabetical order
 
-                        for path in include_paths {
-                            if let Ok((inc_contents, inc_trunc)) = safe_io::read_file_capped(
-                                path.to_str().unwrap_or(""),
-                                4 * 1024 * 1024,
-                            ) {
+                            for path in include_paths {
+                                match safe_io::read_file_capped_regular(
+                                    path.to_str().unwrap_or(""),
+                                    4 * 1024 * 1024,
+                                ) {
+                                    Ok((inc_contents, inc_trunc)) => {
+                                        if inc_trunc {
+                                            coverage::record(format!(
+                                                "sshd config include {} truncated",
+                                                path.display()
+                                            ));
+                                        }
+                                        for l in inc_contents.lines() {
+                                            let l = l.trim();
+                                            if !l.is_empty() && !l.starts_with('#') {
+                                                config_lines.push(l.to_string());
+                                            }
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                                        coverage::record(format!(
+                                            "sshd include {} is NOT a regular file (fifo/device) — \
+                                             parse refused; treat as tampering",
+                                            path.display()
+                                        ));
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                    } else {
+                        match safe_io::read_file_capped_regular(path_part, 4 * 1024 * 1024) {
+                            Ok((inc_contents, inc_trunc)) => {
                                 if inc_trunc {
                                     coverage::record(format!(
                                         "sshd config include {} truncated",
-                                        path.display()
+                                        path_part
                                     ));
                                 }
                                 for l in inc_contents.lines() {
@@ -95,24 +123,33 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
                                     }
                                 }
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                                coverage::record(format!(
+                                    "sshd include {path_part} is NOT a regular file (fifo/device) — \
+                                     parse refused; treat as tampering"
+                                ));
+                            }
+                            Err(_) => {}
                         }
                     }
-                } else if let Ok((inc_contents, inc_trunc)) =
-                    safe_io::read_file_capped(path_part, 4 * 1024 * 1024)
-                {
-                    if inc_trunc {
-                        coverage::record(format!("sshd config include {} truncated", path_part));
-                    }
-                    for l in inc_contents.lines() {
-                        let l = l.trim();
-                        if !l.is_empty() && !l.starts_with('#') {
-                            config_lines.push(l.to_string());
-                        }
-                    }
+                } else {
+                    config_lines.push(clean.to_string());
                 }
-            } else {
-                config_lines.push(clean.to_string());
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            coverage::record(
+                "/etc/ssh/sshd_config is NOT a regular file (fifo/device) — \
+                 parse refused; treat as tampering"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            coverage::record(format!(
+                "/etc/ssh/sshd_config unreadable ({}) — SSH config fallback incomplete",
+                e.kind()
+            ));
         }
     }
 
@@ -384,47 +421,63 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     let mut shell_usernames: Vec<String> = Vec::new();
     let mut auth_keys_map: HashMap<String, usize> = HashMap::new();
 
-    if let Ok((contents, truncated)) = safe_io::read_file_capped("/etc/passwd", 4 * 1024 * 1024) {
-        if truncated {
-            coverage::record("/etc/passwd truncated".to_string());
-        }
-        for line in contents.lines() {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() == 7 && valid_shells.contains(parts[6]) {
-                let username = parts[0].to_string();
-
-                // Count authorized keys (R24-11: use capped-regular to prevent
-                // FIFO / device hangs and to honour the Capped I/O doctrine).
-                let home = parts[5];
-                let auth_keys_path = format!("{}/.ssh/authorized_keys", home);
-                let count = match safe_io::read_file_capped_regular(
-                    &auth_keys_path,
-                    crate::scanners::access::CAP_AUTHORIZED_KEYS,
-                ) {
-                    Ok((s, truncated)) => {
-                        if truncated {
-                            coverage::record(format!(
-                                "{auth_keys_path} exceeded cap — key count PARTIAL for '{username}'"
-                            ));
-                        }
-                        s.lines()
-                            .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
-                            .count()
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-                    Err(e) => {
-                        // 0 here means UNKNOWN, not "no keys" — say so.
-                        coverage::record(format!(
-                            "{auth_keys_path} unreadable ({}) — key count for '{username}' \
-                             reported as 0 but is UNKNOWN",
-                            e.kind()
-                        ));
-                        0
-                    }
-                };
-                auth_keys_map.insert(username.clone(), count);
-                shell_usernames.push(username);
+    // R26-02: /etc/passwd is host-controlled — use capped-regular.
+    match safe_io::read_file_capped_regular("/etc/passwd", 4 * 1024 * 1024) {
+        Ok((contents, truncated)) => {
+            if truncated {
+                coverage::record("/etc/passwd truncated".to_string());
             }
+            for line in contents.lines() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() == 7 && valid_shells.contains(parts[6]) {
+                    let username = parts[0].to_string();
+
+                    // Count authorized keys (R24-11: use capped-regular to prevent
+                    // FIFO / device hangs and to honour the Capped I/O doctrine).
+                    let home = parts[5];
+                    let auth_keys_path = format!("{}/.ssh/authorized_keys", home);
+                    let count = match safe_io::read_file_capped_regular(
+                        &auth_keys_path,
+                        crate::scanners::access::CAP_AUTHORIZED_KEYS,
+                    ) {
+                        Ok((s, truncated)) => {
+                            if truncated {
+                                coverage::record(format!(
+                                    "{auth_keys_path} exceeded cap — key count PARTIAL for '{username}'"
+                                ));
+                            }
+                            s.lines()
+                                .filter(|k| !k.trim().is_empty() && !k.starts_with('#'))
+                                .count()
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(e) => {
+                            // 0 here means UNKNOWN, not "no keys" — say so.
+                            coverage::record(format!(
+                                "{auth_keys_path} unreadable ({}) — key count for '{username}' \
+                                 reported as 0 but is UNKNOWN",
+                                e.kind()
+                            ));
+                            0
+                        }
+                    };
+                    auth_keys_map.insert(username.clone(), count);
+                    shell_usernames.push(username);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            coverage::record(
+                "/etc/passwd is NOT a regular file (fifo/device) — \
+                 shell user enumeration refused; treat as tampering"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            coverage::record(format!(
+                "/etc/passwd unreadable ({}) — shell user enumeration incomplete",
+                e.kind()
+            ));
         }
     }
 

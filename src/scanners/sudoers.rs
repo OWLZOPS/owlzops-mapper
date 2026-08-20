@@ -138,7 +138,9 @@ where
             continue;
         }
 
-        match safe_io::read_file_capped(&file, MAX_SUDOERS_BYTES) {
+        // R26-02: sudoers files are host-controlled — a FIFO here would block
+        // open(2) forever and hang the whole scan.
+        match safe_io::read_file_capped_regular(&file, MAX_SUDOERS_BYTES) {
             Ok((content, truncated)) => {
                 if truncated {
                     coverage::record(format!(
@@ -201,6 +203,12 @@ where
                          (config defect, not a coverage gap)"
                     ));
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                coverage::record(format!(
+                    "sudoers: {file} is NOT a regular file (fifo/device) — \
+                     parse refused; treat as tampering. NOPASSWD audit INCOMPLETE"
+                ));
             }
             Err(e) => {
                 coverage::record(format!(
