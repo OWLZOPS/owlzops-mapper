@@ -13,6 +13,15 @@ use crate::{coverage, safe_io};
 /// unresolvable, exactly like sudo's own parser.
 const MAX_ALIAS_DEPTH: u8 = 16;
 
+/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
+/// unprivileged user. Shared with `scoring.rs` so the policy has exactly one
+/// source of truth and cannot drift.
+pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
+
+/// Set when an entry's command list resolves to ALL, directly or via a
+/// Cmnd_Alias. Scoring keys on this instead of re-parsing the string (R26-19).
+pub const SUDO_ALL_MARKER: &str = "[GRANTS:ALL]";
+
 /// Yield logical (continuation-joined) lines from sudoers content.
 /// Lines ending with a backslash are joined with the next line, preserving
 /// a single space between them (after stripping trailing whitespace).

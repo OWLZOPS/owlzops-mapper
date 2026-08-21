@@ -8,15 +8,6 @@ use std::path::PathBuf;
 
 use crate::scanners::fs_inventory;
 
-/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
-/// unprivileged user. Shared with `scoring.rs` so the policy has exactly one
-/// source of truth and cannot drift.
-pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
-
-/// Set when an entry's command list resolves to ALL, directly or via a
-/// Cmnd_Alias. Scoring keys on this instead of re-parsing the string (R26-19).
-pub const SUDO_ALL_MARKER: &str = "[GRANTS:ALL]";
-
 // ── Unified sudoers parser (R16 hardening) ────────────────────────────────
 use crate::scanners::sudoers;
 
@@ -224,15 +215,16 @@ fn gather_sudo_nopasswd(scan: &sudoers::SudoersScan) -> Vec<String> {
                 ));
             }
             Some(t) => entries.push(format!(
-                "{file}: {entry}  {SUDO_PRIVESC_MARKER} {t} is replaceable by an \
+                "{file}: {entry}  {} {t} is replaceable by an \
                  unprivileged user (world-writable path or parent); this rule \
-                 grants an unrestricted root shell]"
+                 grants an unrestricted root shell]",
+                sudoers::SUDO_PRIVESC_MARKER
             )),
             None => {
                 let mut line = format!("{file}: {entry}");
                 if sudoers::is_nopasswd_all(entry, &scan.aliases) {
                     line.push(' ');
-                    line.push_str(SUDO_ALL_MARKER);
+                    line.push_str(sudoers::SUDO_ALL_MARKER);
                 }
                 entries.push(line);
             }
