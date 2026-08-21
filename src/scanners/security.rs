@@ -13,6 +13,10 @@ use crate::scanners::fs_inventory;
 /// source of truth and cannot drift.
 pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
 
+/// Set when an entry's command list resolves to ALL, directly or via a
+/// Cmnd_Alias. Scoring keys on this instead of re-parsing the string (R26-19).
+pub const SUDO_ALL_MARKER: &str = "[GRANTS:ALL]";
+
 // ── Unified sudoers parser (R16 hardening) ────────────────────────────────
 use crate::scanners::sudoers;
 
@@ -203,12 +207,12 @@ fn is_local_ip(ip: &str) -> bool {
 
 // ── Sudo audit ───────────────────────────────────────────────────────────
 
-fn gather_sudo_nopasswd() -> Vec<String> {
+fn gather_sudo_nopasswd(scan: &sudoers::SudoersScan) -> Vec<String> {
     let mut entries = Vec::new();
 
-    sudoers::each_sudoers_entry(|file, entry| {
+    for (file, entry) in &scan.entries {
         if !sudoers::entry_has_nopasswd(entry) {
-            return;
+            continue;
         }
         // Check for self-target (tamper-proof path of the scanner itself)
         match self_sudo_target(entry) {
@@ -224,9 +228,16 @@ fn gather_sudo_nopasswd() -> Vec<String> {
                  unprivileged user (world-writable path or parent); this rule \
                  grants an unrestricted root shell]"
             )),
-            None => entries.push(format!("{}: {}", file, entry)),
+            None => {
+                let mut line = format!("{file}: {entry}");
+                if sudoers::is_nopasswd_all(entry, &scan.aliases) {
+                    line.push(' ');
+                    line.push_str(SUDO_ALL_MARKER);
+                }
+                entries.push(line);
+            }
         }
-    });
+    }
 
     entries
 }
@@ -547,11 +558,14 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
             .is_some();
 
     // --- Sudo and Sysctl audits --------------------------------------------
-    let sudo_nopasswd_entries = gather_sudo_nopasswd();
+    let sudoers_scan = sudoers::scan_sudoers();
+
+    let sudo_nopasswd_entries = gather_sudo_nopasswd(&sudoers_scan);
     let sudoers_mode = get_sudoers_mode();
     let sysctl_issues = gather_sysctl_issues();
 
     let access_alignment = crate::scanners::access::gather_access_alignment(
+        &sudoers_scan,
         &crate::scanners::access::KeyPolicy::default(),
     );
 
