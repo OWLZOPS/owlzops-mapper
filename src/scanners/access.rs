@@ -102,103 +102,98 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
     })
 }
 
-/// Check whether an entry is a NOPASSWD: ALL rule, taking `Cmnd_Alias`
-/// definitions into account.
-///
-/// R26-06: `deploy ALL=(ALL) NOPASSWD: MAINTENANCE` with
-/// `Cmnd_Alias MAINTENANCE = ALL` is the same grant and must be detected.
-fn is_nopasswd_all(entry: &str, aliases: &sudoers::CmndAliases) -> bool {
-    if !sudoers::entry_has_nopasswd(entry) {
-        return false;
-    }
-    // Look for the command list after the last colon and expand aliases.
-    if let Some(tail) = entry.rsplit(':').next() {
-        tail.split([',', ' ', '\t'])
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .any(|t| aliases.resolves_to_all(t, 0))
-    } else {
-        false
-    }
-}
-
-pub fn gather_access_alignment(policy: &KeyPolicy) -> AccessAuditResult {
+pub fn gather_access_alignment(
+    scan: &sudoers::SudoersScan,
+    policy: &KeyPolicy,
+) -> AccessAuditResult {
     use std::io::ErrorKind;
     let mut result = AccessAuditResult::default();
 
-    if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
-        for line in passwd.lines() {
-            let f: Vec<&str> = line.split(':').collect();
-            if f.len() < 7 {
-                continue;
+    // R26-17: complete R26-02 — the third /etc/passwd reader must be capped and
+    // regular-file-only. Uncapped read_to_string also violated Capped I/O.
+    match crate::safe_io::read_file_capped_regular("/etc/passwd", 4 * 1024 * 1024) {
+        Ok((passwd, truncated)) => {
+            if truncated {
+                result
+                    .coverage_warnings
+                    .push("/etc/passwd exceeded cap — account enumeration PARTIAL".into());
             }
-            let (user, home, shell) = (f[0], f[5], f[6]);
-            if shell.ends_with("nologin") || shell.ends_with("false") {
-                continue;
-            }
-            let ak = format!("{home}/.ssh/authorized_keys");
+            for line in passwd.lines() {
+                let f: Vec<&str> = line.split(':').collect();
+                if f.len() < 7 {
+                    continue;
+                }
+                let (user, home, shell) = (f[0], f[5], f[6]);
+                if shell.ends_with("nologin") || shell.ends_with("false") {
+                    continue;
+                }
+                let ak = format!("{home}/.ssh/authorized_keys");
 
-            // R24-02: use safe_io capped regular read to prevent DoS via FIFO,
-            // /dev/zero symlinks, or other non-regular files.
-            match crate::safe_io::read_file_capped_regular(&ak, CAP_AUTHORIZED_KEYS) {
-                Ok((content, truncated)) => {
-                    if truncated {
+                // R24-02: use safe_io capped regular read to prevent DoS via FIFO,
+                // /dev/zero symlinks, or other non-regular files.
+                match crate::safe_io::read_file_capped_regular(&ak, CAP_AUTHORIZED_KEYS) {
+                    Ok((content, truncated)) => {
+                        if truncated {
+                            result.coverage_warnings.push(format!(
+                                "user '{user}': {ak} exceeded {CAP_AUTHORIZED_KEYS} B — key audit PARTIAL"
+                            ));
+                        }
+                        for l in content.lines() {
+                            let l = l.trim();
+                            if l.is_empty() || l.starts_with('#') {
+                                continue;
+                            }
+                            if let Some(audit) = classify_key(user, l, policy) {
+                                result.keys.push(audit);
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                         result.coverage_warnings.push(format!(
-                            "user '{user}': {ak} exceeded {CAP_AUTHORIZED_KEYS} B — key audit PARTIAL"
+                            "user '{user}': {ak} unreadable (permission denied)"
                         ));
                     }
-                    for l in content.lines() {
-                        let l = l.trim();
-                        if l.is_empty() || l.starts_with('#') {
-                            continue;
-                        }
-                        if let Some(audit) = classify_key(user, l, policy) {
-                            result.keys.push(audit);
-                        }
+                    // read_file_capped_regular rejects FIFOs/devices by design.
+                    // It signals this with ErrorKind::InvalidData (R24-12).
+                    Err(e) if e.kind() == ErrorKind::InvalidData => {
+                        result.coverage_warnings.push(format!(
+                            "user '{user}': {ak} is NOT a regular file (fifo/device/symlink to one) — \
+                             key audit refused; treat as tampering"
+                        ));
                     }
+                    Err(e) => result
+                        .coverage_warnings
+                        .push(format!("user '{user}': {ak} unreadable ({})", e.kind())),
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    result.coverage_warnings.push(format!(
-                        "user '{user}': {ak} unreadable (permission denied)"
-                    ));
-                }
-                // read_file_capped_regular rejects FIFOs/devices by design.
-                // It signals this with ErrorKind::InvalidData (R24-12).
-                Err(e) if e.kind() == ErrorKind::InvalidData => {
-                    result.coverage_warnings.push(format!(
-                        "user '{user}': {ak} is NOT a regular file (fifo/device/symlink to one) — \
-                         key audit refused; treat as tampering"
-                    ));
-                }
-                Err(e) => result
-                    .coverage_warnings
-                    .push(format!("user '{user}': {ak} unreadable ({})", e.kind())),
             }
         }
-    } else {
-        result
-            .coverage_warnings
-            .push("/etc/passwd unreadable — account enumeration incomplete".into());
+        Err(e) if e.kind() == ErrorKind::InvalidData => {
+            result.coverage_warnings.push(
+                "/etc/passwd is NOT a regular file (fifo/device) — account \
+                 enumeration refused; treat as tampering"
+                    .into(),
+            );
+        }
+        Err(e) => {
+            result.coverage_warnings.push(format!(
+                "/etc/passwd unreadable ({}) — account enumeration incomplete",
+                e.kind()
+            ));
+        }
     }
 
-    // First pass: collect Cmnd_Alias definitions from all sudoers files.
-    let mut cmnd_aliases = sudoers::CmndAliases::default();
-    sudoers::each_sudoers_entry(|_file, entry| {
-        cmnd_aliases.absorb(entry);
-    });
-
-    // Second pass: detect NOPASSWD: ALL with alias expansion.
-    sudoers::each_sudoers_entry(|file, entry| {
-        if is_nopasswd_all(entry, &cmnd_aliases) {
+    // R26-18: single walk — aliases and entries from one pass.
+    for (file, entry) in &scan.entries {
+        if sudoers::is_nopasswd_all(entry, &scan.aliases) {
             let principal = entry.split_whitespace().next().unwrap_or("?").to_string();
             result.sudoers_nopasswd_all.push(SudoersEntry {
                 principal,
-                source_file: file.to_string(),
+                source_file: file.clone(),
                 scope: "ALL".into(),
             });
         }
-    });
+    }
 
     result
 }
@@ -212,13 +207,13 @@ mod tests {
         let mut aliases = sudoers::CmndAliases::default();
         aliases.absorb("Cmnd_Alias MAINTENANCE = ALL");
         let entry = "deploy ALL=(ALL) NOPASSWD: MAINTENANCE";
-        assert!(is_nopasswd_all(entry, &aliases));
+        assert!(sudoers::is_nopasswd_all(entry, &aliases));
     }
 
     #[test]
     fn non_alias_path_does_not_match() {
         let aliases = sudoers::CmndAliases::default();
         let entry = "deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl";
-        assert!(!is_nopasswd_all(entry, &aliases));
+        assert!(!sudoers::is_nopasswd_all(entry, &aliases));
     }
 }
