@@ -218,13 +218,13 @@ fn gather_sudo_nopasswd(scan: &sudoers::SudoersScan) -> Vec<String> {
                 "{file}: {entry}  {} {t} is replaceable by an \
                  unprivileged user (world-writable path or parent); this rule \
                  grants an unrestricted root shell]",
-                sudoers::SUDO_PRIVESC_MARKER
+                crate::models::SUDO_PRIVESC_MARKER
             )),
             None => {
                 let mut line = format!("{file}: {entry}");
                 if sudoers::is_nopasswd_all(entry, &scan.aliases) {
                     line.push(' ');
-                    line.push_str(sudoers::SUDO_ALL_MARKER);
+                    line.push_str(crate::models::SUDO_ALL_MARKER);
                 }
                 entries.push(line);
             }

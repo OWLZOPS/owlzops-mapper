@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
+/// unprivileged user. Shared with scoring so policy has one source of truth.
+pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
+
+/// Set when an entry's command list resolves to ALL, directly or via a
+/// Cmnd_Alias. Scoring keys on this instead of re-parsing the string (R26-19).
+pub const SUDO_ALL_MARKER: &str = "[GRANTS:ALL]";
+
 fn default_scoring_version() -> u8 {
     1
 }
