@@ -433,7 +433,9 @@ async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentRepo
 }
 
 fn read_user_home(username: &str) -> Option<String> {
-    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    // R26-29: fourth /etc/passwd reader — same doctrine as R26-02/R26-17.
+    let (passwd, _truncated) =
+        crate::safe_io::read_file_capped_regular("/etc/passwd", 4 * 1024 * 1024).ok()?;
     passwd.lines().find_map(|line| {
         let mut parts = line.splitn(7, ':');
         if parts.next()? == username {
