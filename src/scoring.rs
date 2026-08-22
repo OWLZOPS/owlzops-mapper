@@ -29,7 +29,11 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
 /// v10 (0.5.31): SEC-052/053/054 systemd generators, one-way kernel switches as drift class.
 /// v11 (0.5.32): (PAM stack injection SEC‑055/056/057)
-pub const SCORING_VERSION: u8 = 11;
+/// v12 (0.5.35): SEC-005 now weights 15 for continuation-joined and
+///   Cmnd_Alias-resolved NOPASSWD: ALL (R26-08/R26-19); REL-002 no longer
+///   fires on hosts whose backup tool is configured but was previously
+///   undetectable under env_clear() (R26-03). Same host, different score.
+pub const SCORING_VERSION: u8 = 12;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -3075,6 +3079,21 @@ mod tests {
         assert!(fires(&r));
     }
 
+    #[test]
+    fn scoring_version_is_bumped_when_sec005_weighting_changes() {
+        // Guard for R26-22: if a future change makes the same sudoers input score
+        // differently, this test fails and SCORING_VERSION must be bumped with it.
+        let mut r = minimal_report();
+        r.security.sudo_nopasswd_entries = vec![format!(
+            "/etc/sudoers: deploy ALL=(ALL) NOPASSWD: MAINTENANCE {}",
+            crate::models::SUDO_ALL_MARKER
+        )];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-005")
+            .unwrap();
+        assert_eq!((SCORING_VERSION, f.weight), (12, 15));
+    }
     #[test]
     fn sec016_reads_suspicious_processes() {
         use crate::models::SuspiciousProcess;
