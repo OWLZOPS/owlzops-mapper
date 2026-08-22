@@ -675,6 +675,62 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // ── security.access_alignment.sudoers_nopasswd_all (R26-28) ────────────
+    // Keyed on (principal, source_file) rather than the raw line: the entry
+    // text carries markers and file paths that change for cosmetic reasons.
+    {
+        let index = |r: &AgentReport| -> HashSet<(String, String)> {
+            r.security
+                .access_alignment
+                .sudoers_nopasswd_all
+                .iter()
+                .map(|e| (e.principal.clone(), e.source_file.clone()))
+                .collect()
+        };
+        let b = index(before);
+        let a = index(after);
+
+        for (principal, file) in a.difference(&b) {
+            changes.push(Change {
+                field: "security.sudoers_nopasswd_all".into(),
+                before: None,
+                after: Some(format!(
+                    "{principal} gained passwordless sudo to ALL via {file}"
+                )),
+                severity: Severity::Degraded,
+            });
+        }
+        for (principal, file) in b.difference(&a) {
+            changes.push(Change {
+                field: "security.sudoers_nopasswd_all".into(),
+                before: Some(format!(
+                    "{principal} had passwordless sudo to ALL via {file}"
+                )),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+
+        // Count-level drift for non-ALL NOPASSWD rules: the text carries
+        // markers, so compare the magnitude, not the strings.
+        let (bn, an) = (
+            before.security.sudo_nopasswd_entries.len(),
+            after.security.sudo_nopasswd_entries.len(),
+        );
+        if bn != an {
+            changes.push(Change {
+                field: "security.sudo_nopasswd_entries".into(),
+                before: Some(bn.to_string()),
+                after: Some(an.to_string()),
+                severity: if an > bn {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                },
+            });
+        }
+    }
+
     // --- security.ebpf_inventory (R19-10 / R21-01) ---
     let before_tags: HashSet<&str> = before
         .security
@@ -1613,7 +1669,6 @@ mod tests {
                 .any(|c| c.field == "security.ebpf_inventory.prog"),
             "swapping one BPF program for another must surface in drift even at equal count"
         );
-        // The vanished tag is Improved, the new tag is Degraded — both present.
         assert!(
             diff.changes
                 .iter()
@@ -1661,7 +1716,6 @@ mod tests {
         assert_eq!(change.severity, Severity::Degraded);
         assert!(change.after.as_deref().unwrap().contains("named"));
 
-        // Symmetry: complain→enforce is Improved; a stable complain set is silent.
         assert!(
             compare_reports(&after, &before)
                 .changes
@@ -1681,12 +1735,9 @@ mod tests {
 
     #[test]
     fn kernel_taint_bit_appearing_is_drift() {
-        // A taint bit set in `after` but not `before` means a module loaded AFTER
-        // the baseline — Degraded even for bits (E/O) that are benign as steady
-        // state. An always-tainted box (stable value) must not drift.
         let mut before = test_report();
         before.security.kernel_taint = KernelTaint {
-            raw: 1 << 12, // O — out-of-tree driver already present at baseline
+            raw: 1 << 12,
             flags: vec![TaintFlag {
                 bit: 12,
                 code: 'O',
@@ -1697,7 +1748,7 @@ mod tests {
         };
         let mut after = test_report();
         after.security.kernel_taint = KernelTaint {
-            raw: (1 << 12) | (1 << 13), // E newly appeared (unsigned module loaded)
+            raw: (1 << 12) | (1 << 13),
             flags: vec![
                 TaintFlag {
                     bit: 12,
@@ -1722,11 +1773,9 @@ mod tests {
             .find(|c| c.field == "security.kernel_taint")
             .expect("newly-set taint bit not detected");
         assert_eq!(change.severity, Severity::Degraded);
-        // Only the NEW bit (E) is reported, not the pre-existing O.
         assert!(change.after.as_deref().unwrap().contains("unsigned module"));
         assert!(!change.after.as_deref().unwrap().contains("out-of-tree"));
 
-        // Stable taint value (nvidia always-tainted) → no drift.
         assert!(
             !compare_reports(&after, &after)
                 .changes
@@ -1735,8 +1784,6 @@ mod tests {
             "unchanged taint value must produce no drift"
         );
     }
-
-    // ── new setuid/file_capabilities drift tests ───────────────────────────
 
     #[test]
     fn setuid_binary_appearing_is_drift() {
@@ -1802,7 +1849,6 @@ mod tests {
         assert_eq!(c.severity, Severity::Degraded);
         assert!(c.after.as_deref().unwrap().contains("CAP_BPF"));
 
-        // De-escalation (cap removed) → Improved; identical → no drift.
         assert!(
             compare_reports(&after, &before)
                 .changes
@@ -1820,8 +1866,6 @@ mod tests {
             "identical cap inventory must produce no drift"
         );
     }
-
-    // ── R24-15: one‑way switch direction tests ────────────────────────────
 
     #[test]
     fn one_way_switch_hardening_is_improved_not_degraded() {
@@ -1848,7 +1892,6 @@ mod tests {
 
     #[test]
     fn one_way_switch_weakening_is_degraded() {
-        // 1 -> 0 cannot happen without a reboot: /proc tampering or kernel swap.
         let mut before = test_report();
         before.security.one_way_switches = [("modules_disabled".to_string(), Some(1))]
             .into_iter()
@@ -1868,12 +1911,11 @@ mod tests {
 
     #[test]
     fn vanished_one_way_switch_is_never_silent() {
-        // R24-07 guard: absent != unchanged.
         let mut before = test_report();
         before.security.one_way_switches = [("kexec_load_disabled".to_string(), Some(1))]
             .into_iter()
             .collect();
-        let after = test_report(); // empty map
+        let after = test_report();
 
         let c = compare_reports(&before, &after)
             .changes
@@ -1906,10 +1948,7 @@ mod tests {
 
     #[test]
     fn local_root_and_remote_root_do_not_drift() {
-        // Local root scan uses is_root_execution, remote root uses
-        // remote_privileged=Some(true). Derived privilege must be equal
-        // (R25-79).
-        let local = test_report(); // is_root_execution=true, remote_privileged=None
+        let local = test_report();
         let mut remote = test_report();
         remote.remote_privileged = Some(true);
 
@@ -1956,5 +1995,24 @@ mod tests {
         assert_eq!(c.severity, Severity::Improved);
         assert_eq!(c.before.as_deref(), Some("false"));
         assert_eq!(c.after.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn a_new_nopasswd_all_grant_appears_in_the_diff() {
+        let before = test_report();
+        let mut after = test_report();
+        after.security.access_alignment.sudoers_nopasswd_all = vec![SudoersEntry {
+            principal: "deploy".into(),
+            source_file: "/etc/sudoers.d/90-deploy".into(),
+            scope: "ALL".into(),
+        }];
+        let diff = compare_reports(&before, &after);
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.field == "security.sudoers_nopasswd_all"
+                    && c.severity == Severity::Degraded),
+            "a new passwordless root grant must be visible in the drift report"
+        );
     }
 }
