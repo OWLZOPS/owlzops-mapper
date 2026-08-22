@@ -94,9 +94,9 @@ const MAX_SUDOERS_FILES: usize = 512;
 pub struct CmndAliases(HashMap<String, Vec<String>>);
 
 impl CmndAliases {
-    /// Absorb a `Cmnd_Alias` definition if `entry` is one.
-    /// Only the first `=` after the alias name is considered; the RHS is
-    /// split on commas exactly like sudo does.
+    /// Absorb one or more `Cmnd_Alias` definitions. sudoers(5) allows several
+    /// specs in a single directive, separated by ':' (R26-23):
+    ///   Cmnd_Alias SAFE = /usr/bin/id : MAINTENANCE = ALL
     pub fn absorb(&mut self, entry: &str) {
         let Some(rest) = entry.strip_prefix("Cmnd_Alias") else {
             return;
@@ -104,19 +104,24 @@ impl CmndAliases {
         if !rest.starts_with(char::is_whitespace) {
             return;
         }
-        let Some((name, list)) = rest.trim().split_once('=') else {
-            return;
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            return;
+
+        for spec in rest.trim().split(':') {
+            let Some((name, list)) = spec.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let members: Vec<String> = list
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if !members.is_empty() {
+                self.0.insert(name.to_string(), members);
+            }
         }
-        let members: Vec<String> = list
-            .split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
-        self.0.insert(name.to_string(), members);
     }
 
     /// True if `token` resolves — directly or through aliases — to `ALL`.
@@ -375,6 +380,18 @@ mod tests {
             "transitive alias must resolve"
         );
         assert!(!a.resolves_to_all("/usr/bin/systemctl", 0));
+    }
+
+    #[test]
+    fn absorb_handles_multiple_specs_on_one_line() {
+        let mut a = CmndAliases::default();
+        a.absorb("Cmnd_Alias SAFE = /usr/bin/id, /usr/bin/uptime : MAINTENANCE = ALL");
+
+        assert!(
+            a.resolves_to_all("MAINTENANCE", 0),
+            "second spec must register"
+        );
+        assert!(!a.resolves_to_all("SAFE", 0));
     }
 
     #[test]
