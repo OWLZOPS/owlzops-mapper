@@ -32,6 +32,17 @@ fn index_file_caps(v: &[FileCapFinding]) -> HashMap<&str, (u64, u64, bool)> {
 pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport {
     let mut changes = Vec::new();
 
+    // R26-30: a version change can alter COLLECTION semantics, not just
+    // weights. scoring_version guards risk_score; this guards everything else.
+    if before.version != after.version {
+        changes.push(Change {
+            field: "meta.binary_version".into(),
+            before: Some(before.version.clone()),
+            after: Some(after.version.clone()),
+            severity: Severity::Changed,
+        });
+    }
+
     // --- risk_score ---
     if before.risk_score != after.risk_score {
         let formula_changed = before.scoring_version != after.scoring_version;
@@ -1425,6 +1436,17 @@ pub fn print_diff_terminal(report: &DiffReport) {
             st(&a.version),
             a.risk_score
         );
+
+        // R26-30: cross-version diffs may reflect collection semantics changes,
+        // not host drift.
+        if b.version != a.version {
+            println!(
+                "  \x1b[1;33m[!] snapshots produced by different binaries ({} → {}) — field-level differences may reflect changed collection semantics, not host drift.\x1b[0m",
+                st(&b.version),
+                st(&a.version)
+            );
+        }
+
         match human_span(&b.timestamp, &a.timestamp) {
             Some((_, true)) => println!(
                 "  \x1b[1;33m[!] 'after' is OLDER than 'before' — arguments swapped?\x1b[0m"
