@@ -574,9 +574,11 @@ fn gather_backup_info(
     systemd_timers: &[String],
 ) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
-    // Freshness of the last backup snapshot is not reliably available without
-    // accessing the repository, which is out of scope for a read-only audit.
-    let last_restic = None;
+
+    // R26-25: previous implementation always returned None after repository
+    // query removal. Use local cache mtime as activity evidence, not a
+    // snapshot confirmation.
+    let last_restic = last_backup_run_utc();
 
     for &tool in &["restic", "borg", "duplicati"] {
         let binary_found = crate::utils::resolve_tool(tool).is_some();
@@ -648,6 +650,16 @@ fn gather_backup_info(
     }
 
     (tools, last_restic)
+}
+
+/// Freshness from the local cache mtime. Never contacts the repository:
+/// a read-only audit must not authenticate to a backup target (R26-25).
+fn last_backup_run_utc() -> Option<String> {
+    ["/root/.cache/restic", "/root/.cache/borg"]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .max()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
 }
 
 fn parse_offset_to_ms(raw: &str) -> Option<f64> {

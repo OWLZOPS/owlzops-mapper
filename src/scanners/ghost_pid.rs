@@ -33,13 +33,22 @@
 //!   io_uring is unavailable or for tempdir‑based tests.
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs;
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// These are used only by the io_uring path, which is available on glibc Linux
+// but not on musl (no statx). Keeping them without cfg produced unused-import
+// warnings in the musl release build.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::ffi::CString;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::fs::File;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::os::unix::io::AsRawFd;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::time::Instant;
 
 use crate::coverage;
 use crate::models::GhostPidFinding;

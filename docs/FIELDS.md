@@ -72,7 +72,7 @@ Use it to build integrations, dashboards, or alerting rules.
 | `top_memory_processes[].instances` | integer | Number of instances with this name |
 | `failed_services` | array of strings | Failed systemd units |
 | `backup_tools` | array of strings | Detected backup tools |
-| `last_restic_snapshot` | string \| null | ISO‑8601 timestamp of last Restic snapshot |
+| `last_restic_snapshot` | string \| null | Last local backup cache activity (mtime of `/root/.cache/restic` or `/root/.cache/borg`); null means no cache activity was found, not that no snapshots exist |
 | `ntp_synchronized` | boolean | Whether time is synchronized |
 | `time_offset_ms` | float \| null | Offset from NTP in milliseconds |
 | `reboot_required_pkgs` | array of strings | Packages that triggered reboot requirement |
