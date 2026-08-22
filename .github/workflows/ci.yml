@@ -65,6 +65,23 @@ jobs:
             exit 1
           fi
 
+      # R26-02/17/29: enforce capped-I/O doctrine and shared sanitizer predicate.
+      - name: Guard capped-I/O doctrine (R26-02/17/29)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          if rg -n 'fs::read_to_string\(|File::open\(' src/ \
+               | rg -v 'safe_io\.rs|/proc|/sys|/dev|mod tests|uploads' ; then
+            echo "::error::uncapped read on a host-controlled path — use safe_io::read_file_capped_regular"
+            exit 1
+          fi
+          for f in $(rg -l 'fn sanitize_' src/); do
+            rg -q 'is_terminal_unsafe|sanitize_for_document' "$f" || {
+              echo "::error file=$f::sanitizer does not use the shared predicate"
+              exit 1
+            }
+          done
+          rg -n '"which"' src/ && { echo "::error::use resolve_tool, not a fork of which"; exit 1; } || true
+
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
