@@ -1,9 +1,5 @@
 use crate::coverage;
 use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin, ProvenanceSource};
-/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
-/// unprivileged user. Shared with `security.rs` so the policy has exactly one
-/// source of truth and cannot drift.
-const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -245,10 +241,9 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
     if !report.security.sudo_nopasswd_entries.is_empty() {
         let has_all = report.security.sudo_nopasswd_entries.iter().any(|entry| {
-            let lower = entry.to_lowercase();
-            lower.contains("nopasswd: all")
-                || lower.ends_with("nopasswd:all")
-                || entry.contains(SUDO_PRIVESC_MARKER)
+            // R26-19: scanner already resolved aliases; do not re-parse.
+            entry.contains(crate::models::SUDO_ALL_MARKER)
+                || entry.contains(crate::models::SUDO_PRIVESC_MARKER)
         });
         let weight = if has_all { 15 } else { 5 };
         findings.push(Finding {
@@ -3585,7 +3580,7 @@ mod tests {
         let mut r = minimal_report();
         r.security.sudo_nopasswd_entries = vec![format!(
             "/etc/sudoers: drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper  {} /tmp/owlzops-mapper is replaceable ...]",
-            SUDO_PRIVESC_MARKER
+            crate::models::SUDO_PRIVESC_MARKER
         )];
         let f = evaluate(&r)
             .into_iter()

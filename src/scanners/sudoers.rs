@@ -133,6 +133,43 @@ impl CmndAliases {
     }
 }
 
+/// Result of a single sudoers tree walk.
+/// `each_sudoers_entry` has coverage side effects; calling it more than once
+/// duplicates every warning and multiplies I/O. Callers needing both aliases
+/// and entries take this instead (R26-18).
+pub struct SudoersScan {
+    pub aliases: CmndAliases,
+    /// (source file, logical entry), in walk order.
+    pub entries: Vec<(String, String)>,
+}
+
+/// Walk the sudoers tree exactly once and return both aliases and entries.
+pub fn scan_sudoers() -> SudoersScan {
+    let mut aliases = CmndAliases::default();
+    let mut entries = Vec::new();
+    each_sudoers_entry(|file, entry| {
+        aliases.absorb(entry);
+        entries.push((file.to_string(), entry.to_string()));
+    });
+    SudoersScan { aliases, entries }
+}
+
+/// Check whether an entry is a NOPASSWD: ALL rule, taking `Cmnd_Alias`
+/// definitions into account. Shared by both scanner call sites (R26-19).
+pub fn is_nopasswd_all(entry: &str, aliases: &CmndAliases) -> bool {
+    if !entry_has_nopasswd(entry) {
+        return false;
+    }
+    if let Some(tail) = entry.rsplit(':').next() {
+        tail.split([',', ' ', '\t'])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .any(|t| aliases.resolves_to_all(t, 0))
+    } else {
+        false
+    }
+}
+
 /// Canonical key for the visited set – always an absolute, cleaned path.
 fn canon_path_key(path: &str) -> String {
     Path::new(path)
@@ -338,5 +375,18 @@ mod tests {
             "transitive alias must resolve"
         );
         assert!(!a.resolves_to_all("/usr/bin/systemctl", 0));
+    }
+
+    #[test]
+    fn scan_sudoers_visits_each_file_once() {
+        let scan = scan_sudoers();
+        let files: HashSet<&str> = scan.entries.iter().map(|(f, _)| f.as_str()).collect();
+        let unique: std::collections::BTreeSet<&str> =
+            scan.entries.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(
+            files.len(),
+            unique.len(),
+            "one walk must visit each file once"
+        );
     }
 }
