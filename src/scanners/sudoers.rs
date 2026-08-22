@@ -174,20 +174,92 @@ pub fn scan_sudoers_from(roots: &[String]) -> SudoersScan {
     SudoersScan { aliases, entries }
 }
 
-/// Check whether an entry is a NOPASSWD: ALL rule, taking `Cmnd_Alias`
-/// definitions into account. Shared by both scanner call sites (R26-19).
+/// Apply a Tag_Spec. Returns true if `tok` WAS a tag (so the caller must not
+/// treat it as a command). Only NOPASSWD/PASSWD change the password state;
+/// the rest are consumed so they cannot be mistaken for a command name.
+fn apply_tag(tok: &str, nopasswd: &mut bool) -> bool {
+    if tok.eq_ignore_ascii_case("NOPASSWD") {
+        *nopasswd = true;
+        return true;
+    }
+    if tok.eq_ignore_ascii_case("PASSWD") {
+        *nopasswd = false;
+        return true;
+    }
+    const OTHER: [&str; 14] = [
+        "NOEXEC",
+        "EXEC",
+        "SETENV",
+        "NOSETENV",
+        "LOG_INPUT",
+        "NOLOG_INPUT",
+        "LOG_OUTPUT",
+        "NOLOG_OUTPUT",
+        "FOLLOW",
+        "NOFOLLOW",
+        "MAIL",
+        "NOMAIL",
+        "INTERCEPT",
+        "NOINTERCEPT",
+    ];
+    OTHER.iter().any(|t| tok.eq_ignore_ascii_case(t))
+}
+
+/// True if the entry grants a passwordless ALL, directly or via `Cmnd_Alias`.
+///
+/// R26-27: tags are transitive across the Cmnd_Spec_List, so the grant may sit
+/// anywhere in it — `NOPASSWD: ALL, PASSWD: /bin/false` is full passwordless
+/// root. Looking only after the LAST colon missed exactly that shape.
 pub fn is_nopasswd_all(entry: &str, aliases: &CmndAliases) -> bool {
     if !entry_has_nopasswd(entry) {
         return false;
     }
-    if let Some(tail) = entry.rsplit(':').next() {
-        tail.split([',', ' ', '\t'])
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .any(|t| aliases.resolves_to_all(t, 0))
-    } else {
-        false
+
+    // User_List Host_List '=' Cmnd_Spec_List — commands live after the first '='.
+    let Some((_, rhs)) = entry.split_once('=') else {
+        return false;
+    };
+
+    let mut nopasswd = false;
+    let mut paren = 0i32;
+
+    for raw in rhs.split([',', ' ', '\t']) {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            continue;
+        }
+
+        // A parenthesised Runas_Spec may hold commas and colons: `(ALL:ALL)`.
+        let opens = tok.matches('(').count() as i32;
+        let closes = tok.matches(')').count() as i32;
+        let was_inside = paren > 0;
+        paren = (paren + opens - closes).max(0);
+        if was_inside || opens > 0 {
+            continue;
+        }
+
+        // A tag may be glued to the command: "NOPASSWD:ALL".
+        let mut rest = tok;
+        while let Some(i) = rest.find(':') {
+            apply_tag(rest[..i].trim(), &mut nopasswd);
+            rest = rest[i + 1..].trim_start();
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        // "NOPASSWD : ALL" — the tag arrives as a standalone token.
+        if apply_tag(rest, &mut nopasswd) {
+            continue;
+        }
+        // A negation removes a command; it never grants one.
+        if rest.starts_with('!') {
+            continue;
+        }
+        if nopasswd && aliases.resolves_to_all(rest, 0) {
+            return true;
+        }
     }
+    false
 }
 
 /// Canonical key for the visited set – always an absolute, cleaned path.
@@ -460,5 +532,42 @@ mod tests {
             per_file.values().all(|&n| n == 1),
             "duplicate walk: {per_file:?}"
         );
+    }
+
+    #[test]
+    fn nopasswd_all_is_found_when_a_later_spec_re_tags() {
+        let a = CmndAliases::default();
+        assert!(is_nopasswd_all(
+            "deploy ALL=(ALL) NOPASSWD: ALL, PASSWD: /bin/false",
+            &a
+        ));
+        assert!(is_nopasswd_all(
+            "deploy ALL=(ALL) NOPASSWD: ALL, NOEXEC: /bin/foo",
+            &a
+        ));
+    }
+
+    #[test]
+    fn passwd_tagged_all_is_not_a_passwordless_grant() {
+        let a = CmndAliases::default();
+        assert!(!is_nopasswd_all("deploy ALL=(ALL) PASSWD: ALL", &a));
+        assert!(!is_nopasswd_all(
+            "deploy ALL=(ALL) NOPASSWD: /usr/bin/id, PASSWD: ALL",
+            &a
+        ));
+    }
+
+    #[test]
+    fn runas_spec_with_a_colon_is_not_parsed_as_a_tag() {
+        let a = CmndAliases::default();
+        assert!(is_nopasswd_all("deploy ALL=(ALL:ALL) NOPASSWD: ALL", &a));
+    }
+
+    #[test]
+    fn spaced_and_glued_tag_forms_both_resolve() {
+        let a = CmndAliases::default();
+        assert!(is_nopasswd_all("deploy ALL=(ALL) NOPASSWD:ALL", &a));
+        assert!(is_nopasswd_all("deploy ALL=(ALL) NOPASSWD : ALL", &a));
+        assert!(!is_nopasswd_all("deploy ALL=(ALL) NOPASSWD : /bin/foo", &a));
     }
 }
