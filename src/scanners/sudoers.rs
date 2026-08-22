@@ -159,6 +159,21 @@ pub fn scan_sudoers() -> SudoersScan {
     SudoersScan { aliases, entries }
 }
 
+/// Walk the given sudoers roots exactly once and return both aliases and entries.
+///
+/// Used by tests and intended for future non-/etc roots; production currently
+/// goes through `scan_sudoers`.
+#[allow(dead_code)]
+pub fn scan_sudoers_from(roots: &[String]) -> SudoersScan {
+    let mut aliases = CmndAliases::default();
+    let mut entries = Vec::new();
+    each_sudoers_entry_from(roots, |file, entry| {
+        aliases.absorb(entry);
+        entries.push((file.to_string(), entry.to_string()));
+    });
+    SudoersScan { aliases, entries }
+}
+
 /// Check whether an entry is a NOPASSWD: ALL rule, taking `Cmnd_Alias`
 /// definitions into account. Shared by both scanner call sites (R26-19).
 pub fn is_nopasswd_all(entry: &str, aliases: &CmndAliases) -> bool {
@@ -184,16 +199,15 @@ fn canon_path_key(path: &str) -> String {
         .to_string()
 }
 
-/// Walk all sudoers files (including those referenced via #include/@include)
-/// and call the callback for each logical line.
-pub fn each_sudoers_entry<F>(mut callback: F)
+/// Walk the given sudoers roots.
+/// Production uses `each_sudoers_entry`; this parameterised form exists so the
+/// walk and cross-file alias resolution are testable against a tempdir instead
+/// of the real /etc (R26-24).
+pub fn each_sudoers_entry_from<F>(roots: &[String], mut callback: F)
 where
     F: FnMut(&str, &str),
 {
-    let mut queue: Vec<(String, u8)> = vec![
-        ("/etc/sudoers".to_string(), 0),
-        ("/etc/sudoers.d".to_string(), 0),
-    ];
+    let mut queue: Vec<(String, u8)> = roots.iter().map(|r| (r.clone(), 0)).collect();
     let mut visited: HashSet<String> = HashSet::new();
     let mut files_seen = 0usize;
 
@@ -319,6 +333,18 @@ where
     }
 }
 
+/// Walk all sudoers files (including those referenced via #include/@include)
+/// and call the callback for each logical line.
+pub fn each_sudoers_entry<F>(callback: F)
+where
+    F: FnMut(&str, &str),
+{
+    each_sudoers_entry_from(
+        &["/etc/sudoers".to_string(), "/etc/sudoers.d".to_string()],
+        callback,
+    );
+}
+
 /// Check if the given entry contains a NOPASSWD tag.
 /// Case‑insensitive, matches any occurrence of the substring "nopasswd"
 /// (with or without a following colon/space), mirroring the original behaviour.
@@ -395,15 +421,44 @@ mod tests {
     }
 
     #[test]
-    fn scan_sudoers_visits_each_file_once() {
-        let scan = scan_sudoers();
-        let files: HashSet<&str> = scan.entries.iter().map(|(f, _)| f.as_str()).collect();
-        let unique: std::collections::BTreeSet<&str> =
-            scan.entries.iter().map(|(f, _)| f.as_str()).collect();
-        assert_eq!(
-            files.len(),
-            unique.len(),
-            "one walk must visit each file once"
+    fn alias_in_one_file_resolves_a_rule_in_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("sudoers.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("10-aliases"), "Cmnd_Alias MAINTENANCE = ALL\n").unwrap();
+        std::fs::write(
+            d.join("20-deploy"),
+            "deploy ALL=(ALL) NOPASSWD: MAINTENANCE\n",
+        )
+        .unwrap();
+
+        let roots = vec![d.to_string_lossy().to_string()];
+        let scan = scan_sudoers_from(&roots);
+        let hit = scan
+            .entries
+            .iter()
+            .any(|(_, e)| is_nopasswd_all(e, &scan.aliases));
+        assert!(hit, "an alias defined in another file must still resolve");
+    }
+
+    #[test]
+    fn each_file_is_read_exactly_once_per_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("sudoers.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("10-one"), "a ALL=(ALL) NOPASSWD: ALL\n").unwrap();
+        std::fs::write(d.join("20-two"), "b ALL=(ALL) NOPASSWD: ALL\n").unwrap();
+
+        let roots = vec![d.to_string_lossy().to_string()];
+        let mut per_file: std::collections::HashMap<String, usize> = Default::default();
+        each_sudoers_entry_from(&roots, |file, _| {
+            *per_file.entry(file.to_string()).or_default() += 1;
+        });
+
+        assert_eq!(per_file.len(), 2);
+        assert!(
+            per_file.values().all(|&n| n == 1),
+            "duplicate walk: {per_file:?}"
         );
     }
 }
