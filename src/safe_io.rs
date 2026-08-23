@@ -97,6 +97,7 @@ fn read_regular_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, boo
 /// Same FIFO/device protection as `read_file_capped_regular`, but returns the
 /// handle instead of the contents: capping is wrong when the whole file must
 /// be consumed (a truncated hash is a wrong hash). R26-39.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 pub fn open_regular_streaming(path: &str) -> io::Result<std::fs::File> {
     let f = std::fs::OpenOptions::new()
         .read(true)
