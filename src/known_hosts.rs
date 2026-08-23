@@ -1,7 +1,9 @@
 use data_encoding::BASE64;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -54,6 +56,11 @@ pub struct KnownHostsChecker {
     /// R25-76: `@cert-authority` and unknown `@marker` lines must fail closed,
     /// not turn into trust-on-first-use.
     unsupported_marker: Option<String>,
+    /// R27-09: a TOFU pin that could not be written is a coverage FACT, not a
+    /// log line. `coverage::record` is forbidden here (concurrent fleet
+    /// writer), so the note is drained by run_remote_scan_russh into
+    /// RemoteCoverage after the handshake.
+    pin_failure: OnceLock<String>,
 }
 
 impl KnownHostsChecker {
@@ -91,6 +98,7 @@ impl KnownHostsChecker {
             pin_file,
             entries,
             unsupported_marker,
+            pin_failure: OnceLock::new(),
         })
     }
 
@@ -196,6 +204,7 @@ impl KnownHostsChecker {
             pin_file,
             entries,
             unsupported_marker,
+            pin_failure: OnceLock::new(),
         }
     }
 
@@ -457,28 +466,55 @@ impl KnownHostsChecker {
         // No entry for this host at all → TOFU.
         let candidate = &Self::host_candidates(&self.host, self.port)[0];
         let entry = format!("{} {} {}\n", candidate, ptype_canon, pdata);
+
+        // R27-08: trust store directory gets 0700, file gets 0600, and we
+        // refuse to follow a pre-planted symlink.
         if let Some(dir) = self.pin_file.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
+            && let Err(e) = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
         {
             tracing::error!(dir = %dir.display(), error = %e, "failed to create directory for known_hosts");
         }
+
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NOCTTY)
             .open(&self.pin_file)
         {
             Ok(mut f) => {
                 use std::io::Write;
                 if let Err(e) = f.write_all(entry.as_bytes()) {
                     tracing::error!(path = %self.pin_file.display(), error = %e, "failed to write to known_hosts");
+                    // R27-09: surface the fact that the pin was not written.
+                    let _ = self.pin_failure.set(format!(
+                        "host key for {} was NOT pinned ({}) — every subsequent scan of this host will trust-on-first-use again",
+                        self.host, e.kind()
+                    ));
                 }
             }
             Err(e) => {
                 tracing::error!(path = %self.pin_file.display(), error = %e, "cannot open known_hosts for writing");
+                // R27-09: surface the fact that the pin was not written.
+                let _ = self.pin_failure.set(format!(
+                    "host key for {} was NOT pinned ({}) — every subsequent scan of this host will trust-on-first-use again",
+                    self.host, e.kind()
+                ));
             }
         }
+
         tracing::warn!(host = %self.host, "new host key — pinned to ~/.owlzops/known_hosts");
         Ok(true)
+    }
+
+    /// Drain the pin-write failure note, if any. Caller is expected to push
+    /// this into `RemoteCoverage::notes` after the SSH handshake.
+    pub fn take_pin_failure(&self) -> Option<&str> {
+        self.pin_failure.get().map(String::as_str)
     }
 }
 
@@ -764,5 +800,33 @@ mod tests {
 
         // CA entry for another host must not set unsupported_marker for localhost.
         assert!(checker.verify(pub_key).is_ok());
+    }
+
+    #[test]
+    fn tofu_refuses_to_write_through_a_symlinked_trust_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("attacker-owned");
+        std::fs::write(&target, "").unwrap();
+        let pin = tmp.path().join("pin");
+        std::os::unix::fs::symlink(&target, &pin).unwrap();
+
+        let key = russh::keys::ssh_key::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+
+        let checker = KnownHostsChecker::from_files(
+            "unknown-host".into(),
+            22,
+            tmp.path().join("absent"),
+            pin,
+        );
+
+        let _ = checker.verify(key.public_key());
+        assert!(
+            std::fs::read_to_string(&target).unwrap().is_empty(), // CAPPED_IO_OK: test reads local temp file
+            "O_NOFOLLOW must prevent the pin from landing in the symlink target"
+        );
     }
 }
