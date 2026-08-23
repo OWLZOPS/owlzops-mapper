@@ -192,12 +192,26 @@ fn resolve_dpkg(candidates: &HashSet<String>) -> Option<HashMap<String, String>>
             continue;
         };
 
-        let Ok((content, truncated)) =
-            crate::safe_io::read_file_capped(&path.to_string_lossy(), MAX_LIST_BYTES)
-        else {
-            lists_skipped += 1;
-            continue;
-        };
+        // R26-38: /var/lib/dpkg/info is host-controlled, not a pseudo-fs.
+        let (content, truncated) =
+            match crate::safe_io::read_file_capped_regular(&path.to_string_lossy(), MAX_LIST_BYTES)
+            {
+                Ok((c, t)) => (c, t),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    crate::coverage::record(format!(
+                        "provenance: {} is NOT a regular file (fifo/device) — dpkg \
+                     list parse refused; treat as tampering. Attribution for its \
+                     package may be INCOMPLETE",
+                        path.display()
+                    ));
+                    lists_skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    lists_skipped += 1;
+                    continue;
+                }
+            };
         lists_read += 1;
         if truncated {
             crate::coverage::record(format!(
@@ -243,11 +257,20 @@ fn resolve_apk(candidates: &HashSet<String>) -> Option<(HashMap<String, String>,
         return Some((HashMap::new(), false));
     }
 
-    let (content, truncated) = match crate::safe_io::read_file_capped(
+    // R26-38: /lib/apk/db/installed is host-controlled, not a pseudo-fs.
+    let (content, truncated) = match crate::safe_io::read_file_capped_regular(
         "/lib/apk/db/installed",
         MAX_LIST_BYTES,
     ) {
         Ok((c, t)) => (c, t),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            crate::coverage::record(
+                "provenance: /lib/apk/db/installed is NOT a regular file (fifo/device) — \
+                     apk attribution refused; treat as tampering. Provenance is UNAVAILABLE"
+                    .to_string(),
+            );
+            return None;
+        }
         Err(e) => {
             crate::coverage::record(format!(
                 "provenance: /lib/apk/db/installed unreadable ({}) — apk attribution unavailable",
