@@ -271,6 +271,16 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
     if let Ok(p) = std::env::var("OWLZOPS_SUDO_PASS")
         && !p.is_empty()
     {
+        // R27-12: remove the secret from the orchestrator's environ. It would
+        // otherwise sit in /proc/self/environ for any same-uid process to read,
+        // while our own DLP scanner reports exactly this class of secret in
+        // other processes' environments.
+        //
+        // SAFETY: called once at startup before any threads are spawned; no
+        // concurrent reader/writer of the environment exists, so this cannot
+        // race (std::env::remove_var is unsafe in Rust 2024 only because of
+        // multi-threaded processes).
+        unsafe { std::env::remove_var("OWLZOPS_SUDO_PASS") };
         return Ok(Zeroizing::new(p));
     }
 
