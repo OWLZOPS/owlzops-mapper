@@ -521,12 +521,8 @@ fn scan_ghost_file(path: &str, max_bytes: u64) -> io::Result<(GhostScan, GhostMe
     // file itself. Use the streaming regular-open primitive.
     let mut f = crate::safe_io::open_regular_streaming(path)?;
     let meta = f.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "map_files target is not a regular file",
-        ));
-    }
+    // R26-46: open_regular_streaming already rejected non-regular targets;
+    // the fd's file type cannot change afterwards.
     let size = meta.len();
 
     let mut buf = vec![0u8; GHOST_CHUNK]; // single allocation, reused every iteration
