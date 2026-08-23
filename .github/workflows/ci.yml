@@ -65,7 +65,7 @@ jobs:
             exit 1
           fi
 
-      # R26-02/17/29/31/33/36/40/43/44: capped-I/O doctrine.
+      # R26-02/17/29/31/33/36/40/43/44/48: capped-I/O doctrine.
       - name: Guard capped-I/O doctrine
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -79,10 +79,19 @@ jobs:
             fail=1
           fi
 
+          # R26-48(b): `rg -P` exits non-zero when the build lacks PCRE2, which
+          # inside `if` reads as "no matches" — the guard would silently stop
+          # running while the step stays green. Fail loudly instead.
+          if ! printf 'x\n' | rg -qP 'x' 2>/dev/null ; then
+            echo "::error::ripgrep in this image has no PCRE2 (-P); the literal-path guard cannot run"
+            fail=1
+          fi
+
           # R26-43: a procfs reader given a LITERAL path that is not a kernel
           # pseudo-file. Variable paths stay author-asserted; literals are
-          # exactly how R26-02 happened.
-          if rg -n -P 'read_procfs_(bytes_)?capped\(\s*"(?!/proc/|/sys/)' src/ \
+          # exactly how R26-02 happened. -U: rustfmt breaks long literal args
+          # onto the next line — the shape provenance.rs had before R26-38.
+          if rg -U -n -P 'read_procfs_(bytes_)?capped\(\s*"(?!/proc/|/sys/)' src/ \
                | rg -v '^src/safe_io\.rs:' ; then
             echo "::error::read_procfs_* on literal non-pseudo-fs path — use read_file_capped_regular"
             fail=1
