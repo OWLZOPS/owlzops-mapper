@@ -364,7 +364,7 @@ fn parse_jsonl_strict_path(
 ) -> Result<Vec<AgentReport>, String> {
     use std::io::{BufRead, BufReader, Read};
 
-    let file = std::fs::File::open(path)
+    let file = crate::safe_io::open_regular_streaming(&path.to_string_lossy())
         .map_err(|e| format!("Failed to open '{label}' file {}: {e}", path.display()))?;
     let mut reader = BufReader::new(file);
 
@@ -508,8 +508,10 @@ async fn run_command(
             // R24-13: an unreadable --hosts file must never degrade into a
             // local scan — the object of the audit would silently change.
             if let Some(ref path) = args.hosts {
-                let contents = match std::fs::read_to_string(path) {
-                    Ok(c) => c,
+                use std::io::BufRead;
+
+                let file = match crate::safe_io::open_regular_streaming(path) {
+                    Ok(f) => f,
                     Err(e) => {
                         eprintln!(
                             "Failed to read hosts file {:?}: {} — refusing to silently fall back to a LOCAL scan",
@@ -518,8 +520,9 @@ async fn run_command(
                         return EXIT_USAGE;
                     }
                 };
+
                 let before = hosts.len();
-                for line in contents.lines() {
+                for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
                     let h = line.trim();
                     if !h.is_empty() && !h.starts_with('#') {
                         hosts.push(h.to_string());

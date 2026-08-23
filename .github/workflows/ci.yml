@@ -65,7 +65,7 @@ jobs:
             exit 1
           fi
 
-      # R26-02/17/29/31/33/36: capped-I/O doctrine.
+      # R26-02/17/29/31/33/36/40: capped-I/O doctrine.
       - name: Guard capped-I/O doctrine
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -76,6 +76,16 @@ jobs:
           # path, read_file_capped_regular asserts a host-controlled one.
           if rg -n 'read_file_(bytes_)?capped\(' src/ | rg -v '^src/safe_io\.rs:' ; then
             echo "::error::renamed API — use read_procfs_capped for /proc,/sys,/dev or read_file_capped_regular for host paths"
+            fail=1
+          fi
+
+          # Raw blocking opens outside safe_io. Streaming call sites use
+          # safe_io::open_regular_streaming; genuine exceptions carry an inline
+          # `// CAPPED_IO_OK: <why>` (R26-40).
+          if rg -n 'fs::read_to_string\(|File::open\(' src/ \
+               | rg -v '^src/safe_io\.rs:' \
+               | rg -v 'CAPPED_IO_OK' ; then
+            echo "::error::uncapped blocking open — use read_file_capped_regular/open_regular_streaming, or annotate CAPPED_IO_OK"
             fail=1
           fi
 

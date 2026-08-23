@@ -746,6 +746,8 @@ async fn upload_via_channel(
             .await
             .map_err(|e| RemoteError::from_russh(e, host))?;
 
+        // CAPPED_IO_OK: streaming upload of operator-supplied local binary,
+        // not a host-controlled scanner path.
         let mut file = tokio::fs::File::open(local_bin)
             .await
             .map_err(|e| RemoteError::Io {

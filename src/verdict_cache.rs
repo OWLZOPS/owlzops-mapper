@@ -43,10 +43,11 @@ fn now() -> u64 {
 
 impl VerdictCache {
     pub fn load(path: PathBuf) -> Self {
-        let entries = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let entries =
+            crate::safe_io::read_file_capped_regular(&path.to_string_lossy(), 16 * 1024 * 1024)
+                .ok()
+                .and_then(|(s, _)| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
         Self {
             path,
             entries,
