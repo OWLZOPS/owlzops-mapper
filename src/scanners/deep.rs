@@ -710,7 +710,7 @@ pub fn parse_starttime_ticks(stat: &str) -> Option<u64> {
 /// Wall-clock start (epoch secs). One 4 KiB read of /proc/<pid>/stat per deep PID; btime cached once.
 pub fn proc_start_epoch(proc_root: &str, pid: u32) -> Option<u64> {
     let btime = boot_epoch()?;
-    let stat = std::fs::read_to_string(format!("{}/{}/stat", proc_root, pid)).ok()?;
+    let stat = std::fs::read_to_string(format!("{}/{}/stat", proc_root, pid)).ok()?; // CAPPED_IO_OK: dynamic procfs path
     Some(btime + parse_starttime_ticks(&stat)? / clk_tck())
 }
 

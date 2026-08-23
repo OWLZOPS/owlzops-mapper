@@ -353,7 +353,7 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     const WINDOW: usize = 4096; // in-flight SQEs; also bounds statx-buf memory
 
     let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
-    let dir = File::open(proc_root).ok()?; // dirfd = DI seam (works on tempdirs)
+    let dir = File::open(proc_root).ok()?; // CAPPED_IO_OK: proc directory, not a host-controlled file
     let dfd = types::Fd(dir.as_raw_fd());
     let mut ring = IoUring::new(RING_DEPTH).ok()?; // creation IS the capability probe
 

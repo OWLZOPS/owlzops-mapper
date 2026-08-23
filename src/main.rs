@@ -1227,14 +1227,27 @@ async fn run_command(
             }
             let before_path = files[files.len() - 2].clone();
             let after_path = files[files.len() - 1].clone();
-            let before_data = std::fs::read_to_string(&before_path).unwrap_or_else(|e| {
+
+            let before_data = crate::safe_io::read_file_capped_regular(
+                &before_path.to_string_lossy(),
+                64 * 1024 * 1024,
+            )
+            .unwrap_or_else(|e| {
                 eprintln!("Failed to read '{}': {}", before_path.display(), e);
                 std::process::exit(1);
-            });
-            let after_data = std::fs::read_to_string(&after_path).unwrap_or_else(|e| {
+            })
+            .0;
+
+            let after_data = crate::safe_io::read_file_capped_regular(
+                &after_path.to_string_lossy(),
+                64 * 1024 * 1024,
+            )
+            .unwrap_or_else(|e| {
                 eprintln!("Failed to read '{}': {}", after_path.display(), e);
                 std::process::exit(1);
-            });
+            })
+            .0;
+
             let before: AgentReport = serde_json::from_str(&before_data).unwrap_or_else(|e| {
                 eprintln!("Invalid JSON in '{}': {}", before_path.display(), e);
                 std::process::exit(1);
@@ -1355,14 +1368,25 @@ async fn run_command(
                 return 0;
             }
 
-            let before_data = std::fs::read_to_string(&cmp_args.before).unwrap_or_else(|e| {
-                eprintln!("Failed to read 'before' file: {e}");
+            let before_data = crate::safe_io::read_file_capped_regular(
+                &cmp_args.before.to_string_lossy(),
+                64 * 1024 * 1024,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read '{}': {}", cmp_args.before.display(), e);
                 std::process::exit(1);
-            });
-            let after_data = std::fs::read_to_string(&cmp_args.after).unwrap_or_else(|e| {
-                eprintln!("Failed to read 'after' file: {e}");
+            })
+            .0;
+
+            let after_data = crate::safe_io::read_file_capped_regular(
+                &cmp_args.after.to_string_lossy(),
+                64 * 1024 * 1024,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read '{}': {}", cmp_args.after.display(), e);
                 std::process::exit(1);
-            });
+            })
+            .0;
 
             let parse_report = |data: &str, label: &str| -> AgentReport {
                 if let Ok(report) = serde_json::from_str::<AgentReport>(data) {

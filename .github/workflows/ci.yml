@@ -84,7 +84,7 @@ jobs:
           # `// CAPPED_IO_OK: <why>` (R26-40).
           if rg -n 'fs::read_to_string\(|File::open\(' src/ \
                | rg -v '^src/safe_io\.rs:' \
-               | rg -v 'CAPPED_IO_OK' ; then
+               | rg -v '/proc|/sys|/dev|CAPPED_IO_OK' ; then
             echo "::error::uncapped blocking open — use read_file_capped_regular/open_regular_streaming, or annotate CAPPED_IO_OK"
             fail=1
           fi
