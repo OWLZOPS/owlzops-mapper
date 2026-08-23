@@ -247,7 +247,7 @@ impl RemoteError {
 // ---------------------------------------------------------------------------
 
 struct ClientHandler {
-    known_hosts_checker: KnownHostsChecker,
+    known_hosts_checker: Arc<KnownHostsChecker>,
 }
 
 impl client::Handler for ClientHandler {
@@ -1033,10 +1033,12 @@ pub async fn run_remote_scan_russh(
     }
 
     let known_hosts_checker =
-        KnownHostsChecker::new(hostname.clone(), port).map_err(|e| RemoteError::HostKeyCheck {
-            host: hostname.clone(),
-            detail: e.to_string(),
-        })?;
+        Arc::new(KnownHostsChecker::new(hostname.clone(), port).map_err(|e| {
+            RemoteError::HostKeyCheck {
+                host: hostname.clone(),
+                detail: e.to_string(),
+            }
+        })?);
 
     let pinned = known_hosts_checker.pinned_algorithms();
 
@@ -1061,7 +1063,7 @@ pub async fn run_remote_scan_russh(
     });
 
     let handler = ClientHandler {
-        known_hosts_checker,
+        known_hosts_checker: known_hosts_checker.clone(),
     };
 
     let ssh_key_path = ssh_key_path.to_string();
@@ -1105,6 +1107,11 @@ pub async fn run_remote_scan_russh(
     let uploaded = AtomicBool::new(false);
     let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
     let mut remote_coverage = RemoteCoverage::default();
+
+    // R27-09: surface TOFU pin write failure in the host report, not just stderr.
+    if let Some(note) = known_hosts_checker.take_pin_failure() {
+        remote_coverage.notes.push(note.to_string());
+    }
 
     let result = tokio::time::timeout(overall, async {
         if let Some(pass) = sudo_pass {
