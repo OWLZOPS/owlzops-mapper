@@ -144,22 +144,24 @@ jobs:
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
 
-      # R27-05: verify signatures before publishing
+      # R27-05/R27-19: verify each artifact has a signature
       - name: Verify every signature before publishing
         run: |
           set -euo pipefail
           shopt -s nullglob
-          expected=$(( $(ls -1 *.tar.gz *.sha256 sbom-*.json 2>/dev/null | wc -l) ))
 
+          # R27-19: iterate ARTIFACTS and require a signature for each.
+          # An exported public key is also a .asc and has no counterpart
+          # file to verify against, so iterating *.asc is fragile.
+          artifacts=( *.tar.gz *.sha256 sbom-*.json )
           n=0
-          for sig in *.asc; do
-            gpg --batch --verify "$sig" "${sig%.asc}"
+          for file in "${artifacts[@]}"; do
+            [ -f "$file.asc" ] || { echo "::error::no signature for $file"; exit 1; }
+            gpg --batch --verify "$file.asc" "$file"
             n=$((n+1))
           done
+          expected=${#artifacts[@]}
 
-          # R27-17: tie the threshold to the actual artifact set, not a
-          # hard-coded number. A future fourth target must not silently
-          # weaken this check.
           [ "$n" -eq "$expected" ] && [ "$n" -ge 9 ] || {
             echo "::error::$n signatures for $expected artifacts (minimum 9)"
             exit 1
@@ -173,7 +175,6 @@ jobs:
             *.sha256
             *.asc
             sbom-*.json
-            sbom-*.json.asc
 
   release:
     name: Create GitHub Release
@@ -200,20 +201,29 @@ jobs:
       - name: Generate release notes
         run: git-cliff --latest --strip header -o RELEASE_NOTES.md
 
-      # Repository CHANGELOG.md: full history with version headings (R27-01).
+      # R27-01: full history for the repository changelog
       - name: Regenerate full changelog
-        run: git-cliff -o CHANGELOG.md
+        run: |
+          set -e
+          git-cliff -o CHANGELOG.md
+          # R27-20: an empty or malformed changelog must not reach the PR.
+          test -s CHANGELOG.md && head -1 CHANGELOG.md | grep -q '^# Changelog' || {
+            echo "::error::git-cliff produced an empty or malformed CHANGELOG.md"
+            exit 1
+          }
 
       - name: Publish release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           body_path: RELEASE_NOTES.md
+          # R27-18: patterns are expanded independently with no dedup.
+          # `*.asc` already covers sbom-*.json.asc — listing both queues
+          # the same asset twice and causes upload races.
           files: |
             *.tar.gz
             *.sha256
             *.asc
             sbom-*.json
-            sbom-*.json.asc
           draft: false
           # SemVer: anything after '-' is a pre-release (R27-06).
           prerelease: ${{ contains(github.ref_name, '-') }}
