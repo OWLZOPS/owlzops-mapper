@@ -65,6 +65,12 @@ jobs:
             exit 1
           fi
 
+      - name: Install ripgrep
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       # R26-02/17/29/31/33/36/40/43/44/48: capped-I/O doctrine.
       - name: Guard capped-I/O doctrine
         if: matrix.os == 'ubuntu-24.04'
