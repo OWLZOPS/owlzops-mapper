@@ -517,7 +517,9 @@ impl GhostMeta {
 /// Chunked read of a (possibly deleted) inode. `max_bytes` is a parameter for DI/testability.
 /// EINTR-safe; refuses non-regular targets.
 fn scan_ghost_file(path: &str, max_bytes: u64) -> io::Result<(GhostScan, GhostMeta)> {
-    let mut f = std::fs::File::open(path)?;
+    // R26-39: path came from /proc/<pid>/maps — attacker-controlled, not a procfs
+    // file itself. Use the streaming regular-open primitive.
+    let mut f = crate::safe_io::open_regular_streaming(path)?;
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
         return Err(io::Error::new(
@@ -708,7 +710,7 @@ pub fn parse_starttime_ticks(stat: &str) -> Option<u64> {
 /// Wall-clock start (epoch secs). One 4 KiB read of /proc/<pid>/stat per deep PID; btime cached once.
 pub fn proc_start_epoch(proc_root: &str, pid: u32) -> Option<u64> {
     let btime = boot_epoch()?;
-    let stat = std::fs::read_to_string(format!("{}/{}/stat", proc_root, pid)).ok()?;
+    let stat = std::fs::read_to_string(format!("{}/{}/stat", proc_root, pid)).ok()?; // CAPPED_IO_OK: dynamic procfs path
     Some(btime + parse_starttime_ticks(&stat)? / clk_tck())
 }
 

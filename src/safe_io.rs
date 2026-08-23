@@ -1,9 +1,19 @@
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 
-/// Read a file into a String, capping at `max_bytes`. Returns (content, truncated).
+/// Read a KERNEL PSEUDO-FILE into a String, capping at `max_bytes`.
+/// Returns (content, truncated).
+///
+/// `/proc`, `/sys` and `/dev` ONLY. These cannot be replaced with a FIFO by a
+/// host attacker, so a plain blocking `File::open` is safe there. For anything
+/// on a host-controlled filesystem use `read_file_capped_regular` — see R26-02.
+/// The name carries the constraint on purpose: `read_procfs_capped("/etc/sudoers")`
+/// is wrong on sight (R26-31).
+///
+/// R26-33: capped-I/O guard no longer uses context separators; the new guard
+/// is exact and checks renamed procfs APIs. See .github/workflows/ci.yml.
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
-pub fn read_file_capped(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
+pub fn read_procfs_capped(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
     let read = f
@@ -19,9 +29,13 @@ pub fn read_file_capped(path: &str, max_bytes: usize) -> io::Result<(String, boo
     Ok((text, truncated))
 }
 
-/// Read a file into raw bytes, capping at `max_bytes`. Returns (bytes, truncated).
+/// Read a KERNEL PSEUDO-FILE into raw bytes, capping at `max_bytes`.
+/// Returns (bytes, truncated).
+///
+/// Same constraints as `read_procfs_capped`: `/proc`, `/sys`, `/dev` ONLY.
+/// Host-controlled paths must use `read_file_capped_regular` (R26-31/R26-36).
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
-pub fn read_file_bytes_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
+pub fn read_procfs_bytes_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(max_bytes.min(64 * 1024));
     let read = f
@@ -78,9 +92,31 @@ fn read_regular_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, boo
     Ok((buf, truncated))
 }
 
+/// Open a host-controlled file for STREAMING reads (hashing, ELF parsing).
+///
+/// Same FIFO/device protection as `read_file_capped_regular`, but returns the
+/// handle instead of the contents: capping is wrong when the whole file must
+/// be consumed (a truncated hash is a wrong hash). R26-39.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+pub fn open_regular_streaming(path: &str) -> io::Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+
+    if !f.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file (FIFO or device on a scanner path)",
+        ));
+    }
+
+    Ok(f)
+}
+
 // ── R23-10: safe open for host-controlled paths (FIFO/device resistant) ──
 
-/// Like `read_file_capped`, but opens the file with `O_NONBLOCK | O_NOCTTY`
+/// Like `read_procfs_capped`, but opens the file with `O_NONBLOCK | O_NOCTTY`
 /// and verifies that the resulting file descriptor is a regular file.
 ///
 /// Paths under scanner control (`/etc/ld.so.preload`, unit files, cron files)
@@ -142,43 +178,43 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn read_file_capped_normal() {
+    fn read_procfs_capped_normal() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         write!(tmp, "hello world").unwrap();
         let path = tmp.path().to_str().unwrap();
-        let (content, truncated) = read_file_capped(path, 100).unwrap();
+        let (content, truncated) = read_procfs_capped(path, 100).unwrap();
         assert_eq!(content, "hello world");
         assert!(!truncated);
     }
 
     #[test]
-    fn read_file_capped_truncated() {
+    fn read_procfs_capped_truncated() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         let data = vec![b'A'; 200];
         tmp.write_all(&data).unwrap();
         let path = tmp.path().to_str().unwrap();
-        let (content, truncated) = read_file_capped(path, 100).unwrap();
+        let (content, truncated) = read_procfs_capped(path, 100).unwrap();
         assert_eq!(content.len(), 100);
         assert!(truncated);
     }
 
     #[test]
-    fn read_file_capped_exact() {
+    fn read_procfs_capped_exact() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         let data = vec![b'B'; 100];
         tmp.write_all(&data).unwrap();
         let path = tmp.path().to_str().unwrap();
-        let (content, truncated) = read_file_capped(path, 100).unwrap();
+        let (content, truncated) = read_procfs_capped(path, 100).unwrap();
         assert_eq!(content.len(), 100);
         assert!(!truncated);
     }
 
     #[test]
-    fn read_file_capped_invalid_utf8() {
+    fn read_procfs_capped_invalid_utf8() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
         let path = tmp.path().to_str().unwrap();
-        let (content, truncated) = read_file_capped(path, 10).unwrap();
+        let (content, truncated) = read_procfs_capped(path, 10).unwrap();
         assert!(content.contains('\u{FFFD}'));
         assert!(!truncated);
     }

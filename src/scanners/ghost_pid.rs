@@ -69,7 +69,7 @@ pub fn scan_ghost_pids(deep: bool) -> Vec<GhostPidFinding> {
 fn has_hidepid_option() -> bool {
     // Larger cap: /proc/mounts is big on mount-heavy (Docker) hosts; a
     // truncated `proc` line would silently defeat this guard.
-    if let Ok((content, _)) = safe_io::read_file_capped("/proc/mounts", 256 * 1024) {
+    if let Ok((content, _)) = safe_io::read_procfs_capped("/proc/mounts", 256 * 1024) {
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             let source = parts.next().unwrap_or("");
@@ -192,7 +192,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // the kill arbiter will classify it as "kill" (downgraded suspicion).
         let status_path = proc_root.join(pid.to_string()).join("status");
         let (tgid, state_from_status) =
-            match safe_io::read_file_capped(status_path.to_string_lossy().as_ref(), 8192) {
+            match safe_io::read_procfs_capped(status_path.to_string_lossy().as_ref(), 8192) {
                 Ok((content, _)) => parse_tgid_and_state(&content),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None), // keep for arbiter
                 Err(_) => continue, // other errors → drop noise
@@ -235,7 +235,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
 /// Other errors → `true` (drop noise).
 fn is_thread(proc_root: &Path, pid: u32) -> bool {
     let path = proc_root.join(pid.to_string()).join("status");
-    match safe_io::read_file_capped(path.to_string_lossy().as_ref(), 8192) {
+    match safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 8192) {
         Ok((content, _)) => matches!(parse_tgid_and_state(&content).0, Some(t) if t != pid),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false, // keep
         Err(_) => true,                                              // drop noise
@@ -353,7 +353,7 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     const WINDOW: usize = 4096; // in-flight SQEs; also bounds statx-buf memory
 
     let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
-    let dir = File::open(proc_root).ok()?; // dirfd = DI seam (works on tempdirs)
+    let dir = File::open(proc_root).ok()?; // CAPPED_IO_OK: proc directory, not a host-controlled file
     let dfd = types::Fd(dir.as_raw_fd());
     let mut ring = IoUring::new(RING_DEPTH).ok()?; // creation IS the capability probe
 
@@ -492,7 +492,7 @@ fn pid_scan_bounds() -> (u32, Option<(u32, u32)>) {
 }
 
 fn read_u32_sysfile(path: &str) -> Option<u32> {
-    let (content, _) = safe_io::read_file_capped(path, 64).ok()?;
+    let (content, _) = safe_io::read_procfs_capped(path, 64).ok()?;
     content.trim().parse().ok()
 }
 
@@ -510,7 +510,7 @@ fn kill_exists(pid: u32) -> bool {
 
 fn read_state_and_age(proc_root: &Path, pid: u32) -> (Option<String>, Option<u64>) {
     let path = proc_root.join(pid.to_string()).join("stat");
-    let content = match safe_io::read_file_capped(path.to_string_lossy().as_ref(), 8192) {
+    let content = match safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 8192) {
         Ok((c, _)) => c,
         Err(_) => return (None, None),
     };
@@ -550,7 +550,7 @@ fn clock_ticks_per_sec() -> u64 {
 }
 
 fn read_uptime_secs() -> Option<u64> {
-    let (content, _) = safe_io::read_file_capped("/proc/uptime", 128).ok()?;
+    let (content, _) = safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
     content
         .split_whitespace()
         .next()?

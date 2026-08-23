@@ -325,8 +325,10 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
             }
         }
     } else if let Some(ref hosts_path) = args.audit.hosts {
-        let contents = match std::fs::read_to_string(hosts_path) {
-            Ok(c) => c,
+        use std::io::BufRead;
+
+        let file = match crate::safe_io::open_regular_streaming(hosts_path) {
+            Ok(f) => f,
             Err(e) => {
                 eprintln!(
                     "Failed to read hosts file {:?}: {} — refusing to silently fall back to a LOCAL scan",
@@ -335,8 +337,10 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
                 return 1;
             }
         };
-        let first_host = contents
+        let reader = std::io::BufReader::new(file);
+        let first_host = reader
             .lines()
+            .map_while(Result::ok)
             .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
             .map(|l| l.trim().to_string());
         if let Some(host) = first_host {

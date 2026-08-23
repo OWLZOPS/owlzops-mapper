@@ -2037,4 +2037,19 @@ mod tests {
             "a new passwordless root grant must be visible in the drift report"
         );
     }
+
+    // R26-42: ensure cross-version caveat survives JSON/XLSX export.
+    #[test]
+    fn a_binary_version_change_is_recorded_for_every_output_channel() {
+        let before = test_report();
+        let mut after = test_report();
+        after.version = "0.5.36".into();
+        let diff = compare_reports(&before, &after);
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.field == "meta.binary_version"),
+            "cross-version caveat must survive JSON/XLSX export, not just the terminal"
+        );
+    }
 }

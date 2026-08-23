@@ -147,7 +147,7 @@ fn tracefs_root() -> Option<&'static str> {
 
 fn function_tracer_active(root: &str) -> bool {
     let active = |path: String| {
-        safe_io::read_file_capped(&path, 256)
+        safe_io::read_procfs_capped(&path, 256)
             .map(|(s, _)| {
                 let t = s.trim();
                 !t.is_empty() && t != "nop"
@@ -181,7 +181,7 @@ pub fn gather_ftrace_hooks() -> FtraceHookInventory {
     inv.live_tracer_active = function_tracer_active(root);
 
     if let Ok((kp, _)) =
-        safe_io::read_file_capped(&format!("{root}/kprobe_events"), CAP_KPROBE_EVENTS)
+        safe_io::read_procfs_capped(&format!("{root}/kprobe_events"), CAP_KPROBE_EVENTS)
     {
         inv.syscall_kprobes = parse_kprobe_events(&kp)
             .into_iter()
@@ -189,7 +189,7 @@ pub fn gather_ftrace_hooks() -> FtraceHookInventory {
             .collect();
     }
 
-    let (content, truncated) = match safe_io::read_file_capped(
+    let (content, truncated) = match safe_io::read_procfs_capped(
         &format!("{root}/enabled_functions"),
         CAP_ENABLED_FUNCTIONS,
     ) {

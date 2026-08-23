@@ -67,7 +67,7 @@ pub(crate) fn decode_taint(raw: u64) -> Vec<TaintFlag> {
 
 #[cfg(target_os = "linux")]
 pub fn gather_kernel_taint() -> KernelTaint {
-    let (content, _) = match safe_io::read_file_capped("/proc/sys/kernel/tainted", 64) {
+    let (content, _) = match safe_io::read_procfs_capped("/proc/sys/kernel/tainted", 64) {
         Ok(v) => v,
         Err(e) => {
             coverage::record(format!(

@@ -410,6 +410,38 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
     )
 }
 
+/// Read a host-controlled cron file using the capped regular-file API.
+/// Records explicit coverage for truncation, non-regular objects, and I/O errors.
+/// Returns `None` if the file should not be parsed.
+fn read_cron_source(path: &str, label: &str) -> Option<String> {
+    match crate::safe_io::read_file_capped_regular(path, CRON_FILE_CAP) {
+        Ok((content, truncated)) => {
+            if truncated {
+                crate::coverage::record(format!("{label} exceeded cap — cron inventory PARTIAL"));
+            }
+            Some(content)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            crate::coverage::record(format!(
+                "{label} is NOT a regular file (fifo/device) — cron parse refused; \
+                 treat as tampering. Persistence audit INCOMPLETE"
+            ));
+            None
+        }
+        Err(e) => {
+            crate::coverage::record(format!(
+                "{label} unreadable ({}) — cron inventory INCOMPLETE",
+                e.kind()
+            ));
+            None
+        }
+    }
+}
+
+/// Cron files are small; 1 MiB is generous and bounds a /dev/zero swap.
+const CRON_FILE_CAP: usize = 1024 * 1024;
+
 /// Collects running services, failed services, cron jobs (classified), and systemd timers.
 fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
     // running native services
@@ -459,7 +491,9 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
 
     // cron jobs (all sources) – now classified
     let mut raw_lines = Vec::new();
-    if let Ok(ct) = fs::read_to_string("/etc/crontab") {
+
+    // R26-37: /etc/crontab is host-controlled; a FIFO here hangs gather_services.
+    if let Some(ct) = read_cron_source("/etc/crontab", "/etc/crontab") {
         for l in ct.lines() {
             let l = l.trim();
             if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
@@ -467,6 +501,7 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             }
         }
     }
+
     if let Ok(dir) = fs::read_dir("/etc/cron.d") {
         for entry in dir.flatten() {
             let path = entry.path();
@@ -484,20 +519,23 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             {
                 continue;
             }
-            if let Ok(contents) = fs::read_to_string(&path) {
+            let label = format!("/etc/cron.d/{name}");
+            if let Some(contents) = read_cron_source(&path.to_string_lossy(), &label) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
-                        raw_lines.push(format!("/etc/cron.d/{}: {}", name, l));
+                        raw_lines.push(format!("{label}: {}", l));
                     }
                 }
             }
         }
     }
+
     if let Ok(spool) = fs::read_dir("/var/spool/cron/crontabs") {
         for entry in spool.flatten() {
             let user = entry.file_name().to_string_lossy().to_string();
-            if let Ok(contents) = fs::read_to_string(entry.path()) {
+            let label = format!("/var/spool/cron/crontabs/{user}");
+            if let Some(contents) = read_cron_source(&entry.path().to_string_lossy(), &label) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
@@ -507,6 +545,7 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             }
         }
     }
+
     if let Ok(spool) = fs::read_dir("/var/spool/cron") {
         for entry in spool.flatten() {
             let path = entry.path();
@@ -514,7 +553,8 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
                 continue;
             }
             let user = entry.file_name().to_string_lossy().to_string();
-            if let Ok(contents) = fs::read_to_string(&path) {
+            let label = format!("/var/spool/cron/{user}");
+            if let Some(contents) = read_cron_source(&path.to_string_lossy(), &label) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
@@ -524,7 +564,8 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             }
         }
     }
-    if let Ok(anacron) = fs::read_to_string("/etc/anacrontab") {
+
+    if let Some(anacron) = read_cron_source("/etc/anacrontab", "/etc/anacrontab") {
         for l in anacron.lines() {
             let l = l.trim();
             if l.is_empty() || l.starts_with('#') || is_cron_env(l) {

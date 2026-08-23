@@ -32,13 +32,13 @@ pub(crate) fn complain_profile(attr_current: &str) -> Option<&str> {
 pub fn gather_confinement() -> ConfinementReport {
     let mut report = ConfinementReport::default();
 
-    if let Ok((content, _)) = safe_io::read_file_capped("/sys/kernel/security/lsm", 4096) {
+    if let Ok((content, _)) = safe_io::read_procfs_capped("/sys/kernel/security/lsm", 4096) {
         report.lsms = parse_lsm_list(&content);
     }
     let has = |name: &str| report.lsms.iter().any(|l| l == name);
 
     if has("selinux")
-        && let Ok((v, _)) = safe_io::read_file_capped("/sys/fs/selinux/enforce", 16)
+        && let Ok((v, _)) = safe_io::read_procfs_capped("/sys/fs/selinux/enforce", 16)
     {
         report.selinux_permissive = v.trim() == "0";
     }
@@ -55,12 +55,13 @@ pub fn gather_confinement() -> ConfinementReport {
                 else {
                     continue;
                 };
-                match safe_io::read_file_capped(&format!("/proc/{pid}/attr/current"), 4096) {
+                match safe_io::read_procfs_capped(&format!("/proc/{pid}/attr/current"), 4096) {
                     Ok((attr, _)) => {
                         if let Some(profile) = complain_profile(&attr) {
-                            let comm = safe_io::read_file_capped(&format!("/proc/{pid}/comm"), 256)
-                                .map(|(s, _)| s.trim().to_string())
-                                .unwrap_or_default();
+                            let comm =
+                                safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 256)
+                                    .map(|(s, _)| s.trim().to_string())
+                                    .unwrap_or_default();
                             report.complain_profiles.push(ComplainProc {
                                 pid,
                                 comm,

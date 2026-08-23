@@ -97,7 +97,7 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
         Proto::Udp6 => "/proc/net/udp6",
     };
 
-    let (content, truncated) = match safe_io::read_file_capped(path, safe_io::CAP_PROC_NET) {
+    let (content, truncated) = match safe_io::read_procfs_capped(path, safe_io::CAP_PROC_NET) {
         Ok((c, t)) => (c, t),
         // Kernel without IPv6 support → legitimate absence, silence is correct.
         Err(e) if e.kind() == ErrorKind::NotFound => return,
@@ -244,7 +244,7 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
                 .clone();
 
             let comm = {
-                match safe_io::read_file_capped(&format!("/proc/{pid}/comm"), 4096) {
+                match safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096) {
                     Ok((c, truncated)) => {
                         if truncated {
                             coverage::record(format!("/proc/{pid}/comm truncated"));

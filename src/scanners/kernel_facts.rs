@@ -27,7 +27,7 @@ const ONE_WAY_SWITCHES: &[(&str, &str)] = &[
 pub(crate) fn gather_one_way_switches() -> BTreeMap<String, Option<u8>> {
     let mut map = BTreeMap::new();
     for (path, label) in ONE_WAY_SWITCHES {
-        let value = match safe_io::read_file_capped(path, 4096) {
+        let value = match safe_io::read_procfs_capped(path, 4096) {
             Ok((content, truncated)) => {
                 if truncated {
                     coverage::record(format!("{path} truncated"));
@@ -73,7 +73,7 @@ pub(crate) fn gather_one_way_switches() -> BTreeMap<String, Option<u8>> {
 /// indistinguishable from a genuinely empty pattern, which the kernel treats
 /// as "disabled" and is safe — coverage distinguishes the two (R23-07).
 pub fn gather_kernel_facts() -> (Option<String>, Option<bool>, Option<String>) {
-    let core_pattern = match safe_io::read_file_capped("/proc/sys/kernel/core_pattern", 4096) {
+    let core_pattern = match safe_io::read_procfs_capped("/proc/sys/kernel/core_pattern", 4096) {
         Ok((s, _)) => Some(s.trim().to_string()),
         Err(e) => {
             coverage::record(format!(
@@ -83,7 +83,7 @@ pub fn gather_kernel_facts() -> (Option<String>, Option<bool>, Option<String>) {
         }
     };
 
-    let modules_disabled = safe_io::read_file_capped("/proc/sys/kernel/modules_disabled", 4096)
+    let modules_disabled = safe_io::read_procfs_capped("/proc/sys/kernel/modules_disabled", 4096)
         .ok()
         .and_then(|(s, _)| s.trim().parse::<u8>().ok())
         .map(|v| v == 1);
@@ -94,7 +94,7 @@ pub fn gather_kernel_facts() -> (Option<String>, Option<bool>, Option<String>) {
         );
     }
 
-    let lockdown = safe_io::read_file_capped("/sys/kernel/security/lockdown", 4096)
+    let lockdown = safe_io::read_procfs_capped("/sys/kernel/security/lockdown", 4096)
         .ok()
         .map(|(s, _)| {
             let s = s.trim();

@@ -16,6 +16,31 @@ fn parse_openssl_enddate(raw: &str) -> Option<i64> {
     Some(diff.num_days())
 }
 
+/// Read a host-controlled system file with capped regular semantics.
+/// Records tampering and truncation coverage facts.
+fn read_system_file(path: &str, label: &str) -> Option<String> {
+    match safe_io::read_file_capped_regular(path, 1024 * 1024) {
+        Ok((content, truncated)) => {
+            if truncated {
+                crate::coverage::record(format!("{label} exceeded cap — data PARTIAL"));
+            }
+            Some(content)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            crate::coverage::record(format!(
+                "{label} is NOT a regular file (fifo/device) — parse refused; \
+                 treat as tampering"
+            ));
+            None
+        }
+        Err(e) => {
+            crate::coverage::record(format!("{label} unreadable ({})", e.kind()));
+            None
+        }
+    }
+}
+
 pub fn gather_network_info() -> NetworkInfo {
     let mut firewall_active = false;
 
@@ -66,9 +91,9 @@ pub fn gather_network_info() -> NetworkInfo {
         firewall_active = has_input_drop_policy || has_input_rules;
     }
 
-    // DNS Resolvers
+    // DNS Resolvers — /etc/resolv.conf is host-controlled (R26-37)
     let mut dns_resolvers = Vec::new();
-    if let Ok(resolv) = fs::read_to_string("/etc/resolv.conf") {
+    if let Some(resolv) = read_system_file("/etc/resolv.conf", "/etc/resolv.conf") {
         for line in resolv.lines() {
             let l = line.trim();
             if l.starts_with("nameserver") {
@@ -80,9 +105,9 @@ pub fn gather_network_info() -> NetworkInfo {
         }
     }
 
-    // Custom /etc/hosts overrides
+    // Custom /etc/hosts overrides — /etc/hosts is host-controlled (R26-37)
     let mut custom_host_overrides = Vec::new();
-    if let Ok(hosts) = fs::read_to_string("/etc/hosts") {
+    if let Some(hosts) = read_system_file("/etc/hosts", "/etc/hosts") {
         for line in hosts.lines() {
             let l = line.trim();
             if l.is_empty() || l.starts_with('#') {

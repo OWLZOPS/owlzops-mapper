@@ -32,7 +32,7 @@ pub fn scan_mount_masking() -> Vec<MountMaskingFinding> {
 
 /// Split out for testing against a tempfile fixture.
 fn detect_from_path(path: &str) -> Vec<MountMaskingFinding> {
-    let (content, truncated) = match crate::safe_io::read_file_capped(path, CAP_MOUNTINFO) {
+    let (content, truncated) = match crate::safe_io::read_procfs_capped(path, CAP_MOUNTINFO) {
         Ok(v) => v,
         Err(_) => {
             // mountinfo is world-readable on normal hosts; failure is notable.
