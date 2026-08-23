@@ -65,22 +65,38 @@ jobs:
             exit 1
           fi
 
-      # R26-02/17/29: enforce capped-I/O doctrine and shared sanitizer predicate.
-      - name: Guard capped-I/O doctrine (R26-02/17/29)
+      # R26-02/17/29/31: enforce capped-I/O doctrine and shared sanitizer predicate.
+      - name: Guard capped-I/O doctrine
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          if rg -n 'fs::read_to_string\(|File::open\(' src/ \
-               | rg -v 'safe_io\.rs|/proc|/sys|/dev|mod tests|uploads' ; then
-            echo "::error::uncapped read on a host-controlled path — use safe_io::read_file_capped_regular"
-            exit 1
+          set -uo pipefail
+          fail=0
+
+          if rg -U -n -A1 'read_file_(bytes_)?capped\(' src/ \
+               | rg -v 'safe_io\.rs' \
+               | rg -v '/proc|/sys|/dev|proc_root|PROC_' ; then
+            echo "::error::read_file_capped/read_file_bytes_capped used off a kernel pseudo-file — use read_file_capped_regular"
+            fail=1
           fi
+
+          if rg -U -n -B1 'fs::read_to_string\(|File::open\(' src/ \
+               | rg -v 'safe_io\.rs' \
+               | rg -v '/proc|/sys|/dev|proc_root|CAPPED_IO_OK' ; then
+            echo "::error::uncapped blocking open — use safe_io::read_file_capped_regular (or mark CAPPED_IO_OK)"
+            fail=1
+          fi
+
           for f in $(rg -l 'fn sanitize_' src/); do
-            rg -q 'is_terminal_unsafe|sanitize_for_document' "$f" || {
-              echo "::error file=$f::sanitizer does not use the shared predicate"
-              exit 1
-            }
+            rg -q 'is_terminal_unsafe|sanitize_for_document' "$f" \
+              || { echo "::error file=$f::sanitizer does not use the shared predicate"; fail=1; }
           done
-          rg -n '"which"' src/ && { echo "::error::use resolve_tool, not a fork of which"; exit 1; } || true
+
+          if rg -n '"which"' src/ ; then
+            echo "::error::use resolve_tool, not a fork of which"
+            fail=1
+          fi
+
+          exit $fail
 
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

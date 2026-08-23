@@ -208,7 +208,9 @@ pub fn gather_network_info() -> NetworkInfo {
     if (dns_resolvers.contains(&"127.0.0.53".to_string())
         || dns_resolvers.contains(&"127.0.0.54".to_string()))
         && let Ok((content, _truncated)) =
-            safe_io::read_file_capped("/run/systemd/resolve/resolv.conf", 4096)
+            // R26-31: /run/systemd/resolve/resolv.conf is a host-controlled file; use
+            // read_file_capped_regular, not read_file_capped (procfs-only).
+            safe_io::read_file_capped_regular("/run/systemd/resolve/resolv.conf", 4096)
     {
         for line in content.lines() {
             let trimmed = line.trim();
