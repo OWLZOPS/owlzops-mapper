@@ -308,6 +308,7 @@ fn outcome_for_writer_failure(
 ///
 /// R26-05: refusing to diff on unreadable lines prevents a dropped record
 /// from being shown as "host removed".
+#[cfg(test)]
 fn parse_jsonl_strict(data: &str, label: &str) -> Result<Vec<AgentReport>, String> {
     // Try a full JSON array first (e.g. from a non-streaming fleet output).
     if let Ok(reports) = serde_json::from_str::<Vec<AgentReport>>(data) {
@@ -352,6 +353,105 @@ fn parse_jsonl_strict(data: &str, label: &str) -> Result<Vec<AgentReport>, Strin
     }
 
     Ok(jsonl)
+}
+
+/// Parse a compare input file that may be a single JSON object, a JSON array,
+/// or newline-delimited JSON records. Reads JSONL incrementally to avoid
+/// holding an entire fleet report in memory (R26-40).
+fn parse_jsonl_strict_path(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<Vec<AgentReport>, String> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open '{label}' file {}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    // Sniff the first non-empty line: `[` means a JSON array, everything else
+    // must be either a single report or the first JSONL record.
+    let mut first = String::new();
+    loop {
+        first.clear();
+        let n = reader
+            .read_line(&mut first)
+            .map_err(|e| format!("Failed to read '{label}' file {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = first.trim();
+        if !trimmed.is_empty() {
+            first = trimmed.to_string();
+            break;
+        }
+    }
+
+    if first.is_empty() {
+        return Err(format!(
+            "No valid JSON found in '{label}' file {}",
+            path.display()
+        ));
+    }
+
+    // JSON array: this is the rare non-streaming case. It is a snapshot array,
+    // not a JSONL file, so read it whole.
+    if first.starts_with('[') {
+        let mut rest = first;
+        reader
+            .read_to_string(&mut rest)
+            .map_err(|e| format!("Failed to read '{label}' file {}: {e}", path.display()))?;
+        let reports: Vec<AgentReport> = serde_json::from_str(&rest)
+            .map_err(|e| format!("Invalid JSON array in '{label}': {e}"))?;
+        return Ok(reports);
+    }
+
+    // First record is a single JSON object. It may be followed by more records
+    // (JSONL) or be the only object (legacy single report).
+    let first_report: AgentReport =
+        serde_json::from_str(&first).map_err(|e| format!("'{label}' line 1: {e}"))?;
+    let mut reports = vec![first_report];
+
+    let mut bad: Vec<(usize, String)> = Vec::new();
+    let mut line_no = 1usize;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read '{label}' file {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        line_no += 1;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<AgentReport>(trimmed) {
+            Ok(r) => reports.push(r),
+            Err(e) => bad.push((line_no, e.to_string())),
+        }
+    }
+
+    if !bad.is_empty() {
+        let mut msg = String::new();
+        for (n, e) in bad.iter().take(5) {
+            msg.push_str(&format!("'{label}' line {n}: {e}\n"));
+        }
+        msg.push_str(&format!(
+            "Error: {} of {} JSONL record(s) in '{label}' are unreadable. \
+             Refusing to diff — an unparsed host is indistinguishable from a \
+             decommissioned one. Re-run the scan or fix the file.",
+            bad.len(),
+            bad.len() + reports.len()
+        ));
+        return Err(msg);
+    }
+
+    Ok(reports)
 }
 
 /// Used by runner and scanner modules to adapt coverage hints. Keep here as
@@ -1175,30 +1275,24 @@ async fn run_command(
         }
 
         Commands::Compare(cmp_args) => {
-            let before_data = std::fs::read_to_string(&cmp_args.before).unwrap_or_else(|e| {
-                eprintln!("Failed to read 'before' file: {e}");
-                std::process::exit(1);
-            });
-            let after_data = std::fs::read_to_string(&cmp_args.after).unwrap_or_else(|e| {
-                eprintln!("Failed to read 'after' file: {e}");
-                std::process::exit(1);
-            });
-
             if cmp_args.multi_host {
-                let before = match parse_jsonl_strict(&before_data, "before") {
-                    Ok(reports) => reports,
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(EXIT_INCOMPLETE);
-                    }
-                };
-                let after = match parse_jsonl_strict(&after_data, "after") {
-                    Ok(reports) => reports,
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(EXIT_INCOMPLETE);
-                    }
-                };
+                let before =
+                    match parse_jsonl_strict_path(std::path::Path::new(&cmp_args.before), "before")
+                    {
+                        Ok(reports) => reports,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(EXIT_INCOMPLETE);
+                        }
+                    };
+                let after =
+                    match parse_jsonl_strict_path(std::path::Path::new(&cmp_args.after), "after") {
+                        Ok(reports) => reports,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(EXIT_INCOMPLETE);
+                        }
+                    };
                 let diffs = compare::compare_multi(&before, &after);
 
                 match cmp_args.format {
@@ -1257,6 +1351,15 @@ async fn run_command(
                 }
                 return 0;
             }
+
+            let before_data = std::fs::read_to_string(&cmp_args.before).unwrap_or_else(|e| {
+                eprintln!("Failed to read 'before' file: {e}");
+                std::process::exit(1);
+            });
+            let after_data = std::fs::read_to_string(&cmp_args.after).unwrap_or_else(|e| {
+                eprintln!("Failed to read 'after' file: {e}");
+                std::process::exit(1);
+            });
 
             let parse_report = |data: &str, label: &str| -> AgentReport {
                 if let Ok(report) = serde_json::from_str::<AgentReport>(data) {
