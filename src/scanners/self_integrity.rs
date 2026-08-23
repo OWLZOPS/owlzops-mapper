@@ -189,7 +189,9 @@ fn check_os_type(report: &mut IntegrityReport) {
 /// Returns `Some(true)` on first match (early exit), `Some(false)` if scanned
 /// without finding any, or `None` if the file cannot be opened.
 fn family_has_established(path: &str) -> Option<bool> {
-    // R26-39: our own binary path is host-controlled; avoid a FIFO hang.
+    // /proc/net/tcp{,6}: procfs, so a FIFO swap is impossible. Using the
+    // regular-open primitive is merely stricter than needed, not required.
+    // If procfs streaming spreads, add `open_procfs_streaming` (R26-45).
     let f = crate::safe_io::open_regular_streaming(path).ok()?;
     let reader = BufReader::new(f);
     for line in reader.lines().skip(1).map_while(Result::ok) {
