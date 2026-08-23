@@ -92,6 +92,27 @@ fn read_regular_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, boo
     Ok((buf, truncated))
 }
 
+/// Open a host-controlled file for STREAMING reads (hashing, ELF parsing).
+///
+/// Same FIFO/device protection as `read_file_capped_regular`, but returns the
+/// handle instead of the contents: capping is wrong when the whole file must
+/// be consumed (a truncated hash is a wrong hash). R26-39.
+pub fn open_regular_streaming(path: &str) -> io::Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+
+    if !f.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file (FIFO or device on a scanner path)",
+        ));
+    }
+
+    Ok(f)
+}
+
 // ── R23-10: safe open for host-controlled paths (FIFO/device resistant) ──
 
 /// Like `read_procfs_capped`, but opens the file with `O_NONBLOCK | O_NOCTTY`

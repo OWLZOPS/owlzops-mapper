@@ -517,7 +517,9 @@ impl GhostMeta {
 /// Chunked read of a (possibly deleted) inode. `max_bytes` is a parameter for DI/testability.
 /// EINTR-safe; refuses non-regular targets.
 fn scan_ghost_file(path: &str, max_bytes: u64) -> io::Result<(GhostScan, GhostMeta)> {
-    let mut f = std::fs::File::open(path)?;
+    // R26-39: path came from /proc/<pid>/maps — attacker-controlled, not a procfs
+    // file itself. Use the streaming regular-open primitive.
+    let mut f = crate::safe_io::open_regular_streaming(path)?;
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
         return Err(io::Error::new(
