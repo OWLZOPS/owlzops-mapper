@@ -4,9 +4,15 @@ use std::os::unix::fs::OpenOptionsExt;
 /// Read a KERNEL PSEUDO-FILE into a String, capping at `max_bytes`.
 /// Returns (content, truncated).
 ///
-/// `/proc`, `/sys` and `/dev` ONLY. These cannot be replaced with a FIFO by a
-/// host attacker, so a plain blocking `File::open` is safe there. For anything
-/// on a host-controlled filesystem use `read_file_capped_regular` — see R26-02.
+/// `/proc`, `/sys` and other kernel-backed pseudo-filesystems (tracefs,
+/// debugfs) ONLY. Those reject `mknod`/`mkfifo`, so a plain blocking
+/// `File::open` cannot be made to hang there.
+///
+/// R26-44: `/dev` is NOT in this set. devtmpfs is writable by root and is the
+/// canonical home of FIFOs and devices — `/dev/zero` is an infinite stream and
+/// a FIFO there blocks `open(2)` forever. Anything under `/dev`, like anything
+/// host-controlled, goes through `read_file_capped_regular` — see R26-02.
+///
 /// The name carries the constraint on purpose: `read_procfs_capped("/etc/sudoers")`
 /// is wrong on sight (R26-31).
 ///
@@ -32,7 +38,11 @@ pub fn read_procfs_capped(path: &str, max_bytes: usize) -> io::Result<(String, b
 /// Read a KERNEL PSEUDO-FILE into raw bytes, capping at `max_bytes`.
 /// Returns (bytes, truncated).
 ///
-/// Same constraints as `read_procfs_capped`: `/proc`, `/sys`, `/dev` ONLY.
+/// Same constraints as `read_procfs_capped`: `/proc`, `/sys` and other
+/// kernel-backed pseudo-filesystems (tracefs, debugfs) ONLY.
+///
+/// R26-44: `/dev` is NOT included — devtmpfs is writable by root and can
+/// contain FIFOs; anything there must use `read_file_capped_regular`.
 /// Host-controlled paths must use `read_file_capped_regular` (R26-31/R26-36).
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 pub fn read_procfs_bytes_capped(path: &str, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
@@ -128,7 +138,7 @@ pub fn open_regular_streaming(path: &str) -> io::Result<std::fs::File> {
 /// whether to record a coverage warning.
 ///
 /// This function MUST be used for every scanner path that lives on a host‑
-/// controlled filesystem (i.e. not `/proc`, `/sys`, or `/dev`).
+/// controlled filesystem (i.e. not `/proc`, `/sys`, or other kernel pseudo-fs).
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 pub fn read_file_capped_regular(path: &str, max_bytes: usize) -> io::Result<(String, bool)> {
     let (buf, truncated) = read_regular_capped(path, max_bytes)?;
