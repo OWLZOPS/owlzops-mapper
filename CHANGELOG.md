@@ -38,7 +38,6 @@
 
 - **safe_io:** Rename procfs readers and make capped-I/O guard exact (R26-31/R26-33/R26-36)
 - **scanners:** Fix misleading comment and dead branch (R26-45, R26-46)
-- **scanners:** Fix misleading comment and dead branch
 
 ### Testing
 
