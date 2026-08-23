@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+# R27-03: least privilege at workflow level
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -31,9 +35,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
+      # R27-02: tags do not trigger CI; verify the released commit matches Cargo.toml
+      - name: Verify tag matches Cargo.toml
+        run: |
+          TAG="${{ github.ref_name }}"
+          CRATE="v$(grep -m1 '^version[[:space:]]*=' Cargo.toml | cut -d'"' -f2)"
+          [ "$TAG" = "$CRATE" ] || {
+            echo "::error file=Cargo.toml::tag $TAG does not match crate version $CRATE — \
+                  reports would carry the wrong version in meta.binary_version"
+            exit 1
+          }
+
       - name: Install musl tools (Linux only)
         if: matrix.target != 'aarch64-apple-darwin'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Test the exact commit being released
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --locked
 
       - name: Build
         run: |
@@ -69,7 +88,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
-      # Optimization: install cargo-cyclonedx via pre-built binary instead of compiling from source
       - name: Install cargo-cyclonedx
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad  # Release 2.85.10
         with:
@@ -96,7 +114,8 @@ jobs:
       - name: Import GPG key
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          echo "trusted-key $(gpg --list-keys --with-colons | grep '^pub' | cut -d: -f5)" >> ~/.gnupg/gpg.conf
+          # R27-07: take the first public key only
+          echo "trusted-key $(gpg --list-keys --with-colons | grep '^pub' | cut -d: -f5 | head -1)" >> ~/.gnupg/gpg.conf
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
@@ -107,6 +126,17 @@ jobs:
           done
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      # R27-05: verify signatures before publishing
+      - name: Verify every signature before publishing
+        run: |
+          set -e
+          n=0
+          for sig in *.asc; do
+            gpg --batch --verify "$sig" "${sig%.asc}"
+            n=$((n+1))
+          done
+          [ "$n" -ge 7 ] || { echo "::error::only $n signatures produced, expected >= 7"; exit 1; }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -140,8 +170,12 @@ jobs:
         with:
           tool: git-cliff
 
-      - name: Generate changelog
+      - name: Generate release notes
         run: git-cliff --latest --strip header -o RELEASE_NOTES.md
+
+      # Repository CHANGELOG.md: full history with version headings (R27-01).
+      - name: Regenerate full changelog
+        run: git-cliff -o CHANGELOG.md
 
       - name: Publish release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
@@ -154,14 +188,15 @@ jobs:
             sbom.json
             sbom.json.asc
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          # SemVer: anything after '-' is a pre-release (R27-06).
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
       - name: Create Pull Request for changelog update
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           BRANCH_NAME="changelog/${{ github.ref_name }}-${{ github.run_id }}"
-          mv RELEASE_NOTES.md CHANGELOG.md
+          rm -f RELEASE_NOTES.md
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b $BRANCH_NAME
