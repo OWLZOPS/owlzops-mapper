@@ -67,18 +67,18 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
             continue;
         };
 
-        let maps = match crate::safe_io::read_file_capped(&format!("/proc/{pid}/maps"), 1024 * 1024)
-        {
-            Ok((m, _)) => {
-                read_ok += 1;
-                m
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                denied += 1;
-                continue;
-            }
-            Err(_) => continue,
-        };
+        let maps =
+            match crate::safe_io::read_procfs_capped(&format!("/proc/{pid}/maps"), 1024 * 1024) {
+                Ok((m, _)) => {
+                    read_ok += 1;
+                    m
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    denied += 1;
+                    continue;
+                }
+                Err(_) => continue,
+            };
 
         // Exact match on the path field (last column), not substring.
         let mapped: HashSet<&str> = maps

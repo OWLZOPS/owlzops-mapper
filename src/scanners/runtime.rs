@@ -399,7 +399,7 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                 .filter(|&pid| pid > 0)
                 .and_then(|pid| {
                     let path = format!("/proc/{pid}/status");
-                    crate::safe_io::read_file_capped(&path, 16 * 1024)
+                    crate::safe_io::read_procfs_capped(&path, 16 * 1024)
                         .ok()
                         .and_then(|(content, _)| {
                             crate::scanners::capabilities::parse_status(&content)

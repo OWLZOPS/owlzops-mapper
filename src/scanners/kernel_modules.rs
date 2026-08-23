@@ -90,7 +90,7 @@ fn scan_sysfs_live() -> BTreeSet<String> {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        match safe_io::read_file_capped(&format!("/sys/module/{name}/initstate"), 64) {
+        match safe_io::read_procfs_capped(&format!("/sys/module/{name}/initstate"), 64) {
             Ok((state, _)) if state.trim() == "live" => {
                 set.insert(name);
             }
@@ -102,7 +102,7 @@ fn scan_sysfs_live() -> BTreeSet<String> {
 
 #[cfg(target_os = "linux")]
 pub fn gather_kernel_modules() -> KernelModuleInventory {
-    let mut proc_modules = match safe_io::read_file_capped("/proc/modules", CAP_PROC_MODULES) {
+    let mut proc_modules = match safe_io::read_procfs_capped("/proc/modules", CAP_PROC_MODULES) {
         Ok((content, truncated)) => {
             if truncated {
                 coverage::record(
@@ -124,7 +124,7 @@ pub fn gather_kernel_modules() -> KernelModuleInventory {
     let sysfs_live = scan_sysfs_live();
 
     let (kallsyms, kallsyms_checked) =
-        match safe_io::read_file_capped("/proc/kallsyms", CAP_KALLSYMS) {
+        match safe_io::read_procfs_capped("/proc/kallsyms", CAP_KALLSYMS) {
             Ok((content, truncated)) => {
                 if truncated {
                     coverage::record(
@@ -157,7 +157,7 @@ pub fn gather_kernel_modules() -> KernelModuleInventory {
     // the first /proc/modules read and the kallsyms scan.
     // Union of both snapshots eliminates the false SEC-040 → exit-code-3.
     if let Ok((proc_after_raw, truncated_after)) =
-        safe_io::read_file_capped("/proc/modules", CAP_PROC_MODULES)
+        safe_io::read_procfs_capped("/proc/modules", CAP_PROC_MODULES)
     {
         if truncated_after {
             coverage::record(

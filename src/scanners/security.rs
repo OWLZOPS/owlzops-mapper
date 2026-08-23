@@ -297,12 +297,12 @@ fn gather_sysctl_issues() -> Vec<String> {
     let mut issues = Vec::new();
 
     // Check suid_dumpable with consideration of core_pattern
-    if let Ok((v, truncated)) = safe_io::read_file_capped("/proc/sys/fs/suid_dumpable", 4096) {
+    if let Ok((v, truncated)) = safe_io::read_procfs_capped("/proc/sys/fs/suid_dumpable", 4096) {
         if truncated {
             coverage::record("/proc/sys/fs/suid_dumpable truncated".to_string());
         }
         let v = v.trim().to_string();
-        let piped = safe_io::read_file_capped("/proc/sys/kernel/core_pattern", 4096)
+        let piped = safe_io::read_procfs_capped("/proc/sys/kernel/core_pattern", 4096)
             .map(|(s, _)| s.trim_start().starts_with('|'))
             .unwrap_or(false);
         let ok = v == "0" || (v == "2" && piped);
@@ -315,7 +315,7 @@ fn gather_sysctl_issues() -> Vec<String> {
     }
 
     // Net.ipv4.ip_forward – context-aware handling done in runner.rs
-    if let Ok((v, truncated)) = safe_io::read_file_capped("/proc/sys/net/ipv4/ip_forward", 4096) {
+    if let Ok((v, truncated)) = safe_io::read_procfs_capped("/proc/sys/net/ipv4/ip_forward", 4096) {
         if truncated {
             coverage::record("/proc/sys/net/ipv4/ip_forward truncated".to_string());
         }
@@ -350,7 +350,7 @@ fn gather_sysctl_issues() -> Vec<String> {
     ];
 
     for &(path, expected, name) in other_checks {
-        if let Ok((value, truncated)) = safe_io::read_file_capped(path, 4096) {
+        if let Ok((value, truncated)) = safe_io::read_procfs_capped(path, 4096) {
             if truncated {
                 coverage::record(format!("{} truncated", path));
             }

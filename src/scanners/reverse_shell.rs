@@ -65,7 +65,7 @@ pub fn scan_reverse_shells() -> Vec<ReverseShellFinding> {
 
 fn collect_established(path: &str, v6: bool) -> HashMap<u64, EstSocket> {
     let mut map = HashMap::new();
-    let (content, truncated) = match safe_io::read_file_capped(path, safe_io::CAP_PROC_NET) {
+    let (content, truncated) = match safe_io::read_procfs_capped(path, safe_io::CAP_PROC_NET) {
         Ok(v) => v,
         // Kernel without IPv6 has no /proc/net/tcp6 – silence is correct.
         Err(e) if e.kind() == ErrorKind::NotFound => return map,
@@ -207,7 +207,7 @@ fn correlate_with_processes(
         };
 
         // Cheap gate: read comm first, skip non-interpreters before the fd walk.
-        let comm = match safe_io::read_file_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
+        let comm = match safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
             Ok((c, _)) => c.trim().to_string(),
             Err(_) => continue,
         };

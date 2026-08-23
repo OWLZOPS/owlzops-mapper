@@ -53,7 +53,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         // Process name
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/comm", pid);
-        let process_name = safe_io::read_file_capped(&path_buf, 4096)
+        let process_name = safe_io::read_procfs_capped(&path_buf, 4096)
             .map(|(s, truncated)| {
                 if truncated {
                     coverage::record(format!("{} truncated", path_buf));
@@ -69,7 +69,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         // 1. Environment Variables
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/environ", pid);
-        match safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
+        match safe_io::read_procfs_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
             Ok((env_data, truncated)) => {
                 if truncated {
                     coverage::record(format!("{} truncated", path_buf));
@@ -104,7 +104,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         // 2. Command Line Arguments
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/cmdline", pid);
-        match safe_io::read_file_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
+        match safe_io::read_procfs_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
             Ok((cmd_data, truncated)) => {
                 if truncated {
                     coverage::record(format!("{} truncated", path_buf));

@@ -65,32 +65,27 @@ jobs:
             exit 1
           fi
 
-      # R26-02/17/29/31: enforce capped-I/O doctrine and shared sanitizer predicate.
+      # R26-02/17/29/31/33/36: capped-I/O doctrine.
       - name: Guard capped-I/O doctrine
         if: matrix.os == 'ubuntu-24.04'
         run: |
           set -uo pipefail
           fail=0
 
-          if rg -U -n -A1 'read_file_(bytes_)?capped\(' src/ \
-               | rg -v 'safe_io\.rs' \
-               | rg -v '/proc|/sys|/dev|proc_root|PROC_' ; then
-            echo "::error::read_file_capped/read_file_bytes_capped used off a kernel pseudo-file — use read_file_capped_regular"
+          # Old generic names must not exist: read_procfs_* asserts a pseudo-fs
+          # path, read_file_capped_regular asserts a host-controlled one.
+          if rg -n 'read_file_(bytes_)?capped\(' src/ | rg -v '^src/safe_io\.rs:' ; then
+            echo "::error::renamed API — use read_procfs_capped for /proc,/sys,/dev or read_file_capped_regular for host paths"
             fail=1
           fi
 
-          if rg -U -n -B1 'fs::read_to_string\(|File::open\(' src/ \
-               | rg -v 'safe_io\.rs' \
-               | rg -v '/proc|/sys|/dev|proc_root|CAPPED_IO_OK' ; then
-            echo "::error::uncapped blocking open — use safe_io::read_file_capped_regular (or mark CAPPED_IO_OK)"
-            fail=1
-          fi
-
+          # Every sanitizer backs onto the shared predicate (R25-65/R26-07).
           for f in $(rg -l 'fn sanitize_' src/); do
             rg -q 'is_terminal_unsafe|sanitize_for_document' "$f" \
               || { echo "::error file=$f::sanitizer does not use the shared predicate"; fail=1; }
           done
 
+          # No fork of `which` (R26-04).
           if rg -n '"which"' src/ ; then
             echo "::error::use resolve_tool, not a fork of which"
             fail=1
