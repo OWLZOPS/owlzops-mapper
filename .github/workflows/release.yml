@@ -80,12 +80,25 @@ jobs:
 
       - name: Generate SBOM for this target
         run: |
+          set -e
           cargo cyclonedx --format json --target ${{ matrix.target }} ${{ matrix.features }} \
-            --override-filename sbom-${{ matrix.target }}.json
+            --override-filename sbom-${{ matrix.target }}
+
+          # R27-16: --override-filename takes a BASE name; cargo-cyclonedx
+          # appends the format extension. Passing "…json" would produce
+          # "…json.json", the upload pattern misses it, and the failure
+          # surfaces two jobs later in `sign`.
+          test -f "sbom-${{ matrix.target }}.json" || {
+            echo "::error::expected sbom-${{ matrix.target }}.json — produced: $(ls sbom* 2>/dev/null || echo none)"
+            exit 1
+          }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ${{ matrix.archive }}
+          # R27-16: a missing artifact must fail the job that produced it,
+          # not the job that consumes it.
+          if-no-files-found: error
           path: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
@@ -111,7 +124,21 @@ jobs:
 
       - name: Sign all artifacts (archives, checksums, SBOMs)
         run: |
-          for file in *.tar.gz *.sha256 sbom-*.json; do
+          set -euo pipefail
+          shopt -s nullglob
+          archives=( *.tar.gz )
+          sums=( *.sha256 )
+          sboms=( sbom-*.json )
+
+          n=${#archives[@]}
+          # R27-17: a bare glob that matches nothing is passed to gpg
+          # literally and fails mid-loop with a misleading message.
+          [ "$n" -ge 1 ] && [ "${#sums[@]}" -eq "$n" ] && [ "${#sboms[@]}" -eq "$n" ] || {
+            echo "::error::incomplete artifact set: $n archives, ${#sums[@]} checksums, ${#sboms[@]} SBOMs"
+            exit 1
+          }
+
+          for file in "${archives[@]}" "${sums[@]}" "${sboms[@]}"; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --detach-sign --armor "$file"
           done
         env:
@@ -120,13 +147,23 @@ jobs:
       # R27-05: verify signatures before publishing
       - name: Verify every signature before publishing
         run: |
-          set -e
+          set -euo pipefail
+          shopt -s nullglob
+          expected=$(( $(ls -1 *.tar.gz *.sha256 sbom-*.json 2>/dev/null | wc -l) ))
+
           n=0
           for sig in *.asc; do
             gpg --batch --verify "$sig" "${sig%.asc}"
             n=$((n+1))
           done
-          [ "$n" -ge 9 ] || { echo "::error::only $n signatures produced, expected >= 9"; exit 1; }
+
+          # R27-17: tie the threshold to the actual artifact set, not a
+          # hard-coded number. A future fourth target must not silently
+          # weaken this check.
+          [ "$n" -eq "$expected" ] && [ "$n" -ge 9 ] || {
+            echo "::error::$n signatures for $expected artifacts (minimum 9)"
+            exit 1
+          }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
