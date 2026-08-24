@@ -23,12 +23,25 @@
 - **safe_io:** Allow dead_code for streaming opener on remote-only builds
 - **main:** Import Read for streaming JSONL parser (R26-40)
 - **safe-io:** Remove /dev from procfs doctrine; add literal path check (R26-43, R26-44)
+- **ci:** Close R26-48 (multi-line literal guard and PCRE2 probe)
+- **ci:** Install ripgrep, add -U and PCRE2 probe
+- **release:** Harden release workflow
+- **doc:** Regenerate changelog
+- **security:** Close R27-08, R27-09, R27-04
+- **output:** Sanitize XLSX filename against hostname traversal (R27-11)
+- **release:** Clear OWLZOPS_SUDO_PASS from environ (R27-12)
+- **release:** Avoid duplicate .asc upload and harden signature/changelog checks
+
+### Build System
+
+- **deps:** Bump taiki-e/install-action from 2.85.10 to 2.86.4 (#201)
 
 ### CI/CD
 
 - Catch read_file_capped on host-controlled paths (R26-31)
 - Enable raw-open guard and convert operator file readers (R26-40)
 - Enable raw-open guard and annotate remaining operator/procfs exceptions
+- **release:** Fix SBOM filename and validate artifact set before signing
 
 ### Features
 
@@ -38,6 +51,7 @@
 
 - **safe_io:** Rename procfs readers and make capped-I/O guard exact (R26-31/R26-33/R26-36)
 - **scanners:** Fix misleading comment and dead branch (R26-45, R26-46)
+- **scanners:** Fix misleading comment and dead branch
 
 ### Testing
 
