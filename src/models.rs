@@ -744,6 +744,9 @@ pub struct SecretLeak {
     pub process: String,
     pub source: String,
     pub matched_key: String,
+    /// R27-16: self_attributed is set when the record is the scanner's own process.
+    #[serde(default)]
+    pub self_attributed: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

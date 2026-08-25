@@ -61,6 +61,10 @@ const MIN_UPLOAD_BYTES_PER_SEC: u64 = 16 * 1024;
 /// wait is covered by no other bound (R25-58).
 const UPLOAD_TAIL_BUDGET: Duration = Duration::from_secs(60);
 
+/// A sudo password longer than this is a pipe accident, not a credential.
+// R27-15: cap stdin read to prevent unbounded allocation.
+const CAP_SUDO_PASS_STDIN: u64 = 4096;
+
 // ---------------------------------------------------------------------------
 // Sudo outcome classification
 // ---------------------------------------------------------------------------
@@ -346,6 +350,16 @@ pub fn take_sudo_pass_from_environ() -> Option<Zeroizing<String>> {
     v.map(Zeroizing::new)
 }
 
+/// Build the `password\n` line sudo expects on stdin without ever growing the
+/// buffer: `String::to_string` allocates exact capacity, so a later `push`
+/// reallocates and frees an un-zeroed copy of the secret (R27-15).
+fn sudo_stdin_line(pass: &Zeroizing<String>) -> Zeroizing<String> {
+    let mut line = Zeroizing::new(String::with_capacity(pass.len() + 1));
+    line.push_str(pass);
+    line.push('\n');
+    line
+}
+
 /// Resolve sudo password from either the pre‑scrubbed environment value,
 /// interactive prompt, or stdin. The returned string is zeroizing; never log it.
 ///
@@ -376,21 +390,40 @@ pub fn resolve_sudo_password(
         return Ok(Zeroizing::new(p));
     }
 
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
+    // R27-15: cap stdin read at 4 KiB and use Zeroizing<Vec<u8>> to avoid
+    // unzeroed copies in reallocations; trim trailing newline/CR without
+    // allocating another String.
+    let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
+    let n = std::io::stdin()
+        .take(CAP_SUDO_PASS_STDIN + 1)
+        .read_to_end(&mut raw)
         .map_err(|e| RemoteError::HostKeyCheck {
             host: "localhost".to_string(),
             detail: e.to_string(),
         })?;
-    let pass = buf.trim_end_matches(['\n', '\r']).to_string();
+    if n as u64 > CAP_SUDO_PASS_STDIN {
+        return Err(RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: format!("sudo password on stdin exceeds {CAP_SUDO_PASS_STDIN} bytes"),
+        });
+    }
+    let trimmed = raw
+        .iter()
+        .rposition(|b| !matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    let pass = std::str::from_utf8(&raw[..trimmed])
+        .map(|s| Zeroizing::new(s.to_owned()))
+        .map_err(|_| RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: "sudo password on stdin is not valid UTF-8".to_string(),
+        })?;
     if pass.is_empty() {
         return Err(RemoteError::SudoAuth {
             host: "localhost".to_string(),
             detail: "empty sudo password provided via stdin".to_string(),
         });
     }
-    Ok(Zeroizing::new(pass))
+    Ok(pass)
 }
 
 // ---------------------------------------------------------------------------
@@ -712,8 +745,8 @@ async fn validate_sudo_password(
     let mut ch = session.channel_open_session().await?;
     ch.exec(true, "LC_ALL=C sudo -k -S -p '' -v").await?;
 
-    let mut line = Zeroizing::new(sudo_pass.to_string());
-    line.push('\n');
+    // R27-15: use helper to avoid reallocation of the secret line.
+    let line = sudo_stdin_line(sudo_pass);
     ch.data(line.as_bytes()).await?;
     ch.eof().await?;
 
@@ -1376,8 +1409,8 @@ pub async fn run_remote_scan_russh(
         if let Some(pass) = sudo_pass
             && use_sudo
         {
-            let mut line = Zeroizing::new(pass.to_string());
-            line.push('\n');
+            // R27-15: use helper to avoid reallocation of the secret line.
+            let line = sudo_stdin_line(pass);
             exec_channel
                 .data(line.as_bytes())
                 .await
@@ -1553,5 +1586,21 @@ mod tests {
             b"OWLZOPS_SUDO_PASS=\0\0",
             "unreadable is not a reason to leave it"
         );
+    }
+
+    #[test]
+    fn sudo_line_never_reallocates() {
+        let pass = Zeroizing::new("hunter2".to_string());
+        let line = sudo_stdin_line(&pass);
+        assert_eq!(&**line, "hunter2\n");
+        assert_eq!(line.capacity(), pass.len() + 1);
+    }
+
+    #[test]
+    fn sudo_line_handles_empty_and_multibyte() {
+        assert_eq!(&**sudo_stdin_line(&Zeroizing::new(String::new())), "\n");
+        let p = Zeroizing::new("пароль".to_string());
+        let l = sudo_stdin_line(&p);
+        assert_eq!(l.capacity(), p.len() + 1, "capacity is in bytes, not chars");
     }
 }

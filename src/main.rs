@@ -1444,7 +1444,7 @@ async fn run_command(
 }
 
 fn main() {
-    // FIRST statement: scrub initial environment before any threads or runtime exist (R27-13, R27-14).
+    // FIRST statement: scrub initial environment before any threads or runtime exist  (R27-13, R27-14).
     let sudo_from_env = ssh_engine::take_sudo_pass_from_environ();
 
     raise_nofile_limit();
