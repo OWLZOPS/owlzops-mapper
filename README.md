@@ -186,23 +186,26 @@ The binary uploads itself over SSH, runs, collects JSON, removes itself from eac
 
 #### Passing the sudo password
 
-For remote scans that require a password, use `--ask-sudo-pass`. The password
-can be provided interactively, via stdin, or through the environment variable
-`OWLZOPS_SUDO_PASS` (not recommended for long-lived processes). Examples:
+For remote scans that require a password, use `--sudo-pass-fd N` (most secure),
+`--ask-sudo-pass` with a pipe, or the deprecated environment variable
+`OWLZOPS_SUDO_PASS`.
 
 ```bash
-# interactive prompt
-owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
+# Most secure: pass via open file descriptor (e.g., from a password manager)
+exec 3<<<"$SUDO_PASS"
+owlzops-mapper audit --host 192.0.2.10 --sudo-pass-fd 3
+exec 3<&-
 
 # via stdin (recommended for scripts)
 printf '%s' "$SUDO_PASS" | owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
 
-# via environment (one-shot)
+# deprecated: environment variable (one-shot)
 OWLZOPS_SUDO_PASS="$SUDO_PASS" owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
 ```
 
-The password is held in `Zeroizing` and removed from the process environment
-as early as possible. See `SECURITY.md` for details.
+The password is held in a protected `SecretString` (zeroized on drop, locked
+from swap and core dumps where supported) and removed from the process
+environment as early as possible. See `SECURITY.md` for details.
 
 ### Snapshot & drift
 
@@ -258,6 +261,7 @@ The design commitments above are stated as testable properties in [SECURITY.md](
 | `--copy-binary` | Upload the static binary automatically |
 | `--local-binary` | Path to the static binary to upload instead of the running one |
 | `--ask-sudo-pass` | Prompt for sudo password, forwarded over SSH |
+| `--sudo-pass-fd N` | Read sudo password from an already-open file descriptor (most secure) |
 | `--keep-binary` | Skip cleanup, leave the binary on the remote host. Requires `--remote-path` when used with `--copy-binary` |
 | `--fail-on-incomplete` | Exit with code 4 when coverage is incomplete (failed scanner, missing host, non-root, warnings) |
 | `--external-ip` | Opt-in public IP lookup |
