@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="owlzops_mapper.svg" alt="Owlzops Mapper Logo" width="500" />
+</div>
+
 # owlzops-mapper
 
 [![CI](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml/badge.svg)](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml)
