@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="owlzops_mapper.svg" alt="Owlzops Mapper Logo" width="500" />
+</div>
+
 # owlzops-mapper
 
 [![CI](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml/badge.svg)](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml)
@@ -179,6 +183,26 @@ owlzops-mapper audit \
 The binary uploads itself over SSH, runs, collects JSON, removes itself from each host, and writes one multi-sheet Excel report. No agent install, no open ports beyond SSH.
 
 `--ask-sudo-pass` forwards the sudo password securely over the SSH channel — no `NOPASSWD` sudoers rule required.
+
+#### Passing the sudo password
+
+For remote scans that require a password, use `--ask-sudo-pass`. The password
+can be provided interactively, via stdin, or through the environment variable
+`OWLZOPS_SUDO_PASS` (not recommended for long-lived processes). Examples:
+
+```bash
+# interactive prompt
+owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
+
+# via stdin (recommended for scripts)
+printf '%s' "$SUDO_PASS" | owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
+
+# via environment (one-shot)
+OWLZOPS_SUDO_PASS="$SUDO_PASS" owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
+```
+
+The password is held in `Zeroizing` and removed from the process environment
+as early as possible. See `SECURITY.md` for details.
 
 ### Snapshot & drift
 

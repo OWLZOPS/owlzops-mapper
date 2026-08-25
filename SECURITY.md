@@ -105,6 +105,34 @@ We ship fixes forward. If you're behind, upgrading is the fix.
 
 ---
 
+## Sudo password handling
+
+`OWLZOPS_SUDO_PASS` is a **best-effort** channel for non-interactive fleet scans.
+It is read from the initial environment **once**, before the Tokio runtime starts,
+and the bytes are zeroed in `/proc/self/environ` (R27-13). However:
+
+- There is an unavoidable window between `execve` and the scrub in `main`.
+- The variable remains in the environment of the **parent shell** if exported,
+  and may be visible to other processes of the same user or in shell history.
+
+Prefer a pipe for automated scans:
+
+```bash
+printf '%s' "$pass" | owlzops-mapper audit --host ... --ask-sudo-pass
+```
+
+Alternatively, use the environment variable **only** as a prefix assignment,
+which does not persist in the parent shell:
+
+```bash
+OWLZOPS_SUDO_PASS='...' owlzops-mapper audit --host ...
+```
+
+Never export `OWLZOPS_SUDO_PASS` in a profile script or CI environment where
+the value might be logged or inherited by unrelated processes.
+
+---
+
 ## Verifying what you run
 
 Every release publishes, for each target:

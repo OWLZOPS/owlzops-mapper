@@ -18,6 +18,31 @@ const SENSITIVE_KEYS: &[&str] = &[
     "NPM_TOKEN",
 ];
 
+// R27-16: suffix-based sensitive key matching to catch OWLZOPS_SUDO_PASS,
+// VAULT_TOKEN, etc., without false positives like SSH_ASKPASS (the char
+// before PASS is 'K', not '_').
+const SENSITIVE_SUFFIXES: &[&str] = &[
+    "_PASS",
+    "_PASSWD",
+    "_PASSWORD",
+    "_SECRET",
+    "_TOKEN",
+    "_API_KEY",
+    "_SECRET_KEY",
+    "_PRIVATE_KEY",
+    "_ACCESS_KEY",
+];
+
+fn ends_with_icase(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
+    SENSITIVE_KEYS.iter().any(|&k| key.eq_ignore_ascii_case(k))
+        || SENSITIVE_SUFFIXES.iter().any(|&s| ends_with_icase(key, s))
+}
+
 const SENSITIVE_FLAGS: &[&str] = &["--password=", "-p=", "--token=", "--secret="];
 
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
@@ -46,6 +71,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         let Ok(pid) = file_name.parse::<u32>() else {
             continue;
         };
+
+        // R27-16: mark findings from the scanner's own process to avoid hiding them.
+        let self_pid = (pid == std::process::id()).then_some(pid);
 
         // Per‑PID flag – raised once if either environ or cmdline is EACCES.
         let mut pid_denied = false;
@@ -82,15 +110,17 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                         continue;
                     };
 
-                    if SENSITIVE_KEYS
-                        .iter()
-                        .any(|&sk| key.eq_ignore_ascii_case(sk))
-                    {
+                    if is_sensitive_key(key) {
                         leaks.push(SecretLeak {
                             pid,
                             process: process_name.clone(),
                             source: "environ".to_string(),
                             matched_key: key.to_string(),
+                            self_attributed: self_pid.map(|_| {
+                                "owlzops-mapper's own process — a secret still in our \
+                                 initial environment means the R27-13 scrub did not run"
+                                    .to_string()
+                            }),
                         });
                     }
                 }
@@ -121,6 +151,11 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                 process: process_name.clone(),
                                 source: "cmdline".to_string(),
                                 matched_key: flag.to_string(),
+                                self_attributed: self_pid.map(|_| {
+                                    "owlzops-mapper's own process — a secret still in our \
+                                     initial environment means the R27-13 scrub did not run"
+                                        .to_string()
+                                }),
                             });
                         }
                     }
@@ -135,6 +170,11 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                             process: process_name.clone(),
                             source: "cmdline".to_string(),
                             matched_key: "mysql-password".to_string(),
+                            self_attributed: self_pid.map(|_| {
+                                "owlzops-mapper's own process — a secret still in our \
+                                 initial environment means the R27-13 scrub did not run"
+                                    .to_string()
+                            }),
                         });
                     }
                 }
@@ -165,4 +205,33 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
     }
 
     leaks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_key_suffixes_match_without_overmatching() {
+        for k in [
+            "OWLZOPS_SUDO_PASS",
+            "VAULT_TOKEN",
+            "ANSIBLE_BECOME_PASS",
+            "REDIS_PASSWORD",
+            "PGPASSWORD",
+            "aws_secret_access_key",
+        ] {
+            assert!(is_sensitive_key(k), "{k} must match");
+        }
+        for k in [
+            "SSH_ASKPASS",
+            "GIT_ASKPASS",
+            "SUDO_ASKPASS",
+            "TOKENIZERS_PARALLELISM",
+            "PATH",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(!is_sensitive_key(k), "{k} is a false positive");
+        }
+    }
 }

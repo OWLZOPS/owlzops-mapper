@@ -8,11 +8,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+#[cfg(any(target_os = "linux", test))]
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
 use crate::models::AgentReport;
 use crate::safe_io;
+use crate::secrets::SecretString;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    static mut environ: *mut *mut libc::c_char;
+}
 
 // ---------------------------------------------------------------------------
 // Remote channel constants
@@ -55,6 +63,10 @@ const MIN_UPLOAD_BYTES_PER_SEC: u64 = 16 * 1024;
 /// Tail allowance: after EOF the remote is only running chmod/mv, and that
 /// wait is covered by no other bound (R25-58).
 const UPLOAD_TAIL_BUDGET: Duration = Duration::from_secs(60);
+
+/// A sudo password longer than this is a pipe accident, not a credential.
+// R27-15: cap stdin read to prevent unbounded allocation.
+const CAP_SUDO_PASS_STDIN: u64 = 4096;
 
 // ---------------------------------------------------------------------------
 // Sudo outcome classification
@@ -265,23 +277,103 @@ impl client::Handler for ClientHandler {
 // Sudo password resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve sudo password from environment or interactive prompt. The returned
-/// string is zeroizing; never log it.
-pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
-    if let Ok(p) = std::env::var("OWLZOPS_SUDO_PASS")
-        && !p.is_empty()
-    {
-        // R27-12: remove the secret from the orchestrator's environ. It would
-        // otherwise sit in /proc/self/environ for any same-uid process to read,
-        // while our own DLP scanner reports exactly this class of secret in
-        // other processes' environments.
-        //
-        // SAFETY: called once at startup before any threads are spawned; no
-        // concurrent reader/writer of the environment exists, so this cannot
-        // race (std::env::remove_var is unsafe in Rust 2024 only because of
-        // multi-threaded processes).
-        unsafe { std::env::remove_var("OWLZOPS_SUDO_PASS") };
-        return Ok(Zeroizing::new(p));
+/// Name of the environment variable that may carry the sudo password. Used
+/// only in the early scrub (R27-13).
+pub const SUDO_PASS_ENV: &str = "OWLZOPS_SUDO_PASS";
+
+/// Copy out the value of `KEY=value` and zero the value bytes **in place**,
+/// leaving `KEY=` intact. Pure over a raw entry so the byte logic is testable
+/// without touching the real environment.
+#[cfg(any(target_os = "linux", test))]
+fn take_entry_value(entry: &mut [u8], key: &str) -> Option<Zeroizing<String>> {
+    let k = key.as_bytes();
+    // `entry[k.len()] == b'='` is what stops OWLZOPS_SUDO_PASSWORD from matching
+    // the OWLZOPS_SUDO_PASS prefix.
+    if entry.len() <= k.len() || &entry[..k.len()] != k || entry[k.len()] != b'=' {
+        return None;
+    }
+    let val = &mut entry[k.len() + 1..];
+    let out = std::str::from_utf8(val)
+        .ok()
+        .map(|s| Zeroizing::new(s.to_owned()));
+    val.zeroize(); // zeroed even when the value was not valid UTF-8
+    out
+}
+
+/// Lift the sudo password out of the process's **initial** environment and zero
+/// the bytes the kernel serves from `/proc/self/environ`.
+///
+/// `std::env::remove_var` alone is NOT sufficient (R27-13): the kernel serves
+/// that file from `mm->env_start .. mm->env_end`, a stack region fixed at
+/// `execve` and movable only via `prctl(PR_SET_MM)` (CAP_SYS_RESOURCE). libc's
+/// `unsetenv` unlinks the pointer from the `environ` array; the `KEY=value`
+/// bytes stay mapped. Reading the file needs only `PTRACE_MODE_READ_FSCREDS`,
+/// which Yama's `ptrace_scope` does not gate — any same-uid process qualifies.
+///
+/// MUST be the first statement of `main` (R27-14).
+#[cfg(target_os = "linux")]
+pub fn take_sudo_pass_from_environ() -> Option<Zeroizing<String>> {
+    let key = SUDO_PASS_ENV.as_bytes();
+    let mut found = None;
+
+    // SAFETY: called as the first statement of `main`, before the tokio runtime
+    // is built and before any thread other than the initial one exists, so no
+    // concurrent getenv/setenv/unsetenv can observe the array or the strings.
+    // Entries of the initial environment point into the writable stack region
+    // [env_start, env_end); writing through them is precisely what makes the
+    // change visible in /proc/self/environ. `len` is captured before zeroing;
+    // iteration advances by pointer, not by strlen.
+    unsafe {
+        let mut slot = environ;
+        if slot.is_null() {
+            return None;
+        }
+        while !(*slot).is_null() {
+            let entry = *slot;
+            let len = libc::strlen(entry);
+            if len > key.len() {
+                let bytes = std::slice::from_raw_parts_mut(entry.cast::<u8>(), len);
+                // A crafted envp may repeat the key; scrub every occurrence.
+                if let Some(v) = take_entry_value(bytes, SUDO_PASS_ENV) {
+                    found.get_or_insert(v);
+                }
+            }
+            slot = slot.add(1);
+        }
+        std::env::remove_var(SUDO_PASS_ENV);
+    }
+
+    found.filter(|p| !p.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn take_sudo_pass_from_environ() -> Option<Zeroizing<String>> {
+    // No procfs: unlinking from `environ` is the whole exposure surface.
+    let v = std::env::var(SUDO_PASS_ENV).ok().filter(|p| !p.is_empty());
+    unsafe { std::env::remove_var(SUDO_PASS_ENV) };
+    v.map(Zeroizing::new)
+}
+
+/// Build the `password\n` line sudo expects on stdin without ever growing the
+/// buffer: `String::to_string` allocates exact capacity, so a later `push`
+/// reallocates and frees an un-zeroed copy of the secret (R27-15).
+fn sudo_stdin_line(pass: &SecretString) -> Zeroizing<String> {
+    let mut line = Zeroizing::new(String::with_capacity(pass.len() + 1));
+    line.push_str(pass.as_str());
+    line.push('\n');
+    line
+}
+
+/// Resolve sudo password from either the pre‑scrubbed environment value,
+/// interactive prompt, or stdin. The returned secret is protected from swap
+/// and core dumps where supported.
+///
+/// NOTE: This function no longer reads the environment. The early scrub in
+/// `main` extracts the environment variable and passes it in via `from_env`.
+/// This avoids touching the environment after the runtime has started (R27-14).
+pub fn resolve_sudo_password(from_env: Option<SecretString>) -> Result<SecretString, RemoteError> {
+    if let Some(p) = from_env {
+        return Ok(p);
     }
 
     if std::io::stdin().is_terminal() {
@@ -298,24 +390,43 @@ pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
                 detail: "empty sudo password entered".to_string(),
             });
         }
-        return Ok(Zeroizing::new(p));
+        return Ok(SecretString::new(p));
     }
 
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
+    // R27-15: cap stdin read at 4 KiB and use Zeroizing<Vec<u8>> to avoid
+    // unzeroed copies in reallocations; trim trailing newline/CR without
+    // allocating another String.
+    let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
+    let n = std::io::stdin()
+        .take(CAP_SUDO_PASS_STDIN + 1)
+        .read_to_end(&mut raw)
         .map_err(|e| RemoteError::HostKeyCheck {
             host: "localhost".to_string(),
             detail: e.to_string(),
         })?;
-    let pass = buf.trim_end_matches(['\n', '\r']).to_string();
+    if n as u64 > CAP_SUDO_PASS_STDIN {
+        return Err(RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: format!("sudo password on stdin exceeds {CAP_SUDO_PASS_STDIN} bytes"),
+        });
+    }
+    let trimmed = raw
+        .iter()
+        .rposition(|b| !matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    let pass = std::str::from_utf8(&raw[..trimmed])
+        .map(|s| Zeroizing::new(s.to_owned()))
+        .map_err(|_| RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: "sudo password on stdin is not valid UTF-8".to_string(),
+        })?;
     if pass.is_empty() {
         return Err(RemoteError::SudoAuth {
             host: "localhost".to_string(),
             detail: "empty sudo password provided via stdin".to_string(),
         });
     }
-    Ok(Zeroizing::new(pass))
+    Ok(SecretString::new(pass.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -631,14 +742,14 @@ async fn make_remote_staging(
 /// the orchestrator before upload.
 async fn validate_sudo_password(
     session: &client::Handle<ClientHandler>,
-    sudo_pass: &Zeroizing<String>,
+    sudo_pass: &SecretString,
     host: &str,
 ) -> Result<(), RemoteError> {
     let mut ch = session.channel_open_session().await?;
     ch.exec(true, "LC_ALL=C sudo -k -S -p '' -v").await?;
 
-    let mut line = Zeroizing::new(sudo_pass.to_string());
-    line.push('\n');
+    // R27-15: use helper to avoid reallocation of the secret line.
+    let line = sudo_stdin_line(sudo_pass);
     ch.data(line.as_bytes()).await?;
     ch.eof().await?;
 
@@ -993,6 +1104,7 @@ impl RemoteCoverage {
         }
     }
 }
+
 // ---------------------------------------------------------------------------
 // Main remote scan
 // ---------------------------------------------------------------------------
@@ -1003,7 +1115,7 @@ pub async fn run_remote_scan_russh(
     ssh_user: &str,
     ssh_key_path: &str,
     remote_path: Option<&str>,
-    sudo_pass: Option<&Zeroizing<String>>,
+    sudo_pass: Option<&SecretString>,
     copy_binary: bool,
     keep_binary: bool,
     local_bin: Option<&str>,
@@ -1300,8 +1412,8 @@ pub async fn run_remote_scan_russh(
         if let Some(pass) = sudo_pass
             && use_sudo
         {
-            let mut line = Zeroizing::new(pass.to_string());
-            line.push('\n');
+            // R27-15: use helper to avoid reallocation of the secret line.
+            let line = sudo_stdin_line(pass);
             exec_channel
                 .data(line.as_bytes())
                 .await
@@ -1441,5 +1553,57 @@ pub async fn run_remote_scan_russh(
         Ok(Ok(stdout)) => Ok((stdout, remote_coverage)),
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_entry_value_is_zeroed_in_place() {
+        let mut e = b"OWLZOPS_SUDO_PASS=hunter2".to_vec();
+        let got = take_entry_value(&mut e, SUDO_PASS_ENV);
+        assert_eq!(got.as_deref().map(|s| s.as_str()), Some("hunter2"));
+        assert_eq!(&e[..], b"OWLZOPS_SUDO_PASS=\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn longer_key_sharing_the_prefix_is_not_a_match() {
+        // The '=' check is the whole guard here.
+        let mut e = b"OWLZOPS_SUDO_PASSWORD=x".to_vec();
+        assert!(take_entry_value(&mut e, SUDO_PASS_ENV).is_none());
+        assert_eq!(
+            &e[..],
+            b"OWLZOPS_SUDO_PASSWORD=x",
+            "unrelated entry must be untouched"
+        );
+    }
+
+    #[test]
+    fn non_utf8_value_is_still_zeroed() {
+        let mut e = b"OWLZOPS_SUDO_PASS=\xff\xfe".to_vec();
+        assert!(take_entry_value(&mut e, SUDO_PASS_ENV).is_none());
+        assert_eq!(
+            &e[..],
+            b"OWLZOPS_SUDO_PASS=\0\0",
+            "unreadable is not a reason to leave it"
+        );
+    }
+
+    #[test]
+    fn sudo_line_never_reallocates() {
+        let pass = SecretString::new("hunter2".to_string());
+        let line = sudo_stdin_line(&pass);
+        assert_eq!(&**line, "hunter2\n");
+        assert_eq!(line.capacity(), pass.len() + 1);
+    }
+
+    #[test]
+    fn sudo_line_handles_empty_and_multibyte() {
+        assert_eq!(&**sudo_stdin_line(&SecretString::new(String::new())), "\n");
+        let p = SecretString::new("пароль".to_string());
+        let l = sudo_stdin_line(&p);
+        assert_eq!(l.capacity(), p.len() + 1, "capacity is in bytes, not chars");
     }
 }

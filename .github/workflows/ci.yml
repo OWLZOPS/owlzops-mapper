@@ -146,6 +146,12 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: bash .github/scripts/check_commit_refs.sh
 
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Check env var manipulation gate
+        run: bash .github/scripts/check_env_var_gate.sh
+
   build-macos-orchestrator:
     name: Build macOS orchestrator
     runs-on: macos-latest

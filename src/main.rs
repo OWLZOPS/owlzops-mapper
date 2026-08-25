@@ -9,6 +9,7 @@ mod runner;
 mod safe_io;
 mod scanners;
 mod scoring;
+mod secrets;
 mod self_identity;
 mod ssh_engine;
 mod ui;
@@ -27,6 +28,7 @@ use runner::snapshot_run;
 #[cfg(feature = "local-scan")]
 use runner::{is_local_host, run_local_scan_async};
 use scoring::*;
+use secrets::SecretString;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -36,7 +38,6 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{Notify, Semaphore};
 use tracing::warn;
-use zeroize::Zeroizing;
 
 // sanitize hostname when printing to terminal in compare paths
 use crate::ui::sanitize_terminal as st;
@@ -480,11 +481,23 @@ fn raise_nofile_limit() {
     }
 }
 
+// Quick Win 1: harden process dumpability at startup to close the window
+// before the environment scrub runs. Works only on Linux.
+#[cfg(target_os = "linux")]
+fn harden_self_dumpable() {
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("warning: prctl(PR_SET_DUMPABLE, 0) failed: {e}");
+    }
+}
+
 async fn run_command(
     cli: Cli,
     multi: MultiProgress,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
+    sudo_from_env: Option<SecretString>,
 ) -> i32 {
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
@@ -567,8 +580,8 @@ async fn run_command(
                 }
 
                 // Resolve sudo password once (before any progress bars)
-                let sudo_pass: Option<Arc<Zeroizing<String>>> = if args.ask_sudo_pass {
-                    match ssh_engine::resolve_sudo_password() {
+                let sudo_pass: Option<Arc<SecretString>> = if args.ask_sudo_pass {
+                    match ssh_engine::resolve_sudo_password(sudo_from_env) {
                         Ok(p) => Some(Arc::new(p)),
                         Err(e) => {
                             eprintln!("Error: {e}");
@@ -1442,10 +1455,29 @@ async fn run_command(
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Quick Win 1: close the window before environment scrub.
+    #[cfg(target_os = "linux")]
+    harden_self_dumpable();
+
+    // FIRST statement: scrub initial environment before any threads or runtime exist (R27-13, R27-14).
+    let sudo_from_env = ssh_engine::take_sudo_pass_from_environ().map(SecretString::from_zeroizing);
     raise_nofile_limit();
 
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start async runtime: {e}");
+            std::process::exit(EXIT_INTERNAL_ERROR);
+        }
+    };
+    rt.block_on(async_main(sudo_from_env));
+}
+
+async fn async_main(sudo_from_env: Option<SecretString>) {
     // Shared progress bar handle. Installed before the tracing subscriber so
     // every structured log record can suspend bars automatically (R25-71).
     let multi = MultiProgress::new();
@@ -1488,6 +1520,7 @@ async fn main() {
         multi,
         shutdown_clone,
         shutdown_notify_clone,
+        sudo_from_env,
     ));
 
     // ---- Signal handler (runs for the entire lifetime) ----
