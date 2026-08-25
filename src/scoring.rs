@@ -33,7 +33,11 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 ///   Cmnd_Alias-resolved NOPASSWD: ALL (R26-08/R26-19); REL-002 no longer
 ///   fires on hosts whose backup tool is configured but was previously
 ///   undetectable under env_clear() (R26-03). Same host, different score.
-pub const SCORING_VERSION: u8 = 12;
+/// v13 (0.5.36): R27-16 extended `is_sensitive_key` with suffix rules, so
+/// SEC-014 now fires on hosts where it previously produced no finding.
+/// Snapshot pairs spanning this version must be flagged as a collection-
+/// semantics change, not reported as real drift (R27-24).
+pub const SCORING_VERSION: u8 = 13;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -1902,8 +1906,8 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Побочный эффект удалён; перенесён в warn_evaluate_side_effects.
-        // Здесь только формирование finding SEC-045.
+        // Side effect removed; moved to warn_evaluate_side_effects.
+        // Only forming finding SEC-045 here.
         let unpackaged =
             sel(&|f| !f.volatile && f.writability == W::RootOnly && f.package.is_none());
         if !unpackaged.is_empty() {
@@ -2092,20 +2096,26 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    if !report.security.secret_hygiene.is_empty() {
+    // R27-25: secrets found in the scanner's own environment are a hygiene
+    // issue of the scanner, not of the host. Never hidden (Raw Truth), but
+    // never weighted against the host.
+    let (self_leaks, host_leaks): (Vec<_>, Vec<_>) = report
+        .security
+        .secret_hygiene
+        .iter()
+        .partition(|l| l.self_attributed.is_some());
+
+    if !host_leaks.is_empty() {
         let mut evidence_list = Vec::new();
-        for leak in report.security.secret_hygiene.iter().take(3) {
+        for leak in host_leaks.iter().take(3) {
             evidence_list.push(format!(
                 "'{}' in {} of {} (pid {})",
                 leak.matched_key, leak.source, leak.process, leak.pid
             ));
         }
         let mut evidence_str = evidence_list.join(", ");
-        if report.security.secret_hygiene.len() > 3 {
-            evidence_str.push_str(&format!(
-                " and {} more...",
-                report.security.secret_hygiene.len() - 3
-            ));
+        if host_leaks.len() > 3 {
+            evidence_str.push_str(&format!(" and {} more...", host_leaks.len() - 3));
         }
 
         findings.push(Finding {
@@ -2114,10 +2124,29 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             title: "Cleartext secrets exposed in process memory".to_string(),
             category: Category::Security,
             weight: 25,
+            evidence: format!("Found {} leak(s): {}", host_leaks.len(), evidence_str),
+            suppressed: None,
+            cis_ref: None,
+        });
+    }
+
+    if !self_leaks.is_empty() {
+        findings.push(Finding {
+            id: "SEC-058",
+            source: Scanner::Security,
+            title: "Scanner's own process carries a secret in its environment".to_string(),
+            category: Category::Security,
+            weight: 0, // informational only
             evidence: format!(
-                "Found {} leak(s): {}",
-                report.security.secret_hygiene.len(),
-                evidence_str
+                "{} key(s) in owlzops-mapper's own environ/cmdline: {}. The startup \
+                 scrub (R27-13) only removes OWLZOPS_SUDO_PASS; anything else was \
+                 inherited from the invoking shell.",
+                self_leaks.len(),
+                self_leaks
+                    .iter()
+                    .map(|l| l.matched_key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             suppressed: None,
             cis_ref: None,
@@ -2650,6 +2679,7 @@ pub fn warn_evaluate_side_effects(exec_start_injections: &[crate::models::ExecSt
         ));
     }
 }
+
 #[allow(dead_code)]
 pub fn score(findings: Vec<Finding>) -> ScoredReport {
     let mut sec = 0u8;
@@ -3092,7 +3122,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (12, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (13, 15));
     }
     #[test]
     fn sec016_reads_suspicious_processes() {
@@ -4021,5 +4051,52 @@ mod tests {
                 "`{name}` has no Scanner variant"
             );
         }
+    }
+
+    #[test]
+    fn sec014_ignores_self_attributed_leaks() {
+        let mut r = minimal_report();
+        r.security.secret_hygiene = vec![SecretLeak {
+            pid: std::process::id(),
+            process: "owlzops-mapper".into(),
+            source: "environ".into(),
+            matched_key: "VAULT_TOKEN".into(),
+            self_attributed: Some("own process".into()),
+        }];
+        let f = evaluate(&r);
+        assert!(
+            !f.iter().any(|f| f.id == "SEC-014"),
+            "the host must not be charged for the scanner's own environment"
+        );
+        let own = f.iter().find(|f| f.id == "SEC-058").expect("SEC-058 fires");
+        assert_eq!(own.weight, 0, "informational, never weighted");
+        assert!(
+            own.evidence.contains("VAULT_TOKEN"),
+            "Raw Truth: never dropped"
+        );
+    }
+
+    #[test]
+    fn sec014_counts_only_host_leaks_when_mixed() {
+        let mut r = minimal_report();
+        let mk = |pid, key: &str, own: bool| SecretLeak {
+            pid,
+            process: "p".into(),
+            source: "environ".into(),
+            matched_key: key.into(),
+            self_attributed: own.then(|| "own process".to_string()),
+        };
+        r.security.secret_hygiene = vec![
+            mk(std::process::id(), "VAULT_TOKEN", true),
+            mk(4242, "PGPASSWORD", false),
+        ];
+        let f = evaluate(&r);
+        let sec014 = f.iter().find(|f| f.id == "SEC-014").expect("fires");
+        assert!(
+            sec014.evidence.contains("Found 1 leak"),
+            "self leak must not be counted"
+        );
+        assert!(sec014.evidence.contains("PGPASSWORD"));
+        assert!(!sec014.evidence.contains("VAULT_TOKEN"));
     }
 }
