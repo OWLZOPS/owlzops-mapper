@@ -485,6 +485,7 @@ async fn run_command(
     multi: MultiProgress,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
+    sudo_from_env: Option<Zeroizing<String>>,
 ) -> i32 {
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
@@ -568,7 +569,7 @@ async fn run_command(
 
                 // Resolve sudo password once (before any progress bars)
                 let sudo_pass: Option<Arc<Zeroizing<String>>> = if args.ask_sudo_pass {
-                    match ssh_engine::resolve_sudo_password() {
+                    match ssh_engine::resolve_sudo_password(sudo_from_env) {
                         Ok(p) => Some(Arc::new(p)),
                         Err(e) => {
                             eprintln!("Error: {e}");
@@ -1442,10 +1443,26 @@ async fn run_command(
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // FIRST statement: scrub initial environment before any threads or runtime exist (R27-13, R27-14).
+    let sudo_from_env = ssh_engine::take_sudo_pass_from_environ();
+
     raise_nofile_limit();
 
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start async runtime: {e}");
+            std::process::exit(EXIT_INTERNAL_ERROR);
+        }
+    };
+    rt.block_on(async_main(sudo_from_env));
+}
+
+async fn async_main(sudo_from_env: Option<Zeroizing<String>>) {
     // Shared progress bar handle. Installed before the tracing subscriber so
     // every structured log record can suspend bars automatically (R25-71).
     let multi = MultiProgress::new();
@@ -1488,6 +1505,7 @@ async fn main() {
         multi,
         shutdown_clone,
         shutdown_notify_clone,
+        sudo_from_env,
     ));
 
     // ---- Signal handler (runs for the entire lifetime) ----

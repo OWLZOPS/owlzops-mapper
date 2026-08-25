@@ -8,11 +8,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::known_hosts::KnownHostsChecker;
 use crate::models::AgentReport;
 use crate::safe_io;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    static mut environ: *mut *mut libc::c_char;
+}
 
 // ---------------------------------------------------------------------------
 // Remote channel constants
@@ -265,23 +270,93 @@ impl client::Handler for ClientHandler {
 // Sudo password resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve sudo password from environment or interactive prompt. The returned
-/// string is zeroizing; never log it.
-pub fn resolve_sudo_password() -> Result<Zeroizing<String>, RemoteError> {
-    if let Ok(p) = std::env::var("OWLZOPS_SUDO_PASS")
-        && !p.is_empty()
-    {
-        // R27-12: remove the secret from the orchestrator's environ. It would
-        // otherwise sit in /proc/self/environ for any same-uid process to read,
-        // while our own DLP scanner reports exactly this class of secret in
-        // other processes' environments.
-        //
-        // SAFETY: called once at startup before any threads are spawned; no
-        // concurrent reader/writer of the environment exists, so this cannot
-        // race (std::env::remove_var is unsafe in Rust 2024 only because of
-        // multi-threaded processes).
-        unsafe { std::env::remove_var("OWLZOPS_SUDO_PASS") };
-        return Ok(Zeroizing::new(p));
+/// Name of the environment variable that may carry the sudo password. Used
+/// only in the early scrub (R27-13).
+pub const SUDO_PASS_ENV: &str = "OWLZOPS_SUDO_PASS";
+
+/// Copy out the value of `KEY=value` and zero the value bytes **in place**,
+/// leaving `KEY=` intact. Pure over a raw entry so the byte logic is testable
+/// without touching the real environment.
+fn take_entry_value(entry: &mut [u8], key: &str) -> Option<Zeroizing<String>> {
+    let k = key.as_bytes();
+    // `entry[k.len()] == b'='` is what stops OWLZOPS_SUDO_PASSWORD from matching
+    // the OWLZOPS_SUDO_PASS prefix.
+    if entry.len() <= k.len() || &entry[..k.len()] != k || entry[k.len()] != b'=' {
+        return None;
+    }
+    let val = &mut entry[k.len() + 1..];
+    let out = std::str::from_utf8(val)
+        .ok()
+        .map(|s| Zeroizing::new(s.to_owned()));
+    val.zeroize(); // zeroed even when the value was not valid UTF-8
+    out
+}
+
+/// Lift the sudo password out of the process's **initial** environment and zero
+/// the bytes the kernel serves from `/proc/self/environ`.
+///
+/// `std::env::remove_var` alone is NOT sufficient (R27-13): the kernel serves
+/// that file from `mm->env_start .. mm->env_end`, a stack region fixed at
+/// `execve` and movable only via `prctl(PR_SET_MM)` (CAP_SYS_RESOURCE). libc's
+/// `unsetenv` unlinks the pointer from the `environ` array; the `KEY=value`
+/// bytes stay mapped. Reading the file needs only `PTRACE_MODE_READ_FSCREDS`,
+/// which Yama's `ptrace_scope` does not gate — any same-uid process qualifies.
+///
+/// MUST be the first statement of `main` (R27-14).
+#[cfg(target_os = "linux")]
+pub fn take_sudo_pass_from_environ() -> Option<Zeroizing<String>> {
+    let key = SUDO_PASS_ENV.as_bytes();
+    let mut found = None;
+
+    // SAFETY: called as the first statement of `main`, before the tokio runtime
+    // is built and before any thread other than the initial one exists, so no
+    // concurrent getenv/setenv/unsetenv can observe the array or the strings.
+    // Entries of the initial environment point into the writable stack region
+    // [env_start, env_end); writing through them is precisely what makes the
+    // change visible in /proc/self/environ. `len` is captured before zeroing;
+    // iteration advances by pointer, not by strlen.
+    unsafe {
+        let mut slot = environ;
+        if slot.is_null() {
+            return None;
+        }
+        while !(*slot).is_null() {
+            let entry = *slot;
+            let len = libc::strlen(entry);
+            if len > key.len() {
+                let bytes = std::slice::from_raw_parts_mut(entry.cast::<u8>(), len);
+                // A crafted envp may repeat the key; scrub every occurrence.
+                if let Some(v) = take_entry_value(bytes, SUDO_PASS_ENV) {
+                    found.get_or_insert(v);
+                }
+            }
+            slot = slot.add(1);
+        }
+        std::env::remove_var(SUDO_PASS_ENV);
+    }
+
+    found.filter(|p| !p.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn take_sudo_pass_from_environ() -> Option<Zeroizing<String>> {
+    // No procfs: unlinking from `environ` is the whole exposure surface.
+    let v = std::env::var(SUDO_PASS_ENV).ok().filter(|p| !p.is_empty());
+    unsafe { std::env::remove_var(SUDO_PASS_ENV) };
+    v.map(Zeroizing::new)
+}
+
+/// Resolve sudo password from either the pre‑scrubbed environment value,
+/// interactive prompt, or stdin. The returned string is zeroizing; never log it.
+///
+/// NOTE: This function no longer reads the environment. The early scrub in
+/// `main` extracts the environment variable and passes it in via `from_env`.
+/// This avoids touching the environment after the runtime has started (R27-14).
+pub fn resolve_sudo_password(
+    from_env: Option<Zeroizing<String>>,
+) -> Result<Zeroizing<String>, RemoteError> {
+    if let Some(p) = from_env {
+        return Ok(p);
     }
 
     if std::io::stdin().is_terminal() {
@@ -993,6 +1068,7 @@ impl RemoteCoverage {
         }
     }
 }
+
 // ---------------------------------------------------------------------------
 // Main remote scan
 // ---------------------------------------------------------------------------
@@ -1441,5 +1517,41 @@ pub async fn run_remote_scan_russh(
         Ok(Ok(stdout)) => Ok((stdout, remote_coverage)),
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_entry_value_is_zeroed_in_place() {
+        let mut e = b"OWLZOPS_SUDO_PASS=hunter2".to_vec();
+        let got = take_entry_value(&mut e, SUDO_PASS_ENV);
+        assert_eq!(got.as_deref().map(|s| s.as_str()), Some("hunter2"));
+        assert_eq!(&e[..], b"OWLZOPS_SUDO_PASS=\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn longer_key_sharing_the_prefix_is_not_a_match() {
+        // The '=' check is the whole guard here.
+        let mut e = b"OWLZOPS_SUDO_PASSWORD=x".to_vec();
+        assert!(take_entry_value(&mut e, SUDO_PASS_ENV).is_none());
+        assert_eq!(
+            &e[..],
+            b"OWLZOPS_SUDO_PASSWORD=x",
+            "unrelated entry must be untouched"
+        );
+    }
+
+    #[test]
+    fn non_utf8_value_is_still_zeroed() {
+        let mut e = b"OWLZOPS_SUDO_PASS=\xff\xfe".to_vec();
+        assert!(take_entry_value(&mut e, SUDO_PASS_ENV).is_none());
+        assert_eq!(
+            &e[..],
+            b"OWLZOPS_SUDO_PASS=\0\0",
+            "unreadable is not a reason to leave it"
+        );
     }
 }
