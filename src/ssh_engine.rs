@@ -281,6 +281,7 @@ pub const SUDO_PASS_ENV: &str = "OWLZOPS_SUDO_PASS";
 /// Copy out the value of `KEY=value` and zero the value bytes **in place**,
 /// leaving `KEY=` intact. Pure over a raw entry so the byte logic is testable
 /// without touching the real environment.
+#[cfg(any(target_os = "linux", test))]
 fn take_entry_value(entry: &mut [u8], key: &str) -> Option<Zeroizing<String>> {
     let k = key.as_bytes();
     // `entry[k.len()] == b'='` is what stops OWLZOPS_SUDO_PASSWORD from matching
