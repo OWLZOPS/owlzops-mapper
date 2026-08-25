@@ -480,6 +480,17 @@ fn raise_nofile_limit() {
     }
 }
 
+// Quick Win 1: harden process dumpability at startup to close the window
+// before the environment scrub runs. Works only on Linux.
+#[cfg(target_os = "linux")]
+fn harden_self_dumpable() {
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("warning: prctl(PR_SET_DUMPABLE, 0) failed: {e}");
+    }
+}
+
 async fn run_command(
     cli: Cli,
     multi: MultiProgress,
@@ -1444,7 +1455,11 @@ async fn run_command(
 }
 
 fn main() {
-    // FIRST statement: scrub initial environment before any threads or runtime exist  (R27-13, R27-14).
+    // Quick Win 1: close the window before environment scrub.
+    #[cfg(target_os = "linux")]
+    harden_self_dumpable();
+
+    // FIRST statement: scrub initial environment before any threads or runtime exist (R27-13, R27-14).
     let sudo_from_env = ssh_engine::take_sudo_pass_from_environ();
 
     raise_nofile_limit();
