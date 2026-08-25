@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use zeroize::{Zeroize, Zeroizing};
+#[cfg(any(target_os = "linux", test))]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::known_hosts::KnownHostsChecker;
 use crate::models::AgentReport;
