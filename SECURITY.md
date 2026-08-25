@@ -107,22 +107,31 @@ We ship fixes forward. If you're behind, upgrading is the fix.
 
 ## Sudo password handling
 
-`OWLZOPS_SUDO_PASS` is a **best-effort** channel for non-interactive fleet scans.
-It is read from the initial environment **once**, before the Tokio runtime starts,
-and the bytes are zeroed in `/proc/self/environ` (R27-13). However:
+Prefer `--sudo-pass-fd N` for automated scans; the secret never appears in
+`/proc/self/environ` or the parent shell environment:
 
-- There is an unavoidable window between `execve` and the scrub in `main`.
-- The variable remains in the environment of the **parent shell** if exported,
-  and may be visible to other processes of the same user or in shell history.
+```bash
+exec 3<<<"$pass"
+owlzops-mapper audit --host ... --sudo-pass-fd 3
+exec 3<&-
+```
 
-Prefer a pipe for automated scans:
+If you cannot use a file descriptor, pipe the password to `--ask-sudo-pass`:
 
 ```bash
 printf '%s' "$pass" | owlzops-mapper audit --host ... --ask-sudo-pass
 ```
 
-Alternatively, use the environment variable **only** as a prefix assignment,
-which does not persist in the parent shell:
+`OWLZOPS_SUDO_PASS` remains as a **deprecated** fallback and will be removed in a
+future release. It is read from the initial environment **once**, before the Tokio
+runtime starts, and the bytes are zeroed in `/proc/self/environ` (R27-13). However:
+
+- There is an unavoidable window between `execve` and the scrub in `main`.
+- The variable remains in the environment of the **parent shell** if exported,
+  and may be visible to other processes of the same user or in shell history.
+
+If you must use it, do so as a one-shot prefix assignment, which does not persist
+in the parent shell:
 
 ```bash
 OWLZOPS_SUDO_PASS='...' owlzops-mapper audit --host ...

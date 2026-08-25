@@ -429,6 +429,74 @@ pub fn resolve_sudo_password(from_env: Option<SecretString>) -> Result<SecretStr
     Ok(SecretString::new(pass.to_string()))
 }
 
+/// Read a sudo password from an already-open file descriptor.
+///
+/// The fd is read only once and is never closed by us; ownership remains with
+/// the caller. This prevents the secret from appearing in the environment or
+/// in shell history.
+#[cfg(unix)]
+pub fn read_sudo_pass_from_fd(fd: i32) -> Result<SecretString, RemoteError> {
+    use std::os::fd::FromRawFd;
+
+    // Validate the fd before adopting it, so we never take ownership of a
+    // closed or non-file descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        let e = std::io::Error::last_os_error();
+        return Err(RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: format!("--sudo-pass-fd {fd} is not a valid open file descriptor: {e}"),
+        });
+    }
+
+    // SAFETY: fd is valid and remains open; we do not close it after reading.
+    // The caller keeps ownership.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
+    let n = file
+        .take(CAP_SUDO_PASS_STDIN + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: format!("failed to read sudo password from fd {fd}: {e}"),
+        })?;
+
+    if n as u64 > CAP_SUDO_PASS_STDIN {
+        return Err(RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: format!("sudo password from fd {fd} exceeds {CAP_SUDO_PASS_STDIN} bytes"),
+        });
+    }
+
+    let trimmed = raw
+        .iter()
+        .rposition(|b| !matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    let pass = std::str::from_utf8(&raw[..trimmed])
+        .map(|s| Zeroizing::new(s.to_owned()))
+        .map_err(|_| RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: "sudo password from fd is not valid UTF-8".to_string(),
+        })?;
+
+    if pass.is_empty() {
+        return Err(RemoteError::SudoAuth {
+            host: "localhost".to_string(),
+            detail: "empty sudo password provided via fd".to_string(),
+        });
+    }
+
+    Ok(SecretString::from_zeroizing(pass))
+}
+
+#[cfg(not(unix))]
+pub fn read_sudo_pass_from_fd(_fd: i32) -> Result<SecretString, RemoteError> {
+    Err(RemoteError::SudoAuth {
+        host: "localhost".to_string(),
+        detail: "--sudo-pass-fd is only supported on Unix".to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Host/port parsing and TCP hardening
 // ---------------------------------------------------------------------------

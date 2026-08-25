@@ -580,7 +580,22 @@ async fn run_command(
                 }
 
                 // Resolve sudo password once (before any progress bars)
-                let sudo_pass: Option<Arc<SecretString>> = if args.ask_sudo_pass {
+                let sudo_pass: Option<Arc<SecretString>> = if let Some(fd) = args.sudo_pass_fd {
+                    match ssh_engine::read_sudo_pass_from_fd(fd) {
+                        Ok(p) => Some(Arc::new(p)),
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            return EXIT_USAGE;
+                        }
+                    }
+                } else if args.ask_sudo_pass {
+                    // Warn about deprecated environment variable if present.
+                    if sudo_from_env.is_some() {
+                        eprintln!(
+                            "warning: OWLZOPS_SUDO_PASS is deprecated and will be removed. \
+                             Prefer --sudo-pass-fd N or --ask-sudo-pass with a pipe."
+                        );
+                    }
                     match ssh_engine::resolve_sudo_password(sudo_from_env) {
                         Ok(p) => Some(Arc::new(p)),
                         Err(e) => {

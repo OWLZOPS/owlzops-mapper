@@ -79,6 +79,12 @@ pub struct AuditArgs {
     #[arg(long, default_value_t = false)]
     pub ask_sudo_pass: bool,
 
+    /// Read sudo password from this already-open file descriptor instead of
+    /// prompting or reading the environment. Takes precedence over
+    /// `--ask-sudo-pass` and `OWLZOPS_SUDO_PASS`.
+    #[arg(long, value_name = "FD", conflicts_with = "ask_sudo_pass")]
+    pub sudo_pass_fd: Option<i32>,
+
     /// Maximum concurrent SSH sessions (default: 50).
     #[arg(long, default_value_t = 50)]
     pub max_concurrent: usize,
