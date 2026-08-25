@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::known_hosts::KnownHostsChecker;
 use crate::models::AgentReport;
 use crate::safe_io;
+use crate::secrets::SecretString;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
@@ -356,22 +357,21 @@ pub fn take_sudo_pass_from_environ() -> Option<Zeroizing<String>> {
 /// Build the `password\n` line sudo expects on stdin without ever growing the
 /// buffer: `String::to_string` allocates exact capacity, so a later `push`
 /// reallocates and frees an un-zeroed copy of the secret (R27-15).
-fn sudo_stdin_line(pass: &Zeroizing<String>) -> Zeroizing<String> {
+fn sudo_stdin_line(pass: &SecretString) -> Zeroizing<String> {
     let mut line = Zeroizing::new(String::with_capacity(pass.len() + 1));
-    line.push_str(pass);
+    line.push_str(pass.as_str());
     line.push('\n');
     line
 }
 
 /// Resolve sudo password from either the pre‑scrubbed environment value,
-/// interactive prompt, or stdin. The returned string is zeroizing; never log it.
+/// interactive prompt, or stdin. The returned secret is protected from swap
+/// and core dumps where supported.
 ///
 /// NOTE: This function no longer reads the environment. The early scrub in
 /// `main` extracts the environment variable and passes it in via `from_env`.
 /// This avoids touching the environment after the runtime has started (R27-14).
-pub fn resolve_sudo_password(
-    from_env: Option<Zeroizing<String>>,
-) -> Result<Zeroizing<String>, RemoteError> {
+pub fn resolve_sudo_password(from_env: Option<SecretString>) -> Result<SecretString, RemoteError> {
     if let Some(p) = from_env {
         return Ok(p);
     }
@@ -390,7 +390,7 @@ pub fn resolve_sudo_password(
                 detail: "empty sudo password entered".to_string(),
             });
         }
-        return Ok(Zeroizing::new(p));
+        return Ok(SecretString::new(p));
     }
 
     // R27-15: cap stdin read at 4 KiB and use Zeroizing<Vec<u8>> to avoid
@@ -426,7 +426,7 @@ pub fn resolve_sudo_password(
             detail: "empty sudo password provided via stdin".to_string(),
         });
     }
-    Ok(pass)
+    Ok(SecretString::new(pass.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +742,7 @@ async fn make_remote_staging(
 /// the orchestrator before upload.
 async fn validate_sudo_password(
     session: &client::Handle<ClientHandler>,
-    sudo_pass: &Zeroizing<String>,
+    sudo_pass: &SecretString,
     host: &str,
 ) -> Result<(), RemoteError> {
     let mut ch = session.channel_open_session().await?;
@@ -1115,7 +1115,7 @@ pub async fn run_remote_scan_russh(
     ssh_user: &str,
     ssh_key_path: &str,
     remote_path: Option<&str>,
-    sudo_pass: Option<&Zeroizing<String>>,
+    sudo_pass: Option<&SecretString>,
     copy_binary: bool,
     keep_binary: bool,
     local_bin: Option<&str>,
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[test]
     fn sudo_line_never_reallocates() {
-        let pass = Zeroizing::new("hunter2".to_string());
+        let pass = SecretString::new("hunter2".to_string());
         let line = sudo_stdin_line(&pass);
         assert_eq!(&**line, "hunter2\n");
         assert_eq!(line.capacity(), pass.len() + 1);
@@ -1601,8 +1601,8 @@ mod tests {
 
     #[test]
     fn sudo_line_handles_empty_and_multibyte() {
-        assert_eq!(&**sudo_stdin_line(&Zeroizing::new(String::new())), "\n");
-        let p = Zeroizing::new("пароль".to_string());
+        assert_eq!(&**sudo_stdin_line(&SecretString::new(String::new())), "\n");
+        let p = SecretString::new("пароль".to_string());
         let l = sudo_stdin_line(&p);
         assert_eq!(l.capacity(), p.len() + 1, "capacity is in bytes, not chars");
     }
