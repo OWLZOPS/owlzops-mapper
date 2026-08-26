@@ -191,10 +191,11 @@ For remote scans that require a password, use `--sudo-pass-fd N` (most secure),
 `OWLZOPS_SUDO_PASS`.
 
 ```bash
-# Most secure: pass via open file descriptor (e.g., from a password manager)
-exec 3<<<"$SUDO_PASS"
-owlzops-mapper audit --host 192.0.2.10 --sudo-pass-fd 3
-exec 3<&-
+# Most secure: feed the fd from a pipe, never a here-string.
+# `<<<` writes a temp file in $TMPDIR on bash < 5.1, which puts the fleet
+# password on disk (R27-23).
+owlzops-mapper audit --host 192.0.2.10 --sudo-pass-fd 3 \
+  3< <(printf '%s' "$SUDO_PASS")
 
 # via stdin (recommended for scripts)
 printf '%s' "$SUDO_PASS" | owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass

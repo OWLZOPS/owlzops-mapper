@@ -152,6 +152,9 @@ jobs:
       - name: Check env var manipulation gate
         run: bash .github/scripts/check_env_var_gate.sh
 
+      - name: Doctrine gates (R27-14 / R27-17 / R27-18)
+        run: bash .github/scripts/check_doctrine_gates.sh
+
   build-macos-orchestrator:
     name: Build macOS orchestrator
     runs-on: macos-latest

@@ -108,12 +108,13 @@ We ship fixes forward. If you're behind, upgrading is the fix.
 ## Sudo password handling
 
 Prefer `--sudo-pass-fd N` for automated scans; the secret never appears in
-`/proc/self/environ` or the parent shell environment:
+`/proc/self/environ` or the parent shell environment. Use a pipe, not a
+here-string: `<<<` is implemented with a temporary file on bash < 5.1, which
+puts the fleet password on disk (R27-23).
 
 ```bash
-exec 3<<<"$pass"
-owlzops-mapper audit --host ... --sudo-pass-fd 3
-exec 3<&-
+owlzops-mapper audit --host ... --sudo-pass-fd 3 \
+  3< <(printf '%s' "$pass")
 ```
 
 If you cannot use a file descriptor, pipe the password to `--ask-sudo-pass`:

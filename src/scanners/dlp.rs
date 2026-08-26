@@ -126,7 +126,20 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                pid_denied = true;
+                if self_pid.is_some() {
+                    // Self-inflicted, not a privilege gap: PR_SET_DUMPABLE=0 makes
+                    // /proc/self/environ (mode 0400) root-owned, so a non-root scan
+                    // cannot read its own. Attributed, never counted as a generic
+                    // denial, and never silently dropped (R27-22).
+                    coverage::record(
+                        "dlp: own /proc/self/environ unreadable — PR_SET_DUMPABLE=0 \
+                         reassigned it to root; the R27-16 self-check is inert on \
+                         non-root scans"
+                            .to_string(),
+                    );
+                } else {
+                    pid_denied = true;
+                }
             }
             Err(_) => {}
         }
@@ -180,7 +193,17 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                pid_denied = true;
+                if self_pid.is_some() {
+                    // Same self-inflicted condition as environ, but for cmdline.
+                    coverage::record(
+                        "dlp: own /proc/self/cmdline unreadable — PR_SET_DUMPABLE=0 \
+                         reassigned it to root; the R27-16 self-check is inert on \
+                         non-root scans"
+                            .to_string(),
+                    );
+                } else {
+                    pid_denied = true;
+                }
             }
             Err(_) => {}
         }
