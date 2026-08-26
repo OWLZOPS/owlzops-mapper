@@ -9,7 +9,10 @@ use zeroize::Zeroizing;
 
 /// A secret string protected from being written to swap or included in core
 /// dumps on Linux. Falls back to `Zeroizing<String>` on other platforms.
-#[derive(Clone)]
+// No Clone (R27-19): a cloned Zeroizing<String> is a fresh allocation that
+// from_zeroizing's mlock/madvise never touched, so the copy would silently
+// lack the protection the type promises. Share with Arc<SecretString> —
+// main.rs already does.
 pub struct SecretString {
     inner: Zeroizing<String>,
 }
@@ -51,6 +54,11 @@ impl SecretString {
                         // Try mlock first; if it fails, still attempt madvise.
                         if libc::mlock(aligned as *const libc::c_void, aligned_len) != 0 {
                             let err = std::io::Error::last_os_error();
+                            // Duplicate to stderr: coverage may not reach a report
+                            // in fleet mode without a local host (R27-20).
+                            eprintln!(
+                                "warning: mlock failed ({err}) — sudo password may reach swap"
+                            );
                             crate::coverage::record(format!(
                                 "secrets: mlock failed ({err}) — sudo password may be written to swap"
                             ));
@@ -63,6 +71,9 @@ impl SecretString {
                         ) != 0
                         {
                             let err = std::io::Error::last_os_error();
+                            eprintln!(
+                                "warning: madvise(MADV_DONTDUMP) failed ({err}) — sudo password may be included in core dumps"
+                            );
                             crate::coverage::record(format!(
                                 "secrets: madvise(MADV_DONTDUMP) failed ({err}) — sudo password may be included in core dumps"
                             ));
