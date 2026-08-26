@@ -449,11 +449,14 @@ pub fn read_sudo_pass_from_fd(fd: i32) -> Result<SecretString, RemoteError> {
         });
     }
 
-    // SAFETY: fd is valid and remains open; we do not close it after reading.
-    // The caller keeps ownership.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // SAFETY: `fd` was just validated with F_GETFD, so it names an open
+    // descriptor. Ownership is parked in `ManuallyDrop` immediately: without
+    // it, the `Take<File>` temporary below would close(fd) at the end of the
+    // statement, contrary to this function's contract (R27-18).
+    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
     let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
-    let n = file
+    // `impl Read for &File`: reads through a borrow, never consuming the File.
+    let n = (&*file)
         .take(CAP_SUDO_PASS_STDIN + 1)
         .read_to_end(&mut raw)
         .map_err(|e| RemoteError::SudoAuth {
@@ -1673,5 +1676,31 @@ mod tests {
         let p = SecretString::new("пароль".to_string());
         let l = sudo_stdin_line(&p);
         assert_eq!(l.capacity(), p.len() + 1, "capacity is in bytes, not chars");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn caller_fd_survives_the_read() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let msg = b"hunter2\n";
+        assert_eq!(
+            unsafe { libc::write(w, msg.as_ptr().cast(), msg.len()) },
+            msg.len() as isize
+        );
+        unsafe { libc::close(w) };
+
+        let p = read_sudo_pass_from_fd(r).expect("must read");
+        assert_eq!(p.as_str(), "hunter2");
+
+        // read() == 0 means the pipe is open and at EOF; -1/EBADF means we closed it.
+        let mut b = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(r, b.as_mut_ptr().cast(), 1) },
+            0,
+            "read_sudo_pass_from_fd closed a descriptor it does not own"
+        );
+        unsafe { libc::close(r) };
     }
 }
