@@ -49,6 +49,13 @@ fn starts_with_icase(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
+/// Is an EACCES on this /proc entry explainable by our own PR_SET_DUMPABLE(0)?
+/// Only for entries the kernel registers 0400: dumpable reassigns the inode
+/// owner to root but never changes the mode, so 0444 entries stay readable.
+fn eacces_explained_by_dumpable(entry: &str) -> bool {
+    matches!(entry, "environ" | "auxv" | "personality")
+}
+
 pub fn scan_process_memory() -> Vec<SecretLeak> {
     let mut leaks = Vec::new();
 
@@ -60,8 +67,8 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
     let mut path_buf = String::with_capacity(64);
 
     // Count how many *processes* had unreadable /proc/<pid>/environ or cmdline
-    // due to EACCES (typically non‑root scan).  One aggregate coverage line
-    // is emitted at the end to avoid flooding the operator with per‑PID noise.
+    // due to EACCES (typically non‑root scan). One aggregate coverage line is
+    // emitted at the end to avoid flooding the operator with per‑PID noise.
     let mut denied = 0usize;
 
     for entry in entries.flatten() {
@@ -126,7 +133,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                if self_pid.is_some() {
+                if self_pid.is_some() && eacces_explained_by_dumpable("environ") {
                     // Self-inflicted, not a privilege gap: PR_SET_DUMPABLE=0 makes
                     // /proc/self/environ (mode 0400) root-owned, so a non-root scan
                     // cannot read its own. Attributed, never counted as a generic
@@ -194,16 +201,20 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 if self_pid.is_some() {
-                    // Same self-inflicted condition as environ, but for cmdline.
+                    // NOT the environ case (R27-27). `cmdline` is ONE(.., S_IRUGO)
+                    // = 0444 and `proc_pid_cmdline_read` performs no ptrace check,
+                    // so PR_SET_DUMPABLE=0 cannot produce EACCES here. Anything
+                    // that does is an anomaly (LSM denial, hidepid, procfs
+                    // overlay — the SEC-021 masking class) and must NOT be
+                    // explained away.
                     coverage::record(
-                        "dlp: own /proc/self/cmdline unreadable — PR_SET_DUMPABLE=0 \
-                         reassigned it to root; the R27-16 self-check is inert on \
-                         non-root scans"
+                        "dlp: own /proc/self/cmdline is EACCES despite mode 0444 — \
+                         not explainable by PR_SET_DUMPABLE; procfs may be masked \
+                         or LSM-restricted. INVESTIGATE."
                             .to_string(),
                     );
-                } else {
-                    pid_denied = true;
                 }
+                pid_denied = true;
             }
             Err(_) => {}
         }
@@ -256,5 +267,17 @@ mod tests {
         ] {
             assert!(!is_sensitive_key(k), "{k} is a false positive");
         }
+    }
+
+    #[test]
+    fn only_owner_readable_proc_entries_are_explained_by_dumpable() {
+        assert!(eacces_explained_by_dumpable("environ"), "REG(.., S_IRUSR)");
+        assert!(eacces_explained_by_dumpable("auxv"), "REG(.., S_IRUSR)");
+        assert!(
+            !eacces_explained_by_dumpable("cmdline"),
+            "ONE(.., S_IRUGO) = 0444 and no ptrace check — dumpable cannot cause EACCES"
+        );
+        assert!(!eacces_explained_by_dumpable("status"), "ONE(.., S_IRUGO)");
+        assert!(!eacces_explained_by_dumpable("maps"), "world-readable");
     }
 }
