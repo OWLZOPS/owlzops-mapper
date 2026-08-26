@@ -80,8 +80,9 @@ pub struct AuditArgs {
     pub ask_sudo_pass: bool,
 
     /// Read sudo password from this already-open file descriptor instead of
-    /// prompting or reading the environment. Takes precedence over
-    /// `--ask-sudo-pass` and `OWLZOPS_SUDO_PASS`.
+    /// prompting or reading the environment. Mutually exclusive with
+    /// `--ask-sudo-pass`; any value in `OWLZOPS_SUDO_PASS` is discarded.
+    // R27-23: corrected help text (not precedence, mutual exclusion).
     #[arg(long, value_name = "FD", conflicts_with = "ask_sudo_pass")]
     pub sudo_pass_fd: Option<i32>,
 

@@ -579,6 +579,16 @@ async fn run_command(
                     remote.push(h.clone());
                 }
 
+                // R27-23: warn when a deprecated env secret is present but no
+                // password channel was selected; it is discarded silently otherwise.
+                if sudo_from_env.is_some() && !args.ask_sudo_pass && args.sudo_pass_fd.is_none() {
+                    eprintln!(
+                        "warning: OWLZOPS_SUDO_PASS was set but no password channel was \
+                         selected — the value is discarded. Use --sudo-pass-fd N, or \
+                         --ask-sudo-pass to consume the variable (deprecated)."
+                    );
+                }
+
                 // Resolve sudo password once (before any progress bars)
                 let sudo_pass: Option<Arc<SecretString>> = if let Some(fd) = args.sudo_pass_fd {
                     match ssh_engine::read_sudo_pass_from_fd(fd) {
