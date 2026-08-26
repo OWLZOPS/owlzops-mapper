@@ -364,6 +364,39 @@ fn sudo_stdin_line(pass: &SecretString) -> Zeroizing<String> {
     line
 }
 
+/// Read a capped, newline-trimmed secret from any reader. Single source of
+/// truth for both the stdin and the `--sudo-pass-fd` paths (R27-21).
+fn read_capped_secret<R: Read>(r: R, source: &str) -> Result<SecretString, RemoteError> {
+    let err = |detail: String| RemoteError::SudoAuth {
+        host: "localhost".to_string(),
+        detail,
+    };
+
+    let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
+    let n = r
+        .take(CAP_SUDO_PASS_STDIN + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| err(format!("failed to read sudo password from {source}: {e}")))?;
+    if n as u64 > CAP_SUDO_PASS_STDIN {
+        return Err(err(format!(
+            "sudo password from {source} exceeds {CAP_SUDO_PASS_STDIN} bytes"
+        )));
+    }
+
+    let trimmed = raw
+        .iter()
+        .rposition(|b| !matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    let pass = std::str::from_utf8(&raw[..trimmed])
+        .map(|s| Zeroizing::new(s.to_owned()))
+        .map_err(|_| err(format!("sudo password from {source} is not valid UTF-8")))?;
+    if pass.is_empty() {
+        return Err(err(format!("empty sudo password provided via {source}")));
+    }
+    // from_zeroizing, never new(..to_string()): no second allocation.
+    Ok(SecretString::from_zeroizing(pass))
+}
+
 /// Resolve sudo password from either the pre‑scrubbed environment value,
 /// interactive prompt, or stdin. The returned secret is protected from swap
 /// and core dumps where supported.
@@ -393,40 +426,7 @@ pub fn resolve_sudo_password(from_env: Option<SecretString>) -> Result<SecretStr
         return Ok(SecretString::new(p));
     }
 
-    // R27-15: cap stdin read at 4 KiB and use Zeroizing<Vec<u8>> to avoid
-    // unzeroed copies in reallocations; trim trailing newline/CR without
-    // allocating another String.
-    let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
-    let n = std::io::stdin()
-        .take(CAP_SUDO_PASS_STDIN + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| RemoteError::HostKeyCheck {
-            host: "localhost".to_string(),
-            detail: e.to_string(),
-        })?;
-    if n as u64 > CAP_SUDO_PASS_STDIN {
-        return Err(RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: format!("sudo password on stdin exceeds {CAP_SUDO_PASS_STDIN} bytes"),
-        });
-    }
-    let trimmed = raw
-        .iter()
-        .rposition(|b| !matches!(b, b'\n' | b'\r'))
-        .map_or(0, |i| i + 1);
-    let pass = std::str::from_utf8(&raw[..trimmed])
-        .map(|s| Zeroizing::new(s.to_owned()))
-        .map_err(|_| RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: "sudo password on stdin is not valid UTF-8".to_string(),
-        })?;
-    if pass.is_empty() {
-        return Err(RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: "empty sudo password provided via stdin".to_string(),
-        });
-    }
-    Ok(SecretString::new(pass.to_string()))
+    read_capped_secret(std::io::stdin(), "stdin")
 }
 
 /// Read a sudo password from an already-open file descriptor.
@@ -454,42 +454,7 @@ pub fn read_sudo_pass_from_fd(fd: i32) -> Result<SecretString, RemoteError> {
     // it, the `Take<File>` temporary below would close(fd) at the end of the
     // statement, contrary to this function's contract (R27-18).
     let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-    let mut raw = Zeroizing::new(Vec::<u8>::with_capacity(CAP_SUDO_PASS_STDIN as usize));
-    // `impl Read for &File`: reads through a borrow, never consuming the File.
-    let n = (&*file)
-        .take(CAP_SUDO_PASS_STDIN + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: format!("failed to read sudo password from fd {fd}: {e}"),
-        })?;
-
-    if n as u64 > CAP_SUDO_PASS_STDIN {
-        return Err(RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: format!("sudo password from fd {fd} exceeds {CAP_SUDO_PASS_STDIN} bytes"),
-        });
-    }
-
-    let trimmed = raw
-        .iter()
-        .rposition(|b| !matches!(b, b'\n' | b'\r'))
-        .map_or(0, |i| i + 1);
-    let pass = std::str::from_utf8(&raw[..trimmed])
-        .map(|s| Zeroizing::new(s.to_owned()))
-        .map_err(|_| RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: "sudo password from fd is not valid UTF-8".to_string(),
-        })?;
-
-    if pass.is_empty() {
-        return Err(RemoteError::SudoAuth {
-            host: "localhost".to_string(),
-            detail: "empty sudo password provided via fd".to_string(),
-        });
-    }
-
-    Ok(SecretString::from_zeroizing(pass))
+    read_capped_secret(&*file, &format!("fd {fd}"))
 }
 
 #[cfg(not(unix))]
