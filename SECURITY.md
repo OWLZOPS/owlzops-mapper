@@ -143,6 +143,47 @@ the value might be logged or inherited by unrelated processes.
 
 ---
 
+## Secret handling in the orchestrator
+
+The sudo password, whatever channel supplied it, lives in a `SecretString`
+(`src/secrets.rs`). These are commitments, not implementation notes.
+
+**Never readable from `/proc/self/environ`.** `OWLZOPS_SUDO_PASS` is copied out
+and its bytes are zeroed in place in the initial environment block before the
+Tokio runtime is built. `unsetenv` alone does not achieve this: the kernel
+serves `/proc/<pid>/environ` from `mm->env_start .. mm->env_end`, a region fixed
+at `execve`, and only the pointer leaves the `environ` array.
+
+```bash
+OWLZOPS_SUDO_PASS=canary owlzops-mapper audit --host 192.0.2.1 --ask-sudo-pass &
+sleep 1
+# as root: PR_SET_DUMPABLE(0) already denies the same-uid read below
+sudo tr '\0' '\n' < /proc/$!/environ | grep '^OWLZOPS_SUDO_PASS'
+# must print exactly "OWLZOPS_SUDO_PASS=" — never "=canary"
+```
+
+**Never in swap, never in a core dump.** `prctl(PR_SET_DUMPABLE, 0)` is the
+first statement of `main`; `mlock(2)` and `madvise(MADV_DONTDUMP)` cover the
+backing page. Failure of any of the three is reported on stderr *and* in
+`coverage_warnings` — degradation of this control is never silent.
+
+```bash
+grep VmLck /proc/<scanning-pid>/status   # non-zero while a password is held
+```
+
+**Never in a log, a report or a panic message.** `SecretString` has no
+`Display`; its `Debug` renders `SecretString([REDACTED])` and withholds even
+the length. Enforced in CI by `.github/scripts/check_doctrine_gates.sh`.
+
+**Zeroized on drop, exactly one copy.** `SecretString` is not `Clone`; the fleet
+shares one instance through `Arc`. Every intermediate buffer on the stdin and
+`--sudo-pass-fd` paths is `Zeroizing`, and no path grows a `String` holding the
+secret (a reallocation would free an un-zeroed copy).
+
+A build in which any of the four does not hold is a vulnerability, not a bug.
+
+---
+
 ## Verifying what you run
 
 Every release publishes, for each target:
