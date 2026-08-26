@@ -9,9 +9,18 @@ use zeroize::Zeroizing;
 
 /// A secret string protected from being written to swap or included in core
 /// dumps on Linux. Falls back to `Zeroizing<String>` on other platforms.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecretString {
     inner: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Zeroizing<String> derives Debug and forwards to String; a derived
+        // impl would print the password verbatim (R27-17). Length is withheld
+        // as well — it is a small but real disclosure.
+        f.write_str("SecretString([REDACTED])")
+    }
 }
 
 impl SecretString {
@@ -106,5 +115,14 @@ mod tests {
         let z = Zeroizing::new("password123".to_string());
         let s = SecretString::from_zeroizing(z);
         assert_eq!(s.as_str(), "password123");
+    }
+
+    #[test]
+    fn debug_never_renders_the_secret() {
+        let s = SecretString::new("hunter2".to_string());
+        let d = format!("{s:?}");
+        assert!(!d.contains("hunter2"), "Debug leaked the secret: {d}");
+        assert!(!d.contains('7'), "Debug leaked the length");
+        assert_eq!(d, "SecretString([REDACTED])");
     }
 }
