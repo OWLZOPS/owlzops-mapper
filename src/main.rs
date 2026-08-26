@@ -492,6 +492,9 @@ fn harden_self_dumpable() {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn harden_self_dumpable() {}
+
 async fn run_command(
     cli: Cli,
     multi: MultiProgress,
@@ -1481,11 +1484,11 @@ async fn run_command(
 }
 
 fn main() {
-    // Quick Win 1: close the window before environment scrub.
-    #[cfg(target_os = "linux")]
     harden_self_dumpable();
 
-    // FIRST statement: scrub initial environment before any threads or runtime exist (R27-13, R27-14).
+    // Scrub initial environment before any threads or runtime exist (R27-13, R27-14).
+    // `harden_self_dumpable()` runs first on Linux, but the scrub must precede
+    // the Tokio runtime and any worker threads.
     let sudo_from_env = ssh_engine::take_sudo_pass_from_environ().map(SecretString::from_zeroizing);
     raise_nofile_limit();
 
