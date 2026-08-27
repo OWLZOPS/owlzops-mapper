@@ -300,6 +300,17 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
 // ── Snapshot run (now fully russh‑based) ───────────────────
 
 pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
+    // R27-23: snapshot does not support sudo password channels. They would be
+    // accepted by clap (SnapshotArgs flattens AuditArgs) but silently ignored.
+    // Reject them explicitly instead of creating a false expectation.
+    if args.audit.sudo_pass_fd.is_some() || args.audit.ask_sudo_pass {
+        eprintln!(
+            "error: --sudo-pass-fd and --ask-sudo-pass are not valid for snapshot; \
+             snapshot always saves the local or remote report without sudo escalation"
+        );
+        return 1;
+    }
+
     let output_dir = if args.output_dir == "~/.owlzops/snapshots" && crate::is_running_as_root() {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             let home = read_user_home(&sudo_user).unwrap_or_else(|| format!("/home/{}", sudo_user));

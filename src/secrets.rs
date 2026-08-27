@@ -3,7 +3,7 @@
 //! `Zeroizing<String>` guarantees zeroization on drop, but does not prevent
 //! the OS from paging the buffer to swap or including it in a core dump.
 //! `SecretString` adds `mlock(2)` and `madvise(MADV_DONTDUMP)` on Linux,
-//! degrading silently (with a coverage note) when the kernel refuses.
+//! degrading with a stderr warning and coverage note when the kernel refuses.
 
 use zeroize::Zeroizing;
 
@@ -36,6 +36,15 @@ impl SecretString {
 
     /// Wrap an already zeroizing secret. This allows callers that already have
     /// a `Zeroizing<String>` to upgrade it without an extra copy.
+    ///
+    /// # Invariant
+    /// Exactly one `SecretString` exists per process (enforced by the absence
+    /// of `Clone`). There is no `Drop`/`munlock`: the locked page is held until
+    /// exit, costing one page of `RLIMIT_MEMLOCK`. `mlock`/`madvise` are
+    /// page-granular, so the page is shared with unrelated heap objects; a
+    /// naive `munlock` on drop could unlock a page holding another live secret.
+    /// If a second secret is ever introduced, move to a dedicated `mmap` region
+    /// first.
     pub fn from_zeroizing(inner: Zeroizing<String>) -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -91,6 +100,9 @@ impl SecretString {
     }
 
     /// Get the length in bytes.
+    // `is_empty` is intentionally not defined here: `Deref<Target = str>`
+    // already provides `is_empty`, and an inherent method would be unused,
+    // tripping `-D dead-code`.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
