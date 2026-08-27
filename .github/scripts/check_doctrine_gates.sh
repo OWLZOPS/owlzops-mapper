@@ -34,4 +34,13 @@ if [ -n "$raw" ]; then
   fail=1
 fi
 
+# R27-42: process-time arithmetic must live only in src/proc_time.rs.
+hits=$(grep -rEn '_SC_CLK_TCK|"/proc/uptime"|strip_prefix\("btime ' src/ \
+       | grep -v '^src/proc_time\.rs:' || true)
+if [ -n "$hits" ]; then
+  echo "::error::process-time arithmetic outside src/proc_time.rs (R27-42)"
+  echo "$hits"
+  fail=1
+fi
+
 exit $fail

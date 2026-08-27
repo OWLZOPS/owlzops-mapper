@@ -4,10 +4,14 @@
 //! the original in `ghost_pid.rs`, which still saturated an impossible age to 0.
 //! Both scanners now use these functions instead of local implementations.
 
+use std::sync::OnceLock;
+
 /// Seconds since boot from `/proc/uptime`. `None` when unreadable — callers
 /// must NOT substitute 0: that makes every process look newborn.
 pub fn uptime_secs() -> Option<u64> {
-    let raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    // R27-43: keep the capped read from the original dlp.rs. This is a procfs
+    // read, and the project convention is to use safe_io for all /proc paths.
+    let (raw, _truncated) = crate::safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
     let value = raw
         .split_whitespace()
         .next()
@@ -40,8 +44,22 @@ pub fn age_from_parts(start_ticks: u64, clk_tck: u64, uptime_secs: u64) -> Optio
 /// The field follows the `)` that terminates the comm field and is 20 fields
 /// after it (index 19 in a zero-based split of the rest).
 pub fn starttime_ticks(stat: &str) -> Option<u64> {
-    let rparen = stat.rfind(')')?;
-    let after = stat[rparen + 1..].trim_start();
-    let fields: Vec<&str> = after.split_ascii_whitespace().collect();
-    fields.get(19)?.parse::<u64>().ok()
+    stat.rfind(')')?
+        .checked_add(1)
+        .and_then(|idx| stat.get(idx..))
+        .and_then(|after| after.split_ascii_whitespace().nth(19))
+        .and_then(|field| field.parse().ok())
+}
+
+/// Boot epoch from `/proc/stat`, cached for the lifetime of the process.
+/// Valid only for the real `/proc`; tempdir-based tests must not rely on this
+/// if they need a different proc root.
+pub fn boot_epoch() -> Option<u64> {
+    static BOOT: OnceLock<Option<u64>> = OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let (stat, _truncated) = crate::safe_io::read_procfs_capped("/proc/stat", 256).ok()?;
+        stat.lines()
+            .find_map(|l| l.strip_prefix("btime "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
 }

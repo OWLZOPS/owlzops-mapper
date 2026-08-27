@@ -678,36 +678,20 @@ pub fn enrich_ghosts(
     }
 }
 
-// ── starttime (wall-clock epoch) — reuses ghost_pid's field-22 idiom ──
-
-fn clk_tck() -> u64 {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz > 0 { hz as u64 } else { 100 }
-}
-
-fn boot_epoch() -> Option<u64> {
-    static BOOT: OnceLock<Option<u64>> = OnceLock::new();
-    *BOOT.get_or_init(|| {
-        let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        stat.lines()
-            .find_map(|l| l.strip_prefix("btime "))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
-}
-
-/// Pure parse split out for hermetic tests (comm may contain ')' and spaces).
-pub fn parse_starttime_ticks(stat: &str) -> Option<u64> {
-    let rparen = stat.rfind(')')?;
-    let after = stat[rparen + 1..].trim_start();
-    // field 22 (starttime) == index 19 of the post-')' tail (field 3 = state = index 0).
-    after.split_ascii_whitespace().nth(19)?.parse().ok()
-}
+// ── starttime (wall-clock epoch) ──
+// The tick/field arithmetic lives in `proc_time` (R27-41/R27-42). This module
+// only adds the btime offset that turns an age into an epoch.
 
 /// Wall-clock start (epoch secs). One 4 KiB read of /proc/<pid>/stat per deep PID; btime cached once.
+///
+/// `None` on any failure, including a failed clock-tick lookup: a guessed HZ
+/// shifts the epoch and silently moves the `ghost_analysis` verdict (R27-42).
 pub fn proc_start_epoch(proc_root: &str, pid: u32) -> Option<u64> {
-    let btime = boot_epoch()?;
-    let stat = std::fs::read_to_string(format!("{}/{}/stat", proc_root, pid)).ok()?; // CAPPED_IO_OK: dynamic procfs path
-    Some(btime + parse_starttime_ticks(&stat)? / clk_tck())
+    let btime = crate::proc_time::boot_epoch()?;
+    let (stat, _truncated) =
+        crate::safe_io::read_procfs_capped(&format!("{}/{}/stat", proc_root, pid), 4096).ok()?;
+    let hz = crate::proc_time::clock_ticks_per_sec()?;
+    Some(btime + crate::proc_time::starttime_ticks(&stat)? / hz)
 }
 
 #[cfg(test)]
@@ -785,7 +769,7 @@ mod ghost_tests {
     #[test]
     fn starttime_field22_survives_paren_in_comm() {
         let stat = "1234 (weird )name) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 998877 0";
-        assert_eq!(parse_starttime_ticks(stat), Some(998877));
+        assert_eq!(crate::proc_time::starttime_ticks(stat), Some(998877));
     }
 
     #[test]
