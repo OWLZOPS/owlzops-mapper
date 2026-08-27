@@ -162,7 +162,7 @@ sleep 1
 # refused before sudo ever runs.
 sudo cat /proc/$!/environ | tr '\0' '\n' | grep '^OWLZOPS_SUDO_PASS'
 # must print exactly "OWLZOPS_SUDO_PASS=" — never "=canary"
-kill %1
+kill "$!"
 ```
 
 **Never in swap, never in a core dump.** `prctl(PR_SET_DUMPABLE, 0)` is the
@@ -177,7 +177,11 @@ grep VmLck /proc/<scanning-pid>/status   # non-zero while a password is held
 
 **Never in a log, a report or a panic message.** `SecretString` has no
 `Display`; its `Debug` renders `SecretString([REDACTED])` and withholds even
-the length. Enforced in CI by `.github/scripts/check_doctrine_gates.sh`.
+the length, so no `{:?}` or `?field` can leak it. Enforced in CI by
+`.github/scripts/check_doctrine_gates.sh`. This is a guarantee about
+*accidental* formatting: `as_str()` and `Deref<Target = str>` still hand out a
+plain `&str`, so deliberately printing that slice is possible and is caught by
+review, not by the type.
 
 **Zeroized on drop, exactly one copy.** `SecretString` is not `Clone`; the fleet
 shares one instance through `Arc`. Every intermediate buffer on the stdin and
