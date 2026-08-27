@@ -99,13 +99,11 @@ impl SecretString {
         &self.inner
     }
 
-    /// Get the length in bytes.
-    // `is_empty` is intentionally not defined here: `Deref<Target = str>`
-    // already provides `is_empty`, and an inherent method would be unused,
-    // tripping `-D dead-code`.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
+    // No inherent `len`/`is_empty`: `Deref<Target = str>` provides both.
+    // An inherent `len` alone trips clippy::len_without_is_empty (the lint
+    // scans inherent impls only and does not credit Deref); adding an
+    // inherent `is_empty` alongside it trips dead_code in a binary crate.
+    // Owning neither dissolves the pair.
 }
 
 impl std::ops::Deref for SecretString {
