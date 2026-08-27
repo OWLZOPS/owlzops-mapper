@@ -7,7 +7,9 @@
 /// Seconds since boot from `/proc/uptime`. `None` when unreadable — callers
 /// must NOT substitute 0: that makes every process look newborn.
 pub fn uptime_secs() -> Option<u64> {
-    let raw = std::fs::read_to_string("/proc/uptime").ok()?;
+    // R27-43: keep the capped read from the original dlp.rs. This is a procfs
+    // read, and the project convention is to use safe_io for all /proc paths.
+    let (raw, _truncated) = crate::safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
     let value = raw
         .split_whitespace()
         .next()
@@ -40,8 +42,9 @@ pub fn age_from_parts(start_ticks: u64, clk_tck: u64, uptime_secs: u64) -> Optio
 /// The field follows the `)` that terminates the comm field and is 20 fields
 /// after it (index 19 in a zero-based split of the rest).
 pub fn starttime_ticks(stat: &str) -> Option<u64> {
-    let rparen = stat.rfind(')')?;
-    let after = stat[rparen + 1..].trim_start();
-    let fields: Vec<&str> = after.split_ascii_whitespace().collect();
-    fields.get(19)?.parse::<u64>().ok()
+    stat.rfind(')')?
+        .checked_add(1)
+        .and_then(|idx| stat.get(idx..))
+        .and_then(|after| after.split_ascii_whitespace().nth(19))
+        .and_then(|field| field.parse().ok())
 }
