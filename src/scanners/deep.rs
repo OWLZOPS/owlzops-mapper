@@ -682,25 +682,12 @@ pub fn enrich_ghosts(
 // The tick/field arithmetic lives in `proc_time` (R27-41/R27-42). This module
 // only adds the btime offset that turns an age into an epoch.
 
-/// Boot epoch from `/proc/stat`, cached for the lifetime of the process.
-/// Valid only for the real `/proc`; tempdir-based tests must not rely on this
-/// if they need a different proc root.
-fn boot_epoch() -> Option<u64> {
-    static BOOT: OnceLock<Option<u64>> = OnceLock::new();
-    *BOOT.get_or_init(|| {
-        let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        stat.lines()
-            .find_map(|l| l.strip_prefix("btime "))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
-}
-
 /// Wall-clock start (epoch secs). One 4 KiB read of /proc/<pid>/stat per deep PID; btime cached once.
 ///
-/// `None` on any failure, including an unusable `_SC_CLK_TCK`: a guessed HZ
+/// `None` on any failure, including a failed clock-tick lookup: a guessed HZ
 /// shifts the epoch and silently moves the `ghost_analysis` verdict (R27-42).
 pub fn proc_start_epoch(proc_root: &str, pid: u32) -> Option<u64> {
-    let btime = boot_epoch()?;
+    let btime = crate::proc_time::boot_epoch()?;
     let (stat, _truncated) =
         crate::safe_io::read_procfs_capped(&format!("{}/{}/stat", proc_root, pid), 4096).ok()?;
     let hz = crate::proc_time::clock_ticks_per_sec()?;

@@ -4,6 +4,8 @@
 //! the original in `ghost_pid.rs`, which still saturated an impossible age to 0.
 //! Both scanners now use these functions instead of local implementations.
 
+use std::sync::OnceLock;
+
 /// Seconds since boot from `/proc/uptime`. `None` when unreadable — callers
 /// must NOT substitute 0: that makes every process look newborn.
 pub fn uptime_secs() -> Option<u64> {
@@ -47,4 +49,17 @@ pub fn starttime_ticks(stat: &str) -> Option<u64> {
         .and_then(|idx| stat.get(idx..))
         .and_then(|after| after.split_ascii_whitespace().nth(19))
         .and_then(|field| field.parse().ok())
+}
+
+/// Boot epoch from `/proc/stat`, cached for the lifetime of the process.
+/// Valid only for the real `/proc`; tempdir-based tests must not rely on this
+/// if they need a different proc root.
+pub fn boot_epoch() -> Option<u64> {
+    static BOOT: OnceLock<Option<u64>> = OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let (stat, _truncated) = crate::safe_io::read_procfs_capped("/proc/stat", 256).ok()?;
+        stat.lines()
+            .find_map(|l| l.strip_prefix("btime "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
 }
