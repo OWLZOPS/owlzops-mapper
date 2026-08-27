@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.5.36] - 2026-08-27
+
+
+### Bug Fixes
+
+- **security:** Apply R27-15 and R27-16
+- **security:** Apply R27-13, R27-14, R27-15, R27-16
+- **build:** Gate take_entry_value to linux/test to avoid dead_code on macOS
+- **build:** Gate Zeroize import behind linux/test cfg
+- **security:** Correct SEC-014 attribution and bump scoring version
+- **security:** Redact SecretString Debug output (R27-17)
+- **security:** Do not close borrowed fd in read_sudo_pass_from_fd (R27-18)
+- **security:** Remove Clone from SecretString (R27-19)
+- **security:** Attribute self-inflicted /proc denial in DLP (R27-22)
+- **security:** Align --sudo-pass-fd docs and behavior (R27-23)
+- **security:** Correct EACCES attribution for own /proc/self/cmdline (R27-27)
+- **ci:** Make doctrine gate portable and executable (R27-28)
+- **dlp:** Correct process age handling and scoring tiers
+- **dlp:** Split short-lived secrets into SEC-059
+- **dlp:** Centralize process age arithmetic and harden ghost_pid
+- **scoring:** Align SCORING_VERSION with documented entries
+- **deep:** Consolidate process-time arithmetic into proc_time
+- **proc_time:** Raise /proc/stat cap and surface btime failures
+- **dlp:** Memoize process age and separate path buffers
+
+### Build System
+
+- **deps:** Bump taiki-e/install-action from 2.86.4 to 2.86.5 (#219)
+- **deps:** Bump uuid from 1.24.0 to 1.24.1 (#217)
+
+### CI/CD
+
+- Extend process-time gate to deep.rs
+
+### Documentation
+
+- **readme:** Add owlzops-mapper logo
+- **security:** Document sudo password handling for remote scans
+- **security:** Declare SecretString handling commitments
+- **security:** Fix and scope secret handling commitments
+- **security:** Correct job-control kill and clarify SecretString guarantee
+
+### Features
+
+- **security:** Harden process dumpability at startup (QW1)
+- **ci:** Add env var manipulation gate (QW2)
+- **security:** Add SecretString with mlock/madvise protection
+- **security:** Add --sudo-pass-fd and deprecate OWLZOPS_SUDO_PASS
+- **ci:** Add doctrine gates for env mutation and unsafe fd handling (R27-26)
+- **dlp:** Weight secret leaks by process lifetime
+
+### Miscellaneous
+
+- Polish SecretString and startup comments
+- Polish startup warnings and document secret invariants
+
+### Refactoring
+
+- **security:** Unify capped secret reader for stdin and fd (R27-21)
+- Centralize EACCES attribution and env password warning
+
 ## [0.5.35] - 2026-08-23
 
 
