@@ -56,6 +56,26 @@ fn eacces_explained_by_dumpable(entry: &str) -> bool {
     matches!(entry, "environ" | "auxv" | "personality")
 }
 
+/// Handle EACCES on `/proc/<pid>/<entry>` for our own PID. Returns whether the
+/// denial counts toward the aggregate. Single source of truth so a third procfs
+/// entry cannot inherit the wrong explanation by copy-paste.
+fn note_self_eacces(entry: &str) -> bool {
+    if eacces_explained_by_dumpable(entry) {
+        coverage::record(format!(
+            "dlp: own /proc/self/{entry} unreadable — PR_SET_DUMPABLE=0 reassigned it \
+             to root; the R27-16 self-check is inert on non-root scans"
+        ));
+        false
+    } else {
+        coverage::record(format!(
+            "dlp: own /proc/self/{entry} is EACCES despite a world-readable mode — \
+             not explainable by PR_SET_DUMPABLE; procfs may be masked or \
+             LSM-restricted. INVESTIGATE."
+        ));
+        true
+    }
+}
+
 fn read_uptime_secs() -> Option<u64> {
     let (data, _truncated) = safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
     let first = data.split_whitespace().next()?;
@@ -155,20 +175,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                if self_pid.is_some() && eacces_explained_by_dumpable("environ") {
-                    // Self-inflicted, not a privilege gap: PR_SET_DUMPABLE=0 makes
-                    // /proc/self/environ (mode 0400) root-owned, so a non-root scan
-                    // cannot read its own. Attributed, never counted as a generic
-                    // denial, and never silently dropped (R27-22).
-                    coverage::record(
-                        "dlp: own /proc/self/environ unreadable — PR_SET_DUMPABLE=0 \
-                         reassigned it to root; the R27-16 self-check is inert on \
-                         non-root scans"
-                            .to_string(),
-                    );
-                } else {
-                    pid_denied = true;
-                }
+                pid_denied = self_pid.is_none() || note_self_eacces("environ");
             }
             Err(_) => {}
         }
@@ -224,21 +231,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                if self_pid.is_some() {
-                    // NOT the environ case (R27-27). `cmdline` is ONE(.., S_IRUGO)
-                    // = 0444 and `proc_pid_cmdline_read` performs no ptrace check,
-                    // so PR_SET_DUMPABLE=0 cannot produce EACCES here. Anything
-                    // that does is an anomaly (LSM denial, hidepid, procfs
-                    // overlay — the SEC-021 masking class) and must NOT be
-                    // explained away.
-                    coverage::record(
-                        "dlp: own /proc/self/cmdline is EACCES despite mode 0444 — \
-                         not explainable by PR_SET_DUMPABLE; procfs may be masked \
-                         or LSM-restricted. INVESTIGATE."
-                            .to_string(),
-                    );
-                }
-                pid_denied = true;
+                pid_denied = self_pid.is_none() || note_self_eacces("cmdline");
             }
             Err(_) => {}
         }
@@ -303,5 +296,17 @@ mod tests {
         );
         assert!(!eacces_explained_by_dumpable("status"), "ONE(.., S_IRUGO)");
         assert!(!eacces_explained_by_dumpable("maps"), "world-readable");
+    }
+
+    #[test]
+    fn self_eacces_counts_only_when_unexplained() {
+        assert!(
+            !note_self_eacces("environ"),
+            "0400 — explained, not a denial"
+        );
+        assert!(
+            note_self_eacces("cmdline"),
+            "0444 — unexplained, must be counted"
+        );
     }
 }

@@ -38,12 +38,10 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 ///   undetectable under env_clear() (R26-03). Same host, different score.
 /// v13 (0.5.36): R27-16 extended `is_sensitive_key` with suffix rules, so
 /// SEC-014 now fires on hosts where it previously produced no finding.
+/// R27-25 splits self-attributed leaks out of SEC-014 into SEC-058 (weight 0),
+/// so a host whose only leak was the scanner's own environment now scores lower.
 /// Snapshot pairs spanning this version must be flagged as a collection-
 /// semantics change, not reported as real drift (R27-24).
-/// v14: SEC-014 splits leaks by process age; short-lived processes
-/// (age < 300s) are informational only, long-lived keep the full penalty.
-/// Snapshot pairs spanning this version must be flagged as a collection-
-/// semantics change.
 pub const SCORING_VERSION: u8 = 14;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
