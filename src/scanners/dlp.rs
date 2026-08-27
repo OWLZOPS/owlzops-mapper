@@ -76,23 +76,52 @@ fn note_self_eacces(entry: &str) -> bool {
     }
 }
 
+/// Seconds since boot from `/proc/uptime`. `None` when unreadable — callers
+/// must NOT substitute 0: that makes every process look newborn.
 fn read_uptime_secs() -> Option<u64> {
     let (data, _truncated) = safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
-    let first = data.split_whitespace().next()?;
-    first.parse::<f64>().ok().map(|v| v as u64)
+    let secs = data.split_whitespace().next()?.parse::<f64>().ok()?;
+    (secs.is_finite() && secs >= 0.0).then_some(secs as u64)
 }
 
-fn process_age_secs(pid: u32, uptime_secs: u64) -> Option<u64> {
-    let path = format!("/proc/{}/stat", pid);
-    let (stat, _truncated) = safe_io::read_procfs_capped(&path, 4096).ok()?;
-    // `stat` is already a String.
-    let rest = stat.split_once(')')?.1.trim_start();
-    let mut fields = rest.split_whitespace();
-    // starttime is the 22nd field overall; after the comm it is at index 19
-    let start_ticks: u64 = fields.nth(19)?.parse().ok()?;
-    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    let start_secs = start_ticks / clk_tck;
-    Some(uptime_secs.saturating_sub(start_secs))
+/// Pure: age from the three inputs, so the failure modes are testable without
+/// touching /proc.
+///
+/// `starttime` counts from *host* boot; `/proc/uptime` under lxcfs reports the
+/// *container's* uptime. When the two disagree the age is not computable —
+/// saturating to 0 would mark every leak on the host transient.
+fn age_from_parts(start_ticks: u64, clk_tck: u64, uptime_secs: u64) -> Option<u64> {
+    if clk_tck == 0 {
+        return None;
+    }
+    uptime_secs.checked_sub(start_ticks / clk_tck)
+}
+
+/// Extract `starttime` (field 22) from a `/proc/<pid>/stat` line.
+///
+/// `rsplit_once`, never `split_once`: `comm` is attacker-controlled (15 bytes
+/// via prctl(PR_SET_NAME)) and may contain ')' or spaces. Splitting on the
+/// FIRST ')' shifts every field index and lets a process forge its own age.
+/// Only the LAST ')' ends comm. After comm, starttime sits at index 19.
+fn starttime_ticks(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Age of `pid` in seconds, or `None` when it cannot be established.
+///
+/// `None` is load-bearing: SEC-014 treats unknown age as long-lived and keeps
+/// the full weight. Every failure path here returns `None`, never 0.
+fn process_age_secs(pid: u32, uptime_secs: u64, path_buf: &mut String) -> Option<u64> {
+    path_buf.clear();
+    let _ = write!(path_buf, "/proc/{}/stat", pid);
+    let (stat, _truncated) = safe_io::read_procfs_capped(path_buf, 4096).ok()?;
+    let clk_tck = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    age_from_parts(starttime_ticks(&stat)?, clk_tck, uptime_secs)
 }
 
 pub fn scan_process_memory() -> Vec<SecretLeak> {
@@ -102,7 +131,14 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         return leaks;
     };
 
-    let uptime_secs = read_uptime_secs().unwrap_or(0);
+    let uptime_secs = read_uptime_secs();
+    if uptime_secs.is_none() {
+        coverage::record(
+            "dlp: /proc/uptime unreadable — process ages unknown; every secret leak \
+             keeps full SEC-014 weight (never downgraded on an unknown)"
+                .to_string(),
+        );
+    }
 
     // Reusable buffer for constructing /proc/<pid>/... paths
     let mut path_buf = String::with_capacity(64);
@@ -169,7 +205,8 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                  initial environment means the R27-13 scrub did not run"
                                     .to_string()
                             }),
-                            age_secs: process_age_secs(pid, uptime_secs),
+                            age_secs: uptime_secs
+                                .and_then(|u| process_age_secs(pid, u, &mut path_buf)),
                         });
                     }
                 }
@@ -205,7 +242,8 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                      initial environment means the R27-13 scrub did not run"
                                         .to_string()
                                 }),
-                                age_secs: process_age_secs(pid, uptime_secs),
+                                age_secs: uptime_secs
+                                    .and_then(|u| process_age_secs(pid, u, &mut path_buf)),
                             });
                         }
                     }
@@ -225,7 +263,8 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                  initial environment means the R27-13 scrub did not run"
                                     .to_string()
                             }),
-                            age_secs: process_age_secs(pid, uptime_secs),
+                            age_secs: uptime_secs
+                                .and_then(|u| process_age_secs(pid, u, &mut path_buf)),
                         });
                     }
                 }
@@ -307,6 +346,46 @@ mod tests {
         assert!(
             note_self_eacces("cmdline"),
             "0444 — unexplained, must be counted"
+        );
+    }
+
+    #[test]
+    fn age_is_none_when_starttime_exceeds_uptime() {
+        // lxcfs: container uptime vs host-boot starttime. Saturating to 0 here
+        // would mark every leak on the host transient.
+        assert_eq!(age_from_parts(100_000_000, 100, 60), None);
+        assert_eq!(age_from_parts(6_000, 100, 120), Some(60));
+        assert_eq!(age_from_parts(0, 100, 120), Some(120));
+    }
+
+    #[test]
+    fn starttime_survives_hostile_comm() {
+        const TAIL: &str = " S 1 1337 1337 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 987654";
+        assert_eq!(
+            starttime_ticks(&format!("1337 (bash){TAIL}")),
+            Some(987_654)
+        );
+        // ')' inside comm must not shift the fields.
+        assert_eq!(
+            starttime_ticks(&format!("1337 (evil)x){TAIL}")),
+            Some(987_654)
+        );
+        // Spaces + digits: the shape used to land `flags` on the starttime index.
+        assert_eq!(
+            starttime_ticks(&format!("1337 (x) 4194304){TAIL}")),
+            Some(987_654),
+            "a crafted comm must not be able to forge starttime"
+        );
+    }
+
+    #[test]
+    fn starttime_is_none_on_malformed_stat() {
+        assert_eq!(starttime_ticks("1337 (bash) S 1 2 3"), None, "truncated");
+        assert_eq!(starttime_ticks("garbage"), None);
+        assert_eq!(starttime_ticks(""), None);
+        assert_eq!(
+            starttime_ticks("1337 (bash) S x x x x x x x x x x x x x x x x x x x"),
+            None
         );
     }
 }
