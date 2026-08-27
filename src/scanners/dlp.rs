@@ -56,12 +56,33 @@ fn eacces_explained_by_dumpable(entry: &str) -> bool {
     matches!(entry, "environ" | "auxv" | "personality")
 }
 
+fn read_uptime_secs() -> Option<u64> {
+    let (data, _truncated) = safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
+    let first = data.split_whitespace().next()?;
+    first.parse::<f64>().ok().map(|v| v as u64)
+}
+
+fn process_age_secs(pid: u32, uptime_secs: u64) -> Option<u64> {
+    let path = format!("/proc/{}/stat", pid);
+    let (stat, _truncated) = safe_io::read_procfs_capped(&path, 4096).ok()?;
+    // `stat` is already a String.
+    let rest = stat.split_once(')')?.1.trim_start();
+    let mut fields = rest.split_whitespace();
+    // starttime is the 22nd field overall; after the comm it is at index 19
+    let start_ticks: u64 = fields.nth(19)?.parse().ok()?;
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    let start_secs = start_ticks / clk_tck;
+    Some(uptime_secs.saturating_sub(start_secs))
+}
+
 pub fn scan_process_memory() -> Vec<SecretLeak> {
     let mut leaks = Vec::new();
 
     let Ok(entries) = fs::read_dir("/proc") else {
         return leaks;
     };
+
+    let uptime_secs = read_uptime_secs().unwrap_or(0);
 
     // Reusable buffer for constructing /proc/<pid>/... paths
     let mut path_buf = String::with_capacity(64);
@@ -128,6 +149,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                  initial environment means the R27-13 scrub did not run"
                                     .to_string()
                             }),
+                            age_secs: process_age_secs(pid, uptime_secs),
                         });
                     }
                 }
@@ -176,6 +198,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                      initial environment means the R27-13 scrub did not run"
                                         .to_string()
                                 }),
+                                age_secs: process_age_secs(pid, uptime_secs),
                             });
                         }
                     }
@@ -195,6 +218,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                  initial environment means the R27-13 scrub did not run"
                                     .to_string()
                             }),
+                            age_secs: process_age_secs(pid, uptime_secs),
                         });
                     }
                 }

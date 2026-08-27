@@ -23,6 +23,9 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
+/// Processes younger than this are treated as short-lived for DLP purposes.
+const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
+
 /// Bump whenever finding weights, tiers or IDs change: `compare` uses this to
 /// label a risk_score delta as a formula change, not a real drift.
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
@@ -37,7 +40,11 @@ pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 /// SEC-014 now fires on hosts where it previously produced no finding.
 /// Snapshot pairs spanning this version must be flagged as a collection-
 /// semantics change, not reported as real drift (R27-24).
-pub const SCORING_VERSION: u8 = 13;
+/// v14: SEC-014 splits leaks by process age; short-lived processes
+/// (age < 300s) are informational only, long-lived keep the full penalty.
+/// Snapshot pairs spanning this version must be flagged as a collection-
+/// semantics change.
+pub const SCORING_VERSION: u8 = 14;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -2106,28 +2113,68 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         .partition(|l| l.self_attributed.is_some());
 
     if !host_leaks.is_empty() {
-        let mut evidence_list = Vec::new();
-        for leak in host_leaks.iter().take(3) {
-            evidence_list.push(format!(
-                "'{}' in {} of {} (pid {})",
-                leak.matched_key, leak.source, leak.process, leak.pid
-            ));
-        }
-        let mut evidence_str = evidence_list.join(", ");
-        if host_leaks.len() > 3 {
-            evidence_str.push_str(&format!(" and {} more...", host_leaks.len() - 3));
+        // Split by process age: secrets in very short-lived processes are
+        // likely transient and should not carry the full SEC-014 weight.
+        let (short_lived, long_lived): (
+            Vec<&crate::models::SecretLeak>,
+            Vec<&crate::models::SecretLeak>,
+        ) = host_leaks
+            .into_iter()
+            .partition(|l| l.age_secs.is_some_and(|a| a < DLP_SHORT_LIVED_AGE_SECS));
+
+        if !long_lived.is_empty() {
+            let mut evidence_list = Vec::new();
+            for leak in long_lived.iter().take(3) {
+                evidence_list.push(format!(
+                    "'{}' in {} of {} (pid {})",
+                    leak.matched_key, leak.source, leak.process, leak.pid
+                ));
+            }
+            let mut evidence_str = evidence_list.join(", ");
+            if long_lived.len() > 3 {
+                evidence_str.push_str(&format!(" and {} more...", long_lived.len() - 3));
+            }
+
+            findings.push(Finding {
+                id: "SEC-014",
+                source: Scanner::Security,
+                title: "Cleartext secrets exposed in process memory".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!("Found {} leak(s): {}", long_lived.len(), evidence_str),
+                suppressed: None,
+                cis_ref: None,
+            });
         }
 
-        findings.push(Finding {
-            id: "SEC-014",
-            source: Scanner::Security,
-            title: "Cleartext secrets exposed in process memory".to_string(),
-            category: Category::Security,
-            weight: 25,
-            evidence: format!("Found {} leak(s): {}", host_leaks.len(), evidence_str),
-            suppressed: None,
-            cis_ref: None,
-        });
+        // Short-lived secrets are informational only, never weighted.
+        if !short_lived.is_empty() {
+            let mut evidence_list = Vec::new();
+            for leak in short_lived.iter().take(3) {
+                evidence_list.push(format!(
+                    "'{}' in {} of {} (pid {})",
+                    leak.matched_key, leak.source, leak.process, leak.pid
+                ));
+            }
+            let mut evidence_str = evidence_list.join(", ");
+            if short_lived.len() > 3 {
+                evidence_str.push_str(&format!(" and {} more...", short_lived.len() - 3));
+            }
+
+            findings.push(Finding {
+                id: "SEC-014",
+                source: Scanner::Security,
+                title: "Cleartext secrets in short-lived processes (informational)".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!("Found {} transient leak(s): {}", short_lived.len(), evidence_str),
+                suppressed: Some(
+                    "Short-lived process secrets are unlikely to be exploited; surfacing for Raw Truth only."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
     }
 
     if !self_leaks.is_empty() {
@@ -3122,8 +3169,9 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (13, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (14, 15));
     }
+
     #[test]
     fn sec016_reads_suspicious_processes() {
         use crate::models::SuspiciousProcess;
@@ -4062,6 +4110,7 @@ mod tests {
             source: "environ".into(),
             matched_key: "VAULT_TOKEN".into(),
             self_attributed: Some("own process".into()),
+            age_secs: None,
         }];
         let f = evaluate(&r);
         assert!(
@@ -4085,6 +4134,7 @@ mod tests {
             source: "environ".into(),
             matched_key: key.into(),
             self_attributed: own.then(|| "own process".to_string()),
+            age_secs: None,
         };
         r.security.secret_hygiene = vec![
             mk(std::process::id(), "VAULT_TOKEN", true),
@@ -4098,5 +4148,67 @@ mod tests {
         );
         assert!(sec014.evidence.contains("PGPASSWORD"));
         assert!(!sec014.evidence.contains("VAULT_TOKEN"));
+    }
+
+    #[test]
+    fn sec014_weights_long_lived_secrets_only() {
+        let mk = |pid, key: &str, age: Option<u64>| SecretLeak {
+            pid,
+            process: "p".into(),
+            source: "environ".into(),
+            matched_key: key.into(),
+            self_attributed: None,
+            age_secs: age,
+        };
+
+        let mut r = minimal_report();
+        r.security.secret_hygiene = vec![
+            mk(4242, "PGPASSWORD", Some(600)),
+            mk(4243, "AWS_ACCESS_KEY_ID", Some(1)),
+        ];
+
+        let findings = evaluate(&r);
+        let weighted = findings
+            .iter()
+            .find(|f| f.id == "SEC-014" && f.weight == 25);
+        assert!(weighted.is_some(), "long-lived leak must carry full weight");
+        assert!(
+            weighted.unwrap().evidence.contains("Found 1 leak"),
+            "only long-lived counted in weighted evidence"
+        );
+
+        let informational = findings.iter().find(|f| f.id == "SEC-014" && f.weight == 0);
+        assert!(
+            informational.is_some(),
+            "short-lived leak must be informational"
+        );
+        assert!(
+            informational
+                .unwrap()
+                .evidence
+                .contains("Found 1 transient leak")
+        );
+    }
+
+    #[test]
+    fn sec014_is_informational_when_only_short_lived() {
+        let mut r = minimal_report();
+        r.security.secret_hygiene = vec![SecretLeak {
+            pid: 4242,
+            process: "p".into(),
+            source: "environ".into(),
+            matched_key: "PGPASSWORD".into(),
+            self_attributed: None,
+            age_secs: Some(100),
+        }];
+        let findings = evaluate(&r);
+        let sec014 = findings.iter().find(|f| f.id == "SEC-014");
+        assert!(sec014.is_some(), "SEC-014 must exist");
+        assert_eq!(
+            sec014.unwrap().weight,
+            0,
+            "only short-lived => informational"
+        );
+        assert!(sec014.unwrap().suppressed.is_some());
     }
 }
