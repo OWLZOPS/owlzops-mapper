@@ -157,15 +157,19 @@ at `execve`, and only the pointer leaves the `environ` array.
 ```bash
 OWLZOPS_SUDO_PASS=canary owlzops-mapper audit --host 192.0.2.1 --ask-sudo-pass &
 sleep 1
-# as root: PR_SET_DUMPABLE(0) already denies the same-uid read below
-sudo tr '\0' '\n' < /proc/$!/environ | grep '^OWLZOPS_SUDO_PASS'
+# The redirection must happen *inside* sudo: PR_SET_DUMPABLE(0) reassigns
+# /proc/<pid>/environ (mode 0400) to root, so a shell-level `< file` is
+# refused before sudo ever runs.
+sudo cat /proc/$!/environ | tr '\0' '\n' | grep '^OWLZOPS_SUDO_PASS'
 # must print exactly "OWLZOPS_SUDO_PASS=" — never "=canary"
+kill %1
 ```
 
 **Never in swap, never in a core dump.** `prctl(PR_SET_DUMPABLE, 0)` is the
 first statement of `main`; `mlock(2)` and `madvise(MADV_DONTDUMP)` cover the
 backing page. Failure of any of the three is reported on stderr *and* in
-`coverage_warnings` — degradation of this control is never silent.
+`coverage_warnings` — degradation of this control is never silent. **Linux
+only**: the `macos-arm64` build has no equivalent and makes no such claim.
 
 ```bash
 grep VmLck /proc/<scanning-pid>/status   # non-zero while a password is held
@@ -180,7 +184,12 @@ shares one instance through `Arc`. Every intermediate buffer on the stdin and
 `--sudo-pass-fd` paths is `Zeroizing`, and no path grows a `String` holding the
 secret (a reallocation would free an un-zeroed copy).
 
-A build in which any of the four does not hold is a vulnerability, not a bug.
+The interactive prompt is the exception: `dialoguer` builds the entered string
+in its own buffers before handing it to us, and those are outside our control.
+Use `--sudo-pass-fd` when the guarantee has to be complete.
+
+On Linux, a build in which any of the four does not hold — within the scope
+stated above — is a vulnerability, not a bug.
 
 ---
 
