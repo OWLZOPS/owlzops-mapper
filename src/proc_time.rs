@@ -51,15 +51,77 @@ pub fn starttime_ticks(stat: &str) -> Option<u64> {
         .and_then(|field| field.parse().ok())
 }
 
+/// `/proc/stat` places `btime` **after** the per-IRQ `intr` line, so the whole
+/// preamble (one `cpuN` line per online CPU plus one counter per IRQ) has to be
+/// read first. R27-44: a 256-byte cap never reached it and `boot_epoch`
+/// silently returned `None` on every host.
+const CAP_PROC_STAT: usize = 1024 * 1024;
+
+/// Pure parser: btime may sit far beyond the first screen of /proc/stat.
+fn parse_btime(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 /// Boot epoch from `/proc/stat`, cached for the lifetime of the process.
 /// Valid only for the real `/proc`; tempdir-based tests must not rely on this
 /// if they need a different proc root.
 pub fn boot_epoch() -> Option<u64> {
     static BOOT: OnceLock<Option<u64>> = OnceLock::new();
     *BOOT.get_or_init(|| {
-        let (stat, _truncated) = crate::safe_io::read_procfs_capped("/proc/stat", 256).ok()?;
-        stat.lines()
-            .find_map(|l| l.strip_prefix("btime "))
-            .and_then(|v| v.trim().parse::<u64>().ok())
+        let (stat, truncated) =
+            match crate::safe_io::read_procfs_capped("/proc/stat", CAP_PROC_STAT) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::coverage::record(format!(
+                        "proc_time: /proc/stat unreadable ({}) — boot epoch unknown; \
+                         deep ghost analysis loses its metadata sharpening",
+                        e.kind()
+                    ));
+                    return None;
+                }
+            };
+        let btime = parse_btime(&stat);
+        if btime.is_none() {
+            crate::coverage::record(format!(
+                "proc_time: btime absent from /proc/stat (truncated={truncated}) — \
+                 boot epoch unknown; deep ghost analysis loses its metadata sharpening"
+            ));
+        }
+        btime
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn btime_is_found_after_the_intr_line() {
+        // Real layout: btime follows `intr`, which carries one counter per IRQ.
+        // A cap that stops inside `intr` never reaches it (R27-44).
+        let mut s = String::from("cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 999");
+        for _ in 0..512 {
+            s.push_str(" 0");
+        }
+        s.push_str("\nctxt 12345\nbtime 1700000000\nprocesses 999\n");
+        assert!(
+            s.len() > 256,
+            "fixture must exceed the cap that used to be here"
+        );
+        assert_eq!(parse_btime(&s), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn btime_absent_or_malformed_is_none() {
+        assert_eq!(
+            parse_btime("cpu  1 2 3\nintr 0 0 0\n"),
+            None,
+            "truncated before btime"
+        );
+        assert_eq!(parse_btime("btime notanumber\n"), None);
+        assert_eq!(parse_btime("btimenospace 123\n"), None);
+        assert_eq!(parse_btime(""), None);
+    }
 }

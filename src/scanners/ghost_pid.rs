@@ -549,9 +549,7 @@ fn parse_stat_state_age(content: &str, uptime_secs: Option<u64>) -> (Option<Stri
     // R27-39: None on every failure, never a saturated 0. `confirmed_ioc` is
     // gated on age, so a fabricated "0 seconds old" downgrades every SEC-024
     // to SEC-025 and clears compromised_host.
-    let age = fields
-        .get(19)
-        .and_then(|s| s.parse::<u64>().ok())
+    let age = crate::proc_time::starttime_ticks(content)
         .zip(crate::proc_time::clock_ticks_per_sec())
         .zip(uptime_secs)
         .and_then(|((ticks, hz), up)| crate::proc_time::age_from_parts(ticks, hz, up));
