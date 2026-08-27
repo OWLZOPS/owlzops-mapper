@@ -42,7 +42,9 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 /// so a host whose only leak was the scanner's own environment now scores lower.
 /// Snapshot pairs spanning this version must be flagged as a collection-
 /// semantics change, not reported as real drift (R27-24).
-pub const SCORING_VERSION: u8 = 14;
+/// v14 (0.5.37): split short-lived secret leaks out of SEC-014 into SEC-059
+/// (weight 0), evidence now includes the age threshold.
+pub const SCORING_VERSION: u8 = 15;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -2160,12 +2162,16 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
 
             findings.push(Finding {
-                id: "SEC-014",
+                id: "SEC-059",
                 source: Scanner::Security,
                 title: "Cleartext secrets in short-lived processes (informational)".to_string(),
                 category: Category::Security,
                 weight: 0,
-                evidence: format!("Found {} transient leak(s): {}", short_lived.len(), evidence_str),
+                evidence: format!(
+                    "Found {} leak(s) in process(es) younger than {DLP_SHORT_LIVED_AGE_SECS}s: {}",
+                    short_lived.len(),
+                    evidence_str
+                ),
                 suppressed: Some(
                     "Short-lived process secrets are unlikely to be exploited; surfacing for Raw Truth only."
                         .to_string(),
@@ -3167,7 +3173,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (14, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (15, 15));
     }
 
     #[test]
@@ -4175,7 +4181,7 @@ mod tests {
             "only long-lived counted in weighted evidence"
         );
 
-        let informational = findings.iter().find(|f| f.id == "SEC-014" && f.weight == 0);
+        let informational = findings.iter().find(|f| f.id == "SEC-059" && f.weight == 0);
         assert!(
             informational.is_some(),
             "short-lived leak must be informational"
@@ -4184,7 +4190,7 @@ mod tests {
             informational
                 .unwrap()
                 .evidence
-                .contains("Found 1 transient leak")
+                .contains("Found 1 leak(s) in process(es) younger than 300s")
         );
     }
 
@@ -4200,13 +4206,13 @@ mod tests {
             age_secs: Some(100),
         }];
         let findings = evaluate(&r);
-        let sec014 = findings.iter().find(|f| f.id == "SEC-014");
-        assert!(sec014.is_some(), "SEC-014 must exist");
+        let sec059 = findings.iter().find(|f| f.id == "SEC-059");
+        assert!(sec059.is_some(), "SEC-059 must exist");
         assert_eq!(
-            sec014.unwrap().weight,
+            sec059.unwrap().weight,
             0,
             "only short-lived => informational"
         );
-        assert!(sec014.unwrap().suppressed.is_some());
+        assert!(sec059.unwrap().suppressed.is_some());
     }
 }
