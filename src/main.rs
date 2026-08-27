@@ -505,6 +505,17 @@ async fn run_command(
     let verbose = cli.verbose; // carry verbose flag into output functions
     match cli.command {
         Commands::Audit(args) => {
+            // R27-23: warn when a deprecated env secret is present but no
+            // password channel was selected; it is discarded silently otherwise.
+            // Placed here so it also fires for a local audit or `snapshot`.
+            if sudo_from_env.is_some() && !args.ask_sudo_pass && args.sudo_pass_fd.is_none() {
+                eprintln!(
+                    "warning: OWLZOPS_SUDO_PASS was set but no password channel was \
+                     selected — the value is discarded. Use --sudo-pass-fd N, or \
+                     --ask-sudo-pass to consume the variable (deprecated)."
+                );
+            }
+
             // R25-12: --keep-binary exists to avoid re-uploading. With mktemp
             // staging the next run picks a fresh random directory, so nothing
             // is ever reused: the flag only accumulates leftovers. Refuse the
@@ -580,16 +591,6 @@ async fn run_command(
                         continue;
                     }
                     remote.push(h.clone());
-                }
-
-                // R27-23: warn when a deprecated env secret is present but no
-                // password channel was selected; it is discarded silently otherwise.
-                if sudo_from_env.is_some() && !args.ask_sudo_pass && args.sudo_pass_fd.is_none() {
-                    eprintln!(
-                        "warning: OWLZOPS_SUDO_PASS was set but no password channel was \
-                         selected — the value is discarded. Use --sudo-pass-fd N, or \
-                         --ask-sudo-pass to consume the variable (deprecated)."
-                    );
                 }
 
                 // Resolve sudo password once (before any progress bars)
