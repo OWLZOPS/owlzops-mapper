@@ -5,6 +5,8 @@ mod exporters;
 mod known_hosts;
 mod models;
 mod output;
+#[cfg(target_os = "linux")]
+mod proc_time;
 mod runner;
 mod safe_io;
 mod scanners;

@@ -116,6 +116,17 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         }
     }
 
+    // R27-39: read /proc/uptime once per scan, never inside the per‑PID loop.
+    // An unreadable uptime must make every candidate downgraded, not young.
+    let uptime_secs = crate::proc_time::uptime_secs();
+    if uptime_secs.is_none() {
+        coverage::record(
+            "ghost_pid: /proc/uptime unreadable — process ages unknown; every candidate \
+             is downgraded to SEC-025 and compromised_host cannot be set from this class"
+                .to_string(),
+        );
+    }
+
     let mut stable: Option<BTreeSet<u32>> = None;
     let mut sync_skip_recorded = false;
 
@@ -200,7 +211,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
 
         let stat_path_alive = proc_root.join(pid.to_string()).exists();
         let kill_alive = kill_exists(pid);
-        let (state_from_stat, age_secs) = read_state_and_age(proc_root, pid);
+        let (state_from_stat, age_secs) = read_state_and_age(proc_root, pid, uptime_secs);
 
         let state = state_from_status.or(state_from_stat);
 
@@ -508,16 +519,20 @@ fn kill_exists(pid: u32) -> bool {
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn read_state_and_age(proc_root: &Path, pid: u32) -> (Option<String>, Option<u64>) {
+fn read_state_and_age(
+    proc_root: &Path,
+    pid: u32,
+    uptime_secs: Option<u64>,
+) -> (Option<String>, Option<u64>) {
     let path = proc_root.join(pid.to_string()).join("stat");
     let content = match safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 8192) {
         Ok((c, _)) => c,
         Err(_) => return (None, None),
     };
-    parse_stat_state_age(&content)
+    parse_stat_state_age(&content, uptime_secs)
 }
 
-fn parse_stat_state_age(content: &str) -> (Option<String>, Option<u64>) {
+fn parse_stat_state_age(content: &str, uptime_secs: Option<u64>) -> (Option<String>, Option<u64>) {
     let Some(rparen) = content.rfind(')') else {
         return (None, None);
     };
@@ -531,33 +546,17 @@ fn parse_stat_state_age(content: &str) -> (Option<String>, Option<u64>) {
         .filter(|c| c.is_ascii_alphabetic())
         .map(|c| c.to_string());
 
+    // R27-39: None on every failure, never a saturated 0. `confirmed_ioc` is
+    // gated on age, so a fabricated "0 seconds old" downgrades every SEC-024
+    // to SEC-025 and clears compromised_host.
     let age = fields
         .get(19)
         .and_then(|s| s.parse::<u64>().ok())
-        .and_then(|starttime_ticks| {
-            let hz = clock_ticks_per_sec();
-            let uptime = read_uptime_secs()?;
-            let start_secs = starttime_ticks / hz;
-            Some(uptime.saturating_sub(start_secs))
-        });
+        .zip(crate::proc_time::clock_ticks_per_sec())
+        .zip(uptime_secs)
+        .and_then(|((ticks, hz), up)| crate::proc_time::age_from_parts(ticks, hz, up));
 
     (state, age)
-}
-
-fn clock_ticks_per_sec() -> u64 {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz > 0 { hz as u64 } else { 100 }
-}
-
-fn read_uptime_secs() -> Option<u64> {
-    let (content, _) = safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
-    content
-        .split_whitespace()
-        .next()?
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
 }
 
 fn socket_owning_pids() -> BTreeSet<u32> {
@@ -670,22 +669,23 @@ mod tests {
 
     #[test]
     fn parse_stat_simple() {
-        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 20 0 1 0 8877 0 0";
-        let (state, _age) = parse_stat_state_age(s);
+        // Corrected fixture: 20 fields after comm, starttime at index 19.
+        let s = "1234 (bash) R 1 1234 1234 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 6000";
+        let (state, _age) = parse_stat_state_age(s, Some(3600));
         assert_eq!(state.as_deref(), Some("R"));
     }
 
     #[test]
     fn parse_stat_comm_with_spaces_and_paren() {
         let s = "77 (evil )( proc) S 1 77 77 0 -1 0 0 0 0 0 0 0 20 0 1 0 5000 0 0";
-        let (state, _) = parse_stat_state_age(s);
+        let (state, _) = parse_stat_state_age(s, Some(3600));
         assert_eq!(state.as_deref(), Some("S"), "last ')' must delimit comm");
     }
 
     #[test]
     fn parse_stat_zombie_state() {
         let s = "9 (dead) Z 1 9 9 0 -1 0 0 0 0 0 0 0 20 0 1 0 100 0 0";
-        let (state, _) = parse_stat_state_age(s);
+        let (state, _) = parse_stat_state_age(s, Some(3600));
         assert_eq!(state.as_deref(), Some("Z"));
     }
 
@@ -702,7 +702,10 @@ mod tests {
 
     #[test]
     fn parse_stat_malformed_no_paren() {
-        assert_eq!(parse_stat_state_age("garbage no paren"), (None, None));
+        assert_eq!(
+            parse_stat_state_age("garbage no paren", Some(3600)),
+            (None, None)
+        );
     }
 
     // ── kill arbiter ────────────────────────────────────────
@@ -753,7 +756,7 @@ mod tests {
         // rootkit-controlled stat smuggling an escape as the state token
         let s = "1 (x) \x1b[31mZ 1 1 1 0 -1 0 0 0 0 0 0 0 20 0 1 0 100 0 0";
         assert_eq!(
-            parse_stat_state_age(s).0,
+            parse_stat_state_age(s, Some(3600)).0,
             None,
             "non-alpha first char dropped"
         );
@@ -855,5 +858,30 @@ mod tests {
             }
         }
         assert!(has_sock);
+    }
+
+    // ── new R27-39 age tests ────────────────────────────────
+
+    #[test]
+    fn ghost_age_is_none_when_clocks_disagree() {
+        // lxcfs: container uptime vs host-boot starttime. Saturating to 0 here
+        // downgrades every SEC-024 to SEC-025 and clears compromised_host.
+        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100000000";
+        let (state, age) = parse_stat_state_age(s, Some(60));
+        assert_eq!(state.as_deref(), Some("R"));
+        assert_eq!(age, None, "an impossible age must not read as young");
+    }
+
+    #[test]
+    fn ghost_age_is_none_when_uptime_unavailable() {
+        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 8877";
+        assert_eq!(parse_stat_state_age(s, None).1, None);
+    }
+
+    #[test]
+    fn ghost_age_is_computed_when_clocks_agree() {
+        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6000";
+        // 6000 ticks / 100 = 60 s since boot; uptime 3600 ⇒ age 3540.
+        assert_eq!(parse_stat_state_age(s, Some(3600)).1, Some(3540));
     }
 }
