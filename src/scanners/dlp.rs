@@ -76,42 +76,6 @@ fn note_self_eacces(entry: &str) -> bool {
     }
 }
 
-/// Seconds since boot from `/proc/uptime`. `None` when unreadable — callers
-/// must NOT substitute 0: that makes every process look newborn.
-fn read_uptime_secs() -> Option<u64> {
-    let (data, _truncated) = safe_io::read_procfs_capped("/proc/uptime", 128).ok()?;
-    let secs = data.split_whitespace().next()?.parse::<f64>().ok()?;
-    (secs.is_finite() && secs >= 0.0).then_some(secs as u64)
-}
-
-/// Pure: age from the three inputs, so the failure modes are testable without
-/// touching /proc.
-///
-/// `starttime` counts from *host* boot; `/proc/uptime` under lxcfs reports the
-/// *container's* uptime. When the two disagree the age is not computable —
-/// saturating to 0 would mark every leak on the host transient.
-fn age_from_parts(start_ticks: u64, clk_tck: u64, uptime_secs: u64) -> Option<u64> {
-    if clk_tck == 0 {
-        return None;
-    }
-    uptime_secs.checked_sub(start_ticks / clk_tck)
-}
-
-/// Extract `starttime` (field 22) from a `/proc/<pid>/stat` line.
-///
-/// `rsplit_once`, never `split_once`: `comm` is attacker-controlled (15 bytes
-/// via prctl(PR_SET_NAME)) and may contain ')' or spaces. Splitting on the
-/// FIRST ')' shifts every field index and lets a process forge its own age.
-/// Only the LAST ')' ends comm. After comm, starttime sits at index 19.
-fn starttime_ticks(stat: &str) -> Option<u64> {
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
-}
-
 /// Age of `pid` in seconds, or `None` when it cannot be established.
 ///
 /// `None` is load-bearing: SEC-014 treats unknown age as long-lived and keeps
@@ -120,8 +84,12 @@ fn process_age_secs(pid: u32, uptime_secs: u64, path_buf: &mut String) -> Option
     path_buf.clear();
     let _ = write!(path_buf, "/proc/{}/stat", pid);
     let (stat, _truncated) = safe_io::read_procfs_capped(path_buf, 4096).ok()?;
-    let clk_tck = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
-    age_from_parts(starttime_ticks(&stat)?, clk_tck, uptime_secs)
+    let clk_tck = crate::proc_time::clock_ticks_per_sec()?;
+    crate::proc_time::age_from_parts(
+        crate::proc_time::starttime_ticks(&stat)?,
+        clk_tck,
+        uptime_secs,
+    )
 }
 
 pub fn scan_process_memory() -> Vec<SecretLeak> {
@@ -131,7 +99,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         return leaks;
     };
 
-    let uptime_secs = read_uptime_secs();
+    let uptime_secs = crate::proc_time::uptime_secs();
     if uptime_secs.is_none() {
         coverage::record(
             "dlp: /proc/uptime unreadable — process ages unknown; every secret leak \
@@ -300,6 +268,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc_time::{age_from_parts, starttime_ticks};
 
     #[test]
     fn sensitive_key_suffixes_match_without_overmatching() {
