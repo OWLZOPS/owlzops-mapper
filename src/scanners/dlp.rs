@@ -110,6 +110,10 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
 
     // Reusable buffer for constructing /proc/<pid>/... paths
     let mut path_buf = String::with_capacity(64);
+    // R27-45: a SEPARATE buffer for the age lookup. Sharing `path_buf` left it
+    // pointing at /proc/<pid>/stat while the enclosing section's coverage
+    // messages still name /proc/<pid>/environ|cmdline.
+    let mut age_buf = String::with_capacity(32);
 
     // Count how many *processes* had unreadable /proc/<pid>/environ or cmdline
     // due to EACCES (typically non‑root scan). One aggregate coverage line is
@@ -146,6 +150,11 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
             continue;
         }
 
+        // Lazily resolved, then memoised: a clean host does no extra /proc
+        // reads at all, and a leaking PID does exactly one regardless of how
+        // many sensitive keys it carries.
+        let mut age_memo: Option<Option<u64>> = None;
+
         // 1. Environment Variables
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/environ", pid);
@@ -173,8 +182,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                  initial environment means the R27-13 scrub did not run"
                                     .to_string()
                             }),
-                            age_secs: uptime_secs
-                                .and_then(|u| process_age_secs(pid, u, &mut path_buf)),
+                            age_secs: *age_memo.get_or_insert_with(|| {
+                                uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
+                            }),
                         });
                     }
                 }
@@ -210,8 +220,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                      initial environment means the R27-13 scrub did not run"
                                         .to_string()
                                 }),
-                                age_secs: uptime_secs
-                                    .and_then(|u| process_age_secs(pid, u, &mut path_buf)),
+                                age_secs: *age_memo.get_or_insert_with(|| {
+                                    uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
+                                }),
                             });
                         }
                     }
@@ -231,8 +242,9 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                                  initial environment means the R27-13 scrub did not run"
                                     .to_string()
                             }),
-                            age_secs: uptime_secs
-                                .and_then(|u| process_age_secs(pid, u, &mut path_buf)),
+                            age_secs: *age_memo.get_or_insert_with(|| {
+                                uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
+                            }),
                         });
                     }
                 }

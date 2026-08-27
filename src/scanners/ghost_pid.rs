@@ -536,12 +536,10 @@ fn parse_stat_state_age(content: &str, uptime_secs: Option<u64>) -> (Option<Stri
     let Some(rparen) = content.rfind(')') else {
         return (None, None);
     };
-    let after = content[rparen + 1..].trim_start();
-    let fields: Vec<&str> = after.split_ascii_whitespace().collect();
-    // Defensive: parity with parse_tgid_and_state — one ASCII-alphabetic char
-    // only, so a malformed/hostile stat can't inject escape bytes as "state".
-    let state = fields
-        .first()
+
+    let state = content[rparen + 1..]
+        .split_ascii_whitespace()
+        .next()
         .and_then(|s| s.chars().next())
         .filter(|c| c.is_ascii_alphabetic())
         .map(|c| c.to_string());
