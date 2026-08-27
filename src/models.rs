@@ -747,6 +747,10 @@ pub struct SecretLeak {
     /// R27-16: self_attributed is set when the record is the scanner's own process.
     #[serde(default)]
     pub self_attributed: Option<String>,
+    /// Age of the process in seconds at scan time, when available.
+    /// Used by SEC-014 to ignore transient secrets in short-lived processes.
+    #[serde(default)]
+    pub age_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
