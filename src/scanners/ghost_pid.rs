@@ -222,7 +222,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         return Vec::new();
     }
 
-    let socket_pids = socket_owning_pids();
+    let socket_pids = socket_owning_pids(proc_root);
 
     let mut findings = Vec::new();
     for pid in survivors {
@@ -611,9 +611,12 @@ fn parse_stat_state_age(content: &str, uptime_secs: Option<u64>) -> (Option<Stri
     (state, age)
 }
 
-fn socket_owning_pids() -> BTreeSet<u32> {
+/// R27-52: reads through `proc_root` like every other helper here. Reached only
+/// when survivors exist, so a future end-to-end test that plants a ghost would
+/// otherwise attribute the real host's sockets to a fake PID.
+fn socket_owning_pids(proc_root: &Path) -> BTreeSet<u32> {
     let mut set = BTreeSet::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let Ok(entries) = fs::read_dir(proc_root) else {
         return set;
     };
     const MAX_FD_PER_PID: usize = 4096;
@@ -622,7 +625,7 @@ fn socket_owning_pids() -> BTreeSet<u32> {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        let fd_dir = format!("/proc/{pid}/fd");
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
         let Ok(fds) = fs::read_dir(&fd_dir) else {
             continue;
         };
@@ -631,7 +634,8 @@ fn socket_owning_pids() -> BTreeSet<u32> {
             fd_seen += 1;
             if fd_seen > MAX_FD_PER_PID {
                 coverage::record(format!(
-                    "/proc/{pid}/fd exceeded {MAX_FD_PER_PID} entries – ghost pid socket scan for this pid is partial"
+                    "{} exceeded {MAX_FD_PER_PID} entries – ghost pid socket scan for this pid is partial",
+                    fd_dir.display()
                 ));
                 break;
             }
