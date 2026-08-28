@@ -36,13 +36,13 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 ///   Cmnd_Alias-resolved NOPASSWD: ALL (R26-08/R26-19); REL-002 no longer
 ///   fires on hosts whose backup tool is configured but was previously
 ///   undetectable under env_clear() (R26-03). Same host, different score.
-/// v13 (unreleased): R27-16 extended `is_sensitive_key` with suffix rules, so
+/// v13 (0.5.36): R27-16 extended `is_sensitive_key` with suffix rules, so
 /// SEC-014 now fires on hosts where it previously produced no finding.
 /// R27-25 splits self-attributed leaks out of SEC-014 into SEC-058 (weight 0),
 /// so a host whose only leak was the scanner's own environment now scores lower.
 /// Snapshot pairs spanning this version must be flagged as a collection-
 /// semantics change, not reported as real drift (R27-24).
-/// v14 (unreleased): split short-lived secret leaks out of SEC-014 into SEC-059
+/// v14 (0.5.36): split short-lived secret leaks out of SEC-014 into SEC-059
 /// (weight 0), evidence now includes the age threshold.
 pub const SCORING_VERSION: u8 = 14;
 
