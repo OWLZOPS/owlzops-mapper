@@ -6,6 +6,11 @@ use crate::coverage;
 use crate::models::PreloadFinding;
 use std::collections::{HashMap, HashSet};
 
+/// Cap for `/proc/<pid>/maps`. Large processes (JVM, browsers, databases) can
+/// exceed 1 MiB, and truncation would hide upper-address mappings where
+/// dynamically loaded libraries often live (R27-48).
+const CAP_PROC_MAPS: usize = 8 * 1024 * 1024;
+
 /// Parse ld.so.preload content according to glibc semantics:
 /// - `#` starts a comment (the rest of the line is ignored)
 /// - entries are separated by spaces, tabs, newlines, or colons
@@ -67,18 +72,26 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
             continue;
         };
 
-        let maps =
-            match crate::safe_io::read_procfs_capped(&format!("/proc/{pid}/maps"), 1024 * 1024) {
-                Ok((m, _)) => {
-                    read_ok += 1;
-                    m
+        let maps = match crate::safe_io::read_procfs_capped(
+            &format!("/proc/{pid}/maps"),
+            CAP_PROC_MAPS,
+        ) {
+            Ok((m, truncated)) => {
+                read_ok += 1;
+                if truncated {
+                    coverage::record(format!(
+                        "ld.so.preload corroboration: /proc/{pid}/maps truncated at {CAP_PROC_MAPS} bytes — \
+                         mapped library list for this process may be partial"
+                    ));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    denied += 1;
-                    continue;
-                }
-                Err(_) => continue,
-            };
+                m
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied += 1;
+                continue;
+            }
+            Err(_) => continue,
+        };
 
         // Exact match on the path field (last column), not substring.
         let mapped: HashSet<&str> = maps

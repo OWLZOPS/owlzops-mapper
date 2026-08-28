@@ -180,9 +180,15 @@ pub fn gather_ftrace_hooks() -> FtraceHookInventory {
     inv.tracefs_available = true;
     inv.live_tracer_active = function_tracer_active(root);
 
-    if let Ok((kp, _)) =
+    if let Ok((kp, truncated)) =
         safe_io::read_procfs_capped(&format!("{root}/kprobe_events"), CAP_KPROBE_EVENTS)
     {
+        if truncated {
+            coverage::record(format!(
+                "ftrace: {root}/kprobe_events truncated at {CAP_KPROBE_EVENTS} bytes — \
+                 kprobe hook list may be partial"
+            ));
+        }
         inv.syscall_kprobes = parse_kprobe_events(&kp)
             .into_iter()
             .filter(|k| is_syscall_fn(&k.symbol))
