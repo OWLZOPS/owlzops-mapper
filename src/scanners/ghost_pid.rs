@@ -67,17 +67,24 @@ pub fn scan_ghost_pids(deep: bool) -> Vec<GhostPidFinding> {
 
 /// Returns `true` if `/proc` is mounted with `hidepid=2` or `hidepid=invisible`.
 fn has_hidepid_option() -> bool {
-    // A single overlay line carries the full `lowerdir=` layer list (0.5–2 KiB),
-    // and each container adds 5–10 entries. 256 KiB was reachable on a dense
-    // container host; truncation there hides a mount masking /proc/<pid>, which
-    // is precisely what this scanner looks for (R27-47).
+    // /proc/mounts runs to megabytes on a dense container host: one overlay
+    // line carries the full `lowerdir=` layer list (0.5–2 KiB) and each
+    // container adds 5–10 entries. The cap is sized so truncation is not a
+    // routine event (R27-47).
+    //
+    // Failure direction if it truncates anyway (R27-48): this function looks
+    // for exactly one line — `proc /proc proc <opts>` — which is established at
+    // boot and sits near the top. Losing it makes us return false and RUN the
+    // ghost scan on a hidepid=2 host, manufacturing false positives. Nothing is
+    // hidden. Mount masking is SEC-021 (`mounts.rs`, /proc/self/mountinfo) and
+    // is unaffected by this cap.
     const CAP_PROC_MOUNTS: usize = 8 * 1024 * 1024;
     if let Ok((content, truncated)) = safe_io::read_procfs_capped("/proc/mounts", CAP_PROC_MOUNTS) {
         if truncated {
             coverage::record(format!(
                 "ghost_pid: /proc/mounts exceeded {CAP_PROC_MOUNTS} bytes and was truncated — \
-                 a mount masking /proc/<pid> in the tail would be invisible; \
-                 hidden-process coverage INCOMPLETE"
+                 the hidepid=2 guard may not have seen the /proc mount line; any ghost-pid \
+                 finding on this host may be a kernel-hidden process, not a rootkit artefact"
             ));
         }
         for line in content.lines() {
