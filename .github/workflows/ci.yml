@@ -44,6 +44,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: "v4-gcc-force"
+          shared-key: ${{ matrix.os }}   # isolate cache per OS to avoid glibc mismatch
 
       - name: Check formatting
         run: cargo fmt --all -- --check

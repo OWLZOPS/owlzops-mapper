@@ -267,9 +267,12 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        key: &russh::keys::ssh_key::PublicKey,
+        key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        self.known_hosts_checker.verify(key)
+        // Extract the underlying public key; certificate verification is not
+        // supported and will be rejected by KnownHostsChecker if a @cert-authority
+        // entry is present for this host.
+        self.known_hosts_checker.verify(&key.public_key())
     }
 }
 
