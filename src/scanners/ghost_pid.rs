@@ -67,9 +67,19 @@ pub fn scan_ghost_pids(deep: bool) -> Vec<GhostPidFinding> {
 
 /// Returns `true` if `/proc` is mounted with `hidepid=2` or `hidepid=invisible`.
 fn has_hidepid_option() -> bool {
-    // Larger cap: /proc/mounts is big on mount-heavy (Docker) hosts; a
-    // truncated `proc` line would silently defeat this guard.
-    if let Ok((content, _)) = safe_io::read_procfs_capped("/proc/mounts", 256 * 1024) {
+    // A single overlay line carries the full `lowerdir=` layer list (0.5–2 KiB),
+    // and each container adds 5–10 entries. 256 KiB was reachable on a dense
+    // container host; truncation there hides a mount masking /proc/<pid>, which
+    // is precisely what this scanner looks for (R27-47).
+    const CAP_PROC_MOUNTS: usize = 8 * 1024 * 1024;
+    if let Ok((content, truncated)) = safe_io::read_procfs_capped("/proc/mounts", CAP_PROC_MOUNTS) {
+        if truncated {
+            coverage::record(format!(
+                "ghost_pid: /proc/mounts exceeded {CAP_PROC_MOUNTS} bytes and was truncated — \
+                 a mount masking /proc/<pid> in the tail would be invisible; \
+                 hidden-process coverage INCOMPLETE"
+            ));
+        }
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             let source = parts.next().unwrap_or("");
