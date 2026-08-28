@@ -69,8 +69,9 @@ pub fn scan_ghost_pids(deep: bool) -> Vec<GhostPidFinding> {
     detect(Path::new("/proc"), deep)
 }
 
-/// Returns `true` if `/proc` is mounted with `hidepid=2` or `hidepid=invisible`.
-fn has_hidepid_option() -> bool {
+/// R27-51: reads through `proc_root` like the rest of `detect`'s helpers, so a
+/// tempdir-based test does not inherit the CI host's mount options.
+fn has_hidepid_option(proc_root: &Path) -> bool {
     // /proc/mounts runs to megabytes on a dense container host: one overlay
     // line carries the full `lowerdir=` layer list (0.5–2 KiB) and each
     // container adds 5–10 entries. The cap is sized so truncation is not a
@@ -83,7 +84,10 @@ fn has_hidepid_option() -> bool {
     // hidden. Mount masking is SEC-021 (`mounts.rs`, /proc/self/mountinfo) and
     // is unaffected by this cap.
     const CAP_PROC_MOUNTS: usize = 8 * 1024 * 1024;
-    if let Ok((content, truncated)) = safe_io::read_procfs_capped("/proc/mounts", CAP_PROC_MOUNTS) {
+    let mounts = proc_root.join("mounts");
+    if let Ok((content, truncated)) =
+        safe_io::read_procfs_capped(mounts.to_string_lossy().as_ref(), CAP_PROC_MOUNTS)
+    {
         if truncated {
             coverage::record(format!(
                 "ghost_pid: /proc/mounts exceeded {CAP_PROC_MOUNTS} bytes and was truncated — \
@@ -118,7 +122,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
     // Ghost scan is incompatible with hidepid=2/invisible because readdir
     // legitimately filters out processes, causing false positives.
     // With --deep, the guard is overridden (user accepts potential FP).
-    if has_hidepid_option() {
+    if has_hidepid_option(proc_root) {
         if deep {
             coverage::record(
                 "ghost-pid scan: /proc mounted with hidepid=2/invisible — \
@@ -148,6 +152,10 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         );
     }
 
+    // Resolve pid_max / ns_last_pid once per scan so the coverage note matches
+    // the actual probe range (R27-51).
+    let (upper_bound, wrap_tail, pid_max_known) = pid_scan_bounds(proc_root);
+
     let mut stable: Option<BTreeSet<u32>> = None;
     let mut sync_skip_recorded = false;
 
@@ -158,14 +166,13 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // manufacture transient candidates that defeat the clean-host early
         // exit. A genuinely hidden PID is in neither readdir and survives.
         let listed_before = readdir_pids(proc_root);
-        let (live, used_sync) = probe_live_set(proc_root);
+        let (live, used_sync) = probe_live_set(proc_root, (upper_bound, wrap_tail));
         let listed_after = readdir_pids(proc_root);
 
         // The sync fallback bounds the scan to ns_last_pid. Record that gap
         // ONCE per ghost-pid invocation, not once per probe cycle (R25-94).
         if used_sync && !sync_skip_recorded {
-            let (upper, tail, pid_max_known) = pid_scan_bounds();
-            if should_report_scan_gap(upper, tail, pid_max_known) {
+            if should_report_scan_gap(upper_bound, wrap_tail, pid_max_known) {
                 coverage::record(match pid_max_known {
                     None => format!(
                         "ghost-pid scan (sync fallback): /proc/sys/kernel/pid_max unreadable — \
@@ -178,9 +185,9 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
                          probed (bounded by ns_last_pid={}); a hidden PID above the \
                          allocator cursor after a wrap could be missed. Enable io_uring \
                          for a full-range scan.",
-                        upper + 1,
+                        upper_bound + 1,
                         pid_max,
-                        upper
+                        upper_bound
                     ),
                 });
             }
@@ -374,13 +381,13 @@ fn candidate_diff(
 
 // ── live-set probe (Tier-B io_uring, Tier-C sync fallback) ────────────────
 
-fn probe_live_set(proc_root: &Path) -> (BTreeSet<u32>, bool) {
+fn probe_live_set(proc_root: &Path, bounds: (u32, Option<(u32, u32)>)) -> (BTreeSet<u32>, bool) {
     if proc_root == Path::new("/proc")
         && let Some(set) = probe_live_set_iouring(proc_root)
     {
         return (set, false);
     }
-    (probe_live_set_sync(proc_root), true)
+    (probe_live_set_sync(proc_root, bounds), true)
 }
 
 // Full io_uring implementation is only available on glibc Linux.
@@ -391,7 +398,8 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     const RING_DEPTH: u32 = 4096;
     const WINDOW: usize = 4096; // in-flight SQEs; also bounds statx-buf memory
 
-    let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(PID_MAX_FALLBACK);
+    let pid_max =
+        read_u32_sysfile(Path::new("/proc/sys/kernel/pid_max")).unwrap_or(PID_MAX_FALLBACK);
     let dir = File::open(proc_root).ok()?; // CAPPED_IO_OK: proc directory, not a host-controlled file
     let dfd = types::Fd(dir.as_raw_fd());
     let mut ring = IoUring::new(RING_DEPTH).ok()?; // creation IS the capability probe
@@ -488,9 +496,9 @@ fn probe_live_set_iouring(_proc_root: &Path) -> Option<BTreeSet<u32>> {
     None
 }
 
-fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
+fn probe_live_set_sync(proc_root: &Path, bounds: (u32, Option<(u32, u32)>)) -> BTreeSet<u32> {
     let mut set = BTreeSet::new();
-    let (upper, wrap_tail, _pid_max_known) = pid_scan_bounds();
+    let (upper, wrap_tail) = bounds;
 
     let mut counter: u32 = 0;
     let mut probe = |pid: u32, set: &mut BTreeSet<u32>| {
@@ -516,12 +524,12 @@ fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
 
 /// Returns `(upper, wrap_tail, pid_max_if_known)`. The third element is what
 /// stops the fallback from silently disabling the disclosure (R27-50).
-fn pid_scan_bounds() -> (u32, Option<(u32, u32)>, Option<u32>) {
-    let pid_max_read = read_u32_sysfile("/proc/sys/kernel/pid_max");
+fn pid_scan_bounds(proc_root: &Path) -> (u32, Option<(u32, u32)>, Option<u32>) {
+    let pid_max_read = read_u32_sysfile(&proc_root.join("sys/kernel/pid_max"));
     let pid_max = pid_max_read.unwrap_or(PID_MAX_FALLBACK);
     // ns_last_pid defaulting to pid_max is the SAFE direction: assume the
     // allocator cursor is at the top and probe the whole range.
-    let ns_last = read_u32_sysfile("/proc/sys/kernel/ns_last_pid").unwrap_or(pid_max);
+    let ns_last = read_u32_sysfile(&proc_root.join("sys/kernel/ns_last_pid")).unwrap_or(pid_max);
     let upper = ns_last.min(pid_max);
 
     let near_wrap =
@@ -549,8 +557,9 @@ fn should_report_scan_gap(
     }
 }
 
-fn read_u32_sysfile(path: &str) -> Option<u32> {
-    let (content, _) = safe_io::read_procfs_capped(path, 64).ok()?;
+fn read_u32_sysfile(path: &Path) -> Option<u32> {
+    // 64 bytes: both files hold one decimal, pid_max ≤ 4194304 (7 digits).
+    let (content, _) = safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 64).ok()?;
     content.trim().parse().ok()
 }
 
@@ -817,27 +826,42 @@ mod tests {
 
     // ── pid scan bounds heuristic ───────────────────────────
 
+    fn fake_proc_sys(root: &Path, pid_max: u32, ns_last: u32) {
+        let d = root.join("sys/kernel");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("pid_max"), format!("{pid_max}\n")).unwrap();
+        fs::write(d.join("ns_last_pid"), format!("{ns_last}\n")).unwrap();
+    }
+
     #[test]
-    fn wrap_tail_math() {
-        let bounds = |ns_last: u64, pid_max: u64| -> (u32, Option<(u32, u32)>, Option<u32>) {
-            let upper = ns_last.min(pid_max) as u32;
-            let near = (upper as u64) > pid_max * 9 / 10;
-            let tail = if near && (upper as u64) < pid_max {
-                Some((upper + 1, pid_max as u32))
-            } else {
-                None
-            };
-            (upper, tail, Some(pid_max as u32))
-        };
-        assert_eq!(bounds(5000, 4_194_304), (5000, None, Some(4_194_304)));
-        let (u, t, known) = bounds(4_000_000, 4_194_304);
-        assert_eq!(u, 4_000_000);
-        assert!(t.is_some());
-        assert_eq!(known, Some(4_194_304));
+    fn wrap_tail_math_exercises_the_real_bounds_fn() {
+        // Previously this test carried its own copy of the arithmetic with `9 / 10`
+        // inlined, so changing WRAP_TAIL_FRACTION could not fail it (R27-51).
+        let tmp = tempfile::tempdir().unwrap();
+
+        fake_proc_sys(tmp.path(), 4_194_304, 5_000);
+        assert_eq!(pid_scan_bounds(tmp.path()), (5_000, None, Some(4_194_304)));
+
+        fake_proc_sys(tmp.path(), 4_194_304, 4_000_000);
+        let (upper, tail, known) = pid_scan_bounds(tmp.path());
+        assert_eq!((upper, known), (4_000_000, Some(4_194_304)));
         assert_eq!(
-            bounds(4_194_304, 4_194_304),
-            (4_194_304, None, Some(4_194_304))
+            tail,
+            Some((4_000_001, 4_194_304)),
+            "wrap tail covers the top"
         );
+
+        fake_proc_sys(tmp.path(), 4_194_304, 4_194_304);
+        assert_eq!(
+            pid_scan_bounds(tmp.path()).1,
+            None,
+            "cursor at pid_max: no tail"
+        );
+
+        // pid_max absent ⇒ fallback applied, third element stays None so the caller
+        // discloses it (R27-50).
+        fs::remove_file(tmp.path().join("sys/kernel/pid_max")).unwrap();
+        assert_eq!(pid_scan_bounds(tmp.path()).2, None);
     }
 
     #[test]
@@ -866,6 +890,10 @@ mod tests {
     /// logic via detect() semantics: here we verify a CLEAN root yields nothing.
     fn make_proc(pids: &[u32]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
+        // Bound the brute-force to the planted PIDs instead of inheriting the
+        // CI host's ns_last_pid, which varies by three orders of magnitude
+        // between a fresh runner and a long-lived builder (R27-51).
+        fake_proc_sys(tmp.path(), 4096, 300);
         for &pid in pids {
             let d = tmp.path().join(pid.to_string());
             fs::create_dir_all(d.join("fd")).unwrap();
