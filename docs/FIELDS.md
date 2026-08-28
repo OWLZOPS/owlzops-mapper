@@ -16,7 +16,18 @@ Use it to build integrations, dashboards, or alerting rules.
 | `is_root_execution` | boolean | Whether the scan ran as root |
 | `scan_warnings` | array of strings | Warnings about scan failures or incomplete data |
 | `coverage_warnings` | array of strings | Coverage warnings (truncated files, unreadable /proc entries, etc.) |
+| `failed_scanners` | array of strings | Scanners that failed or panicked during this scan. Non‑empty means coverage was incomplete. In exit codes, incomplete coverage now degrades to `2`; use `--fail-on-incomplete` to make it exit `4`. No longer automatically forces exit `4`. |
+| `remote_privileged` | boolean \| null | For remote scans: `true` = executed with root/sudo, `false` = executed without root, `null` = local scan or legacy snapshot |
 | `scoring_version` | integer | Internal scoring engine version (used for drift comparison) |
+| `self_integrity` | object \| null | Self‑integrity preflight result; `null` = check not performed or legacy snapshot |
+| `databases` | array of objects | Detected databases; see `## databases` |
+
+### `self_integrity`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `self_integrity.compromised` | boolean | Whether the self‑integrity preflight found a compromise indicator |
+| `self_integrity.warnings` | array of strings | Warnings produced by the self‑integrity preflight |
 
 ---
 
@@ -61,7 +72,7 @@ Use it to build integrations, dashboards, or alerting rules.
 | `top_memory_processes[].instances` | integer | Number of instances with this name |
 | `failed_services` | array of strings | Failed systemd units |
 | `backup_tools` | array of strings | Detected backup tools |
-| `last_restic_snapshot` | string \| null | ISO‑8601 timestamp of last Restic snapshot |
+| `last_restic_snapshot` | string \| null | Last local backup cache activity (mtime of `/root/.cache/restic` or `/root/.cache/borg`); null means no cache activity was found, not that no snapshots exist |
 | `ntp_synchronized` | boolean | Whether time is synchronized |
 | `time_offset_ms` | float \| null | Offset from NTP in milliseconds |
 | `reboot_required_pkgs` | array of strings | Packages that triggered reboot requirement |

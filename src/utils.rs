@@ -224,19 +224,129 @@ pub fn canon_path(path: &str) -> Cow<'_, str> {
 // Log sanitization (R16 hardening)
 // ---------------------------------------------------------------------------
 
-/// Neutralise C0/C1 control bytes (incl. \n and ESC) before they reach a
-/// terminal-backed tracing sink. \t is kept as a single space for readability.
-pub fn sanitize_for_log(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c == '\t' {
-                ' '
-            } else if c.is_control() {
-                '\u{FFFD}'
-            } else {
-                c
+/// Strip ANSI escape sequences from `s`.
+///
+/// Handles CSI, OSC, DCS, and simple ESC sequences based on the ANSI escape
+/// code grammar. The state machine advances over the escape sequence and
+/// returns a new string without them.
+fn strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1B {
+            // ESC found, try to parse the sequence.
+            i += 1;
+            if i >= bytes.len() {
+                break;
             }
-        })
+
+            match bytes[i] {
+                // CSI: ESC [ ... final byte 0x40-0x7E
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1; // skip final byte
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \)
+                b']' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // DCS, SOS, PM, APC: ESC P/X/^/_ ... terminated by ST (ESC \)
+                b'P' | b'X' | b'^' | b'_' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x1B && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Simple escape: ESC followed by a single character in 0x30..=0x7E
+                c if (0x30..=0x7E).contains(&c) => {
+                    i += 1; // skip the character
+                }
+                // Invalid or unknown, skip the ESC itself
+                _ => {}
+            }
+        } else {
+            // Copy non-ESC bytes, but we'll later filter control chars.
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    // Convert back to UTF-8, replacing invalid sequences.
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+/// Single source of truth for "this codepoint changes how a terminal renders
+/// its neighbours or can be used to hide/override text".
+///
+/// Two hand-maintained lists in `utils.rs` and `ui.rs` previously diverged:
+/// one caught bidi overrides and the other TAG characters (R25-65). Use this
+/// predicate in BOTH sanitizers.
+pub(crate) fn is_terminal_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c as u32,
+            0x00AD                    // SOFT HYPHEN
+            | 0x061C                  // ARABIC LETTER MARK
+            | 0x180E                  // MONGOLIAN VOWEL SEPARATOR
+            | 0x115F                  // HANGUL CHOSEONG FILLER
+            | 0x1160                  // HANGUL JUNGSEONG FILLER
+            | 0x3164                  // HANGUL FILLER
+            | 0xFFA0                  // HALFWIDTH HANGUL FILLER
+            | 0x200B..=0x200F         // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | 0x202A..=0x202E         // bidi overrides
+            | 0x2028                  // LINE SEPARATOR
+            | 0x2029                  // PARAGRAPH SEPARATOR
+            | 0x2060..=0x206F         // word joiner, invisible operators, isolates
+            | 0xFEFF                  // BOM / ZERO WIDTH NO-BREAK SPACE
+            | 0xE0000..=0xE007F       // Unicode TAG block
+        )
+}
+
+/// Replace all control characters with spaces, then truncate to `max_chars`.
+fn sanitize_and_truncate(s: &str, max_chars: usize) -> String {
+    let stripped = strip_ansi(s);
+    let sanitized: String = stripped
+        .chars()
+        .map(|c| if is_terminal_unsafe(c) { ' ' } else { c })
+        .collect();
+    sanitized.chars().take(max_chars).collect()
+}
+
+/// Neutralise C0/C1 control bytes and ANSI escape sequences before they reach
+/// a terminal-backed tracing sink. The result is safe to embed in log messages
+/// and terminal output, truncated to 300 characters.
+pub fn sanitize_for_log(s: &str) -> String {
+    sanitize_and_truncate(s, 300)
+}
+
+/// Neutralise codepoints that change how neighbouring text renders, for any
+/// document sink (XLSX cells, Typst report, CSV). Unlike `sanitize_for_log`
+/// this does NOT truncate: a report must not silently lose a long path.
+/// R26-07: the same predicate backs every sanitizer.
+pub fn sanitize_for_document(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_terminal_unsafe(c) { '\u{FFFD}' } else { c })
         .collect()
 }
 
@@ -324,6 +434,53 @@ pub fn exit_reader_gone() -> ! {
 // Child helpers
 // ---------------------------------------------------------------------------
 
+/// Non-reaping exit check. `try_wait()` reaps the child, freeing its PID —
+/// and with it the PGID, since the child is its own group leader (setsid).
+/// A group kill issued after that can land on a freshly recycled group
+/// (R24-34/R25-98). WNOWAIT leaves the zombie in place so the PGID stays
+/// reserved until we explicitly reap.
+fn peek_exited(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is zeroed and lives for the call; WNOHANG makes this
+    // non-blocking and WNOWAIT leaves the child unreaped.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    rc == 0 && unsafe { info.si_pid() } == pid as libc::pid_t
+}
+
+/// Non-destructive wait: waits until the child has exited, then kills its
+/// process group BEFORE reaping, so the PGID cannot be recycled before the
+/// group kill (R24-34/R25-98/R26-01). Uses exponential backoff.
+fn wait_group_safe(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
+    let pid = child.id();
+    let start = Instant::now();
+    const POLL_MIN: Duration = Duration::from_micros(200);
+    const POLL_MAX: Duration = Duration::from_millis(50);
+    let mut backoff = POLL_MIN;
+
+    loop {
+        if peek_exited(pid) {
+            // Group killed BEFORE the reap: the PGID is still ours.
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            return child.wait().ok();
+        }
+        if start.elapsed() < deadline {
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(POLL_MAX);
+        } else {
+            // Timeout: kill group and reap, no status available.
+            kill_group_and_reap(child);
+            return None;
+        }
+    }
+}
+
 pub fn run_child_with_timeout(
     program: &str,
     args: &[&str],
@@ -374,57 +531,23 @@ pub fn run_child_with_timeout(
     });
 
     let deadline = Duration::from_secs(timeout_secs);
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < deadline => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                kill_group_and_reap(&mut child);
-                drop(out_handle);
-                drop(err_handle);
-                unregister_child(child_pid);
-                return None;
-            }
+
+    let status = match wait_group_safe(&mut child, deadline) {
+        Some(status) => status,
+        None => {
+            drop(out_handle);
+            drop(err_handle);
+            unregister_child(child_pid);
+            return None;
         }
     };
 
-    // The direct child exited. Anything still holding the stdout pipe is an
-    // orphaned grandchild — kill the group so the reader threads see EOF
-    // instead of blocking join() on a tokio blocking-pool thread forever.
-    unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
     unregister_child(child_pid);
     Some(std::process::Output {
         status,
         stdout: out_handle.join().unwrap_or_default(),
         stderr: err_handle.join().unwrap_or_default(),
     })
-}
-
-/// Wait for a child process to finish, polling with `try_wait()` until `deadline`.
-/// R10-05: defensive reap in the `Err(_)` branch so no zombie escapes.
-/// R24-04: uses group kill to reach grandchildren.
-fn poll_wait(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if start.elapsed() < deadline => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                kill_group_and_reap(child);
-                return child.wait().ok();
-            }
-            Err(_) => {
-                // try_wait failed (realistically ECHILD) – reap defensively
-                kill_group_and_reap(child);
-                return None;
-            }
-        }
-    }
 }
 
 pub fn run_with_timeout(program: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
@@ -484,11 +607,9 @@ fn run_with_timeout_inner(
 
     match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
         Ok(stdout) => {
-            let status = poll_wait(&mut child, Duration::from_secs(2));
-            // The child exited (or was killed), but there might still be
-            // orphaned grandchildren writing to the pipe — ensure they are
-            // terminated so the reader thread does not deadlock.
-            unsafe { libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL) };
+            // R26-01: the group kill is issued INSIDE wait_group_safe, before
+            // the reap. Killing after wait() can land on a recycled PGID.
+            let status = wait_group_safe(&mut child, Duration::from_secs(2));
             let result = if require_success {
                 match status {
                     Some(s) if s.success() => Some(stdout),
@@ -740,6 +861,22 @@ mod tests {
         let result = run_child_with_timeout("sleep", &["60"], 1);
         assert!(result.is_none());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_group_safe_reaps_and_returns_status() {
+        let mut child = hardened_command("/bin/true", &[])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/true");
+        let st = wait_group_safe(&mut child, Duration::from_secs(2));
+        assert!(st.is_some_and(|s| s.success()));
+        assert!(
+            child.wait().is_ok(),
+            "second wait must use the cached status"
+        );
+    }
 
     #[test]
     fn wildcard_bind_matches_canonical_forms() {
@@ -976,5 +1113,53 @@ mod tests {
         // The carve-out must not leak to the rest of /run.
         assert!(is_volatile_exec_path("/run/user/1000/.x/implant"));
         assert!(is_volatile_exec_path("/run/wrappersX/payload"));
+    }
+
+    // --- New tests for sanitize_for_log ---
+
+    #[test]
+    fn sanitize_for_log_removes_ansi_csi_sequences() {
+        let input = "\x1b[31mred\x1b[0m text";
+        assert_eq!(sanitize_for_log(input), "red text");
+    }
+
+    #[test]
+    fn sanitize_for_log_replaces_control_chars_with_spaces() {
+        let input = "hello\x01\x1b[2Jworld";
+        assert_eq!(sanitize_for_log(input), "hello world");
+    }
+
+    #[test]
+    fn sanitize_for_log_truncates_to_300_chars() {
+        let input = "a".repeat(500);
+        assert_eq!(sanitize_for_log(&input).chars().count(), 300);
+    }
+
+    #[test]
+    fn sanitize_for_log_removes_unicode_bidi_controls() {
+        let out = sanitize_for_log("safe\u{202E}evil\u{2066}text\u{202C}");
+        assert!(!out.contains('\u{202E}'));
+        assert!(!out.contains('\u{2066}'));
+        assert!(!out.contains('\u{202C}'));
+    }
+
+    #[test]
+    fn sanitize_for_log_removes_zero_width_format_chars() {
+        let out = sanitize_for_log("a\u{200B}b\u{FEFF}c");
+        assert!(!out.contains('\u{200B}'));
+        assert!(!out.contains('\u{FEFF}'));
+        assert!(out.chars().all(|c| !is_terminal_unsafe(c)));
+    }
+
+    #[test]
+    fn terminal_unsafe_predicate_catches_tag_block() {
+        // U+E0061 is TAG LATIN SMALL LETTER A, used for spoofing.
+        assert!(is_terminal_unsafe('\u{E0061}'));
+        assert!(is_terminal_unsafe('\u{200F}')); // RLM
+        assert!(is_terminal_unsafe('\u{1B}')); // ESC
+        assert!(!is_terminal_unsafe('a'));
+        assert!(!is_terminal_unsafe('1'));
+        // Newline is a control char and must be neutralized by sanitizers.
+        assert!(is_terminal_unsafe('\n'));
     }
 }

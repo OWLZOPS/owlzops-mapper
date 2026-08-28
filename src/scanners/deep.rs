@@ -229,8 +229,10 @@ fn detect_prologue(buf: &[u8]) -> Option<Prologue> {
 }
 
 fn scan_pointers(buf: &[u8], r: &PointerResolver) -> Vec<ResolvedPointer> {
-    buf.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+    buf.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .filter(|&v| (0x1_0000..0x0000_8000_0000_0000).contains(&v))
         .map(|v| {
             let (kind, label) = r.resolve(v);
@@ -515,14 +517,12 @@ impl GhostMeta {
 /// Chunked read of a (possibly deleted) inode. `max_bytes` is a parameter for DI/testability.
 /// EINTR-safe; refuses non-regular targets.
 fn scan_ghost_file(path: &str, max_bytes: u64) -> io::Result<(GhostScan, GhostMeta)> {
-    let mut f = std::fs::File::open(path)?;
+    // R26-39: path came from /proc/<pid>/maps — attacker-controlled, not a procfs
+    // file itself. Use the streaming regular-open primitive.
+    let mut f = crate::safe_io::open_regular_streaming(path)?;
     let meta = f.metadata()?;
-    if !meta.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "map_files target is not a regular file",
-        ));
-    }
+    // R26-46: open_regular_streaming already rejected non-regular targets;
+    // the fd's file type cannot change afterwards.
     let size = meta.len();
 
     let mut buf = vec![0u8; GHOST_CHUNK]; // single allocation, reused every iteration
@@ -678,36 +678,20 @@ pub fn enrich_ghosts(
     }
 }
 
-// ── starttime (wall-clock epoch) — reuses ghost_pid's field-22 idiom ──
-
-fn clk_tck() -> u64 {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz > 0 { hz as u64 } else { 100 }
-}
-
-fn boot_epoch() -> Option<u64> {
-    static BOOT: OnceLock<Option<u64>> = OnceLock::new();
-    *BOOT.get_or_init(|| {
-        let stat = std::fs::read_to_string("/proc/stat").ok()?;
-        stat.lines()
-            .find_map(|l| l.strip_prefix("btime "))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
-}
-
-/// Pure parse split out for hermetic tests (comm may contain ')' and spaces).
-pub fn parse_starttime_ticks(stat: &str) -> Option<u64> {
-    let rparen = stat.rfind(')')?;
-    let after = stat[rparen + 1..].trim_start();
-    // field 22 (starttime) == index 19 of the post-')' tail (field 3 = state = index 0).
-    after.split_ascii_whitespace().nth(19)?.parse().ok()
-}
+// ── starttime (wall-clock epoch) ──
+// The tick/field arithmetic lives in `proc_time` (R27-41/R27-42). This module
+// only adds the btime offset that turns an age into an epoch.
 
 /// Wall-clock start (epoch secs). One 4 KiB read of /proc/<pid>/stat per deep PID; btime cached once.
+///
+/// `None` on any failure, including a failed clock-tick lookup: a guessed HZ
+/// shifts the epoch and silently moves the `ghost_analysis` verdict (R27-42).
 pub fn proc_start_epoch(proc_root: &str, pid: u32) -> Option<u64> {
-    let btime = boot_epoch()?;
-    let stat = std::fs::read_to_string(format!("{}/{}/stat", proc_root, pid)).ok()?;
-    Some(btime + parse_starttime_ticks(&stat)? / clk_tck())
+    let btime = crate::proc_time::boot_epoch()?;
+    let (stat, _truncated) =
+        crate::safe_io::read_procfs_capped(&format!("{}/{}/stat", proc_root, pid), 4096).ok()?;
+    let hz = crate::proc_time::clock_ticks_per_sec()?;
+    Some(btime + crate::proc_time::starttime_ticks(&stat)? / hz)
 }
 
 #[cfg(test)]
@@ -785,7 +769,7 @@ mod ghost_tests {
     #[test]
     fn starttime_field22_survives_paren_in_comm() {
         let stat = "1234 (weird )name) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 998877 0";
-        assert_eq!(parse_starttime_ticks(stat), Some(998877));
+        assert_eq!(crate::proc_time::starttime_ticks(stat), Some(998877));
     }
 
     #[test]

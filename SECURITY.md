@@ -105,6 +105,98 @@ We ship fixes forward. If you're behind, upgrading is the fix.
 
 ---
 
+## Sudo password handling
+
+Prefer `--sudo-pass-fd N` for automated scans; the secret never appears in
+`/proc/self/environ` or the parent shell environment. Use a pipe, not a
+here-string: `<<<` is implemented with a temporary file on bash < 5.1, which
+puts the fleet password on disk (R27-23).
+
+```bash
+owlzops-mapper audit --host ... --sudo-pass-fd 3 \
+  3< <(printf '%s' "$pass")
+```
+
+If you cannot use a file descriptor, pipe the password to `--ask-sudo-pass`:
+
+```bash
+printf '%s' "$pass" | owlzops-mapper audit --host ... --ask-sudo-pass
+```
+
+`OWLZOPS_SUDO_PASS` remains as a **deprecated** fallback and will be removed in a
+future release. It is read from the initial environment **once**, before the Tokio
+runtime starts, and the bytes are zeroed in `/proc/self/environ` (R27-13). However:
+
+- There is an unavoidable window between `execve` and the scrub in `main`.
+- The variable remains in the environment of the **parent shell** if exported,
+  and may be visible to other processes of the same user or in shell history.
+
+If you must use it, do so as a one-shot prefix assignment, which does not persist
+in the parent shell:
+
+```bash
+OWLZOPS_SUDO_PASS='...' owlzops-mapper audit --host ...
+```
+
+Never export `OWLZOPS_SUDO_PASS` in a profile script or CI environment where
+the value might be logged or inherited by unrelated processes.
+
+---
+
+## Secret handling in the orchestrator
+
+The sudo password, whatever channel supplied it, lives in a `SecretString`
+(`src/secrets.rs`). These are commitments, not implementation notes.
+
+**Never readable from `/proc/self/environ`.** `OWLZOPS_SUDO_PASS` is copied out
+and its bytes are zeroed in place in the initial environment block before the
+Tokio runtime is built. `unsetenv` alone does not achieve this: the kernel
+serves `/proc/<pid>/environ` from `mm->env_start .. mm->env_end`, a region fixed
+at `execve`, and only the pointer leaves the `environ` array.
+
+```bash
+OWLZOPS_SUDO_PASS=canary owlzops-mapper audit --host 192.0.2.1 --ask-sudo-pass &
+sleep 1
+# The redirection must happen *inside* sudo: PR_SET_DUMPABLE(0) reassigns
+# /proc/<pid>/environ (mode 0400) to root, so a shell-level `< file` is
+# refused before sudo ever runs.
+sudo cat /proc/$!/environ | tr '\0' '\n' | grep '^OWLZOPS_SUDO_PASS'
+# must print exactly "OWLZOPS_SUDO_PASS=" — never "=canary"
+kill "$!"
+```
+
+**Never in swap, never in a core dump.** `prctl(PR_SET_DUMPABLE, 0)` is the
+first statement of `main`; `mlock(2)` and `madvise(MADV_DONTDUMP)` cover the
+backing page. Failure of any of the three is reported on stderr *and* in
+`coverage_warnings` — degradation of this control is never silent. **Linux
+only**: the `macos-arm64` build has no equivalent and makes no such claim.
+
+```bash
+grep VmLck /proc/<scanning-pid>/status   # non-zero while a password is held
+```
+
+**Never in a log, a report or a panic message.** `SecretString` has no
+`Display`; its `Debug` renders `SecretString([REDACTED])` and withholds even
+the length, so no `{:?}` or `?field` can leak it. Enforced in CI by
+`.github/scripts/check_doctrine_gates.sh`. This is a guarantee about
+*accidental* formatting: `as_str()` and `Deref<Target = str>` still hand out a
+plain `&str`, so deliberately printing that slice is possible and is caught by
+review, not by the type.
+
+**Zeroized on drop, exactly one copy.** `SecretString` is not `Clone`; the fleet
+shares one instance through `Arc`. Every intermediate buffer on the stdin and
+`--sudo-pass-fd` paths is `Zeroizing`, and no path grows a `String` holding the
+secret (a reallocation would free an un-zeroed copy).
+
+The interactive prompt is the exception: `dialoguer` builds the entered string
+in its own buffers before handing it to us, and those are outside our control.
+Use `--sudo-pass-fd` when the guarantee has to be complete.
+
+On Linux, a build in which any of the four does not hold — within the scope
+stated above — is a vulnerability, not a bug.
+
+---
+
 ## Verifying what you run
 
 Every release publishes, for each target:
@@ -201,6 +293,34 @@ open source in the strict sense — the Commons Clause restricts reselling the
 software, which fails the Open Source Definition — but the full scanning engine
 is readable, and free for your company to use forever. You can read every line of
 what will run as root on your servers before you run it. That's the point.
+
+**Stable exit-code contract (from v0.6.0).** Exit codes `0`, `1`, `2`, and `3`
+are part of the public interface and MUST NOT change meaning **from this release
+onwards**. They are relied upon by CI pipelines, paging systems, and downstream
+automation:
+
+> v0.5.x → v0.6.0 changed one meaning, deliberately and once: code `2` now also
+> covers a failed scanner, a host that produced no report, and results that did
+> not reach the output. Code `4` correspondingly narrowed to "no verdict at all,
+> or `--fail-on-incomplete` with incomplete coverage". Pipelines keyed on `4` for
+> failed scanners must switch to `2`, add `--fail-on-incomplete`, or read
+> `failed_scanners` from the JSONL.
+
+| Code | Meaning |
+|------|---------|
+| 0 | Clean — full coverage, no critical or compromised findings |
+| 1 | Critical findings present — full coverage |
+| 2 | Degraded — incomplete coverage: not root, warnings, failed scanner(s), missing host(s), or JSONL write errors |
+| 3 | Active compromise detected — regardless of coverage |
+
+Exit code `130` is reserved for SIGINT/SIGTERM. If a confirmed compromise
+was already recorded before the interrupt, the process exits `3` instead;
+`130` therefore never overrides a terminal security verdict. Consumers can
+treat `130` as "no confirmed compromise was recorded before interrupt".
+
+New failure modes are assigned **new** codes (e.g. `4`, `64`, `130`); they never
+reuse or override the `0–3` band. Breaking this contract is a vulnerability, not a
+feature change.
 
 ---
 

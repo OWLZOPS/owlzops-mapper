@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# R27-28: portable grep-based doctrine gate (no ripgrep dependency)
+# R27-26: CI gate against doctrine drift (env mutations, unsafe fd handling)
+set -euo pipefail
+
+fail=0
+
+# R27-14: environment mutation is allowed only in the pre-runtime scrub.
+hits=$(grep -REn 'env::(set|remove)_var' src/ \
+       | grep -v '^src/ssh_engine\.rs:' || true)
+if [ -n "$hits" ]; then
+  echo "::error::env::set_var/remove_var outside src/ssh_engine.rs (R27-14)"
+  echo "$hits"
+  fail=1
+fi
+
+# R27-13/R27-14: startup scrub must be present in main.
+grep -q 'take_sudo_pass_from_environ' src/main.rs || {
+  echo "::error::startup environ scrub missing from main (R27-13/R27-14)"
+  fail=1
+}
+
+# R27-17: SecretString must have a manual redacting Debug.
+grep -q 'impl std::fmt::Debug for SecretString' src/secrets.rs || {
+  echo "::error::SecretString needs a manual redacting Debug (R27-17)"
+  fail=1
+}
+
+# R27-18: from_raw_fd must not silently take ownership of a borrowed fd.
+raw=$(grep -rEn 'from_raw_fd' src/ | grep -Ev 'ManuallyDrop|OwnedFd' || true)
+if [ -n "$raw" ]; then
+  echo "::error::from_raw_fd without ManuallyDrop/OwnedFd (R27-18)"
+  echo "$raw"
+  fail=1
+fi
+
+# R27-42: process-time arithmetic must live only in src/proc_time.rs.
+hits=$(grep -rEn '_SC_CLK_TCK|"/proc/uptime"|strip_prefix\("btime ' src/ \
+       | grep -v '^src/proc_time\.rs:' || true)
+if [ -n "$hits" ]; then
+  echo "::error::process-time arithmetic outside src/proc_time.rs (R27-42)"
+  echo "$hits"
+  fail=1
+fi
+
+exit $fail

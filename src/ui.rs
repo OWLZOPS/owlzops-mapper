@@ -109,21 +109,17 @@ impl Theme {
 // Sanitisation helper
 // ---------------------------------------------------------------------------
 
-/// Replace control characters, bidi overrides, and zero-width characters
-/// with the Unicode replacement character (U+FFFD).
-/// Tabs (\t) are converted to 4 spaces to fix comfy_table border alignment calculations.
+/// Replace terminal-unsafe codepoints (control chars, bidi controls,
+/// zero-width and TAG characters) with U+FFFD using the shared
+/// `utils::is_terminal_unsafe` classifier (R25-65).
+/// Tabs (`\t`) are expanded to four spaces to keep comfy_table
+/// column alignment stable.
 pub fn sanitize_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\t' => out.push_str("    "),
-            c if c.is_control() => out.push('\u{FFFD}'),
-            '\u{202A}'..='\u{202E}'   // bidi overrides
-            | '\u{2066}'..='\u{2069}' // bidi isolates
-            | '\u{200B}'..='\u{200D}' // zero-width chars
-            | '\u{2060}'             // word joiner
-            | '\u{FEFF}'             // BOM
-            => out.push('\u{FFFD}'),
+            c if crate::utils::is_terminal_unsafe(c) => out.push('\u{FFFD}'),
             c => out.push(c),
         }
     }
@@ -2023,4 +2019,19 @@ fn render_footer() {
     outln!(
         "\x1b[3mRun `owlzops-mapper --format json` to export full payload for Blueprint Engine.\x1b[0m\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_terminal_removes_unicode_tag_block() {
+        // U+E0061 is TAG LATIN SMALL LETTER A; if not filtered it can be used
+        // to hide malicious text in terminals that render it as zero-width.
+        let input = "trusted\u{E0061}host";
+        let output = sanitize_terminal(input);
+        assert_eq!(output, "trusted\u{FFFD}host");
+        assert!(!output.contains('\u{E0061}'));
+    }
 }

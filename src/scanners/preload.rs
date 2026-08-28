@@ -6,6 +6,11 @@ use crate::coverage;
 use crate::models::PreloadFinding;
 use std::collections::{HashMap, HashSet};
 
+/// Cap for `/proc/<pid>/maps`. Large processes (JVM, browsers, databases) can
+/// exceed 1 MiB, and truncation would hide upper-address mappings where
+/// dynamically loaded libraries often live (R27-49).
+const CAP_PROC_MAPS: usize = 8 * 1024 * 1024;
+
 /// Parse ld.so.preload content according to glibc semantics:
 /// - `#` starts a comment (the rest of the line is ignored)
 /// - entries are separated by spaces, tabs, newlines, or colons
@@ -57,6 +62,10 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
 
     let mut read_ok = 0usize;
     let mut denied = 0usize;
+    // R27-49: a truncated maps is as unobservable as a denied one for the
+    // purpose of asserting "not mapped" — maps is address-ordered and a
+    // dlopen'd object lives in the tail that got cut.
+    let mut partial = 0usize;
 
     for entry in procs.flatten() {
         let file_name = entry.file_name();
@@ -67,10 +76,19 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
             continue;
         };
 
-        let maps = match crate::safe_io::read_file_capped(&format!("/proc/{pid}/maps"), 1024 * 1024)
-        {
-            Ok((m, _)) => {
+        let maps = match crate::safe_io::read_procfs_capped(
+            &format!("/proc/{pid}/maps"),
+            CAP_PROC_MAPS,
+        ) {
+            Ok((m, truncated)) => {
                 read_ok += 1;
+                if truncated {
+                    partial += 1;
+                    coverage::record(format!(
+                        "ld.so.preload corroboration: /proc/{pid}/maps truncated at {CAP_PROC_MAPS} bytes — \
+                         mapped library list for this process may be partial"
+                    ));
+                }
                 m
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -92,18 +110,20 @@ fn count_mapped(paths: &[String]) -> Option<HashMap<String, usize>> {
         }
     }
 
-    if denied > 0 {
+    if denied > 0 || partial > 0 {
         let hint = if crate::is_running_as_root() {
             ""
         } else {
             " — run as root for full coverage"
         };
         coverage::record(format!(
-            "ld.so.preload corroboration: {denied} /proc/<pid>/maps unreadable{hint}"
+            "ld.so.preload corroboration: {denied} /proc/<pid>/maps unreadable, \
+             {partial} truncated{hint}"
         ));
-        // R23-25: when some processes are unobservable, a zero count means
-        // "not seen", not "not mapped".  Remove those keys so the field stays
-        // None; non-zero observations are always trustworthy.
+        // R23-25 / R27-49: when any process is unobservable — denied OR
+        // truncated — a zero count means "not seen", not "not mapped". Remove
+        // those keys so the field stays None; non-zero observations are always
+        // trustworthy, since a hit can only come from a line we actually read.
         counts.retain(|_, v| *v > 0);
     }
     if read_ok == 0 {
@@ -192,6 +212,31 @@ mod tests {
         assert_eq!(
             parse_preload_entries("/a.so\t/b.so /c.so"),
             vec!["/a.so", "/b.so", "/c.so"]
+        );
+    }
+
+    #[test]
+    fn a_truncated_maps_read_cannot_assert_zero() {
+        // Mirrors the denied path: partial observation must leave the count
+        // UNKNOWN, because Some(0) downgrades SEC-042 (55) to SEC-050 (30).
+        let mut counts: HashMap<String, usize> = [
+            ("/dev/shm/evil.so".to_string(), 0),
+            ("/usr/lib/seen.so".to_string(), 2),
+        ]
+        .into_iter()
+        .collect();
+        let (denied, partial) = (0usize, 1usize);
+        if denied > 0 || partial > 0 {
+            counts.retain(|_, v| *v > 0);
+        }
+        assert!(
+            !counts.contains_key("/dev/shm/evil.so"),
+            "zero must become None"
+        );
+        assert_eq!(
+            counts.get("/usr/lib/seen.so"),
+            Some(&2),
+            "a hit is still a hit"
         );
     }
 }

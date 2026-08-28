@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
+/// unprivileged user. Shared with scoring so policy has one source of truth.
+pub const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
+
+/// Set when an entry's command list resolves to ALL, directly or via a
+/// Cmnd_Alias. Scoring keys on this instead of re-parsing the string (R26-19).
+pub const SUDO_ALL_MARKER: &str = "[GRANTS:ALL]";
+
 fn default_scoring_version() -> u8 {
     1
 }
@@ -26,6 +34,13 @@ pub struct AgentReport {
     pub scan_warnings: Vec<String>,
     #[serde(default)]
     pub coverage_warnings: Vec<String>,
+    #[serde(default)]
+    pub failed_scanners: Vec<String>,
+    /// How the scan was executed. `None` = local scan or legacy snapshot;
+    /// `Some(false)` = remote scan that ran WITHOUT root — privileged surfaces
+    /// were not read and a low score is not evidence of health.
+    #[serde(default)]
+    pub remote_privileged: Option<bool>,
     #[serde(default = "default_scoring_version")]
     pub scoring_version: u8,
     /// Self‑integrity preflight result. None = check not performed or legacy snapshot.
@@ -38,6 +53,32 @@ pub struct AgentReport {
     pub topology: TopologyInfo,
     pub security: SecurityInfo,
     pub packages: PackagesInfo,
+}
+
+impl AgentReport {
+    /// Whether this scan was able to read privileged surfaces.
+    ///
+    /// The host's `is_root_execution` is ground truth. `remote_privileged`
+    /// is what the orchestrator intended to run. Where they disagree, the
+    /// host wins: sudo can exit 0 and still not yield root (sudoers wrapper,
+    /// `Defaults targetpw`, `runas`). Preferring intent would mark an
+    /// unprivileged scan as full coverage (R25-86).
+    pub fn scan_was_privileged(&self) -> bool {
+        self.is_root_execution && self.remote_privileged.unwrap_or(true)
+    }
+
+    /// The orchestrator's belief about privilege disagrees with the host's
+    /// ground truth (`is_root_execution`). True in BOTH directions:
+    /// - orchestrator thought sudo worked but the scan was not root;
+    /// - orchestrator thought sudo was unavailable but the scan WAS root
+    ///   (false-negative sudo probe, R25-99).
+    pub fn privilege_claim_disagrees(&self) -> bool {
+        match self.remote_privileged {
+            Some(true) => !self.is_root_execution,
+            Some(false) => self.is_root_execution,
+            None => false,
+        }
+    }
 }
 
 impl Default for AgentReport {
@@ -60,6 +101,8 @@ impl Default for AgentReport {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 }
@@ -155,7 +198,9 @@ pub struct DatabaseInfo {
     pub size_mb: u64,
 }
 
+// R26-11: container-level serde(default) for backward-compatible JSON reads.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct NetworkInfo {
     pub firewall_active: bool,
     pub dns_resolvers: Vec<String>,
@@ -175,7 +220,8 @@ pub struct SslCertInfo {
     pub is_warning: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct PortInfo {
     pub protocol: String,
     pub port: String,
@@ -297,6 +343,7 @@ pub enum ProvenanceSource {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,
@@ -697,6 +744,13 @@ pub struct SecretLeak {
     pub process: String,
     pub source: String,
     pub matched_key: String,
+    /// R27-16: self_attributed is set when the record is the scanner's own process.
+    #[serde(default)]
+    pub self_attributed: Option<String>,
+    /// Age of the process in seconds at scan time, when available.
+    /// Used by SEC-014 to ignore transient secrets in short-lived processes.
+    #[serde(default)]
+    pub age_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

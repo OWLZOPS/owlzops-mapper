@@ -61,8 +61,13 @@ pub struct AuditArgs {
     #[arg(long, default_value_t = false)]
     pub copy_binary: bool,
 
-    #[arg(long, default_value = "/tmp/owlzops-mapper")]
-    pub remote_path: String,
+    /// Where to place the binary on the remote host. When omitted, a private
+    /// directory is created there with `mktemp -d` (mode 0700, unpredictable
+    /// name) and removed afterwards — this is the recommended form.
+    /// An explicit path is validated: a group/world-writable parent is refused,
+    /// because the binary is executed under sudo (R24-41).
+    #[arg(long)]
+    pub remote_path: Option<String>,
 
     #[arg(long)]
     pub local_binary: Option<String>,
@@ -74,9 +79,22 @@ pub struct AuditArgs {
     #[arg(long, default_value_t = false)]
     pub ask_sudo_pass: bool,
 
+    /// Read sudo password from this already-open file descriptor instead of
+    /// prompting or reading the environment. Mutually exclusive with
+    /// `--ask-sudo-pass`; any value in `OWLZOPS_SUDO_PASS` is discarded.
+    // R27-23: corrected help text (not precedence, mutual exclusion).
+    #[arg(long, value_name = "FD", conflicts_with = "ask_sudo_pass")]
+    pub sudo_pass_fd: Option<i32>,
+
     /// Maximum concurrent SSH sessions (default: 50).
     #[arg(long, default_value_t = 50)]
     pub max_concurrent: usize,
+
+    /// Exit 4 when coverage was incomplete (a scanner failed, a host did not
+    /// report, or the scan ran without root). Without this flag incomplete
+    /// coverage still yields the degraded code 2 — it is never invisible.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_incomplete: bool,
 
     /// Keep the binary on the remote host after the scan (skip cleanup).
     #[arg(long, default_value_t = false)]

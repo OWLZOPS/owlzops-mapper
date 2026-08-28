@@ -410,6 +410,38 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
     )
 }
 
+/// Read a host-controlled cron file using the capped regular-file API.
+/// Records explicit coverage for truncation, non-regular objects, and I/O errors.
+/// Returns `None` if the file should not be parsed.
+fn read_cron_source(path: &str, label: &str) -> Option<String> {
+    match crate::safe_io::read_file_capped_regular(path, CRON_FILE_CAP) {
+        Ok((content, truncated)) => {
+            if truncated {
+                crate::coverage::record(format!("{label} exceeded cap — cron inventory PARTIAL"));
+            }
+            Some(content)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            crate::coverage::record(format!(
+                "{label} is NOT a regular file (fifo/device) — cron parse refused; \
+                 treat as tampering. Persistence audit INCOMPLETE"
+            ));
+            None
+        }
+        Err(e) => {
+            crate::coverage::record(format!(
+                "{label} unreadable ({}) — cron inventory INCOMPLETE",
+                e.kind()
+            ));
+            None
+        }
+    }
+}
+
+/// Cron files are small; 1 MiB is generous and bounds a /dev/zero swap.
+const CRON_FILE_CAP: usize = 1024 * 1024;
+
 /// Collects running services, failed services, cron jobs (classified), and systemd timers.
 fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
     // running native services
@@ -459,7 +491,9 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
 
     // cron jobs (all sources) – now classified
     let mut raw_lines = Vec::new();
-    if let Ok(ct) = fs::read_to_string("/etc/crontab") {
+
+    // R26-37: /etc/crontab is host-controlled; a FIFO here hangs gather_services.
+    if let Some(ct) = read_cron_source("/etc/crontab", "/etc/crontab") {
         for l in ct.lines() {
             let l = l.trim();
             if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
@@ -467,6 +501,7 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             }
         }
     }
+
     if let Ok(dir) = fs::read_dir("/etc/cron.d") {
         for entry in dir.flatten() {
             let path = entry.path();
@@ -484,20 +519,23 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             {
                 continue;
             }
-            if let Ok(contents) = fs::read_to_string(&path) {
+            let label = format!("/etc/cron.d/{name}");
+            if let Some(contents) = read_cron_source(&path.to_string_lossy(), &label) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
-                        raw_lines.push(format!("/etc/cron.d/{}: {}", name, l));
+                        raw_lines.push(format!("{label}: {}", l));
                     }
                 }
             }
         }
     }
+
     if let Ok(spool) = fs::read_dir("/var/spool/cron/crontabs") {
         for entry in spool.flatten() {
             let user = entry.file_name().to_string_lossy().to_string();
-            if let Ok(contents) = fs::read_to_string(entry.path()) {
+            let label = format!("/var/spool/cron/crontabs/{user}");
+            if let Some(contents) = read_cron_source(&entry.path().to_string_lossy(), &label) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
@@ -507,6 +545,7 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             }
         }
     }
+
     if let Ok(spool) = fs::read_dir("/var/spool/cron") {
         for entry in spool.flatten() {
             let path = entry.path();
@@ -514,7 +553,8 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
                 continue;
             }
             let user = entry.file_name().to_string_lossy().to_string();
-            if let Ok(contents) = fs::read_to_string(&path) {
+            let label = format!("/var/spool/cron/{user}");
+            if let Some(contents) = read_cron_source(&path.to_string_lossy(), &label) {
                 for l in contents.lines() {
                     let l = l.trim();
                     if !l.is_empty() && !l.starts_with('#') && !is_cron_env(l) {
@@ -524,7 +564,8 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
             }
         }
     }
-    if let Ok(anacron) = fs::read_to_string("/etc/anacrontab") {
+
+    if let Some(anacron) = read_cron_source("/etc/anacrontab", "/etc/anacrontab") {
         for l in anacron.lines() {
             let l = l.trim();
             if l.is_empty() || l.starts_with('#') || is_cron_env(l) {
@@ -563,71 +604,71 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
     (native_services, failed_services, cron_jobs, systemd_timers)
 }
 
-/// Detect backup tools and last Restic snapshot.
+/// Detect backup tools using local evidence only.
+/// R26-03/R26-04: previous implementation forked `which` and executed
+/// `restic snapshots`/`borg list` under an env_clear() environment, which
+/// made successful tool detection structurally impossible. Now we rely on
+/// binary resolution via resolve_tool and local configuration/scheduling
+/// evidence instead of network or repository access.
 fn gather_backup_info(
     cron_jobs: &[CronJob],
     systemd_timers: &[String],
 ) -> (Vec<String>, Option<String>) {
     let mut tools = Vec::new();
-    let mut last_restic = None;
+
+    // R26-25: previous implementation always returned None after repository
+    // query removal. Use local cache mtime as activity evidence, not a
+    // snapshot confirmation.
+    let last_restic = last_backup_run_utc();
 
     for &tool in &["restic", "borg", "duplicati"] {
-        let binary_found = crate::utils::run_with_timeout("which", &[tool], 2)
-            .map(|stdout| !stdout.trim().is_empty())
-            .unwrap_or(false);
-
+        let binary_found = crate::utils::resolve_tool(tool).is_some();
         if !binary_found {
             continue;
         }
 
-        let has_data = match tool {
+        let configured = match tool {
             "restic" => {
-                let snapshot_out = crate::utils::run_with_timeout(
-                    "restic",
-                    &["snapshots", "--no-cache", "--json", "--last", "1"],
-                    5,
-                );
-                let snapshots_val = snapshot_out
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-                let snap_arr = snapshots_val
-                    .as_ref()
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.as_slice())
-                    .unwrap_or(&[]);
-
-                if !snap_arr.is_empty() {
-                    last_restic = snap_arr
-                        .first()
-                        .and_then(|s| s.get("time"))
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string());
-                }
-
-                !snap_arr.is_empty()
-                    || Path::new("/root/.restic").exists()
+                Path::new("/etc/restic").exists()
+                    || Path::new("/etc/default/restic").exists()
                     || Path::new("/var/lib/restic").exists()
+                    || Path::new("/root/.restic").exists()
             }
             "borg" => {
-                let has_borg_data = crate::utils::run_with_timeout("borg", &["list", "::"], 5)
-                    .map(|stdout| !stdout.trim().is_empty())
-                    .unwrap_or(false);
-
-                has_borg_data
-                    || Path::new("/root/.borg").exists()
+                Path::new("/etc/borg").exists()
+                    || Path::new("/etc/borgmatic").exists()
                     || Path::new("/var/lib/borg").exists()
+                    || Path::new("/root/.borg").exists()
             }
-            "duplicati" => ["/root/.duplicati", "/var/lib/duplicati", "/opt/duplicati"]
-                .iter()
-                .any(|dir| Path::new(dir).exists()),
+            "duplicati" => {
+                Path::new("/root/.duplicati").exists()
+                    || Path::new("/var/lib/duplicati").exists()
+                    || Path::new("/opt/duplicati").exists()
+            }
             _ => false,
         };
 
-        if has_data {
+        let scheduled = cron_jobs.iter().any(|job| {
+            let l = job.command.to_lowercase();
+            l.contains(tool)
+        }) || systemd_timers.iter().any(|t| {
+            let l = t.to_lowercase();
+            l.contains(tool)
+        });
+
+        if configured || scheduled {
             tools.push(tool.to_string());
+        } else {
+            // Binary present but no evidence of use — record as UNVERIFIED.
+            crate::coverage::record(format!(
+                "backup: '{tool}' binary present but no unit/timer/cron/config found — \
+                 backup posture UNVERIFIED for this tool"
+            ));
         }
     }
 
+    // Keep the legacy synthetic markers for scheduled backups that reference
+    // backup tools but whose binaries are absent.
     let backup_in_cron = cron_jobs.iter().any(|job| {
         let l = job.command.to_lowercase();
         l.contains("restic") || l.contains("borg") || l.contains("rsync") || l.contains("backup")
@@ -650,6 +691,16 @@ fn gather_backup_info(
     }
 
     (tools, last_restic)
+}
+
+/// Freshness from the local cache mtime. Never contacts the repository:
+/// a read-only audit must not authenticate to a backup target (R26-25).
+fn last_backup_run_utc() -> Option<String> {
+    ["/root/.cache/restic", "/root/.cache/borg"]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .max()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
 }
 
 fn parse_offset_to_ms(raw: &str) -> Option<f64> {
@@ -742,16 +793,26 @@ fn gather_ntp_info() -> (bool, Option<f64>) {
 pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
     let reboot_required = Path::new("/var/run/reboot-required").exists();
     let mut reboot_required_pkgs = Vec::new();
-    if reboot_required
-        && let Ok((content, _truncated)) =
-            crate::safe_io::read_file_capped("/var/run/reboot-required.pkgs", 16 * 1024)
-    {
-        let mut seen = std::collections::HashSet::new();
-        for line in content.lines() {
-            let pkg = line.trim().to_string();
-            if !pkg.is_empty() && seen.insert(pkg.clone()) {
-                reboot_required_pkgs.push(pkg);
+    if reboot_required {
+        // R26-02: host-controlled path MUST use read_file_capped_regular.
+        match crate::safe_io::read_file_capped_regular("/var/run/reboot-required.pkgs", 16 * 1024) {
+            Ok((content, _truncated)) => {
+                let mut seen = std::collections::HashSet::new();
+                for line in content.lines() {
+                    let pkg = line.trim().to_string();
+                    if !pkg.is_empty() && seen.insert(pkg.clone()) {
+                        reboot_required_pkgs.push(pkg);
+                    }
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                crate::coverage::record(
+                    "/var/run/reboot-required.pkgs is NOT a regular file (fifo/device) — \
+                     package list refused; treat as tampering"
+                        .to_string(),
+                );
+            }
+            Err(_) => {}
         }
     }
 

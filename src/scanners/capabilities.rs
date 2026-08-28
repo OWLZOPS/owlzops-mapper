@@ -431,7 +431,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         path_buf.clear();
         let _ = write!(path_buf, "{}/{pid}/status", proc_root.display());
 
-        let (content, truncated) = match safe_io::read_file_capped(&path_buf, CAP_PROC_STATUS) {
+        let (content, truncated) = match safe_io::read_procfs_capped(&path_buf, CAP_PROC_STATUS) {
             Ok(v) => v,
             Err(_) => {
                 if entry.path().exists() {
@@ -461,7 +461,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         // bytes up to the first NUL (empty string for a real kthread).
         let cmdline_argv0 = if is_kthread_comm(&st.name) {
             let cpath = format!("{}/{pid}/cmdline", proc_root.display());
-            safe_io::read_file_capped(&cpath, 4096)
+            safe_io::read_procfs_capped(&cpath, 4096)
                 .ok()
                 .map(|(content, _)| content.split('\0').next().unwrap_or("").to_string())
         } else {

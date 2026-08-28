@@ -32,6 +32,17 @@ fn index_file_caps(v: &[FileCapFinding]) -> HashMap<&str, (u64, u64, bool)> {
 pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport {
     let mut changes = Vec::new();
 
+    // R26-30: a version change can alter COLLECTION semantics, not just
+    // weights. scoring_version guards risk_score; this guards everything else.
+    if before.version != after.version {
+        changes.push(Change {
+            field: "meta.binary_version".into(),
+            before: Some(before.version.clone()),
+            after: Some(after.version.clone()),
+            severity: Severity::Changed,
+        });
+    }
+
     // --- risk_score ---
     if before.risk_score != after.risk_score {
         let formula_changed = before.scoring_version != after.scoring_version;
@@ -150,6 +161,28 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         "host.ntp_synchronized",
         false
     );
+
+    // Remote privilege level is a coverage fact, not a host setting.
+    // Compare the DERIVED privilege fact, not the raw delivery field:
+    // a local scan answers via is_root_execution, a remote scan via
+    // remote_privileged. This avoids treating "local root vs remote root"
+    // as a change (R25-79). Losing root visibility makes low scores
+    // incomparable (R25-31).
+    let before_priv = before.scan_was_privileged();
+    let after_priv = after.scan_was_privileged();
+    if before_priv != after_priv {
+        let severity = if after_priv {
+            Severity::Improved
+        } else {
+            Severity::Degraded
+        };
+        changes.push(Change {
+            field: "scan_privileged".into(),
+            before: Some(before_priv.to_string()),
+            after: Some(after_priv.to_string()),
+            severity,
+        });
+    }
 
     // OS / kernel changes (unexpected downgrades)
     if before.host.os_version != after.host.os_version {
@@ -650,6 +683,62 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                     severity: Severity::Improved,
                 });
             }
+        }
+    }
+
+    // ── security.access_alignment.sudoers_nopasswd_all (R26-28) ────────────
+    // Keyed on (principal, source_file) rather than the raw line: the entry
+    // text carries markers and file paths that change for cosmetic reasons.
+    {
+        let index = |r: &AgentReport| -> HashSet<(String, String)> {
+            r.security
+                .access_alignment
+                .sudoers_nopasswd_all
+                .iter()
+                .map(|e| (e.principal.clone(), e.source_file.clone()))
+                .collect()
+        };
+        let b = index(before);
+        let a = index(after);
+
+        for (principal, file) in a.difference(&b) {
+            changes.push(Change {
+                field: "security.sudoers_nopasswd_all".into(),
+                before: None,
+                after: Some(format!(
+                    "{principal} gained passwordless sudo to ALL via {file}"
+                )),
+                severity: Severity::Degraded,
+            });
+        }
+        for (principal, file) in b.difference(&a) {
+            changes.push(Change {
+                field: "security.sudoers_nopasswd_all".into(),
+                before: Some(format!(
+                    "{principal} had passwordless sudo to ALL via {file}"
+                )),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+
+        // Count-level drift for non-ALL NOPASSWD rules: the text carries
+        // markers, so compare the magnitude, not the strings.
+        let (bn, an) = (
+            before.security.sudo_nopasswd_entries.len(),
+            after.security.sudo_nopasswd_entries.len(),
+        );
+        if bn != an {
+            changes.push(Change {
+                field: "security.sudo_nopasswd_entries".into(),
+                before: Some(bn.to_string()),
+                after: Some(an.to_string()),
+                severity: if an > bn {
+                    Severity::Degraded
+                } else {
+                    Severity::Improved
+                },
+            });
         }
     }
 
@@ -1291,7 +1380,11 @@ pub fn compare_multi(before: &[AgentReport], after: &[AgentReport]) -> Vec<Multi
                     }],
                 },
             }),
-            (None, None) => unreachable!(),
+            (None, None) => {
+                // Hostname is derived from the union of both maps, so this arm
+                // is logically unreachable; skip instead of panicking (R25-51).
+                continue;
+            }
         }
     }
     diffs
@@ -1343,6 +1436,17 @@ pub fn print_diff_terminal(report: &DiffReport) {
             st(&a.version),
             a.risk_score
         );
+
+        // R26-30: cross-version diffs may reflect collection semantics changes,
+        // not host drift.
+        if b.version != a.version {
+            println!(
+                "  \x1b[1;33m[!] snapshots produced by different binaries ({} → {}) — field-level differences may reflect changed collection semantics, not host drift.\x1b[0m",
+                st(&b.version),
+                st(&a.version)
+            );
+        }
+
         match human_span(&b.timestamp, &a.timestamp) {
             Some((_, true)) => println!(
                 "  \x1b[1;33m[!] 'after' is OLDER than 'before' — arguments swapped?\x1b[0m"
@@ -1433,6 +1537,8 @@ mod tests {
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
             self_integrity: None,
+            failed_scanners: Vec::new(),
+            remote_privileged: None,
         }
     }
 
@@ -1585,7 +1691,6 @@ mod tests {
                 .any(|c| c.field == "security.ebpf_inventory.prog"),
             "swapping one BPF program for another must surface in drift even at equal count"
         );
-        // The vanished tag is Improved, the new tag is Degraded — both present.
         assert!(
             diff.changes
                 .iter()
@@ -1633,7 +1738,6 @@ mod tests {
         assert_eq!(change.severity, Severity::Degraded);
         assert!(change.after.as_deref().unwrap().contains("named"));
 
-        // Symmetry: complain→enforce is Improved; a stable complain set is silent.
         assert!(
             compare_reports(&after, &before)
                 .changes
@@ -1653,12 +1757,9 @@ mod tests {
 
     #[test]
     fn kernel_taint_bit_appearing_is_drift() {
-        // A taint bit set in `after` but not `before` means a module loaded AFTER
-        // the baseline — Degraded even for bits (E/O) that are benign as steady
-        // state. An always-tainted box (stable value) must not drift.
         let mut before = test_report();
         before.security.kernel_taint = KernelTaint {
-            raw: 1 << 12, // O — out-of-tree driver already present at baseline
+            raw: 1 << 12,
             flags: vec![TaintFlag {
                 bit: 12,
                 code: 'O',
@@ -1669,7 +1770,7 @@ mod tests {
         };
         let mut after = test_report();
         after.security.kernel_taint = KernelTaint {
-            raw: (1 << 12) | (1 << 13), // E newly appeared (unsigned module loaded)
+            raw: (1 << 12) | (1 << 13),
             flags: vec![
                 TaintFlag {
                     bit: 12,
@@ -1694,11 +1795,9 @@ mod tests {
             .find(|c| c.field == "security.kernel_taint")
             .expect("newly-set taint bit not detected");
         assert_eq!(change.severity, Severity::Degraded);
-        // Only the NEW bit (E) is reported, not the pre-existing O.
         assert!(change.after.as_deref().unwrap().contains("unsigned module"));
         assert!(!change.after.as_deref().unwrap().contains("out-of-tree"));
 
-        // Stable taint value (nvidia always-tainted) → no drift.
         assert!(
             !compare_reports(&after, &after)
                 .changes
@@ -1707,8 +1806,6 @@ mod tests {
             "unchanged taint value must produce no drift"
         );
     }
-
-    // ── new setuid/file_capabilities drift tests ───────────────────────────
 
     #[test]
     fn setuid_binary_appearing_is_drift() {
@@ -1774,7 +1871,6 @@ mod tests {
         assert_eq!(c.severity, Severity::Degraded);
         assert!(c.after.as_deref().unwrap().contains("CAP_BPF"));
 
-        // De-escalation (cap removed) → Improved; identical → no drift.
         assert!(
             compare_reports(&after, &before)
                 .changes
@@ -1792,8 +1888,6 @@ mod tests {
             "identical cap inventory must produce no drift"
         );
     }
-
-    // ── R24-15: one‑way switch direction tests ────────────────────────────
 
     #[test]
     fn one_way_switch_hardening_is_improved_not_degraded() {
@@ -1820,7 +1914,6 @@ mod tests {
 
     #[test]
     fn one_way_switch_weakening_is_degraded() {
-        // 1 -> 0 cannot happen without a reboot: /proc tampering or kernel swap.
         let mut before = test_report();
         before.security.one_way_switches = [("modules_disabled".to_string(), Some(1))]
             .into_iter()
@@ -1840,12 +1933,11 @@ mod tests {
 
     #[test]
     fn vanished_one_way_switch_is_never_silent() {
-        // R24-07 guard: absent != unchanged.
         let mut before = test_report();
         before.security.one_way_switches = [("kexec_load_disabled".to_string(), Some(1))]
             .into_iter()
             .collect();
-        let after = test_report(); // empty map
+        let after = test_report();
 
         let c = compare_reports(&before, &after)
             .changes
@@ -1855,5 +1947,109 @@ mod tests {
         assert_eq!(c.before.as_deref(), Some("1"));
         assert_eq!(c.after.as_deref(), Some("absent"));
         assert_eq!(c.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn remote_privileged_lost_is_degraded() {
+        let mut before = test_report();
+        before.remote_privileged = Some(true);
+
+        let mut after = test_report();
+        after.remote_privileged = Some(false);
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "scan_privileged")
+            .expect("privilege loss not detected");
+
+        assert_eq!(c.severity, Severity::Degraded);
+        assert_eq!(c.before.as_deref(), Some("true"));
+        assert_eq!(c.after.as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn local_root_and_remote_root_do_not_drift() {
+        let local = test_report();
+        let mut remote = test_report();
+        remote.remote_privileged = Some(true);
+
+        assert!(
+            !compare_reports(&local, &remote)
+                .changes
+                .iter()
+                .any(|c| c.field == "scan_privileged"),
+            "local root and remote root are the same privilege fact"
+        );
+    }
+
+    #[test]
+    fn local_non_root_and_remote_non_root_do_not_drift() {
+        let mut local = test_report();
+        local.is_root_execution = false;
+
+        let mut remote = test_report();
+        remote.is_root_execution = false;
+        remote.remote_privileged = Some(false);
+
+        assert!(
+            !compare_reports(&local, &remote)
+                .changes
+                .iter()
+                .any(|c| c.field == "scan_privileged"),
+            "local non-root and remote non-root are the same privilege fact"
+        );
+    }
+
+    #[test]
+    fn local_non_root_vs_remote_root_is_improved() {
+        let mut local = test_report();
+        local.is_root_execution = false;
+
+        let mut remote = test_report();
+        remote.remote_privileged = Some(true);
+
+        let c = compare_reports(&local, &remote)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "scan_privileged")
+            .expect("privilege gain must surface");
+        assert_eq!(c.severity, Severity::Improved);
+        assert_eq!(c.before.as_deref(), Some("false"));
+        assert_eq!(c.after.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn a_new_nopasswd_all_grant_appears_in_the_diff() {
+        let before = test_report();
+        let mut after = test_report();
+        after.security.access_alignment.sudoers_nopasswd_all = vec![SudoersEntry {
+            principal: "deploy".into(),
+            source_file: "/etc/sudoers.d/90-deploy".into(),
+            scope: "ALL".into(),
+        }];
+        let diff = compare_reports(&before, &after);
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.field == "security.sudoers_nopasswd_all"
+                    && c.severity == Severity::Degraded),
+            "a new passwordless root grant must be visible in the drift report"
+        );
+    }
+
+    // R26-42: ensure cross-version caveat survives JSON/XLSX export.
+    #[test]
+    fn a_binary_version_change_is_recorded_for_every_output_channel() {
+        let before = test_report();
+        let mut after = test_report();
+        after.version = "0.5.36".into();
+        let diff = compare_reports(&before, &after);
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.field == "meta.binary_version"),
+            "cross-version caveat must survive JSON/XLSX export, not just the terminal"
+        );
     }
 }

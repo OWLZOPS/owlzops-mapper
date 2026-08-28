@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="owlzops_mapper.svg" alt="Owlzops Mapper Logo" width="500" />
+</div>
+
 # owlzops-mapper
 
 [![CI](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml/badge.svg)](https://github.com/OWLZOPS/owlzops-mapper/actions/workflows/ci.yml)
@@ -180,6 +184,30 @@ The binary uploads itself over SSH, runs, collects JSON, removes itself from eac
 
 `--ask-sudo-pass` forwards the sudo password securely over the SSH channel — no `NOPASSWD` sudoers rule required.
 
+#### Passing the sudo password
+
+For remote scans that require a password, use `--sudo-pass-fd N` (most secure),
+`--ask-sudo-pass` with a pipe, or the deprecated environment variable
+`OWLZOPS_SUDO_PASS`.
+
+```bash
+# Most secure: feed the fd from a pipe, never a here-string.
+# `<<<` writes a temp file in $TMPDIR on bash < 5.1, which puts the fleet
+# password on disk (R27-23).
+owlzops-mapper audit --host 192.0.2.10 --sudo-pass-fd 3 \
+  3< <(printf '%s' "$SUDO_PASS")
+
+# via stdin (recommended for scripts)
+printf '%s' "$SUDO_PASS" | owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
+
+# deprecated: environment variable (one-shot)
+OWLZOPS_SUDO_PASS="$SUDO_PASS" owlzops-mapper audit --host 192.0.2.10 --ask-sudo-pass
+```
+
+The password is held in a protected `SecretString` (zeroized on drop, locked
+from swap and core dumps where supported) and removed from the process
+environment as early as possible. See `SECURITY.md` for details.
+
 ### Snapshot & drift
 
 ```bash
@@ -214,7 +242,7 @@ owlzops-mapper compare before.json after.json --format excel -o drift.xlsx
 - Single static musl binary, zero runtime dependencies
 - Read-only, zero permanent footprint, no telemetry
 - GPG-signed releases + SHA256 checksums + SBOM
-- CI pins every GitHub Action by commit SHA, runs `cargo audit` and `cargo deny`
+- CI pins every GitHub Action by commit SHA, runs `cargo audit` and `cargo deny`, and checks that remediation IDs in commit messages are reflected in the changed files
 - Source-available under Apache 2.0 with Commons Clause
 
 The design commitments above are stated as testable properties in [SECURITY.md](SECURITY.md). A violation of any of them is treated as a vulnerability, not a bug.
@@ -234,7 +262,9 @@ The design commitments above are stated as testable properties in [SECURITY.md](
 | `--copy-binary` | Upload the static binary automatically |
 | `--local-binary` | Path to the static binary to upload instead of the running one |
 | `--ask-sudo-pass` | Prompt for sudo password, forwarded over SSH |
-| `--keep-binary` | Skip cleanup, leave the binary on the remote host |
+| `--sudo-pass-fd N` | Read sudo password from an already-open file descriptor (most secure) |
+| `--keep-binary` | Skip cleanup, leave the binary on the remote host. Requires `--remote-path` when used with `--copy-binary` |
+| `--fail-on-incomplete` | Exit with code 4 when coverage is incomplete (failed scanner, missing host, non-root, warnings) |
 | `--external-ip` | Opt-in public IP lookup |
 | `-v, --verbose` | Full per-region memory detail |
 
@@ -247,10 +277,21 @@ Full list: `owlzops-mapper --help`.
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean |
-| 1 | Critical findings present |
-| 2 | Not running as root / scan warnings / fleet produced zero reports |
-| 3 | **Active compromise detected** (IoC / ghost PID / critical memory findings) |
+| 0 | Clean — full coverage, no critical or compromised findings |
+| 1 | Critical findings present — full coverage |
+| 2 | Degraded — incomplete coverage: not running as root, warnings, failed scanner(s), missing host(s), or JSONL write errors |
+| 3 | **Active compromise detected** — regardless of coverage |
+| 4 | No verdict at all, **or** `--fail-on-incomplete` was used and coverage was incomplete |
+| 64 | Usage error: invalid CLI arguments or input files |
+| 130 | Interrupted by SIGINT/SIGTERM |
+
+Codes **0–3 are a stable public contract from v0.6.0**.  
+Their meaning does not change between releases from v0.6.0 onwards.  
+New failure modes get new codes; they never override the existing band.
+
+In fleet mode, hosts that produced no report are listed by address in stderr.
+`hosts_missing` in the exit-code path remains a count; the stderr line carries
+the actual address list for operator follow-up.
 
 ```bash
 sudo owlzops-mapper audit || echo "Security scan failed — check the report"

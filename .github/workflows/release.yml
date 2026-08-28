@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+# R27-03: least privilege at workflow level
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -15,12 +19,15 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             archive: owlzops-mapper-linux-x86_64.tar.gz
+            features: ""          # default
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive: owlzops-mapper-linux-arm64.tar.gz
+            features: ""          # default
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: owlzops-mapper-macos-arm64.tar.gz
+            features: "--no-default-features"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -31,9 +38,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
+      # R27-02: tags do not trigger CI; verify the released commit matches Cargo.toml
+      - name: Verify tag matches Cargo.toml
+        run: |
+          TAG="${{ github.ref_name }}"
+          CRATE="v$(grep -m1 '^version[[:space:]]*=' Cargo.toml | cut -d'"' -f2)"
+          [ "$TAG" = "$CRATE" ] || {
+            echo "::error file=Cargo.toml::tag $TAG does not match crate version $CRATE — \
+                  reports would carry the wrong version in meta.binary_version"
+            exit 1
+          }
+
       - name: Install musl tools (Linux only)
         if: matrix.target != 'aarch64-apple-darwin'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Test the exact commit being released
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --locked
 
       - name: Build
         run: |
@@ -50,42 +72,41 @@ jobs:
           cd ../../..
           sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: ${{ matrix.archive }}
-          path: |
-            ${{ matrix.archive }}
-            ${{ matrix.archive }}.sha256
-
-  sbom:
-    name: Generate SBOM
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # action HEAD as of 2026-06-28
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-
-      # Optimization: install cargo-cyclonedx via pre-built binary instead of compiling from source
+      # R27-04: SBOM per target, not per builder environment
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad  # Release 2.85.10
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518  # Release 2.86.5
         with:
           tool: cargo-cyclonedx
 
-      - name: Generate SBOM
-        run: cargo cyclonedx --format json --override-filename sbom
+      - name: Generate SBOM for this target
+        run: |
+          set -e
+          cargo cyclonedx --format json --target ${{ matrix.target }} ${{ matrix.features }} \
+            --override-filename sbom-${{ matrix.target }}
+
+          # R27-16: --override-filename takes a BASE name; cargo-cyclonedx
+          # appends the format extension. Passing "…json" would produce
+          # "…json.json", the upload pattern misses it, and the failure
+          # surfaces two jobs later in `sign`.
+          test -f "sbom-${{ matrix.target }}.json" || {
+            echo "::error::expected sbom-${{ matrix.target }}.json — produced: $(ls sbom* 2>/dev/null || echo none)"
+            exit 1
+          }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: sbom-artifact
-          path: sbom.json
+          name: ${{ matrix.archive }}
+          # R27-16: a missing artifact must fail the job that produced it,
+          # not the job that consumes it.
+          if-no-files-found: error
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+            sbom-${{ matrix.target }}.json
 
   sign:
     name: Sign artifacts
-    needs: [build, sbom]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -96,17 +117,55 @@ jobs:
       - name: Import GPG key
         run: |
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          echo "trusted-key $(gpg --list-keys --with-colons | grep '^pub' | cut -d: -f5)" >> ~/.gnupg/gpg.conf
+          # R27-07: take the first public key only
+          echo "trusted-key $(gpg --list-keys --with-colons | grep '^pub' | cut -d: -f5 | head -1)" >> ~/.gnupg/gpg.conf
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
-      - name: Sign all artifacts (archives, checksums, SBOM)
+      - name: Sign all artifacts (archives, checksums, SBOMs)
         run: |
-          for file in *.tar.gz *.sha256 sbom.json; do
+          set -euo pipefail
+          shopt -s nullglob
+          archives=( *.tar.gz )
+          sums=( *.sha256 )
+          sboms=( sbom-*.json )
+
+          n=${#archives[@]}
+          # R27-17: a bare glob that matches nothing is passed to gpg
+          # literally and fails mid-loop with a misleading message.
+          [ "$n" -ge 1 ] && [ "${#sums[@]}" -eq "$n" ] && [ "${#sboms[@]}" -eq "$n" ] || {
+            echo "::error::incomplete artifact set: $n archives, ${#sums[@]} checksums, ${#sboms[@]} SBOMs"
+            exit 1
+          }
+
+          for file in "${archives[@]}" "${sums[@]}" "${sboms[@]}"; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --detach-sign --armor "$file"
           done
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      # R27-05/R27-19: verify each artifact has a signature
+      - name: Verify every signature before publishing
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # R27-19: iterate ARTIFACTS and require a signature for each.
+          # An exported public key is also a .asc and has no counterpart
+          # file to verify against, so iterating *.asc is fragile.
+          artifacts=( *.tar.gz *.sha256 sbom-*.json )
+          n=0
+          for file in "${artifacts[@]}"; do
+            [ -f "$file.asc" ] || { echo "::error::no signature for $file"; exit 1; }
+            gpg --batch --verify "$file.asc" "$file"
+            n=$((n+1))
+          done
+          expected=${#artifacts[@]}
+
+          [ "$n" -eq "$expected" ] && [ "$n" -ge 9 ] || {
+            echo "::error::$n signatures for $expected artifacts (minimum 9)"
+            exit 1
+          }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -115,8 +174,7 @@ jobs:
             *.tar.gz
             *.sha256
             *.asc
-            sbom.json
-            sbom.json.asc
+            sbom-*.json
 
   release:
     name: Create GitHub Release
@@ -136,32 +194,46 @@ jobs:
           name: signed-artifacts
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad  # Release 2.85.10
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518  # Release 2.86.5
         with:
           tool: git-cliff
 
-      - name: Generate changelog
+      - name: Generate release notes
         run: git-cliff --latest --strip header -o RELEASE_NOTES.md
+
+      # R27-01: full history for the repository changelog
+      - name: Regenerate full changelog
+        run: |
+          set -e
+          git-cliff -o CHANGELOG.md
+          # R27-20: an empty or malformed changelog must not reach the PR.
+          test -s CHANGELOG.md && head -1 CHANGELOG.md | grep -q '^# Changelog' || {
+            echo "::error::git-cliff produced an empty or malformed CHANGELOG.md"
+            exit 1
+          }
 
       - name: Publish release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           body_path: RELEASE_NOTES.md
+          # R27-18: patterns are expanded independently with no dedup.
+          # `*.asc` already covers sbom-*.json.asc — listing both queues
+          # the same asset twice and causes upload races.
           files: |
             *.tar.gz
             *.sha256
             *.asc
-            sbom.json
-            sbom.json.asc
+            sbom-*.json
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          # SemVer: anything after '-' is a pre-release (R27-06).
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
       - name: Create Pull Request for changelog update
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           BRANCH_NAME="changelog/${{ github.ref_name }}-${{ github.run_id }}"
-          mv RELEASE_NOTES.md CHANGELOG.md
+          rm -f RELEASE_NOTES.md
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b $BRANCH_NAME

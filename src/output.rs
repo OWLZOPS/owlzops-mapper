@@ -4,6 +4,29 @@ use crate::ui;
 use std::path::Path;
 use tracing::warn;
 
+/// Convert a hostname into a safe filename component.
+/// Allow-list approach mirrors validate_remote_path (R27-10): anything not
+/// [A-Za-z0-9._-] is replaced with '_'; empty becomes "unknown".
+/// Prevents path traversal via malicious remote hostname (R27-11).
+#[cfg(feature = "local-scan")]
+fn hostname_to_safe_filename(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
 #[cfg(feature = "local-scan")]
 pub fn output_single(
     report: &AgentReport,
@@ -32,7 +55,7 @@ pub fn output_single(
                 .unwrap_or_else(|| {
                     format!(
                         "owlzops-report-{}-{}.xlsx",
-                        report.host.hostname,
+                        hostname_to_safe_filename(&report.host.hostname),
                         chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
                     )
                 });
@@ -54,6 +77,10 @@ pub fn output_multi(
 ) -> Result<(), String> {
     match format {
         OutputFormat::Text => {
+            if reports.is_empty() {
+                eprintln!("No reports to display.");
+                return Ok(());
+            }
             if reports.len() == 1 {
                 ui::render_dashboard(&reports[0], verbose);
             } else {

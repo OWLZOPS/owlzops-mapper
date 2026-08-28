@@ -140,7 +140,7 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
         };
 
         // Capped comm
-        let comm = crate::safe_io::read_file_capped(&format!("/proc/{}/comm", pid), 4096)
+        let comm = crate::safe_io::read_procfs_capped(&format!("/proc/{}/comm", pid), 4096)
             .map(|(s, _)| s.trim().to_string())
             .unwrap_or_default();
 
@@ -187,7 +187,7 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
 
             // Capped fdinfo
             let fdinfo_path = format!("/proc/{}/fdinfo/{}", pid, fdnum);
-            let fdinfo = match crate::safe_io::read_file_capped(&fdinfo_path, 8192) {
+            let fdinfo = match crate::safe_io::read_procfs_capped(&fdinfo_path, 8192) {
                 Ok((s, _)) => s,
                 Err(_) => continue,
             };

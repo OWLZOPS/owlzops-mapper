@@ -29,17 +29,26 @@
 //! * Tier‑B (io_uring): full 1..=pid_max batched statx, sub‑second on healthy
 //!   hosts even under `--deep`.  No allocator‑wrap blind spot.
 //! * Tier‑C (sync fallback): bounded by `ns_last_pid`, records a coverage note
-//!   when any high‑PID range is skipped.  Used when io_uring is unavailable or
-//!   for tempdir‑based tests.
+//!   once per invocation when any high‑PID range is skipped.  Used when
+//!   io_uring is unavailable or for tempdir‑based tests.
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fs;
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// These are used only by the io_uring path, which is available on glibc Linux
+// but not on musl (no statx). Keeping them without cfg produced unused-import
+// warnings in the musl release build.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::ffi::CString;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::fs::File;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::os::unix::io::AsRawFd;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+use std::time::Instant;
 
 use crate::coverage;
 use crate::models::GhostPidFinding;
@@ -52,15 +61,40 @@ const MAX_FINDINGS: usize = 64;
 const YIELD_EVERY: u32 = 8192;
 const WRAP_TAIL_FRACTION: u64 = 10;
 
+/// Fallback used when `/proc/sys/kernel/pid_max` cannot be read. Never applied
+/// silently — the caller discloses it (R27-50).
+const PID_MAX_FALLBACK: u32 = 32_768;
+
 pub fn scan_ghost_pids(deep: bool) -> Vec<GhostPidFinding> {
     detect(Path::new("/proc"), deep)
 }
 
-/// Returns `true` if `/proc` is mounted with `hidepid=2` or `hidepid=invisible`.
-fn has_hidepid_option() -> bool {
-    // Larger cap: /proc/mounts is big on mount-heavy (Docker) hosts; a
-    // truncated `proc` line would silently defeat this guard.
-    if let Ok((content, _)) = safe_io::read_file_capped("/proc/mounts", 256 * 1024) {
+/// R27-51: reads through `proc_root` like the rest of `detect`'s helpers, so a
+/// tempdir-based test does not inherit the CI host's mount options.
+fn has_hidepid_option(proc_root: &Path) -> bool {
+    // /proc/mounts runs to megabytes on a dense container host: one overlay
+    // line carries the full `lowerdir=` layer list (0.5–2 KiB) and each
+    // container adds 5–10 entries. The cap is sized so truncation is not a
+    // routine event (R27-47).
+    //
+    // Failure direction if it truncates anyway (R27-48): this function looks
+    // for exactly one line — `proc /proc proc <opts>` — which is established at
+    // boot and sits near the top. Losing it makes us return false and RUN the
+    // ghost scan on a hidepid=2 host, manufacturing false positives. Nothing is
+    // hidden. Mount masking is SEC-021 (`mounts.rs`, /proc/self/mountinfo) and
+    // is unaffected by this cap.
+    const CAP_PROC_MOUNTS: usize = 8 * 1024 * 1024;
+    let mounts = proc_root.join("mounts");
+    if let Ok((content, truncated)) =
+        safe_io::read_procfs_capped(mounts.to_string_lossy().as_ref(), CAP_PROC_MOUNTS)
+    {
+        if truncated {
+            coverage::record(format!(
+                "ghost_pid: /proc/mounts exceeded {CAP_PROC_MOUNTS} bytes and was truncated — \
+                 the hidepid=2 guard may not have seen the /proc mount line; any ghost-pid \
+                 finding on this host may be a kernel-hidden process, not a rootkit artefact"
+            ));
+        }
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             let source = parts.next().unwrap_or("");
@@ -88,7 +122,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
     // Ghost scan is incompatible with hidepid=2/invisible because readdir
     // legitimately filters out processes, causing false positives.
     // With --deep, the guard is overridden (user accepts potential FP).
-    if has_hidepid_option() {
+    if has_hidepid_option(proc_root) {
         if deep {
             coverage::record(
                 "ghost-pid scan: /proc mounted with hidepid=2/invisible — \
@@ -107,7 +141,23 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         }
     }
 
+    // R27-39: read /proc/uptime once per scan, never inside the per‑PID loop.
+    // An unreadable uptime must make every candidate downgraded, not young.
+    let uptime_secs = crate::proc_time::uptime_secs();
+    if uptime_secs.is_none() {
+        coverage::record(
+            "ghost_pid: /proc/uptime unreadable — process ages unknown; every candidate \
+             is downgraded to SEC-025 and compromised_host cannot be set from this class"
+                .to_string(),
+        );
+    }
+
+    // Resolve pid_max / ns_last_pid once per scan so the coverage note matches
+    // the actual probe range (R27-51).
+    let (upper_bound, wrap_tail, pid_max_known) = pid_scan_bounds(proc_root);
+
     let mut stable: Option<BTreeSet<u32>> = None;
+    let mut sync_skip_recorded = false;
 
     for cycle in 0..PROBE_CYCLES {
         // "readdir sandwich": snapshot readdir BEFORE and AFTER the slow live
@@ -116,8 +166,33 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // manufacture transient candidates that defeat the clean-host early
         // exit. A genuinely hidden PID is in neither readdir and survives.
         let listed_before = readdir_pids(proc_root);
-        let live = probe_live_set(proc_root);
+        let (live, used_sync) = probe_live_set(proc_root, (upper_bound, wrap_tail));
         let listed_after = readdir_pids(proc_root);
+
+        // The sync fallback bounds the scan to ns_last_pid. Record that gap
+        // ONCE per ghost-pid invocation, not once per probe cycle (R25-94).
+        if used_sync && !sync_skip_recorded {
+            if should_report_scan_gap(upper_bound, wrap_tail, pid_max_known) {
+                coverage::record(match pid_max_known {
+                    None => format!(
+                        "ghost-pid scan (sync fallback): /proc/sys/kernel/pid_max unreadable — \
+                         the scan was bounded at {PID_MAX_FALLBACK} as a fallback. systemd sets \
+                         4194304, so a hidden PID above the fallback was NOT probed. \
+                         Hidden-process coverage INCOMPLETE."
+                    ),
+                    Some(pid_max) => format!(
+                        "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
+                         probed (bounded by ns_last_pid={}); a hidden PID above the \
+                         allocator cursor after a wrap could be missed. Enable io_uring \
+                         for a full-range scan.",
+                        upper_bound + 1,
+                        pid_max,
+                        upper_bound
+                    ),
+                });
+            }
+            sync_skip_recorded = true;
+        }
 
         // R11-09 + R11-10: filter out threads AT CANDIDATE CONSTRUCTION so the
         // early-exit below actually fires on a clean host. ENOENT on
@@ -163,7 +238,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // the kill arbiter will classify it as "kill" (downgraded suspicion).
         let status_path = proc_root.join(pid.to_string()).join("status");
         let (tgid, state_from_status) =
-            match safe_io::read_file_capped(status_path.to_string_lossy().as_ref(), 8192) {
+            match safe_io::read_procfs_capped(status_path.to_string_lossy().as_ref(), 8192) {
                 Ok((content, _)) => parse_tgid_and_state(&content),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None), // keep for arbiter
                 Err(_) => continue, // other errors → drop noise
@@ -171,7 +246,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
 
         let stat_path_alive = proc_root.join(pid.to_string()).exists();
         let kill_alive = kill_exists(pid);
-        let (state_from_stat, age_secs) = read_state_and_age(proc_root, pid);
+        let (state_from_stat, age_secs) = read_state_and_age(proc_root, pid, uptime_secs);
 
         let state = state_from_status.or(state_from_stat);
 
@@ -206,7 +281,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
 /// Other errors → `true` (drop noise).
 fn is_thread(proc_root: &Path, pid: u32) -> bool {
     let path = proc_root.join(pid.to_string()).join("status");
-    match safe_io::read_file_capped(path.to_string_lossy().as_ref(), 8192) {
+    match safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 8192) {
         Ok((content, _)) => matches!(parse_tgid_and_state(&content).0, Some(t) if t != pid),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false, // keep
         Err(_) => true,                                              // drop noise
@@ -306,13 +381,13 @@ fn candidate_diff(
 
 // ── live-set probe (Tier-B io_uring, Tier-C sync fallback) ────────────────
 
-fn probe_live_set(proc_root: &Path) -> BTreeSet<u32> {
+fn probe_live_set(proc_root: &Path, bounds: (u32, Option<(u32, u32)>)) -> (BTreeSet<u32>, bool) {
     if proc_root == Path::new("/proc")
         && let Some(set) = probe_live_set_iouring(proc_root)
     {
-        return set;
+        return (set, false);
     }
-    probe_live_set_sync(proc_root)
+    (probe_live_set_sync(proc_root, bounds), true)
 }
 
 // Full io_uring implementation is only available on glibc Linux.
@@ -323,8 +398,9 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     const RING_DEPTH: u32 = 4096;
     const WINDOW: usize = 4096; // in-flight SQEs; also bounds statx-buf memory
 
-    let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
-    let dir = File::open(proc_root).ok()?; // dirfd = DI seam (works on tempdirs)
+    let pid_max =
+        read_u32_sysfile(Path::new("/proc/sys/kernel/pid_max")).unwrap_or(PID_MAX_FALLBACK);
+    let dir = File::open(proc_root).ok()?; // CAPPED_IO_OK: proc directory, not a host-controlled file
     let dfd = types::Fd(dir.as_raw_fd());
     let mut ring = IoUring::new(RING_DEPTH).ok()?; // creation IS the capability probe
 
@@ -420,9 +496,9 @@ fn probe_live_set_iouring(_proc_root: &Path) -> Option<BTreeSet<u32>> {
     None
 }
 
-fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
+fn probe_live_set_sync(proc_root: &Path, bounds: (u32, Option<(u32, u32)>)) -> BTreeSet<u32> {
     let mut set = BTreeSet::new();
-    let (upper, wrap_tail) = pid_scan_bounds();
+    let (upper, wrap_tail) = bounds;
 
     let mut counter: u32 = 0;
     let mut probe = |pid: u32, set: &mut BTreeSet<u32>| {
@@ -446,9 +522,14 @@ fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
     set
 }
 
-fn pid_scan_bounds() -> (u32, Option<(u32, u32)>) {
-    let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
-    let ns_last = read_u32_sysfile("/proc/sys/kernel/ns_last_pid").unwrap_or(pid_max);
+/// Returns `(upper, wrap_tail, pid_max_if_known)`. The third element is what
+/// stops the fallback from silently disabling the disclosure (R27-50).
+fn pid_scan_bounds(proc_root: &Path) -> (u32, Option<(u32, u32)>, Option<u32>) {
+    let pid_max_read = read_u32_sysfile(&proc_root.join("sys/kernel/pid_max"));
+    let pid_max = pid_max_read.unwrap_or(PID_MAX_FALLBACK);
+    // ns_last_pid defaulting to pid_max is the SAFE direction: assume the
+    // allocator cursor is at the top and probe the whole range.
+    let ns_last = read_u32_sysfile(&proc_root.join("sys/kernel/ns_last_pid")).unwrap_or(pid_max);
     let upper = ns_last.min(pid_max);
 
     let near_wrap =
@@ -459,27 +540,26 @@ fn pid_scan_bounds() -> (u32, Option<(u32, u32)>) {
         None
     };
 
-    // Raw-Truth: only reachable on the Tier-C sync path (Tier-B scans the full
-    // range). If the allocator has wrapped and the cursor sits below still-live
-    // high PIDs, (upper, pid_max] is not exhaustively probed unless the wrap
-    // tail covers it — record the gap rather than hide it.
-    if tail.is_none() && upper < pid_max {
-        coverage::record(format!(
-            "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
-             probed (bounded by ns_last_pid={}); a hidden PID above the \
-             allocator cursor after a wrap could be missed. Enable io_uring \
-             for a full-range scan.",
-            upper + 1,
-            pid_max,
-            upper
-        ));
-    }
-
-    (upper, tail)
+    (upper, tail, pid_max_read)
 }
 
-fn read_u32_sysfile(path: &str) -> Option<u32> {
-    let (content, _) = safe_io::read_file_capped(path, 64).ok()?;
+/// Should the sync-fallback coverage gap be disclosed? Pure, so the tautology
+/// that used to hide it (`fallback < fallback`) cannot come back.
+fn should_report_scan_gap(
+    upper: u32,
+    tail: Option<(u32, u32)>,
+    pid_max_known: Option<u32>,
+) -> bool {
+    match pid_max_known {
+        // Unknown upper bound: the scan is bounded by a guess. Always disclose.
+        None => true,
+        Some(pid_max) => tail.is_none() && upper < pid_max,
+    }
+}
+
+fn read_u32_sysfile(path: &Path) -> Option<u32> {
+    // 64 bytes: both files hold one decimal, pid_max ≤ 4194304 (7 digits).
+    let (content, _) = safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 64).ok()?;
     content.trim().parse().ok()
 }
 
@@ -495,56 +575,40 @@ fn kill_exists(pid: u32) -> bool {
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn read_state_and_age(proc_root: &Path, pid: u32) -> (Option<String>, Option<u64>) {
+fn read_state_and_age(
+    proc_root: &Path,
+    pid: u32,
+    uptime_secs: Option<u64>,
+) -> (Option<String>, Option<u64>) {
     let path = proc_root.join(pid.to_string()).join("stat");
-    let content = match safe_io::read_file_capped(path.to_string_lossy().as_ref(), 8192) {
+    let content = match safe_io::read_procfs_capped(path.to_string_lossy().as_ref(), 8192) {
         Ok((c, _)) => c,
         Err(_) => return (None, None),
     };
-    parse_stat_state_age(&content)
+    parse_stat_state_age(&content, uptime_secs)
 }
 
-fn parse_stat_state_age(content: &str) -> (Option<String>, Option<u64>) {
+fn parse_stat_state_age(content: &str, uptime_secs: Option<u64>) -> (Option<String>, Option<u64>) {
     let Some(rparen) = content.rfind(')') else {
         return (None, None);
     };
-    let after = content[rparen + 1..].trim_start();
-    let fields: Vec<&str> = after.split_ascii_whitespace().collect();
-    // Defensive: parity with parse_tgid_and_state — one ASCII-alphabetic char
-    // only, so a malformed/hostile stat can't inject escape bytes as "state".
-    let state = fields
-        .first()
+
+    let state = content[rparen + 1..]
+        .split_ascii_whitespace()
+        .next()
         .and_then(|s| s.chars().next())
         .filter(|c| c.is_ascii_alphabetic())
         .map(|c| c.to_string());
 
-    let age = fields
-        .get(19)
-        .and_then(|s| s.parse::<u64>().ok())
-        .and_then(|starttime_ticks| {
-            let hz = clock_ticks_per_sec();
-            let uptime = read_uptime_secs()?;
-            let start_secs = starttime_ticks / hz;
-            Some(uptime.saturating_sub(start_secs))
-        });
+    // R27-39: None on every failure, never a saturated 0. `confirmed_ioc` is
+    // gated on age, so a fabricated "0 seconds old" downgrades every SEC-024
+    // to SEC-025 and clears compromised_host.
+    let age = crate::proc_time::starttime_ticks(content)
+        .zip(crate::proc_time::clock_ticks_per_sec())
+        .zip(uptime_secs)
+        .and_then(|((ticks, hz), up)| crate::proc_time::age_from_parts(ticks, hz, up));
 
     (state, age)
-}
-
-fn clock_ticks_per_sec() -> u64 {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz > 0 { hz as u64 } else { 100 }
-}
-
-fn read_uptime_secs() -> Option<u64> {
-    let (content, _) = safe_io::read_file_capped("/proc/uptime", 128).ok()?;
-    content
-        .split_whitespace()
-        .next()?
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
 }
 
 fn socket_owning_pids() -> BTreeSet<u32> {
@@ -657,22 +721,23 @@ mod tests {
 
     #[test]
     fn parse_stat_simple() {
-        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 20 0 1 0 8877 0 0";
-        let (state, _age) = parse_stat_state_age(s);
+        // Corrected fixture: 20 fields after comm, starttime at index 19.
+        let s = "1234 (bash) R 1 1234 1234 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 6000";
+        let (state, _age) = parse_stat_state_age(s, Some(3600));
         assert_eq!(state.as_deref(), Some("R"));
     }
 
     #[test]
     fn parse_stat_comm_with_spaces_and_paren() {
         let s = "77 (evil )( proc) S 1 77 77 0 -1 0 0 0 0 0 0 0 20 0 1 0 5000 0 0";
-        let (state, _) = parse_stat_state_age(s);
+        let (state, _) = parse_stat_state_age(s, Some(3600));
         assert_eq!(state.as_deref(), Some("S"), "last ')' must delimit comm");
     }
 
     #[test]
     fn parse_stat_zombie_state() {
         let s = "9 (dead) Z 1 9 9 0 -1 0 0 0 0 0 0 0 20 0 1 0 100 0 0";
-        let (state, _) = parse_stat_state_age(s);
+        let (state, _) = parse_stat_state_age(s, Some(3600));
         assert_eq!(state.as_deref(), Some("Z"));
     }
 
@@ -689,7 +754,10 @@ mod tests {
 
     #[test]
     fn parse_stat_malformed_no_paren() {
-        assert_eq!(parse_stat_state_age("garbage no paren"), (None, None));
+        assert_eq!(
+            parse_stat_state_age("garbage no paren", Some(3600)),
+            (None, None)
+        );
     }
 
     // ── kill arbiter ────────────────────────────────────────
@@ -740,7 +808,7 @@ mod tests {
         // rootkit-controlled stat smuggling an escape as the state token
         let s = "1 (x) \x1b[31mZ 1 1 1 0 -1 0 0 0 0 0 0 0 20 0 1 0 100 0 0";
         assert_eq!(
-            parse_stat_state_age(s).0,
+            parse_stat_state_age(s, Some(3600)).0,
             None,
             "non-alpha first char dropped"
         );
@@ -758,23 +826,59 @@ mod tests {
 
     // ── pid scan bounds heuristic ───────────────────────────
 
+    fn fake_proc_sys(root: &Path, pid_max: u32, ns_last: u32) {
+        let d = root.join("sys/kernel");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("pid_max"), format!("{pid_max}\n")).unwrap();
+        fs::write(d.join("ns_last_pid"), format!("{ns_last}\n")).unwrap();
+    }
+
     #[test]
-    fn wrap_tail_math() {
-        let bounds = |ns_last: u64, pid_max: u64| -> (u32, Option<(u32, u32)>) {
-            let upper = ns_last.min(pid_max) as u32;
-            let near = (upper as u64) > pid_max * 9 / 10;
-            let tail = if near && (upper as u64) < pid_max {
-                Some((upper + 1, pid_max as u32))
-            } else {
-                None
-            };
-            (upper, tail)
-        };
-        assert_eq!(bounds(5000, 4_194_304), (5000, None));
-        let (u, t) = bounds(4_000_000, 4_194_304);
-        assert_eq!(u, 4_000_000);
-        assert!(t.is_some());
-        assert_eq!(bounds(4_194_304, 4_194_304), (4_194_304, None));
+    fn wrap_tail_math_exercises_the_real_bounds_fn() {
+        // Previously this test carried its own copy of the arithmetic with `9 / 10`
+        // inlined, so changing WRAP_TAIL_FRACTION could not fail it (R27-51).
+        let tmp = tempfile::tempdir().unwrap();
+
+        fake_proc_sys(tmp.path(), 4_194_304, 5_000);
+        assert_eq!(pid_scan_bounds(tmp.path()), (5_000, None, Some(4_194_304)));
+
+        fake_proc_sys(tmp.path(), 4_194_304, 4_000_000);
+        let (upper, tail, known) = pid_scan_bounds(tmp.path());
+        assert_eq!((upper, known), (4_000_000, Some(4_194_304)));
+        assert_eq!(
+            tail,
+            Some((4_000_001, 4_194_304)),
+            "wrap tail covers the top"
+        );
+
+        fake_proc_sys(tmp.path(), 4_194_304, 4_194_304);
+        assert_eq!(
+            pid_scan_bounds(tmp.path()).1,
+            None,
+            "cursor at pid_max: no tail"
+        );
+
+        // pid_max absent ⇒ fallback applied, third element stays None so the caller
+        // discloses it (R27-50).
+        fs::remove_file(tmp.path().join("sys/kernel/pid_max")).unwrap();
+        assert_eq!(pid_scan_bounds(tmp.path()).2, None);
+    }
+
+    #[test]
+    fn unknown_pid_max_is_always_disclosed() {
+        // The old guard compared the fallback against itself and was false, so the
+        // narrowed scan reported clean.
+        assert!(should_report_scan_gap(PID_MAX_FALLBACK, None, None));
+        // Known bound, fully covered: nothing to say.
+        assert!(!should_report_scan_gap(4_194_304, None, Some(4_194_304)));
+        // Known bound, cursor short of it: the original case.
+        assert!(should_report_scan_gap(1_000, None, Some(4_194_304)));
+        // A wrap tail means the top of the range was probed after all.
+        assert!(!should_report_scan_gap(
+            1_000,
+            Some((4_100_000, 4_194_304)),
+            Some(4_194_304)
+        ));
     }
 
     // ── end-to-end over a fake /proc (readdir vs a planted "hidden" PID) ──
@@ -786,6 +890,10 @@ mod tests {
     /// logic via detect() semantics: here we verify a CLEAN root yields nothing.
     fn make_proc(pids: &[u32]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
+        // Bound the brute-force to the planted PIDs instead of inheriting the
+        // CI host's ns_last_pid, which varies by three orders of magnitude
+        // between a fresh runner and a long-lived builder (R27-51).
+        fake_proc_sys(tmp.path(), 4096, 300);
         for &pid in pids {
             let d = tmp.path().join(pid.to_string());
             fs::create_dir_all(d.join("fd")).unwrap();
@@ -842,5 +950,30 @@ mod tests {
             }
         }
         assert!(has_sock);
+    }
+
+    // ── new R27-39 age tests ────────────────────────────────
+
+    #[test]
+    fn ghost_age_is_none_when_clocks_disagree() {
+        // lxcfs: container uptime vs host-boot starttime. Saturating to 0 here
+        // downgrades every SEC-024 to SEC-025 and clears compromised_host.
+        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100000000";
+        let (state, age) = parse_stat_state_age(s, Some(60));
+        assert_eq!(state.as_deref(), Some("R"));
+        assert_eq!(age, None, "an impossible age must not read as young");
+    }
+
+    #[test]
+    fn ghost_age_is_none_when_uptime_unavailable() {
+        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 8877";
+        assert_eq!(parse_stat_state_age(s, None).1, None);
+    }
+
+    #[test]
+    fn ghost_age_is_computed_when_clocks_agree() {
+        let s = "1234 (bash) R 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6000";
+        // 6000 ticks / 100 = 60 s since boot; uptime 3600 ⇒ age 3540.
+        assert_eq!(parse_stat_state_age(s, Some(3600)).1, Some(3540));
     }
 }

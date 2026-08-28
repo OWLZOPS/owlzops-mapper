@@ -44,6 +44,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: "v4-gcc-force"
+          shared-key: ${{ matrix.os }}   # isolate cache per OS to avoid glibc mismatch
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -65,8 +66,95 @@ jobs:
             exit 1
           fi
 
+      - name: Install ripgrep
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      # R26-02/17/29/31/33/36/40/43/44/48: capped-I/O doctrine.
+      - name: Guard capped-I/O doctrine
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          set -uo pipefail
+          fail=0
+
+          # Old generic names must not exist: read_procfs_* asserts a pseudo-fs
+          # path, read_file_capped_regular asserts a host-controlled one.
+          if rg -n 'read_file_(bytes_)?capped\(' src/ | rg -v '^src/safe_io\.rs:' ; then
+            echo "::error::renamed API — use read_procfs_capped for /proc,/sys or read_file_capped_regular for host paths"
+            fail=1
+          fi
+
+          # R26-48(b): `rg -P` exits non-zero when the build lacks PCRE2, which
+          # inside `if` reads as "no matches" — the guard would silently stop
+          # running while the step stays green. Fail loudly instead.
+          if ! printf 'x\n' | rg -qP 'x' 2>/dev/null ; then
+            echo "::error::ripgrep in this image has no PCRE2 (-P); the literal-path guard cannot run"
+            fail=1
+          fi
+
+          # R26-43: a procfs reader given a LITERAL path that is not a kernel
+          # pseudo-file. Variable paths stay author-asserted; literals are
+          # exactly how R26-02 happened. -U: rustfmt breaks long literal args
+          # onto the next line — the shape provenance.rs had before R26-38.
+          if rg -U -n -P 'read_procfs_(bytes_)?capped\(\s*"(?!/proc/|/sys/)' src/ \
+               | rg -v '^src/safe_io\.rs:' ; then
+            echo "::error::read_procfs_* on literal non-pseudo-fs path — use read_file_capped_regular"
+            fail=1
+          fi
+
+          # Raw blocking opens outside safe_io. Streaming call sites use
+          # safe_io::open_regular_streaming; genuine exceptions carry an inline
+          # `// CAPPED_IO_OK: <why>` (R26-40). `/dev` is NOT exempt (R26-44).
+          if rg -n 'fs::read_to_string\(|File::open\(' src/ \
+               | rg -v '^src/safe_io\.rs:' \
+               | rg -v '/proc|/sys|CAPPED_IO_OK' ; then
+            echo "::error::uncapped blocking open — use read_file_capped_regular/open_regular_streaming, or annotate CAPPED_IO_OK"
+            fail=1
+          fi
+
+          # Every sanitizer backs onto the shared predicate (R25-65/R26-07).
+          for f in $(rg -l 'fn sanitize_' src/); do
+            rg -q 'is_terminal_unsafe|sanitize_for_document' "$f" \
+              || { echo "::error file=$f::sanitizer does not use the shared predicate"; fail=1; }
+          done
+
+          # No fork of `which` (R26-04).
+          if rg -n '"which"' src/ ; then
+            echo "::error::use resolve_tool, not a fork of which"
+            fail=1
+          fi
+
+          exit $fail
+
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  check-commit-refs:
+    name: Check remediation references
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # R25-70: need the PR merge-base, not just HEAD~1.
+          fetch-depth: 0
+
+      - name: Check commit references against diff
+        env:
+          # Empty outside pull_request; the script falls back to HEAD~1.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/check_commit_refs.sh
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Check env var manipulation gate
+        run: bash .github/scripts/check_env_var_gate.sh
+
+      - name: Doctrine gates (R27-14 / R27-17 / R27-18)
+        run: bash .github/scripts/check_doctrine_gates.sh
 
   build-macos-orchestrator:
     name: Build macOS orchestrator

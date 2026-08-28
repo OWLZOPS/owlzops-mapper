@@ -384,7 +384,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
             continue;
         };
 
-        let comm = match safe_io::read_file_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
+        let comm = match safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
             Ok((c, _)) => c.trim().to_string(),
             Err(_) => continue,
         };
@@ -392,7 +392,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         let mut pid_hits = 0usize;
 
         // --- 1. ENVIRON SCAN ---
-        if let Ok((data, truncated)) = safe_io::read_file_bytes_capped(
+        if let Ok((data, truncated)) = safe_io::read_procfs_bytes_capped(
             &format!("{proc_root}/{pid}/environ"),
             safe_io::CAP_PROC_ENVIRON,
         ) {
@@ -437,7 +437,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         // --- 2. MAPS SCAN ---
         if findings.len() < MAX_FINDINGS {
             if let Ok((content, truncated)) =
-                safe_io::read_file_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
+                safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
             {
                 if truncated {
                     coverage::record(format!(
