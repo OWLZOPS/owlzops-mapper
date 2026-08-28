@@ -76,6 +76,26 @@ fn note_self_eacces(entry: &str) -> bool {
     }
 }
 
+/// Reason string for a leak attributed to our own process, keyed on the source.
+/// Single source of truth so a second `source` cannot inherit the first one's
+/// explanation by copy-paste (R27-46).
+fn self_attribution(source: &str) -> String {
+    match source {
+        "environ" => "owlzops-mapper's own process — a secret still in our initial \
+                      environment means the R27-13 scrub did not run"
+            .to_string(),
+        "cmdline" => "owlzops-mapper's own process — a secret on our own command line. \
+                      The R27-13 scrub covers the environment only; argv is served from \
+                      /proc/self/cmdline (mode 0444, no ptrace check) and is readable by \
+                      any user on the host"
+            .to_string(),
+        other => format!(
+            "owlzops-mapper's own process — secret found in {other}; no attribution \
+             text is defined for this source"
+        ),
+    }
+}
+
 /// Age of `pid` in seconds, or `None` when it cannot be established.
 ///
 /// `None` is load-bearing: SEC-014 treats unknown age as long-lived and keeps
@@ -155,6 +175,21 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
         // many sensitive keys it carries.
         let mut age_memo: Option<Option<u64>> = None;
 
+        // R27-46: one construction site. The three hand-written copies had already
+        // drifted — both cmdline blocks carried the environ scrub's explanation.
+        let mut push_leak = |source: &'static str, matched_key: String| {
+            leaks.push(SecretLeak {
+                pid,
+                process: process_name.clone(),
+                source: source.to_string(),
+                matched_key,
+                self_attributed: self_pid.map(|_| self_attribution(source)),
+                age_secs: *age_memo.get_or_insert_with(|| {
+                    uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
+                }),
+            });
+        };
+
         // 1. Environment Variables
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{}/environ", pid);
@@ -172,20 +207,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                     };
 
                     if is_sensitive_key(key) {
-                        leaks.push(SecretLeak {
-                            pid,
-                            process: process_name.clone(),
-                            source: "environ".to_string(),
-                            matched_key: key.to_string(),
-                            self_attributed: self_pid.map(|_| {
-                                "owlzops-mapper's own process — a secret still in our \
-                                 initial environment means the R27-13 scrub did not run"
-                                    .to_string()
-                            }),
-                            age_secs: *age_memo.get_or_insert_with(|| {
-                                uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
-                            }),
-                        });
+                        push_leak("environ", key.to_string());
                     }
                 }
             }
@@ -210,20 +232,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
 
                     for &flag in SENSITIVE_FLAGS {
                         if starts_with_icase(arg, flag) {
-                            leaks.push(SecretLeak {
-                                pid,
-                                process: process_name.clone(),
-                                source: "cmdline".to_string(),
-                                matched_key: flag.to_string(),
-                                self_attributed: self_pid.map(|_| {
-                                    "owlzops-mapper's own process — a secret still in our \
-                                     initial environment means the R27-13 scrub did not run"
-                                        .to_string()
-                                }),
-                                age_secs: *age_memo.get_or_insert_with(|| {
-                                    uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
-                                }),
-                            });
+                            push_leak("cmdline", flag.to_string());
                         }
                     }
 
@@ -232,20 +241,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                         && let Some(pwd) = arg.strip_prefix("-p")
                         && !pwd.is_empty()
                     {
-                        leaks.push(SecretLeak {
-                            pid,
-                            process: process_name.clone(),
-                            source: "cmdline".to_string(),
-                            matched_key: "mysql-password".to_string(),
-                            self_attributed: self_pid.map(|_| {
-                                "owlzops-mapper's own process — a secret still in our \
-                                 initial environment means the R27-13 scrub did not run"
-                                    .to_string()
-                            }),
-                            age_secs: *age_memo.get_or_insert_with(|| {
-                                uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
-                            }),
-                        });
+                        push_leak("cmdline", "mysql-password".to_string());
                     }
                 }
             }
@@ -328,6 +324,25 @@ mod tests {
             note_self_eacces("cmdline"),
             "0444 — unexplained, must be counted"
         );
+    }
+
+    #[test]
+    fn self_attribution_matches_its_source() {
+        let env = self_attribution("environ");
+        let cmd = self_attribution("cmdline");
+        assert!(env.contains("initial environment") && env.contains("R27-13"));
+        assert!(
+            !cmd.contains("scrub did not run"),
+            "the environ scrub does not explain a secret on our own argv"
+        );
+        assert!(
+            !cmd.contains("initial environment"),
+            "cmdline explanation must not point at the environ scrub"
+        );
+        assert!(cmd.contains("command line"));
+        // An unfamiliar source must name itself, not borrow someone else's reason.
+        let other = self_attribution("maps");
+        assert!(other.contains("maps") && !other.contains("R27-13"));
     }
 
     #[test]
