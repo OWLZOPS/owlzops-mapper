@@ -61,6 +61,10 @@ const MAX_FINDINGS: usize = 64;
 const YIELD_EVERY: u32 = 8192;
 const WRAP_TAIL_FRACTION: u64 = 10;
 
+/// Fallback used when `/proc/sys/kernel/pid_max` cannot be read. Never applied
+/// silently — the caller discloses it (R27-50).
+const PID_MAX_FALLBACK: u32 = 32_768;
+
 pub fn scan_ghost_pids(deep: bool) -> Vec<GhostPidFinding> {
     detect(Path::new("/proc"), deep)
 }
@@ -160,18 +164,25 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // The sync fallback bounds the scan to ns_last_pid. Record that gap
         // ONCE per ghost-pid invocation, not once per probe cycle (R25-94).
         if used_sync && !sync_skip_recorded {
-            let (upper, tail) = pid_scan_bounds();
-            let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
-            if tail.is_none() && upper < pid_max {
-                coverage::record(format!(
-                    "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
-                     probed (bounded by ns_last_pid={}); a hidden PID above the \
-                     allocator cursor after a wrap could be missed. Enable io_uring \
-                     for a full-range scan.",
-                    upper + 1,
-                    pid_max,
-                    upper
-                ));
+            let (upper, tail, pid_max_known) = pid_scan_bounds();
+            if should_report_scan_gap(upper, tail, pid_max_known) {
+                coverage::record(match pid_max_known {
+                    None => format!(
+                        "ghost-pid scan (sync fallback): /proc/sys/kernel/pid_max unreadable — \
+                         the scan was bounded at {PID_MAX_FALLBACK} as a fallback. systemd sets \
+                         4194304, so a hidden PID above the fallback was NOT probed. \
+                         Hidden-process coverage INCOMPLETE."
+                    ),
+                    Some(pid_max) => format!(
+                        "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
+                         probed (bounded by ns_last_pid={}); a hidden PID above the \
+                         allocator cursor after a wrap could be missed. Enable io_uring \
+                         for a full-range scan.",
+                        upper + 1,
+                        pid_max,
+                        upper
+                    ),
+                });
             }
             sync_skip_recorded = true;
         }
@@ -380,7 +391,7 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
     const RING_DEPTH: u32 = 4096;
     const WINDOW: usize = 4096; // in-flight SQEs; also bounds statx-buf memory
 
-    let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
+    let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(PID_MAX_FALLBACK);
     let dir = File::open(proc_root).ok()?; // CAPPED_IO_OK: proc directory, not a host-controlled file
     let dfd = types::Fd(dir.as_raw_fd());
     let mut ring = IoUring::new(RING_DEPTH).ok()?; // creation IS the capability probe
@@ -479,7 +490,7 @@ fn probe_live_set_iouring(_proc_root: &Path) -> Option<BTreeSet<u32>> {
 
 fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
     let mut set = BTreeSet::new();
-    let (upper, wrap_tail) = pid_scan_bounds();
+    let (upper, wrap_tail, _pid_max_known) = pid_scan_bounds();
 
     let mut counter: u32 = 0;
     let mut probe = |pid: u32, set: &mut BTreeSet<u32>| {
@@ -503,8 +514,13 @@ fn probe_live_set_sync(proc_root: &Path) -> BTreeSet<u32> {
     set
 }
 
-fn pid_scan_bounds() -> (u32, Option<(u32, u32)>) {
-    let pid_max = read_u32_sysfile("/proc/sys/kernel/pid_max").unwrap_or(32_768);
+/// Returns `(upper, wrap_tail, pid_max_if_known)`. The third element is what
+/// stops the fallback from silently disabling the disclosure (R27-50).
+fn pid_scan_bounds() -> (u32, Option<(u32, u32)>, Option<u32>) {
+    let pid_max_read = read_u32_sysfile("/proc/sys/kernel/pid_max");
+    let pid_max = pid_max_read.unwrap_or(PID_MAX_FALLBACK);
+    // ns_last_pid defaulting to pid_max is the SAFE direction: assume the
+    // allocator cursor is at the top and probe the whole range.
     let ns_last = read_u32_sysfile("/proc/sys/kernel/ns_last_pid").unwrap_or(pid_max);
     let upper = ns_last.min(pid_max);
 
@@ -516,7 +532,21 @@ fn pid_scan_bounds() -> (u32, Option<(u32, u32)>) {
         None
     };
 
-    (upper, tail)
+    (upper, tail, pid_max_read)
+}
+
+/// Should the sync-fallback coverage gap be disclosed? Pure, so the tautology
+/// that used to hide it (`fallback < fallback`) cannot come back.
+fn should_report_scan_gap(
+    upper: u32,
+    tail: Option<(u32, u32)>,
+    pid_max_known: Option<u32>,
+) -> bool {
+    match pid_max_known {
+        // Unknown upper bound: the scan is bounded by a guess. Always disclose.
+        None => true,
+        Some(pid_max) => tail.is_none() && upper < pid_max,
+    }
 }
 
 fn read_u32_sysfile(path: &str) -> Option<u32> {
@@ -789,7 +819,7 @@ mod tests {
 
     #[test]
     fn wrap_tail_math() {
-        let bounds = |ns_last: u64, pid_max: u64| -> (u32, Option<(u32, u32)>) {
+        let bounds = |ns_last: u64, pid_max: u64| -> (u32, Option<(u32, u32)>, Option<u32>) {
             let upper = ns_last.min(pid_max) as u32;
             let near = (upper as u64) > pid_max * 9 / 10;
             let tail = if near && (upper as u64) < pid_max {
@@ -797,13 +827,34 @@ mod tests {
             } else {
                 None
             };
-            (upper, tail)
+            (upper, tail, Some(pid_max as u32))
         };
-        assert_eq!(bounds(5000, 4_194_304), (5000, None));
-        let (u, t) = bounds(4_000_000, 4_194_304);
+        assert_eq!(bounds(5000, 4_194_304), (5000, None, Some(4_194_304)));
+        let (u, t, known) = bounds(4_000_000, 4_194_304);
         assert_eq!(u, 4_000_000);
         assert!(t.is_some());
-        assert_eq!(bounds(4_194_304, 4_194_304), (4_194_304, None));
+        assert_eq!(known, Some(4_194_304));
+        assert_eq!(
+            bounds(4_194_304, 4_194_304),
+            (4_194_304, None, Some(4_194_304))
+        );
+    }
+
+    #[test]
+    fn unknown_pid_max_is_always_disclosed() {
+        // The old guard compared the fallback against itself and was false, so the
+        // narrowed scan reported clean.
+        assert!(should_report_scan_gap(PID_MAX_FALLBACK, None, None));
+        // Known bound, fully covered: nothing to say.
+        assert!(!should_report_scan_gap(4_194_304, None, Some(4_194_304)));
+        // Known bound, cursor short of it: the original case.
+        assert!(should_report_scan_gap(1_000, None, Some(4_194_304)));
+        // A wrap tail means the top of the range was probed after all.
+        assert!(!should_report_scan_gap(
+            1_000,
+            Some((4_100_000, 4_194_304)),
+            Some(4_194_304)
+        ));
     }
 
     // ── end-to-end over a fake /proc (readdir vs a planted "hidden" PID) ──
