@@ -157,7 +157,7 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
     let (upper_bound, wrap_tail, pid_max_known) = pid_scan_bounds(proc_root);
 
     let mut stable: Option<BTreeSet<u32>> = None;
-    let mut sync_skip_recorded = false;
+    let mut scan_gap_recorded = false;
 
     for cycle in 0..PROBE_CYCLES {
         // "readdir sandwich": snapshot readdir BEFORE and AFTER the slow live
@@ -166,32 +166,36 @@ fn detect(proc_root: &Path, deep: bool) -> Vec<GhostPidFinding> {
         // manufacture transient candidates that defeat the clean-host early
         // exit. A genuinely hidden PID is in neither readdir and survives.
         let listed_before = readdir_pids(proc_root);
-        let (live, used_sync) = probe_live_set(proc_root, (upper_bound, wrap_tail));
+        let (live, used_sync) = probe_live_set(
+            proc_root,
+            (upper_bound, wrap_tail),
+            pid_max_known.unwrap_or(PID_MAX_FALLBACK),
+        );
         let listed_after = readdir_pids(proc_root);
 
-        // The sync fallback bounds the scan to ns_last_pid. Record that gap
-        // ONCE per ghost-pid invocation, not once per probe cycle (R25-94).
-        if used_sync && !sync_skip_recorded {
-            if should_report_scan_gap(upper_bound, wrap_tail, pid_max_known) {
-                coverage::record(match pid_max_known {
-                    None => format!(
-                        "ghost-pid scan (sync fallback): /proc/sys/kernel/pid_max unreadable — \
-                         the scan was bounded at {PID_MAX_FALLBACK} as a fallback. systemd sets \
-                         4194304, so a hidden PID above the fallback was NOT probed. \
-                         Hidden-process coverage INCOMPLETE."
-                    ),
-                    Some(pid_max) => format!(
-                        "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively \
-                         probed (bounded by ns_last_pid={}); a hidden PID above the \
-                         allocator cursor after a wrap could be missed. Enable io_uring \
-                         for a full-range scan.",
-                        upper_bound + 1,
-                        pid_max,
-                        upper_bound
-                    ),
-                });
+        // R27-50/R27-51: An unreadable pid_max narrows BOTH tiers; the
+        // ns_last_pid gap is Tier-C only. One flag used to conflate them, so
+        // the io_uring path disclosed nothing at all (R27-55).
+        if !scan_gap_recorded {
+            if pid_max_known.is_none() {
+                coverage::record(format!(
+                    "ghost-pid scan: /proc/sys/kernel/pid_max unreadable — the scan was \
+                     bounded at {PID_MAX_FALLBACK} as a fallback. systemd sets 4194304, so a \
+                     hidden PID above the fallback was NOT probed. \
+                     Hidden-process coverage INCOMPLETE."
+                ));
+                scan_gap_recorded = true;
+            } else if used_sync && should_report_scan_gap(upper_bound, wrap_tail, pid_max_known) {
+                coverage::record(format!(
+                    "ghost-pid scan (sync fallback): PIDs {}..={} not exhaustively probed \
+                     (bounded by ns_last_pid={}); a hidden PID above the allocator cursor \
+                     after a wrap could be missed. Enable io_uring for a full-range scan.",
+                    upper_bound + 1,
+                    pid_max_known.unwrap_or(PID_MAX_FALLBACK),
+                    upper_bound
+                ));
+                scan_gap_recorded = true;
             }
-            sync_skip_recorded = true;
         }
 
         // R11-09 + R11-10: filter out threads AT CANDIDATE CONSTRUCTION so the
@@ -381,9 +385,15 @@ fn candidate_diff(
 
 // ── live-set probe (Tier-B io_uring, Tier-C sync fallback) ────────────────
 
-fn probe_live_set(proc_root: &Path, bounds: (u32, Option<(u32, u32)>)) -> (BTreeSet<u32>, bool) {
+/// R27-50/R27-51: pid_max resolved once in `detect` and passed in; no direct
+/// /proc read here, no silent fallback.
+fn probe_live_set(
+    proc_root: &Path,
+    bounds: (u32, Option<(u32, u32)>),
+    pid_max: u32,
+) -> (BTreeSet<u32>, bool) {
     if proc_root == Path::new("/proc")
-        && let Some(set) = probe_live_set_iouring(proc_root)
+        && let Some(set) = probe_live_set_iouring(proc_root, pid_max)
     {
         return (set, false);
     }
@@ -393,13 +403,11 @@ fn probe_live_set(proc_root: &Path, bounds: (u32, Option<(u32, u32)>)) -> (BTree
 // Full io_uring implementation is only available on glibc Linux.
 // musl libc does not expose `statx` or `AT_STATX_DONT_SYNC`.
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
+fn probe_live_set_iouring(proc_root: &Path, pid_max: u32) -> Option<BTreeSet<u32>> {
     use io_uring::{IoUring, opcode, types};
     const RING_DEPTH: u32 = 4096;
     const WINDOW: usize = 4096; // in-flight SQEs; also bounds statx-buf memory
 
-    let pid_max =
-        read_u32_sysfile(Path::new("/proc/sys/kernel/pid_max")).unwrap_or(PID_MAX_FALLBACK);
     let dir = File::open(proc_root).ok()?; // CAPPED_IO_OK: proc directory, not a host-controlled file
     let dfd = types::Fd(dir.as_raw_fd());
     let mut ring = IoUring::new(RING_DEPTH).ok()?; // creation IS the capability probe
@@ -492,7 +500,7 @@ fn probe_live_set_iouring(proc_root: &Path) -> Option<BTreeSet<u32>> {
 
 // Stub for musl Linux (no `libc::statx`) and non-Linux platforms.
 #[cfg(any(not(target_os = "linux"), target_env = "musl"))]
-fn probe_live_set_iouring(_proc_root: &Path) -> Option<BTreeSet<u32>> {
+fn probe_live_set_iouring(_proc_root: &Path, _pid_max: u32) -> Option<BTreeSet<u32>> {
     None
 }
 
