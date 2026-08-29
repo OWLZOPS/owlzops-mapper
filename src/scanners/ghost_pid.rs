@@ -909,10 +909,13 @@ mod tests {
         for &pid in pids {
             let d = tmp.path().join(pid.to_string());
             fs::create_dir_all(d.join("fd")).unwrap();
-            // A minimal stat so read_state_and_age doesn't error.
+            // R27-54: corrected stat fixture — starttime must be the 20th field
+            // after comm (index 19). The previous string placed `100` at
+            // itrealvalue and left starttime at 0, so age was computed
+            // incorrectly in tests relying on this fake proc.
             fs::write(
                 d.join("stat"),
-                format!("{pid} (proc) S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 20 0 1 0 100 0 0"),
+                format!("{pid} (proc) S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100"),
             )
             .unwrap();
             fs::write(d.join("status"), make_status(pid, pid, "S")).unwrap();
