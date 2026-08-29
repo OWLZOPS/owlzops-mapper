@@ -915,13 +915,11 @@ mod tests {
     #[test]
     fn clean_proc_yields_no_ghosts() {
         // Every dir visible to readdir == visible to path-stat → empty diff.
-        // NB: detect() brute-forces the real ns_last_pid, but since our temp
-        // root only contains these dirs, path-stat for other PIDs is ENOENT,
-        // and readdir sees exactly these — diff is empty.
+        // Since R27-51 the scan range comes from the tempdir's own
+        // sys/kernel/{pid_max,ns_last_pid}, so nothing here depends on the CI
+        // host. Keep `fake_proc_sys` in `make_proc`: without it the bound falls
+        // back to PID_MAX_FALLBACK and every cycle does 32768 stats instead of 300.
         let proc = make_proc(&[1, 100, 200]);
-        // Constrain the brute-force to our small set by construction: PIDs not
-        // in the temp root don't exist as paths, so probe_live_set returns only
-        // {1,100,200} for the range that overlaps — and readdir returns the same.
         let ghosts = detect(proc.path(), false);
         assert!(ghosts.is_empty(), "clean root must yield no ghosts");
     }
@@ -937,23 +935,30 @@ mod tests {
     }
 
     #[test]
-    fn socket_link_detection_shape() {
-        // Verify the socket:[ ] prefix match used for corroboration.
+    fn socket_owning_pids_counts_socket_links_only() {
+        // Calls the real function. The previous version mirrored its inner loop,
+        // so a change to the `socket:[` matching could not fail it — the same
+        // defect wrap_tail_math had before R27-51 (R27-53).
         let tmp = tempfile::tempdir().unwrap();
-        let fd = tmp.path().join("fd");
-        fs::create_dir_all(&fd).unwrap();
-        symlink("socket:[123]", fd.join("3")).unwrap();
-        symlink("/dev/null", fd.join("0")).unwrap();
-        // Count socket links directly (mirrors socket_owning_pids inner loop).
-        let mut has_sock = false;
-        for e in fs::read_dir(&fd).unwrap().flatten() {
-            if let Ok(t) = fs::read_link(e.path())
-                && t.to_str().is_some_and(|s| s.starts_with("socket:["))
-            {
-                has_sock = true;
-            }
-        }
-        assert!(has_sock);
+
+        // 100: a socket fd among non-socket fds.
+        let fd100 = tmp.path().join("100/fd");
+        fs::create_dir_all(&fd100).unwrap();
+        symlink("/dev/null", fd100.join("0")).unwrap();
+        symlink("socket:[123]", fd100.join("3")).unwrap();
+
+        // 200: only non-socket fds. `pipe:[` must not be mistaken for a socket.
+        let fd200 = tmp.path().join("200/fd");
+        fs::create_dir_all(&fd200).unwrap();
+        symlink("pipe:[456]", fd200.join("1")).unwrap();
+
+        // 300: no fd dir at all — skipped, never counted as an owner.
+        fs::create_dir_all(tmp.path().join("300")).unwrap();
+
+        let owners = socket_owning_pids(tmp.path());
+        assert!(owners.contains(&100), "socket:[ ] link must count");
+        assert!(!owners.contains(&200), "pipe/anon links must not count");
+        assert!(!owners.contains(&300), "missing fd dir must not count");
     }
 
     // ── new R27-39 age tests ────────────────────────────────
