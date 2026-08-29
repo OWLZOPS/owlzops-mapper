@@ -34,11 +34,22 @@ pub struct VerdictCache {
     dirty: bool,
 }
 
-fn now() -> u64 {
+/// R27-56: wall-clock time as `Option` — never `unwrap_or(0)`, because a zero
+/// "now" makes any cached age 0 and the entry appears freshly written.
+fn now() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+}
+
+/// R27-56: an entry is stale if its age cannot be computed (unusable clock or
+/// backward step) — treat as expired, not as fresh.
+fn is_stale(e: &Entry, now: Option<u64>) -> bool {
+    e.version != CACHE_VERSION
+        || now
+            .and_then(|n| n.checked_sub(e.scanned_at))
+            .is_none_or(|age| age > TTL_SECS)
 }
 
 impl VerdictCache {
@@ -60,7 +71,8 @@ impl VerdictCache {
     /// Any mismatch → `None` → re‑verification required.
     pub fn lookup(&self, exe: &str) -> Option<Verdict> {
         let e = self.entries.get(exe)?;
-        if e.version != CACHE_VERSION || now().saturating_sub(e.scanned_at) > TTL_SECS {
+        // R27-56: backward clock or unusable clock expires the entry.
+        if is_stale(e, now()) {
             return None;
         }
         let m = std::fs::metadata(exe).ok()?;
@@ -75,6 +87,9 @@ impl VerdictCache {
         let Ok(m) = std::fs::metadata(exe) else {
             return;
         };
+        // R27-56: if the clock is unusable, store 0; lookup will treat the
+        // entry as expired (checked_sub returns None).
+        let scanned_at = now().unwrap_or(0);
         self.entries.insert(
             exe.to_string(),
             Entry {
@@ -82,7 +97,7 @@ impl VerdictCache {
                 mtime: m.mtime(),
                 size: m.len(),
                 verdict,
-                scanned_at: now(),
+                scanned_at,
                 version: CACHE_VERSION,
                 sha256: String::new(),
             },
@@ -111,5 +126,34 @@ impl VerdictCache {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backwards_clock_expires_the_entry() {
+        let e = Entry {
+            inode: 0,
+            mtime: 0,
+            size: 0,
+            verdict: Verdict::Benign,
+            scanned_at: 2_000,
+            version: CACHE_VERSION,
+            sha256: String::new(),
+        };
+        // R27-56: clock stepped back ⇒ expired, not fresh.
+        assert!(
+            is_stale(&e, Some(1_000)),
+            "clock stepped back ⇒ expired, not fresh"
+        );
+        // R27-56: unusable clock ⇒ expired.
+        assert!(is_stale(&e, None), "unusable clock ⇒ expired");
+        // Fresh boundary.
+        assert!(!is_stale(&e, Some(2_000 + TTL_SECS - 1)));
+        // Expired boundary.
+        assert!(is_stale(&e, Some(2_000 + TTL_SECS + 1)));
     }
 }
