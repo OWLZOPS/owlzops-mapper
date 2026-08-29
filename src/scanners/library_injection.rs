@@ -4,7 +4,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-#[cfg(feature = "local-scan")]
 use super::deep;
 use crate::coverage;
 use crate::models::LibraryInjectionFinding;
@@ -215,58 +214,6 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
         vendor_anchored,
         file_text_anchored,
     }
-}
-
-#[derive(Debug)]
-struct ExecCluster {
-    lo: u64,
-    hi: u64,
-    pages: usize,
-    span: u64,
-}
-
-fn build_exec_clusters(maps: &str) -> Vec<ExecCluster> {
-    const GAP: u64 = 64 * 1024;
-    let mut regions: Vec<(u64, u64)> = maps
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.splitn(6, char::is_whitespace);
-            let addr = it.next()?;
-            if it.next()?.as_bytes().get(2) != Some(&b'x') {
-                return None;
-            }
-            let (lo, hi) = addr.split_once('-')?;
-            Some((
-                u64::from_str_radix(lo, 16).ok()?,
-                u64::from_str_radix(hi, 16).ok()?,
-            ))
-        })
-        .collect();
-
-    regions.sort_unstable();
-    let mut out: Vec<ExecCluster> = Vec::new();
-    for (lo, hi) in regions {
-        match out.last_mut() {
-            Some(c) if lo.saturating_sub(c.hi) <= GAP => {
-                c.hi = hi;
-                c.pages += 1;
-                c.span = c.hi - c.lo;
-            }
-            _ => out.push(ExecCluster {
-                lo,
-                hi,
-                pages: 1,
-                span: hi - lo,
-            }),
-        }
-    }
-    out
-}
-
-fn is_inside_jit_cluster(addr_lo: u64, clusters: &[ExecCluster]) -> bool {
-    clusters
-        .iter()
-        .any(|c| (c.span >= 8 * 1024 * 1024 || c.pages >= 16) && addr_lo >= c.lo && addr_lo <= c.hi)
 }
 
 const TRAMP_MAX_BYTES: u64 = 4 * 4096;
@@ -503,7 +450,7 @@ fn scan_maps(
     findings: &mut Vec<LibraryInjectionFinding>,
 ) {
     let mut seen: Vec<String> = Vec::new();
-    let clusters = build_exec_clusters(content);
+    let clusters = deep::build_exec_clusters(content);
     let pool = is_trampoline_pool(content);
     let families = deleted_so_families(content);
     let trust_met = trust.exe_ok && (trust.runtime_libs || trust.vendor_anchored);
@@ -614,7 +561,7 @@ fn scan_maps(
         // V8/pointer-compression code cage: kernel maps as executable [heap].
         // Gate is the same JIT reservation as for AnonRwx (VMA layout, not name).
         let heap_in_reservation =
-            tier == ExecTier::ExecHeap && is_inside_jit_cluster(addr_lo, &clusters);
+            tier == ExecTier::ExecHeap && deep::is_inside_jit_cluster(addr_lo, &clusters);
 
         let mut downgrade: Option<&str> = if trust_met {
             match tier {
@@ -623,7 +570,7 @@ fn scan_maps(
                 // executable [heap] is more anomalous than anon-rwx and stays on
                 // the auditor's radar even under runtime trust.
                 ExecTier::ExecHeap if heap_in_reservation => Some("maps-rwx-provisional"),
-                ExecTier::AnonRwx if is_inside_jit_cluster(addr_lo, &clusters) => {
+                ExecTier::AnonRwx if deep::is_inside_jit_cluster(addr_lo, &clusters) => {
                     Some("maps-rwx-jit-hardening")
                 }
                 ExecTier::AnonRwx if small => Some(if pool {

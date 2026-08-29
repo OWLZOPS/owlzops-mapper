@@ -6,6 +6,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::coverage;
+
 const CACHE_VERSION: u32 = 1; // bump when deep logic changes → invalidates everything
 const TTL_SECS: u64 = 14 * 24 * 3600; // re-verify after 14 days (never "trust forever")
 
@@ -87,9 +89,18 @@ impl VerdictCache {
         let Ok(m) = std::fs::metadata(exe) else {
             return;
         };
-        // R27-56: if the clock is unusable, store 0; lookup will treat the
-        // entry as expired (checked_sub returns None).
-        let scanned_at = now().unwrap_or(0);
+        // R27-56: without a usable clock there is no honest `scanned_at`.
+        // Storing 0 would persist a "scanned in 1970" fact that only expires
+        // by arithmetic coincidence. Skip the entry: the next scan re-verifies,
+        // which is the correct behaviour for an unknown timestamp.
+        let Some(scanned_at) = now() else {
+            coverage::record(
+                "verdict cache: wall clock unusable — verdict for this binary not cached; \
+                 the next scan will re-verify"
+                    .to_string(),
+            );
+            return;
+        };
         self.entries.insert(
             exe.to_string(),
             Entry {

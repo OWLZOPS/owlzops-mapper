@@ -278,6 +278,34 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
     })
 }
 
+/// R27-59: parse only `Name` and `Uid` — the fields needed by the malware
+/// sweep and both emitted before `Groups:`. When a very long `Groups:` line
+/// pushes Cap* beyond the read cap, we can still run the sweep and skip only
+/// the capability checks. Returns `None` if either identity field is missing.
+fn parse_status_identity(content: &str) -> Option<(String, u32)> {
+    let mut name = None;
+    let mut euid = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key {
+            "Name" => name = Some(value.trim_ascii().to_string()),
+            "Uid" => {
+                euid = value
+                    .split_ascii_whitespace()
+                    .nth(1)
+                    .and_then(|f| f.parse().ok());
+            }
+            _ => {}
+        }
+        if name.is_some() && euid.is_some() {
+            break;
+        }
+    }
+    Some((name?, euid?))
+}
+
 // ── Kernel thread mimicry helper ────────────────────────────────────────
 
 /// Does this comm match a Linux kernel-thread naming pattern? Kernel threads
@@ -393,7 +421,59 @@ fn classify_suspicious(
 /// Hard cap on stored capability findings.
 const MAX_FINDINGS: usize = 64;
 /// status is ~1–3 KiB; 16 KiB leaves headroom for long Groups:/Cpus_allowed:.
+/// R27-59: `Groups:` can exceed this with thousands of supplementary groups,
+/// pushing Cap* out of the read buffer. Identity fields (Name/Uid) are before
+/// Groups and remain available for the malware sweep.
 const CAP_PROC_STATUS: usize = 16 * 1024;
+
+/// Perform the suspicious-process sweep for a single PID, using only identity
+/// fields. Used both in the normal path and when Cap* are missing (R27-59).
+fn sweep_process(
+    proc_root: &Path,
+    pid: u32,
+    name: &str,
+    euid: u32,
+    suspicious: &mut Vec<SuspiciousProcess>,
+    ambiguous_dropped: &mut usize,
+    mimic_inconclusive: &mut usize,
+) {
+    let exe_link = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    let cmdline_argv0 = if is_kthread_comm(name) {
+        let cpath = format!("{}/{pid}/cmdline", proc_root.display());
+        match safe_io::read_procfs_capped(&cpath, 4096) {
+            Ok((content, _)) => Some(content.split('\0').next().unwrap_or("").to_string()),
+            Err(e) => {
+                // Deliberately still not a mimic: comm alone is spoofable
+                // (RC-1) and SEC-020 sets compromised_host. But the gate ran
+                // and could not observe — that must not vanish.
+                *mimic_inconclusive += 1;
+                let _ = e;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (record, dropped) = classify_suspicious(
+        name,
+        pid,
+        euid,
+        exe_link.as_deref(),
+        cmdline_argv0.as_deref(),
+    );
+    if dropped {
+        *ambiguous_dropped += 1;
+    }
+    if let Some(sp) = record
+        && suspicious.len() < MAX_SUSPICIOUS
+    {
+        suspicious.push(sp);
+    }
+}
 
 /// Walk `proc_root` (production: `/proc`; tests: tempdir) and flag non-root
 /// processes with critical CapEff|CapPrm bits or any ambient set.
@@ -406,6 +486,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
     let mut denied = 0usize;
     let mut over_cap = 0usize;
     let mut ambiguous_dropped = 0usize;
+    let mut mimic_inconclusive = 0usize;
 
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -444,45 +525,47 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
             coverage::record(format!("{path_buf} truncated"));
         }
 
-        let Some(st) = parse_status(&content) else {
-            coverage::record(format!("{path_buf}: mandatory Cap*/Uid fields missing"));
-            continue;
+        // R27-59: Cap* are emitted after Groups:; a long Groups: line can push
+        // them past the cap. The sweep needs only Name+Uid, which are before
+        // Groups, so a truncated status must not remove the process from the
+        // malware sweep.
+        let st = match parse_status(&content) {
+            Some(st) => st,
+            None => {
+                let Some((name, euid)) = parse_status_identity(&content) else {
+                    coverage::record(format!(
+                        "{path_buf}: Name/Uid unreadable — process not swept"
+                    ));
+                    continue;
+                };
+                coverage::record(format!(
+                    "{path_buf}: Cap* fields missing (likely a long Groups: line) — \
+                     capability checks skipped for this pid, malware sweep still applied"
+                ));
+                sweep_process(
+                    proc_root,
+                    pid,
+                    &name,
+                    euid,
+                    &mut suspicious,
+                    &mut ambiguous_dropped,
+                    &mut mimic_inconclusive,
+                );
+                continue; // capability part skipped for this pid
+            }
         };
 
         // Suspicious-process sweep — runs for EVERY process (root included),
-        // BEFORE the capability euid==0 suppression. One readlink per process
-        // (required for fileless detection), reused for name exe_path.
-        let exe_link = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
-
-        // Mimicry gate: only touch cmdline for kthread-looking comms (cheap prefix
-        // check first avoids a read for the ~99% of normal processes). argv0 =
-        // bytes up to the first NUL (empty string for a real kthread).
-        let cmdline_argv0 = if is_kthread_comm(&st.name) {
-            let cpath = format!("{}/{pid}/cmdline", proc_root.display());
-            safe_io::read_procfs_capped(&cpath, 4096)
-                .ok()
-                .map(|(content, _)| content.split('\0').next().unwrap_or("").to_string())
-        } else {
-            None
-        };
-
-        let (record, dropped) = classify_suspicious(
-            &st.name,
+        // BEFORE the capability euid==0 suppression.
+        sweep_process(
+            proc_root,
             pid,
+            &st.name,
             st.euid,
-            exe_link.as_deref(),
-            cmdline_argv0.as_deref(),
+            &mut suspicious,
+            &mut ambiguous_dropped,
+            &mut mimic_inconclusive,
         );
-        if dropped {
-            ambiguous_dropped += 1;
-        }
-        if let Some(sp) = record
-            && suspicious.len() < MAX_SUSPICIOUS
-        {
-            suspicious.push(sp);
-        }
 
         if st.euid == 0 {
             // root: full Prm/Eff/Bnd masks are the default, flagging them is noise.
@@ -510,7 +593,6 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         }
 
         // CAP-002: ambient caps without NoNewPrivs on a non-root process.
-        // A strong signal of misconfiguration or preparation for privilege escalation.
         let reason = if st.caps.ambient != 0 && st.no_new_privs != Some(true) {
             Some(CapReason::AmbientCapsNoNewPrivs)
         } else {
@@ -556,6 +638,12 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
         };
         coverage::record(format!(
             "malware sweep: {ambiguous_dropped} ambiguous name match(es) unresolved (exe unreadable){hint}"
+        ));
+    }
+    if mimic_inconclusive > 0 {
+        coverage::record(format!(
+            "malware sweep: {mimic_inconclusive} process(es) with kthread-like comm had an \
+             unreadable cmdline — mimicry inconclusive (not flagged)"
         ));
     }
 
@@ -976,6 +1064,28 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
         assert!(
             !suspicious.iter().any(|s| s.pid == 101),
             "real kthread must not be flagged"
+        );
+    }
+
+    #[test]
+    fn truncated_status_still_runs_the_malware_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("77");
+        std::fs::create_dir_all(&d).unwrap();
+        // Name + Uid present, Cap* pushed out by a Groups: line past the cap —
+        // the shape a directory user with thousands of supplementary groups gives.
+        let groups: String = (1000..4000).map(|g| format!("{g} ")).collect();
+        std::fs::write(
+            d.join("status"),
+            format!("Name:\txmrig\nUid:\t1000\t1000\t1000\t1000\nGroups:\t{groups}\n"),
+        )
+        .unwrap();
+        symlink("/tmp/xmrig", d.join("exe")).unwrap();
+
+        let (_caps, suspicious) = audit_host_processes(tmp.path());
+        assert!(
+            suspicious.iter().any(|s| s.pid == 77),
+            "a known miner must not escape the sweep because Cap* got truncated"
         );
     }
 }
