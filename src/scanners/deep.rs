@@ -10,7 +10,7 @@ use std::sync::Arc;
 const DEEP_READ_LEN: usize = 256;
 const MAX_DEEP_REGIONS: usize = 64;
 
-// ── Clustering infrastructure (mirrors library_injection.rs) ──
+// ── Clustering infrastructure (shared with library_injection.rs) ──
 
 #[derive(Debug, Clone)]
 pub struct ExecCluster {
@@ -285,7 +285,7 @@ fn attribute_by_pointer(ptrs: &[ResolvedPointer]) -> Option<(Origin, u8)> {
 }
 
 /// Check whether an address falls inside a runtime JIT reservation.
-fn is_inside_jit_cluster(region_lo: u64, clusters: &[ExecCluster]) -> bool {
+pub(crate) fn is_inside_jit_cluster(region_lo: u64, clusters: &[ExecCluster]) -> bool {
     clusters.iter().any(|c| {
         (c.span >= 8 * 1024 * 1024 || c.pages >= 16) && region_lo >= c.lo && region_lo <= c.hi
     })
