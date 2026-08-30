@@ -33,12 +33,31 @@ const SENSITIVE_SUFFIXES: &[&str] = &[
     "_ACCESS_KEY",
 ];
 
+// System environment variables that look sensitive by suffix but are not secrets.
+// XDG_ACTIVATION_TOKEN is a short-lived Wayland window-activation token,
+// not a credential. DBUS_SESSION_BUS_ADDRESS / WAYLAND_DISPLAY / DISPLAY / XAUTHORITY
+// are likewise not credentials. Excluding them here stops SEC-014 from flooding
+// desktop reports with inherited session variables.
+const NON_SECRET_SYSTEM_KEYS: &[&str] = &[
+    "XDG_ACTIVATION_TOKEN",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+];
+
 fn ends_with_icase(s: &str, suffix: &str) -> bool {
     s.len() >= suffix.len()
         && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
 pub(crate) fn is_sensitive_key(key: &str) -> bool {
+    if NON_SECRET_SYSTEM_KEYS
+        .iter()
+        .any(|&k| key.eq_ignore_ascii_case(k))
+    {
+        return false;
+    }
     SENSITIVE_KEYS.iter().any(|&k| key.eq_ignore_ascii_case(k))
         || SENSITIVE_SUFFIXES.iter().any(|&s| ends_with_icase(key, s))
 }
@@ -299,6 +318,19 @@ mod tests {
             "SSH_AUTH_SOCK",
         ] {
             assert!(!is_sensitive_key(k), "{k} is a false positive");
+        }
+    }
+
+    #[test]
+    fn non_secret_system_keys_are_excluded() {
+        for k in [
+            "XDG_ACTIVATION_TOKEN",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+            "XAUTHORITY",
+        ] {
+            assert!(!is_sensitive_key(k), "{k} must not be a secret");
         }
     }
 
