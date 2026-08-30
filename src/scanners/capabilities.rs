@@ -282,6 +282,10 @@ pub fn parse_status(content: &str) -> Option<ProcStatus> {
 /// sweep and both emitted before `Groups:`. When a very long `Groups:` line
 /// pushes Cap* beyond the read cap, we can still run the sweep and skip only
 /// the capability checks. Returns `None` if either identity field is missing.
+///
+/// Last occurrence wins, matching `parse_status`. This keeps the two parsers
+/// consistent if the buffer ever comes from a non-kernel source (e.g. a
+/// tampered procfs — see SEC-021).
 fn parse_status_identity(content: &str) -> Option<(String, u32)> {
     let mut name = None;
     let mut euid = None;
@@ -298,9 +302,6 @@ fn parse_status_identity(content: &str) -> Option<(String, u32)> {
                     .and_then(|f| f.parse().ok());
             }
             _ => {}
-        }
-        if name.is_some() && euid.is_some() {
-            break;
         }
     }
     Some((name?, euid?))
@@ -426,6 +427,13 @@ const MAX_FINDINGS: usize = 64;
 /// Groups and remain available for the malware sweep.
 const CAP_PROC_STATUS: usize = 16 * 1024;
 
+#[derive(Default)]
+struct SweepCounters {
+    ambiguous_dropped: usize,
+    mimic_inconclusive: usize,
+    store_over_cap: usize,
+}
+
 /// Perform the suspicious-process sweep for a single PID, using only identity
 /// fields. Used both in the normal path and when Cap* are missing (R27-59).
 fn sweep_process(
@@ -434,8 +442,7 @@ fn sweep_process(
     name: &str,
     euid: u32,
     suspicious: &mut Vec<SuspiciousProcess>,
-    ambiguous_dropped: &mut usize,
-    mimic_inconclusive: &mut usize,
+    counters: &mut SweepCounters,
 ) {
     let exe_link = std::fs::read_link(format!("{}/{pid}/exe", proc_root.display()))
         .ok()
@@ -449,7 +456,7 @@ fn sweep_process(
                 // Deliberately still not a mimic: comm alone is spoofable
                 // (RC-1) and SEC-020 sets compromised_host. But the gate ran
                 // and could not observe — that must not vanish.
-                *mimic_inconclusive += 1;
+                counters.mimic_inconclusive += 1;
                 let _ = e;
                 None
             }
@@ -466,12 +473,16 @@ fn sweep_process(
         cmdline_argv0.as_deref(),
     );
     if dropped {
-        *ambiguous_dropped += 1;
+        counters.ambiguous_dropped += 1;
     }
-    if let Some(sp) = record
-        && suspicious.len() < MAX_SUSPICIOUS
-    {
-        suspicious.push(sp);
+    if let Some(sp) = record {
+        if suspicious.len() < MAX_SUSPICIOUS {
+            suspicious.push(sp);
+        } else {
+            // R27-60: a dropped record is a capability degradation, not a
+            // non-event. MAX_FINDINGS next door already reports its overflow.
+            counters.store_over_cap += 1;
+        }
     }
 }
 
@@ -485,8 +496,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
     let mut suspicious = Vec::new();
     let mut denied = 0usize;
     let mut over_cap = 0usize;
-    let mut ambiguous_dropped = 0usize;
-    let mut mimic_inconclusive = 0usize;
+    let mut sweep_counters = SweepCounters::default();
 
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -548,8 +558,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
                     &name,
                     euid,
                     &mut suspicious,
-                    &mut ambiguous_dropped,
-                    &mut mimic_inconclusive,
+                    &mut sweep_counters,
                 );
                 continue; // capability part skipped for this pid
             }
@@ -563,8 +572,7 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
             &st.name,
             st.euid,
             &mut suspicious,
-            &mut ambiguous_dropped,
-            &mut mimic_inconclusive,
+            &mut sweep_counters,
         );
 
         if st.euid == 0 {
@@ -630,20 +638,30 @@ pub fn audit_host_processes(proc_root: &Path) -> (Vec<ProcCapFinding>, Vec<Suspi
             "capability audit: finding cap ({MAX_FINDINGS}) reached; {over_cap} more processes matched but were not recorded"
         ));
     }
-    if ambiguous_dropped > 0 {
+    if sweep_counters.ambiguous_dropped > 0 {
         let hint = if crate::is_running_as_root() {
             ""
         } else {
             " — run as root to resolve exe paths"
         };
         coverage::record(format!(
-            "malware sweep: {ambiguous_dropped} ambiguous name match(es) unresolved (exe unreadable){hint}"
+            "malware sweep: {} ambiguous name match(es) unresolved (exe unreadable){hint}",
+            sweep_counters.ambiguous_dropped
         ));
     }
-    if mimic_inconclusive > 0 {
+    if sweep_counters.mimic_inconclusive > 0 {
         coverage::record(format!(
-            "malware sweep: {mimic_inconclusive} process(es) with kthread-like comm had an \
-             unreadable cmdline — mimicry inconclusive (not flagged)"
+            "malware sweep: {} process(es) with kthread-like comm had an \
+             unreadable cmdline — mimicry inconclusive (not flagged)",
+            sweep_counters.mimic_inconclusive
+        ));
+    }
+    if sweep_counters.store_over_cap > 0 {
+        coverage::record(format!(
+            "malware sweep: store cap ({MAX_SUSPICIOUS}) reached; {} more \
+             suspicious process(es) matched but were not recorded — the count in this \
+             report understates the host",
+            sweep_counters.store_over_cap
         ));
     }
 
@@ -1087,5 +1105,24 @@ CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n"
             suspicious.iter().any(|s| s.pid == 77),
             "a known miner must not escape the sweep because Cap* got truncated"
         );
+    }
+
+    #[test]
+    fn suspicious_store_is_capped_not_unbounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `xmrig` is on the explicit blocklist, so every one of these is recorded
+        // without needing an exe link — the fork-bomb shape the cap exists for.
+        for pid in 1..=(MAX_SUSPICIOUS as u32 + 5) {
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("status"),
+                "Name:\txmrig\nUid:\t0\t0\t0\t0\n\
+CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapBnd:\t0\nCapAmb:\t0\n",
+            )
+            .unwrap();
+        }
+        let (_caps, suspicious) = audit_host_processes(tmp.path());
+        assert_eq!(suspicious.len(), MAX_SUSPICIOUS, "store is capped");
     }
 }
