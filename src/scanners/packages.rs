@@ -179,6 +179,18 @@ fn zypper_security_package_names() -> HashSet<String> {
         })
         .collect();
 
+    if patch_names.len() > MAX_PATCHES_TO_INSPECT {
+        // R27-70: a host with >50 pending security patches is exactly the host
+        // whose security-update count matters. Silently truncating the lookup
+        // reclassifies the remainder as ordinary updates.
+        crate::coverage::record(format!(
+            "packages: {} security patch(es) pending, only the first \
+             {MAX_PATCHES_TO_INSPECT} were resolved to package names — the \
+             security-update count is a LOWER BOUND",
+            patch_names.len()
+        ));
+    }
+
     for patch in patch_names.iter().take(MAX_PATCHES_TO_INSPECT) {
         let Some(info_out) =
             crate::utils::run_with_timeout("zypper", &["-q", "info", "-t", "patch", patch], 15)
