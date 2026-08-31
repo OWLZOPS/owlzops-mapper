@@ -1073,21 +1073,6 @@ pub struct DeepMemoryAnalysis {
     pub image_header: bool, // MZ / ELF / PE in the first bytes of RWX region
 }
 
-#[cfg(feature = "local-scan")]
-impl DeepMemoryAnalysis {
-    pub fn inconclusive() -> Self {
-        Self {
-            origin: Origin::Inconclusive,
-            confidence: 0,
-            entropy: 0.0,
-            prologue: None,
-            resolved_pointers: Vec::new(),
-            bytes_examined: 0,
-            image_header: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
