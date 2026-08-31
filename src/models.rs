@@ -882,6 +882,12 @@ pub struct LibraryInjectionFinding {
     /// `None` in fast‑path; silently omitted from JSON when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deep_forensics: Option<DeepMemoryAnalysis>,
+    /// R27-62: why `deep_forensics` is absent. `None` = deep scanning was not
+    /// attempted for this finding. `Some(reason)` = attempted and blocked
+    /// (EACCES pre-5.8, EPERM under YAMA/userns, ENOENT if the VMA is gone,
+    /// or region budget exhausted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_unavailable: Option<String>,
     /// Absolute path of the executable (/proc/pid/exe) — reputation through
     /// provenance/cache. NOT derived from the failable process name.
     #[serde(default)]

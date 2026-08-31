@@ -373,6 +373,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                             is_deleted: false,
                             region_addr: None,
                             deep_forensics: None,
+                            deep_unavailable: None,
                             exe_path: None,
                         });
                         pid_hits += 1;
@@ -540,6 +541,7 @@ fn scan_maps(
                         is_deleted,
                         region_addr: Some(addr.to_string()),
                         deep_forensics: None,
+                        deep_unavailable: None,
                         exe_path: exe_path.map(|s| s.to_string()),
                     });
                     found_ephemeral = true;
@@ -615,6 +617,7 @@ fn scan_maps(
                     is_deleted: false,
                     region_addr: Some(addr.to_string()),
                     deep_forensics: None,
+                    deep_unavailable: None,
                     exe_path: exe_path.map(|s| s.to_string()),
                 });
             }
@@ -656,6 +659,7 @@ fn scan_maps(
                 is_deleted: false,
                 region_addr: Some(addr.to_string()),
                 deep_forensics: None,
+                deep_unavailable: None,
                 exe_path: exe_path.map(|s| s.to_string()),
             });
         }
