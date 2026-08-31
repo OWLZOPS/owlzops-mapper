@@ -389,13 +389,16 @@ pub fn enrich(findings: &mut [LibraryInjectionFinding], pid: u32, ctx: &ProcMemC
         }
     };
     let mut budget = MAX_DEEP_REGIONS;
+    let mut skipped = 0usize;
 
     for f in findings
         .iter_mut()
         .filter(|f| is_rwx_candidate(&f.source) && f.deep_forensics.is_none())
     {
         if budget == 0 {
-            break;
+            // R27-64: same rule as enrich_ghosts (R27-61) — count, don't drop.
+            skipped += 1;
+            continue;
         }
 
         let Some(addr_str) = f.region_addr.as_deref() else {
@@ -406,11 +409,25 @@ pub fn enrich(findings: &mut [LibraryInjectionFinding], pid: u32, ctx: &ProcMemC
             continue;
         };
 
-        f.deep_forensics = Some(match reader.read_at(lo, DEEP_READ_LEN) {
-            Ok(buf) => analyze(&buf, lo, ctx),
-            Err(_) => DeepMemoryAnalysis::inconclusive(),
-        });
+        match reader.read_at(lo, DEEP_READ_LEN) {
+            Ok(buf) => f.deep_forensics = Some(analyze(&buf, lo, ctx)),
+            Err(e) => {
+                // R27-64: an unread region is NOT an inconclusive analysis.
+                coverage::record(format!(
+                    "deep: pid {pid} region {addr_str} unreadable via process_vm_readv ({})",
+                    e.kind()
+                ));
+                f.deep_unavailable = Some(format!("process_vm_readv failed: {}", e.kind()));
+            }
+        }
         budget -= 1;
+    }
+
+    if skipped > 0 {
+        coverage::record(format!(
+            "deep: region budget ({MAX_DEEP_REGIONS}) exhausted for pid {pid}; \
+             {skipped} further rwx region(s) not analysed"
+        ));
     }
 }
 

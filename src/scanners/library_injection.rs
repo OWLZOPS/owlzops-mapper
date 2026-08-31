@@ -307,6 +307,7 @@ pub fn scan_library_injections(cfg: &ScanConfig) -> Vec<LibraryInjectionFinding>
 fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
     let mut findings = Vec::new();
     let mut denied = 0usize;
+    let mut unscanned_pids = 0usize;
     let mut cache = VerdictCache::load(cfg.verdict_cache_path.clone());
 
     let entries = match fs::read_dir(proc_root) {
@@ -321,8 +322,12 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
 
     for entry in entries.flatten() {
         if findings.len() >= MAX_FINDINGS {
-            break;
+            // R27-65: store full — this PID and every one after it goes
+            // unscanned. Don't stay silent.
+            unscanned_pids += 1;
+            continue;
         }
+
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -383,58 +388,62 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         }
 
         // --- 2. MAPS SCAN ---
-        if findings.len() < MAX_FINDINGS {
-            if let Ok((content, truncated)) =
-                safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
-            {
-                if truncated {
-                    coverage::record(format!(
-                        "library_injection: /proc/{pid}/maps truncated at {CAP_PROC_MAPS} B — \
-                         VMAs beyond limit NOT scanned (mmap-spam evasion possible)"
-                    ));
-                }
-                let exe_path = fs::read_link(format!("{proc_root}/{pid}/exe"))
-                    .map(|p| p.to_string_lossy().to_string())
-                    .ok();
-                let trust = assess_runtime(&content, exe_path.as_deref());
+        if let Ok((content, truncated)) =
+            safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
+        {
+            if truncated {
+                coverage::record(format!(
+                    "library_injection: /proc/{pid}/maps truncated at {CAP_PROC_MAPS} B — \
+                     VMAs beyond limit NOT scanned (mmap-spam evasion possible)"
+                ));
+            }
+            let exe_path = fs::read_link(format!("{proc_root}/{pid}/exe"))
+                .map(|p| p.to_string_lossy().to_string())
+                .ok();
+            let trust = assess_runtime(&content, exe_path.as_deref());
 
-                let start = findings.len();
+            let start = findings.len();
 
-                scan_maps(
-                    &content,
-                    pid,
-                    &comm,
-                    &trust,
-                    exe_path.as_deref(),
-                    &cache,
-                    &mut findings,
-                );
+            scan_maps(
+                &content,
+                pid,
+                &comm,
+                &trust,
+                exe_path.as_deref(),
+                &cache,
+                &mut findings,
+            );
 
-                // Slow path: enrich + cache verdict per object
-                #[cfg(feature = "local-scan")]
-                if cfg.deep_for(pid) && findings.len() > start {
-                    let ctx = deep::ProcMemContext::build(&content);
-                    deep::enrich(&mut findings[start..], pid, &ctx);
+            // Slow path: enrich + cache verdict per object
+            #[cfg(feature = "local-scan")]
+            if cfg.deep_for(pid) && findings.len() > start {
+                let ctx = deep::ProcMemContext::build(&content);
+                deep::enrich(&mut findings[start..], pid, &ctx);
 
-                    // Sixth Gate — ghost inode content recovery (local only).
-                    let start_epoch = deep::proc_start_epoch(proc_root, pid);
-                    deep::enrich_ghosts(&mut findings[start..], pid, proc_root, start_epoch);
+                // Sixth Gate — ghost inode content recovery (local only).
+                let start_epoch = deep::proc_start_epoch(proc_root, pid);
+                deep::enrich_ghosts(&mut findings[start..], pid, proc_root, start_epoch);
 
-                    for f in &findings[start..] {
-                        if let Some(v) = f.deep_forensics.as_ref().and_then(verdict_of_region) {
-                            cache.record(&f.object_path, v);
-                        }
+                for f in &findings[start..] {
+                    if let Some(v) = f.deep_forensics.as_ref().and_then(verdict_of_region) {
+                        cache.record(&f.object_path, v);
                     }
                 }
-            } else if pid_hits == 0 {
-                denied += 1;
             }
+        } else if pid_hits == 0 {
+            denied += 1;
         }
     }
 
     if denied > 0 {
         coverage::record(format!(
             "library-injection scan: {denied} process(es) with unreadable maps"
+        ));
+    }
+    if unscanned_pids > 0 {
+        coverage::record(format!(
+            "library-injection scan: finding cap ({MAX_FINDINGS}) reached; \
+             {unscanned_pids} process(es) not scanned at all — findings are a LOWER BOUND"
         ));
     }
     cache.persist();
