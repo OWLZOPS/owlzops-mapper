@@ -3,7 +3,7 @@
 //! `Zeroizing<String>` guarantees zeroization on drop, but does not prevent
 //! the OS from paging the buffer to swap or including it in a core dump.
 //! `SecretString` adds `mlock(2)` and `madvise(MADV_DONTDUMP)` on Linux,
-//! degrading with a stderr warning and coverage note when the kernel refuses.
+//! degrading with a stderr warning when the kernel refuses.
 
 use zeroize::Zeroizing;
 
@@ -28,7 +28,7 @@ impl std::fmt::Debug for SecretString {
 
 impl SecretString {
     /// Wrap a secret string. On Linux, attempts to `mlock` and `madvise` the
-    /// backing memory; if either fails, records a coverage warning but still
+    /// backing memory; if either fails, records a stderr warning but still
     /// returns the secret. The secret is never copied — ownership moves here.
     pub fn new(s: String) -> Self {
         Self::from_zeroizing(Zeroizing::new(s))
@@ -63,14 +63,12 @@ impl SecretString {
                         // Try mlock first; if it fails, still attempt madvise.
                         if libc::mlock(aligned as *const libc::c_void, aligned_len) != 0 {
                             let err = std::io::Error::last_os_error();
-                            // Duplicate to stderr: coverage may not reach a report
-                            // in fleet mode without a local host (R27-20).
+                            // No coverage::record here (R27-63): this runs on the
+                            // orchestrator before any scanner, and drain_scoped
+                            // would attribute it to whichever host drains first.
                             eprintln!(
                                 "warning: mlock failed ({err}) — sudo password may reach swap"
                             );
-                            crate::coverage::record(format!(
-                                "secrets: mlock failed ({err}) — sudo password may be written to swap"
-                            ));
                         }
                         // Always try to exclude from core dumps.
                         if libc::madvise(
@@ -80,12 +78,10 @@ impl SecretString {
                         ) != 0
                         {
                             let err = std::io::Error::last_os_error();
+                            // No coverage::record here (R27-63): same reason.
                             eprintln!(
                                 "warning: madvise(MADV_DONTDUMP) failed ({err}) — sudo password may be included in core dumps"
                             );
-                            crate::coverage::record(format!(
-                                "secrets: madvise(MADV_DONTDUMP) failed ({err}) — sudo password may be included in core dumps"
-                            ));
                         }
                     }
                 }

@@ -648,12 +648,18 @@ pub fn enrich_ghosts(
     start_epoch: Option<u64>,
 ) {
     let mut budget = MAX_DEEP_REGIONS;
+    let mut skipped = 0usize;
+
     for f in findings
         .iter_mut()
         .filter(|f| ghost_candidate(&f.source) && f.deep_forensics.is_none())
     {
         if budget == 0 {
-            break;
+            // R27-61: exhausted budget degrades an explicitly requested
+            // --deep scan. Count the remainder instead of silently dropping
+            // it; the coverage line below reports the exact number.
+            skipped += 1;
+            continue;
         }
         let Some(addr) = f.region_addr.as_deref() else {
             continue;
@@ -672,9 +678,19 @@ pub fn enrich_ghosts(
                     "deep(ghost): pid {} region {} unreadable via map_files ({})",
                     pid, addr, e
                 ));
+                // R27-62: record on the finding itself, so a JSON consumer
+                // can tell "blocked" from "not attempted".
+                f.deep_unavailable = Some(format!("map_files unreadable: {}", e.kind()));
             }
         }
         budget -= 1;
+    }
+
+    if skipped > 0 {
+        coverage::record(format!(
+            "deep(ghost): region budget ({MAX_DEEP_REGIONS}) exhausted for pid {pid}; \
+             {skipped} further ghost region(s) not analysed"
+        ));
     }
 }
 

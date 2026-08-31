@@ -3605,6 +3605,7 @@ mod tests {
             is_deleted: false,
             region_addr: None,
             deep_forensics: None,
+            deep_unavailable: None,
             exe_path: None,
         }];
         let f = evaluate(&r)
