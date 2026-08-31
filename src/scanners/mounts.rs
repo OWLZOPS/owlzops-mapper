@@ -47,13 +47,28 @@ fn detect_from_path(path: &str) -> Vec<MountMaskingFinding> {
     }
 
     let mut findings = Vec::new();
+    let mut over_cap = 0usize;
     for line in content.lines() {
         if findings.len() >= MAX_FINDINGS {
-            break;
+            // R27-68: the cap's own docstring names a hostile /proc as the
+            // threat — which is exactly when the dropped lines matter. Keep
+            // classifying so the count is exact; the extra allocations are
+            // bounded by CAP_MOUNTINFO, not by the attacker.
+            if classify_line(line).is_some() {
+                over_cap += 1;
+            }
+            continue;
         }
         if let Some(f) = classify_line(line) {
             findings.push(f);
         }
+    }
+    if over_cap > 0 {
+        coverage::record(format!(
+            "mount masking: finding cap ({MAX_FINDINGS}) reached; {over_cap} further \
+             masking mount(s) matched but were NOT recorded — SEC-021 evidence is a \
+             LOWER BOUND"
+        ));
     }
     findings
 }
@@ -237,5 +252,21 @@ mod tests {
         let out = detect(f);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].target_path, "/proc/9");
+    }
+
+    #[test]
+    fn finding_cap_is_disclosed_not_silent() {
+        let mut mi = String::new();
+        for i in 1..=(MAX_FINDINGS + 5) {
+            mi.push_str(&format!(
+                "36 35 0:1 / /proc/{i} rw,relatime shared:1 - tmpfs none rw\n"
+            ));
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &mi).unwrap();
+
+        let out = detect_from_path(tmp.path().to_str().unwrap());
+        assert_eq!(out.len(), MAX_FINDINGS, "store is capped");
+        assert_eq!(out[0].target_path, "/proc/1", "order is mountinfo order");
     }
 }
