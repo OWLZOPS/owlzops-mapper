@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 
 use crate::{coverage, safe_io};
 
-/// Maximum alias expansion depth. Mirrors the include-depth limit: a transitive
-/// `Cmnd_Alias A = B`, `B = C`, … chain longer than this is treated as
-/// unresolvable, exactly like sudo's own parser.
+/// Maximum alias expansion depth. Our own bound; sudo detects cycles instead
+/// of imposing a fixed depth, so a deep acyclic chain can diverge from our
+/// resolver. R27-67: reaching this limit must surface as UNKNOWN, not as a
+/// negative answer that hides a passwordless grant.
 const MAX_ALIAS_DEPTH: u8 = 16;
 
 /// Yield logical (continuation-joined) lines from sudoers content.
@@ -124,17 +125,32 @@ impl CmndAliases {
         }
     }
 
-    /// True if `token` resolves — directly or through aliases — to `ALL`.
-    pub fn resolves_to_all(&self, token: &str, depth: u8) -> bool {
+    /// Does `token` resolve — directly or through aliases — to `ALL`?
+    ///
+    /// `None` = the chain was cut at `MAX_ALIAS_DEPTH` and the answer is
+    /// UNKNOWN. R27-67: returning `false` there made a 17-deep chain read as
+    /// "not a passwordless grant", clearing SEC-005 on a host where sudo does
+    /// grant it. Unknown must never masquerade as negative — the same rule the
+    /// three other budgets in this module already follow.
+    pub fn resolves_to_all(&self, token: &str, depth: u8) -> Option<bool> {
         if token == "ALL" {
-            return true;
+            return Some(true);
         }
         if depth >= MAX_ALIAS_DEPTH {
-            return false;
+            return None;
         }
-        self.0
-            .get(token)
-            .is_some_and(|members| members.iter().any(|m| self.resolves_to_all(m, depth + 1)))
+        let Some(members) = self.0.get(token) else {
+            return Some(false); // not an alias at all: a plain command path
+        };
+        let mut cut = false;
+        for m in members {
+            match self.resolves_to_all(m, depth + 1) {
+                Some(true) => return Some(true), // one resolving branch is enough
+                Some(false) => {}
+                None => cut = true,
+            }
+        }
+        if cut { None } else { Some(false) }
     }
 }
 
@@ -255,8 +271,16 @@ pub fn is_nopasswd_all(entry: &str, aliases: &CmndAliases) -> bool {
         if rest.starts_with('!') {
             continue;
         }
-        if nopasswd && aliases.resolves_to_all(rest, 0) {
-            return true;
+        if nopasswd {
+            match aliases.resolves_to_all(rest, 0) {
+                Some(true) => return true,
+                Some(false) => {}
+                None => coverage::record(format!(
+                    "sudoers: alias chain from '{rest}' exceeds {MAX_ALIAS_DEPTH} levels — \
+                     cannot determine whether it grants NOPASSWD: ALL; SEC-005 audit \
+                     INCOMPLETE for this entry"
+                )),
+            }
         }
     }
     false
@@ -473,11 +497,12 @@ mod tests {
         let mut a = CmndAliases::default();
         a.absorb("Cmnd_Alias MAINTENANCE = ALL");
         a.absorb("Cmnd_Alias WRAPPER = MAINTENANCE");
-        assert!(
+        assert_eq!(
             a.resolves_to_all("WRAPPER", 0),
+            Some(true),
             "transitive alias must resolve"
         );
-        assert!(!a.resolves_to_all("/usr/bin/systemctl", 0));
+        assert_eq!(a.resolves_to_all("/usr/bin/systemctl", 0), Some(false));
     }
 
     #[test]
@@ -485,11 +510,12 @@ mod tests {
         let mut a = CmndAliases::default();
         a.absorb("Cmnd_Alias SAFE = /usr/bin/id, /usr/bin/uptime : MAINTENANCE = ALL");
 
-        assert!(
+        assert_eq!(
             a.resolves_to_all("MAINTENANCE", 0),
+            Some(true),
             "second spec must register"
         );
-        assert!(!a.resolves_to_all("SAFE", 0));
+        assert_eq!(a.resolves_to_all("SAFE", 0), Some(false));
     }
 
     #[test]
@@ -569,5 +595,49 @@ mod tests {
         assert!(is_nopasswd_all("deploy ALL=(ALL) NOPASSWD:ALL", &a));
         assert!(is_nopasswd_all("deploy ALL=(ALL) NOPASSWD : ALL", &a));
         assert!(!is_nopasswd_all("deploy ALL=(ALL) NOPASSWD : /bin/foo", &a));
+    }
+
+    #[test]
+    fn an_over_deep_alias_chain_is_unknown_not_negative() {
+        // A0→A1→…→A16 = ALL, 17 links. sudo resolves it; we must not answer "false".
+        let mut a = CmndAliases::default();
+        let names: Vec<String> = (0..17).map(|i| format!("A{i}")).collect();
+        for w in names.windows(2) {
+            a.absorb(&format!("Cmnd_Alias {} = {}", w[0], w[1]));
+        }
+        a.absorb(&format!("Cmnd_Alias {} = ALL", names[16]));
+
+        assert_eq!(
+            a.resolves_to_all(&names[0], 0),
+            None,
+            "cut chain must be UNKNOWN, never a negative answer"
+        );
+        // Within the limit it still resolves.
+        assert_eq!(a.resolves_to_all(&names[2], 0), Some(true));
+    }
+
+    #[test]
+    fn a_plain_command_is_a_real_negative_not_unknown() {
+        let a = CmndAliases::default();
+        assert_eq!(a.resolves_to_all("/usr/bin/systemctl", 0), Some(false));
+    }
+
+    #[test]
+    fn a_cycle_terminates_as_unknown() {
+        let mut a = CmndAliases::default();
+        a.absorb("Cmnd_Alias A = B");
+        a.absorb("Cmnd_Alias B = A");
+        assert_eq!(
+            a.resolves_to_all("A", 0),
+            None,
+            "must terminate, not recurse"
+        );
+    }
+
+    #[test]
+    fn one_resolving_branch_wins_over_a_cut_sibling() {
+        let mut a = CmndAliases::default();
+        a.absorb("Cmnd_Alias X = DEEP, ALL");
+        assert_eq!(a.resolves_to_all("X", 0), Some(true));
     }
 }
