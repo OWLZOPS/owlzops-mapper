@@ -130,6 +130,10 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
             && maps.len() >= MAX_BPF_OBJECTS
             && links.len() >= MAX_BPF_OBJECTS
         {
+            // R27-69: an exact triple fill leaves `dropped` at 0, so the
+            // aggregate below would stay silent while every later PID goes
+            // unexamined. Force the disclosure here.
+            dropped += 1;
             break;
         }
 
@@ -164,6 +168,8 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
                 && maps.len() >= MAX_BPF_OBJECTS
                 && links.len() >= MAX_BPF_OBJECTS
             {
+                // R27-69: same triple-fill guard inside nested loop
+                dropped += 1;
                 break;
             }
 
@@ -243,15 +249,26 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
 
 fn scan_bpf_pins() -> Vec<BpfPinInfo> {
     let mut pins = Vec::new();
-    scan_bpf_dir(Path::new("/sys/fs/bpf"), MAX_PIN_DEPTH, &mut pins);
+    let mut dropped = 0usize;
+    scan_bpf_dir(
+        Path::new("/sys/fs/bpf"),
+        MAX_PIN_DEPTH,
+        &mut pins,
+        &mut dropped,
+    );
+    if dropped > 0 {
+        crate::coverage::record(format!(
+            "ebpf: {dropped} pinned object(s) dropped at MAX_BPF_OBJECTS \
+             ({MAX_BPF_OBJECTS}) — pin inventory INCOMPLETE. A pinned program \
+             outlives its creating process, so this is a persistence surface."
+        ));
+    }
     pins
 }
 
-fn scan_bpf_dir(dir: &Path, depth: u8, pins: &mut Vec<BpfPinInfo>) {
-    if pins.len() >= MAX_BPF_OBJECTS || depth == 0 {
-        if depth == 0 {
-            crate::coverage::record(format!("ebpf: pin scan depth limit at {}", dir.display()));
-        }
+fn scan_bpf_dir(dir: &Path, depth: u8, pins: &mut Vec<BpfPinInfo>, dropped: &mut usize) {
+    if depth == 0 {
+        crate::coverage::record(format!("ebpf: pin scan depth limit at {}", dir.display()));
         return;
     }
 
@@ -261,10 +278,6 @@ fn scan_bpf_dir(dir: &Path, depth: u8, pins: &mut Vec<BpfPinInfo>) {
     };
 
     for entry in entries.flatten() {
-        if pins.len() >= MAX_BPF_OBJECTS {
-            return;
-        }
-
         let path = entry.path();
         let ft = match entry.file_type() {
             Ok(ft) => ft,
@@ -276,7 +289,14 @@ fn scan_bpf_dir(dir: &Path, depth: u8, pins: &mut Vec<BpfPinInfo>) {
         }
 
         if ft.is_dir() {
-            scan_bpf_dir(&path, depth - 1, pins);
+            scan_bpf_dir(&path, depth - 1, pins, dropped);
+            continue;
+        }
+
+        // R27-69: past the cap, keep walking to count. Traversal stays bounded
+        // by MAX_PIN_DEPTH; /sys/fs/bpf is a handful of entries in practice.
+        if pins.len() >= MAX_BPF_OBJECTS {
+            *dropped += 1;
             continue;
         }
 
