@@ -321,13 +321,6 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
     };
 
     for entry in entries.flatten() {
-        if findings.len() >= MAX_FINDINGS {
-            // R27-65: store full — this PID and every one after it goes
-            // unscanned. Don't stay silent.
-            unscanned_pids += 1;
-            continue;
-        }
-
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -344,6 +337,11 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         let mut pid_hits = 0usize;
 
         // --- 1. ENVIRON SCAN ---
+        // Deliberately NOT capped (R27-66): one cheap read, and LD_PRELOAD /
+        // LD_AUDIT from a volatile path is the hardest signal this module
+        // produces — it feeds SEC-023 unconditionally and gates the
+        // unlink-on-load classification via `env_ioc`. Capping it would drop
+        // the strongest finding to preserve room for the weakest.
         if let Ok((data, truncated)) = safe_io::read_procfs_bytes_capped(
             &format!("{proc_root}/{pid}/environ"),
             safe_io::CAP_PROC_ENVIRON,
@@ -388,6 +386,14 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         }
 
         // --- 2. MAPS SCAN ---
+        if findings.len() >= MAX_FINDINGS {
+            // R27-65/R27-66: the maps scan is what the cap exists for. Counted
+            // after the PID parse, so non-numeric /proc entries (self, sys,
+            // net, …) do not inflate the number.
+            unscanned_pids += 1;
+            continue;
+        }
+
         if let Ok((content, truncated)) =
             safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
         {
@@ -443,7 +449,8 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
     if unscanned_pids > 0 {
         coverage::record(format!(
             "library-injection scan: finding cap ({MAX_FINDINGS}) reached; \
-             {unscanned_pids} process(es) not scanned at all — findings are a LOWER BOUND"
+             memory maps of {unscanned_pids} further process(es) not scanned \
+             (LD_* environment still checked) — findings are a LOWER BOUND"
         ));
     }
     cache.persist();
