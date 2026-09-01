@@ -1544,6 +1544,23 @@ pub async fn run_remote_scan_russh(
             }
         }
 
+        // R28-12: main exec truncation is a coverage fact for THIS host, not a
+        // log line. Earlier remote probes record their capping in
+        // remote_coverage.notes; this is the same class and must surface in the
+        // report artifact.
+        if stdout_truncated {
+            remote_coverage.notes.push(format!(
+                "remote stdout exceeded cap ({} bytes) and was truncated — report JSON is PARTIAL",
+                safe_io::CAP_CHILD_STDOUT
+            ));
+        }
+        if stderr_truncated {
+            remote_coverage.notes.push(format!(
+                "remote stderr exceeded cap ({} bytes) and was truncated — error detail is PARTIAL",
+                CAP_REMOTE_STDERR
+            ));
+        }
+
         match exit_code {
             Some(code) => {
                 let se = String::from_utf8_lossy(&stderr);

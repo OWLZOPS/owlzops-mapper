@@ -177,6 +177,8 @@ jobs:
           PY
 
       # R28-05: JSONL key set is a schema contract — it must not depend on values.
+      # Applies to ALL serializable structs across the codebase, not just models.rs.
+      # R28-13: gate scope broadened from models.rs to all of src/.
       - name: Guard JSONL key stability (R28-05)
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -188,8 +190,8 @@ jobs:
           printf '    #[serde(default, skip_serializing_if = "Option::is_none")]\n' \
             | rg -q "$PAT" \
             || { echo "::error::R28-05 guard pattern does not match a known-bad line — guard is blind"; exit 1; }
-          if rg -n "$PAT" src/models.rs ; then
-            echo "::error file=src/models.rs::skip_serializing_if attribute breaks JSONL key stability (R28-05)"
+          if rg -n "$PAT" src/ ; then
+            echo "::error file=src/::skip_serializing_if attribute breaks JSONL key stability (R28-05)"
             exit 1
           fi
 
