@@ -1422,9 +1422,12 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // Deterministic sort: Degraded first, then Changed, then Improved;
-    // within same severity, stable order by field/before/after
-    changes.sort_unstable_by(|a, b| {
+    // R28-11: HashMap/HashSet iteration order is arbitrary, so the entry order
+    // varies between runs on identical inputs. sev_rank alone leaves ties in
+    // insertion order. A report artifact must be byte-reproducible — same
+    // reasoning as the deterministic tie-breaks in runtime.rs and
+    // reverse_shell.rs.
+    changes.sort_by(|a, b| {
         sev_rank(&a.severity)
             .cmp(&sev_rank(&b.severity))
             .then_with(|| a.field.cmp(&b.field))

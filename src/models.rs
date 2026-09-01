@@ -1382,3 +1382,28 @@ pub struct PreloadFinding {
     #[serde(default)]
     pub mapped_by_pids: Option<usize>,
 }
+
+#[test]
+fn field_level_default_wins_over_container_default() {
+    // R28-10: field-level default must survive container-level default (fail-closed)
+    // R28-04 gave ExecStartFinding a container-level #[serde(default)], whose
+    // Default::default() yields runs_as_root == false. The field-level
+    // `default = "default_true"` must still win: false here is fail-OPEN —
+    // every pre-R23 snapshot would silently read as non-root and suppress
+    // SEC-046. Removing the field attribute as "redundant" must break a test,
+    // not a customer's history.
+    let v: ExecStartFinding = serde_json::from_str(
+        r#"{"source":"systemd:x","unit_name":"x","exec_path":"/tmp/x","volatile":true}"#,
+    )
+    .expect("legacy ExecStartFinding must still deserialize");
+    assert!(
+        v.runs_as_root,
+        "field-level default must survive the container-level default (R23-06 fail-closed)"
+    );
+
+    // Same precedence question, non-security field: instances defaults to 1,
+    // not to Default::default()'s 0.
+    let p: ProcessInfo =
+        serde_json::from_str(r#"{"name":"x","pid":1,"memory_mb":2}"#).expect("legacy ProcessInfo");
+    assert_eq!(p.instances, 1);
+}

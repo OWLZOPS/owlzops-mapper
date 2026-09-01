@@ -132,6 +132,14 @@ jobs:
       - name: Guard coverage-sink doctrine (R28-01)
         if: matrix.os == 'ubuntu-24.04'
         run: |
+          set -uo pipefail
+          for f in src/ssh_engine.rs src/known_hosts.rs ; do
+            test -f "$f" || { echo "::error::R28-01 guard target $f is missing — guard is blind"; exit 1; }
+          done
+          # Positive self-test: the pattern must match the literal it forbids.
+          printf 'crate::coverage::record(format!(\n' \
+            | rg -q 'coverage::record\(' \
+            || { echo "::error::R28-01 guard pattern does not match — guard is blind"; exit 1; }
           if rg -n 'coverage::record\(' src/ssh_engine.rs src/known_hosts.rs ; then
             echo "::error::remote-path coverage::record — use RemoteCoverage::notes (R28-01)"
             exit 1
@@ -147,12 +155,22 @@ jobs:
           import re, sys
           src = open("src/models.rs").read()
           bad = []
-          for m in re.finditer(r'((?:^[ \t]*#\[[^\n]*\]\n)+)[ \t]*(?:pub[ \t]+)?struct[ \t]+(\w+)', src, re.M):
+          inspected = 0
+          # R28-09: `#\[[^\n]*\]` requires a single-line attribute. rustfmt wraps
+          # long derives, and a wrapped derive would make this match nothing —
+          # the guard would go green having inspected zero structs (cf. R26-43).
+          for m in re.finditer(r'((?:[ \t]*#\[[^\]]*\]\s*)+)(?:pub[ \t]+)?struct[ \t]+(\w+)', src):
               attrs, name = m.group(1), m.group(2)
               if 'Deserialize' not in attrs:
                   continue
+              inspected += 1
               if not re.search(r'#\[serde\([^)]*\bdefault\b', attrs):
                   bad.append(name)
+          MIN_STRUCTS = 40  # set from the current count; see command below
+          if inspected < MIN_STRUCTS:
+              print(f"::error file=src/models.rs::R28-04 guard inspected only {inspected} "
+                    f"Deserialize structs (expected >= {MIN_STRUCTS}) — the pattern is stale")
+              sys.exit(1)
           if bad:
               print("::error file=src/models.rs::structs without container-level #[serde(default)] (R28-04): " + ", ".join(bad))
               sys.exit(1)
@@ -162,7 +180,15 @@ jobs:
       - name: Guard JSONL key stability (R28-05)
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          if rg -n '^\s*#\[serde\([^]]*skip_serializing_if' src/models.rs ; then
+          set -uo pipefail
+          PAT='^\s*#\[serde\([^\]]*skip_serializing_if'
+          # R28-09: positive self-test. A pattern rg cannot compile exits 2,
+          # which `if` reads as "no matches" — the guard would stay green while
+          # checking nothing. Exactly the R26-48(b) failure mode.
+          printf '    #[serde(default, skip_serializing_if = "Option::is_none")]\n' \
+            | rg -q "$PAT" \
+            || { echo "::error::R28-05 guard pattern does not match a known-bad line — guard is blind"; exit 1; }
+          if rg -n "$PAT" src/models.rs ; then
             echo "::error file=src/models.rs::skip_serializing_if attribute breaks JSONL key stability (R28-05)"
             exit 1
           fi
