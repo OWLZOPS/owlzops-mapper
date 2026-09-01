@@ -213,6 +213,9 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
         };
 
         let mut exe_cache: Option<Option<String>> = None;
+        // R28-06: comm is per-PID, exactly like exe. Reading it inside the fd
+        // loop repeats the syscall once per matched socket on the same process.
+        let mut comm_cache: Option<Option<String>> = None;
         let mut fd_seen = 0usize;
 
         for fd in fds.flatten() {
@@ -243,17 +246,19 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
                 })
                 .clone();
 
-            let comm = {
-                match safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096) {
-                    Ok((c, truncated)) => {
-                        if truncated {
-                            coverage::record(format!("/proc/{pid}/comm truncated"));
+            let comm = comm_cache
+                .get_or_insert_with(|| {
+                    match safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096) {
+                        Ok((c, truncated)) => {
+                            if truncated {
+                                coverage::record(format!("/proc/{pid}/comm truncated"));
+                            }
+                            Some(c.trim().to_string())
                         }
-                        Some(c.trim().to_string())
+                        Err(_) => None,
                     }
-                    Err(_) => None,
-                }
-            };
+                })
+                .clone();
 
             attributed.insert(
                 inode,
