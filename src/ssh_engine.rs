@@ -1211,7 +1211,8 @@ pub async fn run_remote_scan_russh(
             }
         })?);
 
-    let pinned = known_hosts_checker.pinned_algorithms();
+    let mut remote_coverage = RemoteCoverage::default();
+    let pinned = known_hosts_checker.pinned_algorithms(&mut remote_coverage.notes);
 
     // Constrain the server's host key choice to algorithms already present in
     // known_hosts. Without this, a russh preference change can make the entire
@@ -1274,18 +1275,14 @@ pub async fn run_remote_scan_russh(
         });
     }
 
-    let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
-    let uploaded = AtomicBool::new(false);
-    let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
-    // R28-01: remote-side facts (truncation, sudo diagnostics, upload errors)
-    // must land in this host's report via RemoteCoverage::notes, NOT the
-    // process-wide coverage sink, which cannot attribute concurrent fleet tasks.
-    let mut remote_coverage = RemoteCoverage::default();
-
     // R27-09: surface TOFU pin write failure in the host report, not just stderr.
     if let Some(note) = known_hosts_checker.take_pin_failure() {
         remote_coverage.notes.push(note.to_string());
     }
+
+    let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
+    let uploaded = AtomicBool::new(false);
+    let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
 
     let result = tokio::time::timeout(overall, async {
         if let Some(pass) = sudo_pass {
