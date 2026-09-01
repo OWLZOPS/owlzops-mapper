@@ -28,6 +28,33 @@ fn index_file_caps(v: &[FileCapFinding]) -> HashMap<&str, (u64, u64, bool)> {
         .collect()
 }
 
+/// Symmetric set diff over string vectors. Appearance is Degraded,
+/// disappearance is Improved.
+///
+/// R28-03: avoids duplicating the same three blocks that already exist for
+/// sysctl_issues, failed_services, backup_tools and containers; adding a new
+/// set-valued field is now a one-liner.
+fn diff_str_set(out: &mut Vec<Change>, field: &str, before: &[String], after: &[String]) {
+    let b: HashSet<&str> = before.iter().map(String::as_str).collect();
+    let a: HashSet<&str> = after.iter().map(String::as_str).collect();
+    for added in a.difference(&b) {
+        out.push(Change {
+            field: field.to_string(),
+            before: None,
+            after: Some((*added).to_string()),
+            severity: Severity::Degraded,
+        });
+    }
+    for removed in b.difference(&a) {
+        out.push(Change {
+            field: field.to_string(),
+            before: Some((*removed).to_string()),
+            after: None,
+            severity: Severity::Improved,
+        });
+    }
+}
+
 /// Compare two AgentReports and produce a DiffReport
 pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport {
     let mut changes = Vec::new();
@@ -340,6 +367,38 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // R28-02: `process` is comm — mutable and spoofable (prctl(PR_SET_NAME)).
+    // exe_path is the structural identity of the listener and must be diffed
+    // independently. None = NOT OBSERVED (non-root scan), never "no path":
+    // a transition to/from unknown is Changed, never Improved.
+    for (k, a) in &after_ports {
+        let Some(b) = before_ports.get(k) else {
+            continue;
+        };
+        let field = format!("network.listening_ports.{}.{}.{}.exe_path", k.0, k.1, k.2);
+        match (b.exe_path.as_deref(), a.exe_path.as_deref()) {
+            (Some(x), Some(y)) if x != y => changes.push(Change {
+                field,
+                before: Some(x.to_string()),
+                after: Some(y.to_string()),
+                severity: Severity::Degraded,
+            }),
+            (Some(x), None) => changes.push(Change {
+                field,
+                before: Some(x.to_string()),
+                after: Some("unknown (not observed)".into()),
+                severity: Severity::Changed,
+            }),
+            (None, Some(y)) => changes.push(Change {
+                field,
+                before: Some("unknown (not observed)".into()),
+                after: Some(y.to_string()),
+                severity: Severity::Changed,
+            }),
+            _ => {}
+        }
+    }
+
     // Exposure escalation: same (proto,port) but bind changed from local to wildcard
     {
         let mut bb: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
@@ -487,14 +546,75 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             .containers
             .iter()
             .find(|c| c.name == after_c.name)
-            && before_c.image != after_c.image
         {
-            changes.push(Change {
-                field: format!("topology.containers.{}.image", after_c.name),
-                before: Some(before_c.image.clone()),
-                after: Some(after_c.image.clone()),
-                severity: Severity::Degraded,
-            });
+            if before_c.image != after_c.image {
+                changes.push(Change {
+                    field: format!("topology.containers.{}.image", after_c.name),
+                    before: Some(before_c.image.clone()),
+                    after: Some(after_c.image.clone()),
+                    severity: Severity::Degraded,
+                });
+            }
+
+            // R28-03: scoring already raises DOCK-003/004/005/006/010 on these
+            // fields. A diff that stops at (name, image) reports "no change"
+            // for a container recreated with --privileged under the same tag.
+            if before_c.privileged != after_c.privileged {
+                changes.push(Change {
+                    field: format!("topology.containers.{}.privileged", after_c.name),
+                    before: Some(before_c.privileged.to_string()),
+                    after: Some(after_c.privileged.to_string()),
+                    severity: if after_c.privileged {
+                        Severity::Degraded
+                    } else {
+                        Severity::Improved
+                    },
+                });
+            }
+
+            diff_str_set(
+                &mut changes,
+                &format!("topology.containers.{}.cap_add", after_c.name),
+                &before_c.cap_add,
+                &after_c.cap_add,
+            );
+            diff_str_set(
+                &mut changes,
+                &format!("topology.containers.{}.sensitive_mounts", after_c.name),
+                &before_c.sensitive_mounts,
+                &after_c.sensitive_mounts,
+            );
+
+            // None = init pid not readable (stopped container / non-root scan),
+            // NOT "no capabilities". Losing the observation is Changed.
+            match (
+                before_c.runtime_bounding_caps,
+                after_c.runtime_bounding_caps,
+            ) {
+                (Some(b), Some(a)) if b != a => changes.push(Change {
+                    field: format!("topology.containers.{}.runtime_bounding_caps", after_c.name),
+                    before: Some(format!("{b:#018x}")),
+                    after: Some(format!("{a:#018x}")),
+                    severity: if a & !b != 0 {
+                        Severity::Degraded
+                    } else {
+                        Severity::Improved
+                    },
+                }),
+                (Some(b), None) => changes.push(Change {
+                    field: format!("topology.containers.{}.runtime_bounding_caps", after_c.name),
+                    before: Some(format!("{b:#018x}")),
+                    after: Some("unknown (not observed)".into()),
+                    severity: Severity::Changed,
+                }),
+                (None, Some(a)) => changes.push(Change {
+                    field: format!("topology.containers.{}.runtime_bounding_caps", after_c.name),
+                    before: Some("unknown (not observed)".into()),
+                    after: Some(format!("{a:#018x}")),
+                    severity: Severity::Changed,
+                }),
+                _ => {}
+            }
         }
     }
 
@@ -2051,5 +2171,95 @@ mod tests {
                 .any(|c| c.field == "meta.binary_version"),
             "cross-version caveat must survive JSON/XLSX export, not just the terminal"
         );
+    }
+
+    // ── New tests for R28-02 ───────────────────────────────────────────────
+    #[test]
+    fn same_comm_different_exe_on_the_same_port_is_drift() {
+        let mk = |exe: &str| PortInfo {
+            protocol: "tcp".into(),
+            bind_address: "0.0.0.0".into(),
+            port: "80".into(),
+            process: "nginx".into(), // comm identical on purpose
+            pid: Some(1234),
+            exe_path: Some(exe.into()),
+        };
+        let mut before = test_report();
+        before.network.listening_ports = vec![mk("/usr/sbin/nginx")];
+        let mut after = test_report();
+        after.network.listening_ports = vec![mk("/tmp/.nginx")];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field.ends_with(".exe_path"))
+            .expect("exe_path swap under an unchanged comm must surface as drift");
+        assert_eq!(c.severity, Severity::Degraded);
+        assert!(c.after.as_deref().unwrap().contains("/tmp/.nginx"));
+    }
+
+    #[test]
+    fn exe_path_becoming_unknown_is_changed_not_improved() {
+        let mk = |exe: Option<&str>| PortInfo {
+            protocol: "tcp".into(),
+            bind_address: "0.0.0.0".into(),
+            port: "80".into(),
+            process: "nginx".into(),
+            pid: Some(1),
+            exe_path: exe.map(str::to_string),
+        };
+        let mut before = test_report();
+        before.network.listening_ports = vec![mk(Some("/usr/sbin/nginx"))];
+        let mut after = test_report();
+        after.network.listening_ports = vec![mk(None)];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field.ends_with(".exe_path"))
+            .expect("loss of attribution must be visible");
+        assert_eq!(
+            c.severity,
+            Severity::Changed,
+            "unknown is not an improvement"
+        );
+    }
+
+    // ── New tests for R28-03 ───────────────────────────────────────────────
+    #[test]
+    fn container_privileged_flip_under_same_image_is_drift() {
+        let mk = |privileged: bool| ContainerInfo {
+            name: "web".into(),
+            image: "nginx:latest".into(),
+            state: "running".into(),
+            status: "Up".into(),
+            size_mb: 10,
+            log_size_mb: 0,
+            ports: vec![],
+            mounts: vec![],
+            privileged,
+            memory_limit_mb: None,
+            cpu_limit: None,
+            cap_add: vec![],
+            sensitive_mounts: vec![],
+            restart_count: 0,
+            oom_killed: false,
+            health_status: Some("healthy".into()),
+            rw_size_mb: 10,
+            runtime_bounding_caps: None,
+        };
+        let mut before = test_report();
+        before.topology.containers = vec![mk(false)];
+        let mut after = test_report();
+        after.topology.containers = vec![mk(true)];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field.ends_with(".privileged"))
+            .expect("privileged flip under same image tag must be detected");
+        assert_eq!(c.severity, Severity::Degraded);
+        assert_eq!(c.before.as_deref(), Some("false"));
+        assert_eq!(c.after.as_deref(), Some("true"));
     }
 }

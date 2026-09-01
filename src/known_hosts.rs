@@ -289,7 +289,10 @@ impl KnownHostsChecker {
     /// Constraining the SSH offer to these prevents russh preference changes
     /// from turning into fleet-wide HostKeyChanged (R25-30). Empty = unknown
     /// host; caller should fall back to the default set.
-    pub fn pinned_algorithms(&self) -> Vec<russh::keys::ssh_key::Algorithm> {
+    pub fn pinned_algorithms(
+        &self,
+        notes: &mut Vec<String>,
+    ) -> Vec<russh::keys::ssh_key::Algorithm> {
         let mut out = Vec::new();
 
         for entry in self.entries.iter().filter(|e| !e.revoked) {
@@ -298,7 +301,7 @@ impl KnownHostsChecker {
             // key: it must never shape the algorithm offer (R25-77).
             let (algs, unknown) = Self::algorithms_from_openssh_name(&entry.key_type);
             if let Some(unknown) = unknown {
-                crate::coverage::record(format!(
+                notes.push(format!(
                     "known_hosts: unmapped host key type `{}` for host {} — offer not pinned",
                     crate::utils::sanitize_for_log(unknown),
                     self.host
@@ -649,7 +652,7 @@ mod tests {
             tmp_dir.path().join("pin"),
         );
 
-        let algs = checker.pinned_algorithms();
+        let algs = checker.pinned_algorithms(&mut Vec::new());
         assert!(algs.len() >= 2);
     }
 
@@ -668,7 +671,7 @@ mod tests {
             tmp_dir.path().join("pin"),
         );
 
-        let algs = checker.pinned_algorithms();
+        let algs = checker.pinned_algorithms(&mut Vec::new());
         assert!(algs.contains(&Algorithm::Rsa {
             hash: Some(HashAlg::Sha512)
         }));

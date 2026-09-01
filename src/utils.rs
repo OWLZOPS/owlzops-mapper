@@ -535,8 +535,12 @@ pub fn run_child_with_timeout(
     let status = match wait_group_safe(&mut child, deadline) {
         Some(status) => status,
         None => {
-            drop(out_handle);
-            drop(err_handle);
+            // R28-07: drop() detaches, it does not wait. kill_group_and_reap()
+            // inside wait_group_safe has already SIGKILLed the group and reaped,
+            // so both write ends are closed and the readers hit EOF at once —
+            // join is bounded and releases the pipe fds deterministically.
+            let _ = out_handle.join();
+            let _ = err_handle.join();
             unregister_child(child_pid);
             return None;
         }
