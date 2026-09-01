@@ -35,8 +35,8 @@ const CAP_REMOTE_STDERR: usize = 256 * 1024; // 256 KiB
 const PROBE_BUDGET: Duration = Duration::from_secs(20);
 
 /// A much shorter deadline dedicated to the sudo NOPASSWD probe. A wedged
-/// sudo on a host with broken PAM/LDAP must not stall the scan for the full
-/// `PROBE_BUDGET`: we need to find out quickly, then either degrade to an
+/// sudo on a host with broken PAM/LDAP must not stall the scan for more than
+/// this budget: we need to find out quickly, then either degrade to an
 /// unprivileged scan (with a recorded fact) or abort the host with a clear
 /// error.
 const SUDO_PROBE_BUDGET: Duration = Duration::from_secs(5);
@@ -585,6 +585,7 @@ async fn exec_capture_inner(
     session: &client::Handle<ClientHandler>,
     host: &str,
     cmd: &str,
+    notes: &mut Vec<String>,
 ) -> Result<String, RemoteError> {
     let mut ch = session.channel_open_session().await?;
     ch.exec(true, cmd).await?;
@@ -605,8 +606,9 @@ async fn exec_capture_inner(
         }
     }
     if truncated {
-        crate::coverage::record(format!(
-            "remote {host}: probe output exceeded {PROBE_OUTPUT_CAP} bytes and was capped"
+        notes.push(format!(
+            "remote probe output exceeded {PROBE_OUTPUT_CAP} bytes and was capped (command: {})",
+            crate::utils::sanitize_for_log(cmd)
         ));
     }
     match exit_code {
@@ -629,8 +631,9 @@ async fn exec_capture(
     session: &client::Handle<ClientHandler>,
     host: &str,
     cmd: &str,
+    notes: &mut Vec<String>,
 ) -> Result<String, RemoteError> {
-    exec_capture_with_budget(session, host, cmd, PROBE_BUDGET).await
+    exec_capture_with_budget(session, host, cmd, PROBE_BUDGET, notes).await
 }
 
 /// Execute a short command with an explicit deadline. Used when the default
@@ -641,8 +644,9 @@ async fn exec_capture_with_budget(
     host: &str,
     cmd: &str,
     budget: Duration,
+    notes: &mut Vec<String>,
 ) -> Result<String, RemoteError> {
-    tokio::time::timeout(budget, exec_capture_inner(session, host, cmd))
+    tokio::time::timeout(budget, exec_capture_inner(session, host, cmd, notes))
         .await
         .map_err(|_| RemoteError::Timeout {
             host: host.to_string(),
@@ -729,8 +733,9 @@ pub(crate) fn staging_dir_is_sane(dir: &str, root: &str) -> bool {
 async fn make_remote_staging(
     session: &client::Handle<ClientHandler>,
     host: &str,
+    notes: &mut Vec<String>,
 ) -> Result<RemoteArtifact, RemoteError> {
-    let mounts = exec_capture(session, host, "LC_ALL=C cat /proc/mounts").await?;
+    let mounts = exec_capture(session, host, "LC_ALL=C cat /proc/mounts", notes).await?;
     let root = STAGING_ROOTS
         .iter()
         .copied()
@@ -747,6 +752,7 @@ async fn make_remote_staging(
         session,
         host,
         &format!("LC_ALL=C mktemp -d {root}/owlzops-XXXXXXXX"),
+        notes,
     )
     .await?;
     let dir = out.trim();
@@ -783,6 +789,7 @@ async fn validate_sudo_password(
     session: &client::Handle<ClientHandler>,
     sudo_pass: &SecretString,
     host: &str,
+    notes: &mut Vec<String>,
 ) -> Result<(), RemoteError> {
     let mut ch = session.channel_open_session().await?;
     ch.exec(true, "LC_ALL=C sudo -k -S -p '' -v").await?;
@@ -806,8 +813,9 @@ async fn validate_sudo_password(
         }
     }
     if truncated {
-        crate::coverage::record(format!(
-            "remote {host}: sudo pre-flight stderr exceeded {PROBE_OUTPUT_CAP} bytes"
+        notes.push(format!(
+            "sudo pre-flight stderr exceeded {PROBE_OUTPUT_CAP} bytes and was capped — \
+             the sudo diagnostic is PARTIAL"
         ));
     }
 
@@ -863,6 +871,7 @@ async fn upload_via_channel(
     part_path: &str,
     host: &str,
     upload_pb: Option<ProgressBar>,
+    notes: &mut Vec<String>,
 ) -> Result<(), RemoteError> {
     let metadata = tokio::fs::metadata(local_bin)
         .await
@@ -1018,8 +1027,9 @@ async fn upload_via_channel(
         }
 
         if stderr_truncated {
-            crate::coverage::record(format!(
-                "remote {host}: upload stderr exceeded {PROBE_OUTPUT_CAP} bytes and was capped"
+            notes.push(format!(
+                "upload stderr exceeded {PROBE_OUTPUT_CAP} bytes and was capped — \
+                 the upload failure detail below is PARTIAL"
             ));
         }
 
@@ -1267,6 +1277,9 @@ pub async fn run_remote_scan_russh(
     let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
     let uploaded = AtomicBool::new(false);
     let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
+    // R28-01: remote-side facts (truncation, sudo diagnostics, upload errors)
+    // must land in this host's report via RemoteCoverage::notes, NOT the
+    // process-wide coverage sink, which cannot attribute concurrent fleet tasks.
     let mut remote_coverage = RemoteCoverage::default();
 
     // R27-09: surface TOFU pin write failure in the host report, not just stderr.
@@ -1278,7 +1291,7 @@ pub async fn run_remote_scan_russh(
         if let Some(pass) = sudo_pass {
             let sudo_check = tokio::time::timeout(
                 SUDO_AUTH_BUDGET,
-                validate_sudo_password(&session, pass, &hostname),
+                validate_sudo_password(&session, pass, &hostname, &mut remote_coverage.notes),
             )
             .await
             .map_err(|_| RemoteError::SudoAuthTimeout {
@@ -1303,7 +1316,8 @@ pub async fn run_remote_scan_russh(
                 };
                 let _ = artifact.set(a);
             } else {
-                let a = make_remote_staging(&session, &hostname).await?;
+                let a =
+                    make_remote_staging(&session, &hostname, &mut remote_coverage.notes).await?;
                 actual_remote_path = a.bin().to_string();
                 let _ = artifact.set(a);
             }
@@ -1344,6 +1358,7 @@ pub async fn run_remote_scan_russh(
                 &part_for_upload,
                 &hostname,
                 upload_pb,
+                &mut remote_coverage.notes,
             )
             .await?;
             uploaded.store(true, Ordering::Relaxed);
@@ -1362,6 +1377,7 @@ pub async fn run_remote_scan_russh(
                 &hostname,
                 &format!("LC_ALL=C sudo -n -- {actual_remote_path} --version"),
                 SUDO_PROBE_BUDGET,
+                &mut remote_coverage.notes,
             )
             .await
             {
