@@ -109,10 +109,10 @@ curl -L https://github.com/OWLZOPS/owlzops-mapper/releases/latest/download/owlzo
 sudo ./owlzops-mapper audit
 ```
 
-**Install script** — resolves the latest release, verifies SHA256, and verifies the GPG signature when `gpg` is available:
+**Install script** — resolves the latest release, verifies SHA256, and verifies the GPG signature when `gpg` is available. The script is served from `owlzops.com`; it is the same file as [`install.sh`](install.sh) in this repository, and it pulls the binary from GitHub Releases either way:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
+curl -sSL https://owlzops.com/install.sh | sh
 sudo ./owlzops-mapper audit
 ```
 
@@ -128,7 +128,7 @@ If piping a script into a shell isn't something you do — reasonable, given wha
 
 ```bash
 # 1. Install the macOS orchestrator
-curl -sSL https://raw.githubusercontent.com/OWLZOPS/owlzops-mapper/main/install.sh | sh
+curl -sSL https://owlzops.com/install.sh | sh
 
 # 2. Extract the Linux agent under a different name — a plain `tar xz` here
 #    would overwrite the orchestrator you just installed
