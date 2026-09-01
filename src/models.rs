@@ -24,8 +24,6 @@ pub struct SelfIntegrityReport {
     pub warnings: Vec<String>,
 }
 
-// R28-04: container-level serde(default) keeps historical snapshots readable
-// when new fields are added; adding a field can never fail deserialization.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct AgentReport {
@@ -1103,7 +1101,8 @@ pub struct EbpfInventory {
 
 // ── Deep Forensics (Pointer Resolution & Memory Analysis) ──
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DeepMemoryAnalysis {
     pub origin: Origin,
     pub confidence: u8,             // 0..100
@@ -1115,7 +1114,7 @@ pub struct DeepMemoryAnalysis {
     pub image_header: bool, // MZ / ELF / PE in the first bytes of RWX region
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     FfiClosure,
@@ -1125,6 +1124,7 @@ pub enum Origin {
     HotSpot,
     Pcre2Jit,
     UnknownPayload,
+    #[default]
     Inconclusive,
     ManagedJit,     // generic managed-JIT shape (V8, JSC, Zend, PCRE2)
     ReservedBuffer, // empty/sparse reserved exec buffer — no payload
@@ -1136,26 +1136,29 @@ pub enum Origin {
     GhostInconclusive,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Prologue {
+    #[default]
     Endbr64,
     PushRbp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ResolvedPointer {
     pub value: String,
     pub target: String,
     pub kind: PointerKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PointerKind {
     LibText,
     JitCluster,
     LibData,
+    #[default]
     Unmapped,
 }
 

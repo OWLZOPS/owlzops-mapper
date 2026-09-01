@@ -128,6 +128,45 @@ jobs:
 
           exit $fail
 
+      # R28-01: remote-path code must not write to the process-wide coverage sink.
+      - name: Guard coverage-sink doctrine (R28-01)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          if rg -n 'coverage::record\(' src/ssh_engine.rs src/known_hosts.rs ; then
+            echo "::error::remote-path coverage::record — use RemoteCoverage::notes (R28-01)"
+            exit 1
+          fi
+
+      # R28-04: every Deserialize struct in models.rs carries container-level
+      # #[serde(default)], so adding a field can never make historical snapshots
+      # unreadable — R26-05 turns that into a refusal to diff the whole file.
+      - name: Guard serde container default (R28-04)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          src = open("src/models.rs").read()
+          bad = []
+          for m in re.finditer(r'((?:^[ \t]*#\[[^\n]*\]\n)+)[ \t]*(?:pub[ \t]+)?struct[ \t]+(\w+)', src, re.M):
+              attrs, name = m.group(1), m.group(2)
+              if 'Deserialize' not in attrs:
+                  continue
+              if not re.search(r'#\[serde\([^)]*\bdefault\b', attrs):
+                  bad.append(name)
+          if bad:
+              print("::error file=src/models.rs::structs without container-level #[serde(default)] (R28-04): " + ", ".join(bad))
+              sys.exit(1)
+          PY
+
+      # R28-05: JSONL key set is a schema contract — it must not depend on values.
+      - name: Guard JSONL key stability (R28-05)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          if rg -n '^\s*#\[serde\([^]]*skip_serializing_if' src/models.rs ; then
+            echo "::error file=src/models.rs::skip_serializing_if attribute breaks JSONL key stability (R28-05)"
+            exit 1
+          fi
+
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
