@@ -148,7 +148,7 @@ An array of objects, one per detected database engine.
 | `containers` | array of objects | All containers |
 | `containers[].name` | string | Container name |
 | `containers[].image` | string | Image name |
-| `containers[].image_id` | string \| null | Digest of the container image (`sha256:...`). Identifies the exact image bytes; differs from `image` (the tag). `null` = not provided by runtime or legacy snapshot. Added in R28-14 (M-2). |
+| `containers[].image_id` | string \| null | Local image ID (config digest, `sha256:...`) as reported by the runtime's inspect API. Identifies the exact image the container is running; differs from `image` (the tag, which can be re-pointed). NOT the registry manifest digest (`RepoDigests`) — do not use it to query a registry. `null` = not provided by runtime or legacy snapshot. Added in R28-14 (M-2). |
 | `containers[].runtime_bounding_caps` | integer \| null | Live CapBnd of the container's init process (host pid), read from the kernel at scan time. `null` = container not running or /proc unreadable (non-root scan). Ground truth for DOCK-010 runtime-tamper delta. |
 | `containers[].state` | string | `"running"`, `"exited"`, etc. |
 | `containers[].status` | string | Human‑readable status |
