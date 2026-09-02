@@ -291,6 +291,23 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                         container = name,
                         "{} inspect returned no data", runtime_name
                     );
+
+                    // R28-18: a container that failed inspect is still a container.
+                    // Dropping it would make it disappear from the inventory and
+                    // turn a coverage gap into a false "container removed" drift.
+                    container_list.push(ContainerInfo {
+                        name: name.trim_start_matches('/').to_string(),
+                        image: c.image.clone().unwrap_or_else(|| "unknown".to_string()),
+                        image_id: None,
+                        state: c.state.clone().unwrap_or_else(|| "unknown".to_string()),
+                        status: c.status.clone().unwrap_or_else(|| "unknown".to_string()),
+                        // All security/config fields unknown.
+                        ..Default::default()
+                    });
+                    coverage::record(format!(
+                        "runtime: container {} was not inspectable — security/config fields are UNKNOWN",
+                        name
+                    ));
                 }
                 Err(e) => {
                     warn!(error = %e, "{} inspect task failed", runtime_name);
