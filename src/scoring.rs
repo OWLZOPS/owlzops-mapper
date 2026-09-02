@@ -2957,6 +2957,7 @@ mod tests {
         ContainerInfo {
             name: name.into(),
             image: "img".into(),
+            image_id: None,
             state: "running".into(),
             status: "Up 2 hours".into(),
             size_mb: 0,
@@ -3354,6 +3355,7 @@ mod tests {
         let base = |bnd: Option<u64>, cap_add: Vec<String>, privileged: bool| ContainerInfo {
             name: "web".into(),
             image: "nginx".into(),
+            image_id: None,
             state: "running".into(),
             status: "Up".into(),
             size_mb: 0,

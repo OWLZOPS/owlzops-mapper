@@ -556,6 +556,30 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                 });
             }
 
+            // R28-14 (M-2): image tag alone is not identity; the digest is.
+            // A re-pointed `nginx:latest` must surface as drift.
+            match (before_c.image_id.as_deref(), after_c.image_id.as_deref()) {
+                (Some(b), Some(a)) if b != a => changes.push(Change {
+                    field: format!("topology.containers.{}.image_id", after_c.name),
+                    before: Some(b.to_string()),
+                    after: Some(a.to_string()),
+                    severity: Severity::Degraded,
+                }),
+                (Some(b), None) => changes.push(Change {
+                    field: format!("topology.containers.{}.image_id", after_c.name),
+                    before: Some(b.to_string()),
+                    after: Some("unknown (not provided)".into()),
+                    severity: Severity::Changed,
+                }),
+                (None, Some(a)) => changes.push(Change {
+                    field: format!("topology.containers.{}.image_id", after_c.name),
+                    before: Some("unknown (not provided)".into()),
+                    after: Some(a.to_string()),
+                    severity: Severity::Changed,
+                }),
+                _ => {}
+            }
+
             // R28-03: scoring already raises DOCK-003/004/005/006/010 on these
             // fields. A diff that stops at (name, image) reports "no change"
             // for a container recreated with --privileged under the same tag.
@@ -2234,6 +2258,7 @@ mod tests {
         let mk = |privileged: bool| ContainerInfo {
             name: "web".into(),
             image: "nginx:latest".into(),
+            image_id: None,
             state: "running".into(),
             status: "Up".into(),
             size_mb: 10,
