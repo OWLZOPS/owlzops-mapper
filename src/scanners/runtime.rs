@@ -413,9 +413,13 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                 / (1024 * 1024);
             let status = container.status.unwrap_or_else(|| "unknown".to_string());
 
+            // M-2: capture the exact image digest, not just the tag.
+            let image_id = inspect.image.clone();
+
             container_list.push(ContainerInfo {
                 name,
                 image: container.image.unwrap_or_else(|| "unknown".to_string()),
+                image_id,
                 state: container.state.unwrap_or_else(|| "unknown".to_string()),
                 status,
                 size_mb,

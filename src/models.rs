@@ -312,6 +312,12 @@ pub struct ContainerInfo {
     /// (non-root scan). Ground truth for the DOCK-010 runtime-tamper delta.
     #[serde(default)]
     pub runtime_bounding_caps: Option<u64>,
+    /// Digest of the container image, as reported by the runtime inspect API
+    /// (e.g. `sha256:...`). `None` = not provided by the runtime or legacy snapshot.
+    /// Unlike `image` (the tag, such as `nginx:latest`), a digest uniquely
+    /// identifies the exact image bytes; a tag can be re-pointed to a new image.
+    #[serde(default)]
+    pub image_id: Option<String>,
 }
 
 impl ContainerInfo {
