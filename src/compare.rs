@@ -348,7 +348,11 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                 field: "network.listening_ports".into(),
                 before: Some(format!("{}:{}:{}", k.0, k.1, k.2)),
                 after: None,
-                severity: Severity::Improved,
+                // R28-21: a listener that stopped is not automatically better.
+                // A deliberately disabled service, a crashed one, and a C2
+                // beacon that finished its job all look identical here. The
+                // operator decides which; the diff reports the fact.
+                severity: Severity::Changed,
             });
         }
     }
@@ -490,6 +494,22 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         .copied()
         .collect();
     for user in all_users {
+        // R28-21: unwrap_or(0) turned "this account was not enumerated" into
+        // "all their keys were revoked" — an Improved entry manufactured out
+        // of missing data. A user present BEFORE and absent AFTER has an
+        // unknown key count, not zero.
+        if let Some(&b) = before_users.get(user)
+            && !after_users.contains_key(user)
+        {
+            changes.push(Change {
+                field: format!("security.shell_users.{}.authorized_keys_count", user),
+                before: Some(b.to_string()),
+                after: Some("unknown (user not enumerated)".into()),
+                severity: Severity::Changed,
+            });
+            continue;
+        }
+
         let before_count = before_users.get(user).copied().unwrap_or(0);
         let after_count = after_users.get(user).copied().unwrap_or(0);
 
@@ -535,7 +555,12 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             field: "topology.containers".into(),
             before: Some(removed.to_string()),
             after: None,
-            severity: Severity::Improved,
+            // R28-21: a container is inventory, not a finding. Its absence can
+            // be a decommission, an attacker cleaning up after a job, or an
+            // inspect we could not complete (R28-18 drops those). None of the
+            // three is an improvement, and calling it one puts a green entry
+            // in the report for something we did not observe.
+            severity: Severity::Changed,
         });
     }
 
@@ -2258,23 +2283,8 @@ mod tests {
         let mk = |privileged: bool| ContainerInfo {
             name: "web".into(),
             image: "nginx:latest".into(),
-            image_id: None,
-            state: "running".into(),
-            status: "Up".into(),
-            size_mb: 10,
-            log_size_mb: 0,
-            ports: vec![],
-            mounts: vec![],
             privileged,
-            memory_limit_mb: None,
-            cpu_limit: None,
-            cap_add: vec![],
-            sensitive_mounts: vec![],
-            restart_count: 0,
-            oom_killed: false,
-            health_status: Some("healthy".into()),
-            rw_size_mb: 10,
-            runtime_bounding_caps: None,
+            ..Default::default()
         };
         let mut before = test_report();
         before.topology.containers = vec![mk(false)];
@@ -2289,5 +2299,147 @@ mod tests {
         assert_eq!(c.severity, Severity::Degraded);
         assert_eq!(c.before.as_deref(), Some("false"));
         assert_eq!(c.after.as_deref(), Some("true"));
+    }
+
+    // ── New tests for R28-14 (M-2) ─────────────────────────────────────────
+    #[test]
+    fn a_retagged_image_under_the_same_tag_is_drift() {
+        let mk = |digest: Option<&str>| ContainerInfo {
+            name: "web".into(),
+            image: "nginx:latest".into(),
+            image_id: digest.map(str::to_string),
+            ..Default::default()
+        };
+        let mut before = test_report();
+        before.topology.containers = vec![mk(Some("sha256:aaa"))];
+        let mut after = test_report();
+        after.topology.containers = vec![mk(Some("sha256:bbb"))];
+
+        let changes = compare_reports(&before, &after).changes;
+        assert!(
+            !changes.iter().any(|c| c.field.ends_with(".image")),
+            "the tag did not move — only the digest did"
+        );
+        let c = changes
+            .iter()
+            .find(|c| c.field.ends_with(".image_id"))
+            .expect("digest change under an unchanged tag must surface");
+        assert_eq!(c.severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn losing_the_digest_is_changed_not_improved() {
+        let mk = |digest: Option<&str>| ContainerInfo {
+            name: "web".into(),
+            image: "nginx:latest".into(),
+            image_id: digest.map(str::to_string),
+            ..Default::default()
+        };
+        let mut before = test_report();
+        before.topology.containers = vec![mk(Some("sha256:aaa"))];
+        let mut after = test_report();
+        after.topology.containers = vec![mk(None)];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field.ends_with(".image_id"))
+            .expect("loss of digest visibility must be recorded");
+        assert_eq!(
+            c.severity,
+            Severity::Changed,
+            "unknown is not an improvement"
+        );
+    }
+
+    // ── R28-21: disappearance of inventory is not improvement ─────────────
+    #[test]
+    fn a_vanished_container_is_changed_not_improved() {
+        let mut before = test_report();
+        before.topology.containers = vec![ContainerInfo {
+            name: "web".into(),
+            image: "nginx:latest".into(),
+            ..Default::default()
+        }];
+        let after = test_report();
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "topology.containers" && c.before.as_deref() == Some("web"))
+            .expect("disappearance must be reported");
+        assert_eq!(
+            c.severity,
+            Severity::Changed,
+            "a container we can no longer see is not a container that got safer"
+        );
+    }
+
+    #[test]
+    fn a_closed_listener_is_changed_not_improved() {
+        let mut before = test_report();
+        before.network.listening_ports = vec![PortInfo {
+            protocol: "tcp".into(),
+            bind_address: "0.0.0.0".into(),
+            port: "4444".into(),
+            process: "nc".into(),
+            ..Default::default()
+        }];
+        let after = test_report();
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "network.listening_ports" && c.after.is_none())
+            .expect("closed listener must be reported");
+        assert_eq!(
+            c.severity,
+            Severity::Changed,
+            "a beacon that finished its job also stops listening"
+        );
+    }
+
+    #[test]
+    fn an_unenumerated_user_is_not_a_key_revocation() {
+        let mk = |keys: usize| UserInfo {
+            username: "deploy".into(),
+            authorized_keys_count: keys,
+            ..Default::default()
+        };
+        let mut before = test_report();
+        before.security.shell_users = vec![mk(3)];
+        let after = test_report(); // user absent — not enumerated
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field.ends_with(".authorized_keys_count"))
+            .expect("loss of visibility must be reported");
+        assert_eq!(c.severity, Severity::Changed);
+        assert!(c.after.as_deref().unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn a_real_key_revocation_is_still_improved() {
+        let mk = |keys: usize| UserInfo {
+            username: "deploy".into(),
+            authorized_keys_count: keys,
+            ..Default::default()
+        };
+        let mut before = test_report();
+        before.security.shell_users = vec![mk(3)];
+        let mut after = test_report();
+        after.security.shell_users = vec![mk(1)];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field.ends_with(".authorized_keys_count"))
+            .expect("count drop must be reported");
+        assert_eq!(
+            c.severity,
+            Severity::Improved,
+            "the user is still enumerated — this is a genuine revocation"
+        );
     }
 }

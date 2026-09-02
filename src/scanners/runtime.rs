@@ -285,31 +285,35 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                         .names
                         .as_ref()
                         .and_then(|n| n.first())
-                        .map(|s| s.as_str())
+                        // Docker returns "/web"; strip the slash so this name
+                        // matches the one used in topology.containers.
+                        .map(|s| s.trim_start_matches('/'))
                         .unwrap_or("unknown");
+                    // R28-18: without an inspect this container is DROPPED from
+                    // topology.containers. That is invisible three ways: no
+                    // DOCK-* finding can fire for it, compare.rs reads its
+                    // absence as Severity::Improved ("the container is gone"
+                    // reads as good news when the truth is "we could not read
+                    // it"), and the exit code stays clean. A tracing::warn
+                    // reaches none of those three.
+                    coverage::record(format!(
+                        "runtime: {runtime_name} inspect returned no data for container \
+                         {name} — it is ABSENT from topology.containers; its \
+                         privileged/cap_add/sensitive_mounts state was NOT read"
+                    ));
                     warn!(
                         container = name,
                         "{} inspect returned no data", runtime_name
                     );
-
-                    // R28-18: a container that failed inspect is still a container.
-                    // Dropping it would make it disappear from the inventory and
-                    // turn a coverage gap into a false "container removed" drift.
-                    container_list.push(ContainerInfo {
-                        name: name.trim_start_matches('/').to_string(),
-                        image: c.image.clone().unwrap_or_else(|| "unknown".to_string()),
-                        image_id: None,
-                        state: c.state.clone().unwrap_or_else(|| "unknown".to_string()),
-                        status: c.status.clone().unwrap_or_else(|| "unknown".to_string()),
-                        // All security/config fields unknown.
-                        ..Default::default()
-                    });
-                    coverage::record(format!(
-                        "runtime: container {} was not inspectable — security/config fields are UNKNOWN",
-                        name
-                    ));
                 }
                 Err(e) => {
+                    // Same fact, different cause (JoinError: panic or cancel).
+                    // The container name is unrecoverable here — the task that
+                    // carried it is gone — so the count is what we can report.
+                    coverage::record(format!(
+                        "runtime: {runtime_name} inspect task failed ({e}) — one container is \
+                         ABSENT from topology.containers; the container inventory is INCOMPLETE"
+                    ));
                     warn!(error = %e, "{} inspect task failed", runtime_name);
                 }
             }
