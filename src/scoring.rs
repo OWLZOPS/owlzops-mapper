@@ -2960,20 +2960,12 @@ mod tests {
             image_id: None,
             state: "running".into(),
             status: "Up 2 hours".into(),
-            size_mb: 0,
-            log_size_mb: 0,
-            ports: vec![],
-            mounts: vec![],
-            privileged: false,
             memory_limit_mb: Some(512),
             cpu_limit: Some(1.0),
-            cap_add: vec![],
-            sensitive_mounts: vec![],
-            restart_count: 0,
-            oom_killed: false,
-            health_status: None,
-            rw_size_mb: 0,
-            runtime_bounding_caps: None,
+            // R28-17: only fields this fixture asserts on are named.
+            // A new model field must not require an edit here, and must not
+            // get a value chosen to satisfy an unrelated test.
+            ..Default::default()
         }
     }
 
@@ -3358,20 +3350,11 @@ mod tests {
             image_id: None,
             state: "running".into(),
             status: "Up".into(),
-            size_mb: 0,
-            log_size_mb: 0,
-            ports: vec![],
-            mounts: vec![],
             privileged,
-            memory_limit_mb: None,
-            cpu_limit: None,
             cap_add,
-            sensitive_mounts: vec![],
-            restart_count: 0,
-            oom_killed: false,
-            health_status: None,
-            rw_size_mb: 0,
             runtime_bounding_caps: bnd,
+            // R28-17: rest defaulted; only assertion-relevant fields named.
+            ..Default::default()
         };
         let tampered = 0x0000_0000_a804_25fb | (1u64 << 21);
 
