@@ -166,7 +166,9 @@ jobs:
               inspected += 1
               if not re.search(r'#\[serde\([^)]*\bdefault\b', attrs):
                   bad.append(name)
-          MIN_STRUCTS = 40  # set from the current count; see command below
+          # R28-16: actual count in models.rs is 53; allow a small margin for
+          # intentional removal. Bump this threshold when models.rs grows.
+          MIN_STRUCTS = 51
           if inspected < MIN_STRUCTS:
               print(f"::error file=src/models.rs::R28-04 guard inspected only {inspected} "
                     f"Deserialize structs (expected >= {MIN_STRUCTS}) — the pattern is stale")
