@@ -224,6 +224,13 @@ pub enum RemoteError {
     },
     #[error("binary upload to {host} failed: {detail}")]
     UploadFailed { host: String, detail: String },
+    /// The remote report hit the stdout cap. A partial report is refused,
+    /// never guessed: a truncated JSON is indistinguishable from a hostile one.
+    #[error(
+        "{host}: remote report exceeded {cap} bytes and was truncated — \
+         the JSON is incomplete and was NOT parsed"
+    )]
+    ReportTruncated { host: String, cap: usize },
     #[error("host key for {host} has been explicitly revoked in known_hosts")]
     HostKeyRevoked { host: String },
     #[error(
@@ -1544,16 +1551,19 @@ pub async fn run_remote_scan_russh(
             }
         }
 
-        // R28-12: main exec truncation is a coverage fact for THIS host, not a
-        // log line. Earlier remote probes record their capping in
-        // remote_coverage.notes; this is the same class and must surface in the
-        // report artifact.
+        // R28-15: a note on RemoteCoverage cannot carry this fact — main.rs
+        // applies coverage only AFTER serde_json::from_slice succeeds, and a
+        // report cut mid-object never parses. The note would be dropped with
+        // the coverage it rides on. Truncation is a refusal, not a warning:
+        // the exit code is irrelevant once the payload is known incomplete.
         if stdout_truncated {
-            remote_coverage.notes.push(format!(
-                "remote stdout exceeded cap ({} bytes) and was truncated — report JSON is PARTIAL",
-                safe_io::CAP_CHILD_STDOUT
-            ));
+            return Err(RemoteError::ReportTruncated {
+                host: hostname.clone(),
+                cap: safe_io::CAP_CHILD_STDOUT,
+            });
         }
+        // stderr truncation IS reachable: the report can parse while a noisy
+        // host overflows the 256 KiB stderr cap. Keep it as coverage.
         if stderr_truncated {
             remote_coverage.notes.push(format!(
                 "remote stderr exceeded cap ({} bytes) and was truncated — error detail is PARTIAL",
