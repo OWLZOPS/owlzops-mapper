@@ -821,14 +821,31 @@ async fn run_command(
                     let start_time = Instant::now();
                     // ==========================================
 
+                    // ========== ADMISSION CONTROL (R28-08) ==========
+                    // Previously every remote host was spawned immediately and
+                    // blocked on the semaphore, so a 5000-host fleet held 5000
+                    // pending futures. Now the permit is acquired BEFORE spawn,
+                    // and the next task is scheduled only after a running task
+                    // finishes, keeping live futures bounded by max_concurrent.
                     let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
                     let mut join_set = tokio::task::JoinSet::new();
+                    let mut remote_iter = remote.into_iter();
 
-                    for host in remote {
+                    // Spawn the first max_concurrent tasks, acquiring permits
+                    // up front. At startup this is bounded and fast.
+                    for _ in 0..args.max_concurrent {
                         if shutdown.load(Ordering::Relaxed) {
                             break;
                         }
+                        let Some(host) = remote_iter.next() else {
+                            break;
+                        };
                         let sem = semaphore.clone();
+                        // Acquire permit before spawning; this may wait if
+                        // max_concurrent is zero (but CLI validation prevents that).
+                        let Ok(permit) = sem.acquire_owned().await else {
+                            break; // Semaphore closed; can't happen
+                        };
                         let a = AuditArgs {
                             hosts: None,
                             host: Vec::new(),
@@ -839,10 +856,8 @@ async fn run_command(
                         let upload_pb = upload_bar.clone();
 
                         join_set.spawn(async move {
-                            // R13-03: explicit permit error handling.
-                            let Ok(_permit) = sem.acquire_owned().await else {
-                                return None;
-                            };
+                            // Permit is already held; no acquire inside the task.
+                            let _permit = permit;
 
                             // R16 hardening: validation must not depend on the presence
                             // of a sudo password.
@@ -934,7 +949,7 @@ async fn run_command(
                         });
                     }
 
-                    // Process results with two-phase shutdown on Ctrl‑C
+                    // Process results and schedule the next host when a slot frees.
                     loop {
                         tokio::select! {
                             biased;
@@ -991,6 +1006,7 @@ async fn run_command(
                             res = join_set.join_next() => {
                                 match res {
                                     Some(result) => {
+                                        // Process the completed task.
                                         match result {
                                             Ok(Some((host, report))) => {
                                                 agg.add(&report);
@@ -1013,8 +1029,107 @@ async fn run_command(
                                                 warn!("scan task failed: {e}");
                                             }
                                         }
+
+                                        // A slot is now free; try to spawn the next host.
+                                        if !shutdown.load(Ordering::Relaxed)
+                                            && let Some(host) = remote_iter.next()
+                                        {
+                                            // Since a task just completed, a permit is
+                                            // guaranteed available; use try_acquire to avoid
+                                            // async wait inside the result handler.
+                                            let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                                                // Should never happen, but do not spawn without permit.
+                                                warn!("could not acquire permit for next host; dropping host");
+                                                continue;
+                                            };
+                                            let a = AuditArgs {
+                                                hosts: None,
+                                                host: Vec::new(),
+                                                ..args.clone()
+                                            };
+                                            let pass = sudo_pass.clone();
+                                            let host_for_log = host.clone();
+                                            let upload_pb = upload_bar.clone();
+
+                                            join_set.spawn(async move {
+                                                let _permit = permit;
+                                                if let Err(e) = runner::validate_host(&host) {
+                                                    warn!("{e}");
+                                                    return None;
+                                                }
+                                                if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
+                                                    warn!("{e}");
+                                                    return None;
+                                                }
+                                                if let Some(rp) = &a.remote_path
+                                                    && let Err(e) = runner::validate_remote_path(rp)
+                                                {
+                                                    warn!("{e}");
+                                                    return None;
+                                                }
+                                                let overall =
+                                                    Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 35);
+                                                let result = tokio::time::timeout(overall, async {
+                                                    let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+                                                    match ssh_engine::run_remote_scan_russh(
+                                                        &host,
+                                                        &a.ssh_user,
+                                                        &ssh_key_expanded,
+                                                        a.remote_path.as_deref(),
+                                                        pass.as_deref(),
+                                                        a.copy_binary,
+                                                        a.keep_binary,
+                                                        a.local_binary.as_deref(),
+                                                        a.deep,
+                                                        a.remote_timeout_secs,
+                                                        upload_pb,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok((stdout, coverage)) => {
+                                                            match serde_json::from_slice::<AgentReport>(&stdout) {
+                                                                Ok(mut report) => {
+                                                                    coverage.apply_to(&mut report);
+                                                                    Some(report)
+                                                                }
+                                                                Err(e) => {
+                                                                    let raw_preview: String =
+                                                                        String::from_utf8_lossy(&stdout)
+                                                                            .chars()
+                                                                            .take(200)
+                                                                            .collect();
+                                                                    let preview =
+                                                                        crate::utils::sanitize_for_log(&raw_preview);
+                                                                    warn!(
+                                                                        host = %host,
+                                                                        error = %e,
+                                                                        preview = %preview,
+                                                                        "remote output is not a valid AgentReport"
+                                                                    );
+                                                                    None
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(host = %host, error = %e, "russh scan failed");
+                                                            None
+                                                        }
+                                                    }
+                                                })
+                                                .await;
+                                                match result {
+                                                    Ok(Some(report)) => Some((host.clone(), report)),
+                                                    Ok(None) => None,
+                                                    Err(_elapsed) => {
+                                                        warn!(host = %host_for_log, "global timeout for host");
+                                                        None
+                                                    }
+                                                }
+                                            });
+                                        }
                                     }
                                     None => {
+                                        // All tasks finished; exit the loop.
                                         let _elapsed = start_time.elapsed();
                                         scan_bar.finish_and_clear();
                                         if let Some(pb) = &upload_bar { pb.finish_and_clear(); }
