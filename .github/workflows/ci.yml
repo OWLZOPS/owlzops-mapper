@@ -322,7 +322,7 @@ jobs:
           docker run --rm \
             -v $PWD:/src \
             -w /src \
-            opensuse/tumbleweed:latest \
+            opensuse/leap:latest \
             bash -c "
             set -ex
             zypper --non-interactive refresh
