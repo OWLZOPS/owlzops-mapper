@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.5.37] - 2026-09-02
+
+
+### Bug Fixes
+
+- **dlp:** Single SecretLeak construction and source-aware self attribution
+- **ssh_engine:** Check_server_key signature for russh 0.63
+- Handle truncation of /proc/mounts in ghost_pid (R27-47)
+- Handle truncation in kprobe_events and /proc/<pid>/maps
+- Handle procfs truncation as unobservable in ghost_pid, preload
+- Disclose unreadable pid_max in ghost_pid sync fallback (R27-50)
+- Make ghost_pid helpers use proc_root consistently (R27-51)
+- Make socket_owning_pids use proc_root (R27-52)
+- **ghost-pid:** R27-55 — io_uring path respects proc_root and discloses pid_max fallback
+- **verdict-cache:** R27-56 — treat backward clock as stale, not fresh
+- **verdict-cache:** R27-56 — treat backward clock as stale, not fresh
+- **capabilities:** R27-59 — partial degradation, keep malware sweep on truncated status
+- **ghost-pid:** R27-54 — correct starttime position in make_proc fixture
+- **capabilities:** R27-60 — report suspicious-store overflow; align identity parser
+- **dlp:** Exclude non-secret XDG_ACTIVATION_TOKEN from SEC-014
+- **audit:** R27-61, R27-62, R27-63 — deep budget disclosure, blocked-vs-not-attempted, orchestrator coverage leak
+- **audit:** R27-64, R27-65 — disclose unread deep regions and unscanned PIDs
+- **audit:** R27-66 — restore environ scan after MAPS cap, fix counter
+- **sudoers:** R27-67 — deep alias chain must be UNKNOWN, not negative
+- **mounts:** R27-68 — disclose SEC-021 finding cap, stop silent truncation
+- **audit:** R27-69, R27-70 — disclose eBPF pin truncation and zypper patch cap
+- **ssh_engine:** Route remote coverage facts to RemoteCoverage::notes (R28-01)
+- **models:** Apply container serde(default) to inventory structs and drop skip_serializing_if (R28-04/R28-05)
+- **compare:** Diff exe_path for ports and container security fields (R28-02/R28-03)
+- **ssh_engine, known_hosts:** Route remote coverage facts to RemoteCoverage::notes (R28-01)
+- **ssh_engine,ci:** Record main exec truncation in coverage notes and broaden R28-05 gate (R28-12/R28-13)
+- **ssh_engine:** Return ReportTruncated for truncated remote stdout (R28-15)
+- **runtime:** Keep uninspectable containers in inventory (R28-18)
+- **runtime:** Record coverage when container inspect fails (R28-18)
+- **compare:** Inventory disappearance is Changed, not Improved (R28-21)
+
+### Build System
+
+- **deps:** Bump russh from 0.62.6 to 0.63.0
+- **deps:** Bump io-uring from 0.7.13 to 0.7.14 (#200)
+- **deps:** Bump uuid from 1.24.1 to 1.26.0 (#252)
+- **deps:** Bump rust_xlsxwriter from 0.97.1 to 0.99.0 (#253)
+- **deps:** Bump taiki-e/install-action from 2.86.5 to 2.87.0 (#255)
+- **deps:** Bump russh from 0.63.0 to 0.63.1 (#254)
+
+### CI/CD
+
+- Avoid cross-OS cargo cache poisoning
+- Add gates for coverage sink, serde defaults, and JSONL key stability (R28-01/R28-04/R28-05)
+- Pin MIN_STRUCTS to actual count (R28-16)
+
+### Documentation
+
+- **scoring:** Mark SCORING_VERSION entries as v0.5.36
+- Added a new URL for install.sh
+- **fields:** Document image_id and runtime_bounding_caps (R28-14)
+- **fields:** Clarify image_id semantics
+
+### Features
+
+- **containers:** Diff image digest, not just tag (M-2)
+
+### Performance Improvements
+
+- **proc_net:** Cache comm reads per PID; fix(utils): join reader threads on timeout (R28-06/R28-07)
+- **main:** Bound fleet admission to max_concurrent live tasks (R28-08)
+
+### Refactoring
+
+- **scanners:** Deduplicate exec-cluster logic between deep.rs and library_injection.rs
+
+### Testing
+
+- Exercise real socket_owning_pids and update comments (R27-53)
+- Protect R28 guards with positive self-tests and determinism checks (R28-09/R28-10/R28-11)
+- **scoring:** Use Default for ContainerInfo fixtures (R28-17)
+
 ## [0.5.36] - 2026-08-27
 
 
