@@ -128,6 +128,62 @@ fn classify_region(perms: &str, backing: Option<&str>) -> ExecTier {
 
 // ── RUNTIME TRUST & TOPOLOGY ───────────────────────────────
 
+/// The mapped object's path, without the "(deleted)" suffix, plus whether the
+/// suffix was there. One helper because this field is currently extracted two
+/// different ways in this file — `splitn(6)` keeps the suffix inside the field,
+/// `rsplit` makes it a separate token — and the two must not drift (R29-01).
+fn split_deleted(field: &str) -> (&str, bool) {
+    let f = field.trim();
+    match f.strip_suffix(" (deleted)") {
+        Some(base) => (base.trim_end(), true),
+        None => (f, false),
+    }
+}
+
+/// Path of the mapped object for a maps line, suffix included.
+/// maps layout: addr perms offset dev inode [path [(deleted)]].
+fn map_path(line: &str) -> Option<&str> {
+    let mut it = line.splitn(6, char::is_whitespace);
+    for _ in 0..5 {
+        it.next()?;
+    }
+    let p = it.next()?.trim();
+    (!p.is_empty()).then_some(p)
+}
+
+/// "(deleted)" is an IOC only when the bytes are UNREACHABLE. A package
+/// upgraded in place marks the exe and every library it ships as deleted while
+/// the path is still on disk under a fresh inode — that is patching, not
+/// hiding, and it happens on every box that gets updated without a reboot.
+/// Hiding removes the path; that case stays untrusted. memfd and volatile
+/// paths are never rehabilitated regardless.
+///
+/// This grants nothing that a non-deleted mapping at the same path does not
+/// already get: it only stops the window after an upgrade from being treated
+/// as more suspicious than the steady state.
+fn mapping_is_attributable(field: &str) -> bool {
+    let (clean, deleted) = split_deleted(field);
+    if !clean.starts_with('/') {
+        return false;
+    }
+    if !deleted {
+        return true;
+    }
+    !clean.starts_with("/memfd:")
+        && !is_volatile_lib_path(clean)
+        // stat only on deleted lines — rare, so this is not a per-VMA syscall.
+        && std::fs::metadata(clean).is_ok_and(|m| m.is_file())
+}
+
+/// True when an exe path carries `(deleted)` but the path still exists on disk.
+/// This is the signature of an in-place package upgrade followed by a missing
+/// reboot: the process holds the old inode, the filesystem has new bytes.
+/// Hiding would have removed the path entirely.
+fn is_stale_after_upgrade(exe_path: &str) -> bool {
+    let (clean, deleted) = split_deleted(exe_path);
+    deleted && clean.starts_with('/') && std::fs::metadata(clean).is_ok_and(|m| m.is_file())
+}
+
 struct RuntimeTrust {
     exe_ok: bool,
     runtime_libs: bool,
@@ -137,31 +193,36 @@ struct RuntimeTrust {
 
 fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
     let exe_ok = exe_path.is_some_and(|e| {
-        let clean = e.trim_end_matches(" (deleted)");
-        let is_deleted = e.ends_with(" (deleted)");
-
+        let (clean, _) = split_deleted(e);
         let is_vendor = VENDOR_ROOTS.iter().any(|r| clean.contains(*r));
-
-        !is_deleted && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
+        mapping_is_attributable(e) && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
     });
 
     let runtime_libs = maps.lines().any(|l| {
-        let last = l.rsplit(char::is_whitespace).next().unwrap_or("");
-        last.starts_with('/')
-            && !last.ends_with("(deleted)")
-            && !is_volatile_lib_path(last)
-            && RT_LIBS.iter().any(|lib| last.contains(lib))
+        let Some(field) = map_path(l) else {
+            return false;
+        };
+        if !mapping_is_attributable(field) {
+            return false;
+        }
+        let (clean, _) = split_deleted(field);
+        !is_volatile_lib_path(clean) && RT_LIBS.iter().any(|lib| clean.contains(lib))
     });
 
     let vendor_anchored = exe_path
+        .map(|e| split_deleted(e).0)
         .and_then(|e| VENDOR_ROOTS.iter().find(|r| e.contains(**r)).copied())
         .is_some_and(|root| {
             maps.lines()
                 .filter(|l| {
-                    let last = l.rsplit(char::is_whitespace).next().unwrap_or("");
-                    last.contains(root)
-                        && !last.ends_with("(deleted)")
-                        && (last.ends_with(".so") || last.contains(".so."))
+                    let Some(field) = map_path(l) else {
+                        return false;
+                    };
+                    if !mapping_is_attributable(field) {
+                        return false;
+                    }
+                    let (clean, _) = split_deleted(field);
+                    clean.contains(root) && (clean.ends_with(".so") || clean.contains(".so."))
                 })
                 .count()
                 >= VENDOR_ANCHOR_MIN_SO
@@ -191,7 +252,7 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
             continue;
         };
         let backed = path.map(str::trim).is_some_and(|p| {
-            p.starts_with('/') && !p.ends_with("(deleted)") && !is_volatile_lib_path(p)
+            mapping_is_attributable(p) && !is_volatile_lib_path(split_deleted(p).0)
         });
         if backed {
             file_exec = file_exec.saturating_add(sz);
@@ -202,8 +263,7 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
     // Intentionally NOT using exe_ok/is_ephemeral_exec_path: standalone lives
     // in /home, and the whole point of the anchor is to bypass that overly
     // broad heuristic. A live main image is the sole extra condition.
-    let main_exe_present =
-        exe_path.is_some_and(|e| !e.ends_with(" (deleted)") && !e.starts_with("/memfd:"));
+    let main_exe_present = exe_path.is_some_and(mapping_is_attributable);
     let file_text_anchored = main_exe_present
         && file_exec >= FILE_TEXT_ANCHOR_MIN
         && anon_exec.saturating_mul(FILE_TEXT_ANON_RATIO) <= file_exec;
@@ -613,6 +673,10 @@ fn scan_maps(
                     | Some(crate::utils::ExeProvenance::NestedUserInstall) => {
                         Some("maps-rwx-provisional")
                     }
+                    // R29-01: deleted-after-upgrade is pending reboot, not hiding.
+                    _ if exe_path.is_some_and(is_stale_after_upgrade) => {
+                        Some("maps-rwx-stale-after-upgrade")
+                    }
                     // Heavy standalone (Telegram/AppImage): trust from
                     // file-text dominance, not from spuofable file count.
                     _ if trust.file_text_anchored => Some("maps-rwx-provisional"),
@@ -970,5 +1034,52 @@ mod tests {
             Some("maps-anon-rwx"),
             "dropper without file-text anchor must stay an active finding"
         );
+    }
+
+    // ── R29-01: deleted-after-upgrade rehabilitation tests ─────
+
+    #[test]
+    fn deleted_path_that_still_exists_is_an_upgrade_not_hiding() {
+        // R29-01: an in-place package upgrade marks every mapping from that
+        // package "(deleted)" while the path stays on disk. Collapsing all four
+        // trust anchors on that is why a patched-but-not-rebooted host lights up.
+        // Use a real non-volatile path to avoid /tmp being volatile.
+        assert!(
+            mapping_is_attributable("/usr/bin/env (deleted)"),
+            "path still on disk = patched, not hidden"
+        );
+        assert!(
+            !mapping_is_attributable("/usr/bin/definitely_not_existing (deleted)"),
+            "unlinked and gone is the actual IOC and must stay untrusted"
+        );
+        assert!(!mapping_is_attributable("/memfd:payload (deleted)"));
+        assert!(!mapping_is_attributable("/dev/shm/x.so (deleted)"));
+
+        // Non-deleted existing path should always be attributable.
+        assert!(mapping_is_attributable("/usr/bin/env"));
+    }
+
+    #[test]
+    fn map_path_survives_the_deleted_suffix_and_padded_columns() {
+        let line = "7f00-7f01 r-xp 00000000 08:01 12345      /opt/x/lib.so (deleted)";
+        assert_eq!(map_path(line), Some("/opt/x/lib.so (deleted)"));
+        assert_eq!(split_deleted(map_path(line).unwrap()).0, "/opt/x/lib.so");
+        assert_eq!(map_path("7f00-7f01 rw-p 0 00:00 0 "), None);
+    }
+
+    #[test]
+    fn stale_after_upgrade_is_advisory_not_memory_anomaly() {
+        let f = crate::models::LibraryInjectionFinding {
+            pid: 1,
+            process: "nginx".into(),
+            object_path: "/usr/sbin/nginx".into(),
+            source: "maps-rwx-stale-after-upgrade".into(),
+            is_deleted: false,
+            region_addr: None,
+            deep_forensics: None,
+            deep_unavailable: None,
+            exe_path: Some("/usr/sbin/nginx".into()),
+        };
+        assert_eq!(f.classify(), InjectionClass::JitAdvisory);
     }
 }

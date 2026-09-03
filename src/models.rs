@@ -959,6 +959,7 @@ impl LibraryInjectionFinding {
             || self.source == "maps-rwx-cached-clean"
             || self.source == "maps-rwx-provisional"
             || self.source == "maps-rwx-runtime-allowlist"
+            || self.source == "maps-rwx-stale-after-upgrade"  // R29-01: visible, not weighted
             || self.source.ends_with("-jit")
         {
             InjectionClass::JitAdvisory
