@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -89,15 +89,18 @@ fn parse_local(field: &str, v6: bool) -> Option<(String, u16)> {
     Some((addr, port))
 }
 
-fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
+/// Parse a `/proc/net/{tcp,tcp6,udp,udp6}`-style file from `base_dir`.
+/// For the host namespace `base_dir` is `/proc`; for a foreign network
+/// namespace it is `/proc/<pid>`.
+fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &str) {
     let path = match proto {
-        Proto::Tcp => "/proc/net/tcp",
-        Proto::Tcp6 => "/proc/net/tcp6",
-        Proto::Udp => "/proc/net/udp",
-        Proto::Udp6 => "/proc/net/udp6",
+        Proto::Tcp => format!("{base_dir}/net/tcp"),
+        Proto::Tcp6 => format!("{base_dir}/net/tcp6"),
+        Proto::Udp => format!("{base_dir}/net/udp"),
+        Proto::Udp6 => format!("{base_dir}/net/udp6"),
     };
 
-    let (content, truncated) = match safe_io::read_procfs_capped(path, safe_io::CAP_PROC_NET) {
+    let (content, truncated) = match safe_io::read_procfs_capped(&path, safe_io::CAP_PROC_NET) {
         Ok((c, t)) => (c, t),
         // Kernel without IPv6 support → legitimate absence, silence is correct.
         Err(e) if e.kind() == ErrorKind::NotFound => return,
@@ -174,12 +177,84 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
     }
 }
 
+/// Collect listening sockets visible in the current/host network namespace.
 pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
     let mut map = HashMap::new();
     for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
-        parse_proc_net(p, &mut map);
+        parse_proc_net(p, &mut map, "/proc");
     }
     map
+}
+
+/// Read the network namespace inode for a process.
+fn netns_inode(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/ns/net"))
+        .ok()?
+        .to_str()
+        .map(str::to_string)
+}
+
+/// Walk all processes and report listeners that exist in foreign network
+/// namespaces but are NOT present in the host namespace inventory.
+///
+/// These sockets are invisible to the host-level port scanner and therefore
+/// absent from `network.listening_ports`. Raw Truth demands they be surfaced;
+/// they land in coverage so the operator knows the host view is incomplete.
+pub fn report_foreign_netns_listeners() {
+    let host_ns = match std::fs::read_link("/proc/1/ns/net") {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => return,
+    };
+
+    // Host-visible keys: (proto, address, port)
+    let host_sockets = collect_listening_sockets();
+    let host_keys: HashSet<(String, String, u16)> = host_sockets
+        .values()
+        .map(|s| (s.proto.to_string(), s.bind_address.clone(), s.port))
+        .collect();
+
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+
+        let Some(ns) = netns_inode(pid) else { continue };
+        if ns == host_ns {
+            continue;
+        }
+
+        let mut foreign = HashMap::new();
+        let base = format!("/proc/{pid}");
+        for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
+            parse_proc_net(p, &mut foreign, &base);
+        }
+
+        if foreign.is_empty() {
+            continue;
+        }
+
+        let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
+            .ok()
+            .map(|(c, _)| c.trim().to_string())
+            .unwrap_or_else(|| "?".to_string());
+
+        for meta in foreign.values() {
+            let key = (meta.proto.to_string(), meta.bind_address.clone(), meta.port);
+            if !host_keys.contains(&key) {
+                coverage::record(format!(
+                    "netns: pid {pid} ({comm}) listens on {}:{}/{} — not visible in host netns",
+                    meta.bind_address, meta.port, meta.proto
+                ));
+            }
+        }
+    }
 }
 
 pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, ProcAttr> {

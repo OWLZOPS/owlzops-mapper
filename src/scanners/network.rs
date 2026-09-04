@@ -5,7 +5,9 @@ use chrono::{NaiveDateTime, Utc};
 
 use crate::models::{NetworkInfo, PortInfo, SslCertInfo};
 use crate::safe_io;
-use crate::scanners::proc_net::{attribute_sockets, collect_listening_sockets};
+use crate::scanners::proc_net::{
+    attribute_sockets, collect_listening_sockets, report_foreign_netns_listeners,
+};
 use crate::utils::run_with_timeout;
 
 fn parse_openssl_enddate(raw: &str) -> Option<i64> {
@@ -175,6 +177,7 @@ pub fn gather_network_info() -> NetworkInfo {
 
     // ---------- Listening ports via /proc (zero-dependency) ----------
     let sockets = collect_listening_sockets();
+    report_foreign_netns_listeners(); // M-4: surface listeners hidden in other netns
     let attrs = attribute_sockets(&sockets);
 
     let mut listening_ports = Vec::new();
