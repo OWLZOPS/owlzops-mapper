@@ -215,6 +215,11 @@ pub struct NetworkInfo {
     pub listening_ports: Vec<PortInfo>,
     #[serde(default)]
     pub dns_upstreams: Vec<String>,
+    /// Listeners discovered in foreign network namespaces. These are NOT part
+    /// of `listening_ports`, which is host-namespace only. Sorted for stable
+    /// output. Added in R29-02.
+    #[serde(default)]
+    pub foreign_netns_listeners: Vec<ForeignNetnsListener>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -238,6 +243,40 @@ pub struct PortInfo {
     pub pid: Option<u32>,
     #[serde(default)]
     pub exe_path: Option<String>,
+}
+
+// ── Foreign network namespace listeners ─────────────────────────────────
+
+/// A listening socket observed in a network namespace other than the host's.
+/// Inventory, not a coverage gap: we SAW these sockets. They are absent from
+/// `listening_ports` because that view is the host namespace only.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct ForeignNetnsListener {
+    /// Network namespace inode, e.g. "net:[4026532914]".
+    pub netns: String,
+    pub protocol: String,
+    pub bind_address: String,
+    pub port: String,
+    /// comm of an observed process in this namespace. Spoofable — provenance
+    /// only, never a key. Correlate via `container` instead.
+    pub example_process: Option<String>,
+    /// Container name from topology.containers, matched by netns. None = the
+    /// namespace was not attributable to any known container.
+    pub container: Option<String>,
+    /// True for Docker's embedded resolver (127.0.0.11). Kept, never dropped
+    /// (Raw Truth), but flagged so consumers can filter runtime artifacts.
+    pub runtime_infrastructure: bool,
+}
+
+/// Internal mapping between a container and its network namespace.
+/// Serialization is skipped; used only to enrich `ForeignNetnsListener`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Fields will be used by runner.rs link function (R29-02)
+pub struct ContainerNetnsMapping {
+    pub name: String,
+    pub netns: String,
+    pub pid: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -273,6 +312,10 @@ pub struct TopologyInfo {
     pub images_reclaimable_mb: u64,
     #[serde(default)]
     pub build_cache_reclaimable_mb: u64,
+    /// Internal only: mapping from container to netns for enrichment of
+    /// `NetworkInfo.foreign_netns_listeners`. Not serialized.
+    #[serde(skip)]
+    pub container_netns: Vec<ContainerNetnsMapping>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

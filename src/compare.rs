@@ -28,6 +28,16 @@ fn index_file_caps(v: &[FileCapFinding]) -> HashMap<&str, (u64, u64, bool)> {
         .collect()
 }
 
+/// Extract the stable diff key from a foreign-netns listener entry.
+fn foreign_netns_key(l: &crate::models::ForeignNetnsListener) -> (&str, &str, &str, &str) {
+    (
+        l.netns.as_str(),
+        l.protocol.as_str(),
+        l.bind_address.as_str(),
+        l.port.as_str(),
+    )
+}
+
 /// Symmetric set diff over string vectors. Appearance is Degraded,
 /// disappearance is Improved.
 ///
@@ -440,6 +450,39 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                     });
                 }
             }
+        }
+    }
+
+    // --- network.foreign_netns_listeners (R29-02) ---
+    {
+        let before_fnls: HashSet<_> = before
+            .network
+            .foreign_netns_listeners
+            .iter()
+            .map(foreign_netns_key)
+            .collect();
+        let after_fnls: HashSet<_> = after
+            .network
+            .foreign_netns_listeners
+            .iter()
+            .map(foreign_netns_key)
+            .collect();
+
+        for k in after_fnls.difference(&before_fnls) {
+            changes.push(Change {
+                field: "network.foreign_netns_listeners".into(),
+                before: None,
+                after: Some(format!("{} {} {}:{}", k.0, k.1, k.2, k.3)),
+                severity: Severity::Degraded,
+            });
+        }
+        for k in before_fnls.difference(&after_fnls) {
+            changes.push(Change {
+                field: "network.foreign_netns_listeners".into(),
+                before: Some(format!("{} {} {}:{}", k.0, k.1, k.2, k.3)),
+                after: None,
+                severity: Severity::Changed,
+            });
         }
     }
 

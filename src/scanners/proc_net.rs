@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::coverage;
+use crate::models::ForeignNetnsListener;
 use crate::safe_io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,14 +206,17 @@ fn netns_inode(pid: u32) -> Option<String> {
 ///
 /// These sockets are invisible to the host-level port scanner and therefore
 /// absent from `network.listening_ports`. Raw Truth demands they be surfaced;
-/// they land in coverage so the operator knows the host view is incomplete.
+/// they are returned as a Vec of `ForeignNetnsListener` for integration into
+/// `NetworkInfo`.
 ///
 /// Aggregated per network namespace: a Docker host has many processes sharing
-/// one netns, but only one coverage record is emitted with example listeners.
+/// one netns, but only one entry per unique socket is returned.
 ///
 /// `host_sockets` must be the already-collected host inventory. Do NOT
 /// re-read `/proc/net/*` here; the caller has it (M4-01).
-pub fn report_foreign_netns_listeners(host_sockets: &HashMap<u64, SocketMeta>) {
+pub fn report_foreign_netns_listeners(
+    host_sockets: &HashMap<u64, SocketMeta>,
+) -> Vec<ForeignNetnsListener> {
     let host_ns = match std::fs::read_link("/proc/1/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
@@ -221,7 +225,7 @@ pub fn report_foreign_netns_listeners(host_sockets: &HashMap<u64, SocketMeta>) {
                  listeners NOT enumerated; the port inventory may be missing sockets",
                 e.kind()
             ));
-            return;
+            return Vec::new();
         }
     };
 
@@ -238,7 +242,7 @@ pub fn report_foreign_netns_listeners(host_sockets: &HashMap<u64, SocketMeta>) {
                  listeners NOT enumerated",
                 e.kind()
             ));
-            return;
+            return Vec::new();
         }
     };
 
@@ -298,36 +302,34 @@ pub fn report_foreign_netns_listeners(host_sockets: &HashMap<u64, SocketMeta>) {
         ns_cache.insert(ns, (invisible, comm));
     }
 
+    let mut result = Vec::new();
     for (ns, (sockets, comm)) in ns_cache {
-        if sockets.is_empty() {
-            continue;
+        for meta in sockets {
+            result.push(ForeignNetnsListener {
+                netns: ns.clone(),
+                protocol: meta.proto.to_string(),
+                bind_address: meta.bind_address.clone(),
+                port: meta.port.to_string(),
+                example_process: Some(comm.clone()),
+                container: None, // filled later by runner
+                runtime_infrastructure: meta.bind_address == "127.0.0.11",
+            });
         }
-        let examples: Vec<String> = sockets
-            .iter()
-            .take(3)
-            .map(|s| format!("{}:{}/{}", s.bind_address, s.port, s.proto))
-            .collect();
-        let more = sockets.len().saturating_sub(3);
-        let msg = if more > 0 {
-            format!(
-                "netns {} (example process: {}): {} listener(s) not visible in host netns — e.g. {} (+{} more)",
-                ns,
-                comm,
-                sockets.len(),
-                examples.join(", "),
-                more
-            )
-        } else {
-            format!(
-                "netns {} (example process: {}): {} listener(s) not visible in host netns — {}",
-                ns,
-                comm,
-                sockets.len(),
-                examples.join(", ")
-            )
-        };
-        coverage::record(msg);
     }
+
+    // Deterministic order: R29-02, same principle as R28-11.
+    result.sort_by(|a, b| {
+        a.netns
+            .cmp(&b.netns)
+            .then_with(|| a.protocol.cmp(&b.protocol))
+            .then_with(|| a.bind_address.cmp(&b.bind_address))
+            .then_with(|| {
+                a.port
+                    .parse::<u16>()
+                    .unwrap_or(0)
+                    .cmp(&b.port.parse::<u16>().unwrap_or(0))
+            })
+    });
 
     if ns_denied > 0 {
         coverage::record(format!(
@@ -341,6 +343,8 @@ pub fn report_foreign_netns_listeners(host_sockets: &HashMap<u64, SocketMeta>) {
              process(es) in unprobed namespaces — foreign listeners are a LOWER BOUND"
         ));
     }
+
+    result
 }
 
 pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, ProcAttr> {

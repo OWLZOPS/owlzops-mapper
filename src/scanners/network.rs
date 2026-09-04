@@ -178,7 +178,7 @@ pub fn gather_network_info() -> NetworkInfo {
     // ---------- Listening ports via /proc (zero-dependency) ----------
     let sockets = collect_listening_sockets();
     // M4-01: pass the inventory we already have — do not re-parse /proc/net/*.
-    report_foreign_netns_listeners(&sockets);
+    let foreign_netns_listeners = report_foreign_netns_listeners(&sockets);
     let attrs = attribute_sockets(&sockets);
 
     let mut listening_ports = Vec::new();
@@ -262,6 +262,7 @@ pub fn gather_network_info() -> NetworkInfo {
         ssl_certificates,
         listening_ports,
         dns_upstreams,
+        foreign_netns_listeners,
     }
 }
 
