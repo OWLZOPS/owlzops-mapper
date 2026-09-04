@@ -272,11 +272,10 @@ pub struct ForeignNetnsListener {
 /// Internal mapping between a container and its network namespace.
 /// Serialization is skipped; used only to enrich `ForeignNetnsListener`.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Fields will be used by runner.rs link function (R29-02)
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
 pub struct ContainerNetnsMapping {
     pub name: String,
-    pub netns: String,
-    pub pid: Option<i64>,
+    pub netns: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

@@ -106,13 +106,38 @@ const PERSISTENCE_IDS: &str = "SEC-042/043/044/049/050/051/052/053/054/055/056/0
 
 #[cfg(feature = "local-scan")]
 fn link_foreign_netns_to_containers(network: &mut NetworkInfo, topology: &TopologyInfo) {
+    // R29-06: several containers can share one netns (`--network container:X`,
+    // k8s pods). find() returns whichever the runtime listed first, and
+    // container_netns is not sorted — the attribution could flip between scans.
+    // BTreeMap + sorted names makes the winner deterministic, and the sharing
+    // itself is recorded rather than silently dropped.
+    let mut by_netns: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for m in &topology.container_netns {
+        if let Some(ns) = &m.netns {
+            by_netns
+                .entry(ns.as_str())
+                .or_default()
+                .push(m.name.as_str());
+        }
+    }
+
+    for (ns, names) in by_netns.iter_mut() {
+        names.sort_unstable();
+        if names.len() > 1 {
+            crate::coverage::record(format!(
+                "netns {ns} is shared by {} containers ({}) — foreign listeners in it are \
+                 attributed to '{}' only; the socket belongs to the namespace, not to one \
+                 container",
+                names.len(),
+                names.join(", "),
+                names[0]
+            ));
+        }
+    }
+
     for listener in &mut network.foreign_netns_listeners {
-        if let Some(mapping) = topology
-            .container_netns
-            .iter()
-            .find(|m| m.netns == listener.netns)
-        {
-            listener.container = Some(mapping.name.clone());
+        if let Some(names) = by_netns.get(listener.netns.as_str()) {
+            listener.container = Some(names[0].to_string());
         }
     }
 }

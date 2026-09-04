@@ -99,7 +99,10 @@ fn parse_local(field: &str, v6: bool) -> Option<(String, u16)> {
 /// Parse a `/proc/net/{tcp,tcp6,udp,udp6}`-style file from `base_dir`.
 /// For the host namespace `base_dir` is `/proc`; for a foreign network
 /// namespace it is `/proc/<pid>`.
-fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &str) {
+///
+/// Returns true if the file was actually read. The caller needs to tell
+/// "this namespace has no listeners" from "this pid is gone" (R29‑03).
+fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &str) -> bool {
     let path = match proto {
         Proto::Tcp => format!("{base_dir}/net/tcp"),
         Proto::Tcp6 => format!("{base_dir}/net/tcp6"),
@@ -109,8 +112,11 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &
 
     let (content, truncated) = match safe_io::read_procfs_capped(&path, safe_io::CAP_PROC_NET) {
         Ok((c, t)) => (c, t),
-        // Kernel without IPv6 support → legitimate absence, silence is correct.
-        Err(e) if e.kind() == ErrorKind::NotFound => return,
+        // Two different situations share ENOENT here: a kernel without IPv6
+        // (base_dir = /proc, legitimate absence) and a pid that exited between
+        // readdir and this read (base_dir = /proc/<pid>). Silence is correct
+        // for the first; the caller resolves the second via the return value.
+        Err(e) if e.kind() == ErrorKind::NotFound => return false,
         Err(e) => {
             coverage::record(format!(
                 "{path} unreadable ({}) — listening {} sockets NOT enumerated; \
@@ -118,7 +124,7 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &
                 e.kind(),
                 proto.label()
             ));
-            return;
+            return false;
         }
     };
 
@@ -182,13 +188,15 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &
             },
         );
     }
+
+    true
 }
 
 /// Collect listening sockets visible in the current/host network namespace.
 pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
     let mut map = HashMap::new();
     for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
-        parse_proc_net(p, &mut map, "/proc");
+        let _ = parse_proc_net(p, &mut map, "/proc");
     }
     map
 }
@@ -246,6 +254,17 @@ pub fn report_foreign_netns_listeners(
         }
     };
 
+    // R29-04: readdir order is arbitrary, so the first pid seen in a namespace
+    // decides `example_process`. Sort so the lowest pid wins — it is both
+    // deterministic and usually the container's init process. R29-03 depends
+    // on this too: a dead pid must be followed by the next-lowest, not by an
+    // arbitrary one.
+    let mut pids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .collect();
+    pids.sort_unstable();
+
     // netns_inode -> (non-host-visible listeners, example process name)
     let mut ns_cache: HashMap<String, (Vec<SocketMeta>, String)> = HashMap::new();
     // M4-02: reading /proc/<pid>/ns/net requires ptrace_may_access. Without
@@ -254,14 +273,7 @@ pub fn report_foreign_netns_listeners(
     let mut ns_denied = 0usize;
     let mut ns_over_cap = 0usize;
 
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-
+    for pid in pids {
         let Some(ns) = netns_inode(pid) else {
             ns_denied += 1;
             continue;
@@ -282,8 +294,17 @@ pub fn report_foreign_netns_listeners(
 
         let base = format!("/proc/{pid}");
         let mut foreign = HashMap::new();
+        let mut any_read = false;
         for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
-            parse_proc_net(p, &mut foreign, &base);
+            any_read |= parse_proc_net(p, &mut foreign, &base);
+        }
+
+        // R29-03: the pid died between readdir and here. Caching the namespace
+        // now would record an empty listener set and permanently skip every
+        // other live pid in it — the whole container would vanish from the
+        // inventory with nothing in coverage to say so.
+        if !any_read {
+            continue;
         }
 
         let mut invisible = Vec::new();
@@ -452,4 +473,27 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
     }
 
     attributed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vanished_pid_does_not_poison_the_namespace_cache() {
+        // R29-03: /proc/<pid>/net/tcp for a dead pid is ENOENT, which used to be
+        // indistinguishable from "kernel without IPv6".
+        let mut into = HashMap::new();
+        assert!(
+            !parse_proc_net(Proto::Tcp, &mut into, "/proc/4194305"),
+            "an unreadable base_dir must report false so the caller retries"
+        );
+        assert!(into.is_empty());
+
+        let mut host = HashMap::new();
+        assert!(
+            parse_proc_net(Proto::Tcp, &mut host, "/proc"),
+            "the host namespace must report true even when it yields no listeners"
+        );
+    }
 }
