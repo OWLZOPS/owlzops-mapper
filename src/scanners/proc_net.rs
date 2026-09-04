@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::coverage;
+use crate::models::ForeignNetnsListener;
 use crate::safe_io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,12 @@ pub struct ProcAttr {
 
 const TCP_LISTEN: u8 = 0x0A;
 const TCP_CLOSE: u8 = 0x07;
+
+/// Upper bound on foreign namespaces probed. Every other scanner in this
+/// crate is capped; an uncapped walk on a Kubernetes node with hundreds of
+/// pods would read 4 seq_files per pod, each iterating that netns' socket
+/// tables. Exceeding the cap is a coverage fact, not a silent stop.
+const MAX_FOREIGN_NETNS: usize = 64;
 
 /// Decode an IPv4 address from its little-endian hex representation
 /// (8 hex digits) as found in /proc/net/tcp{,6}.
@@ -89,15 +96,18 @@ fn parse_local(field: &str, v6: bool) -> Option<(String, u16)> {
     Some((addr, port))
 }
 
-fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
+/// Parse a `/proc/net/{tcp,tcp6,udp,udp6}`-style file from `base_dir`.
+/// For the host namespace `base_dir` is `/proc`; for a foreign network
+/// namespace it is `/proc/<pid>`.
+fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &str) {
     let path = match proto {
-        Proto::Tcp => "/proc/net/tcp",
-        Proto::Tcp6 => "/proc/net/tcp6",
-        Proto::Udp => "/proc/net/udp",
-        Proto::Udp6 => "/proc/net/udp6",
+        Proto::Tcp => format!("{base_dir}/net/tcp"),
+        Proto::Tcp6 => format!("{base_dir}/net/tcp6"),
+        Proto::Udp => format!("{base_dir}/net/udp"),
+        Proto::Udp6 => format!("{base_dir}/net/udp6"),
     };
 
-    let (content, truncated) = match safe_io::read_procfs_capped(path, safe_io::CAP_PROC_NET) {
+    let (content, truncated) = match safe_io::read_procfs_capped(&path, safe_io::CAP_PROC_NET) {
         Ok((c, t)) => (c, t),
         // Kernel without IPv6 support → legitimate absence, silence is correct.
         Err(e) if e.kind() == ErrorKind::NotFound => return,
@@ -174,12 +184,167 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>) {
     }
 }
 
+/// Collect listening sockets visible in the current/host network namespace.
 pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
     let mut map = HashMap::new();
     for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
-        parse_proc_net(p, &mut map);
+        parse_proc_net(p, &mut map, "/proc");
     }
     map
+}
+
+/// Read the network namespace inode for a process.
+fn netns_inode(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/ns/net"))
+        .ok()?
+        .to_str()
+        .map(str::to_string)
+}
+
+/// Walk all processes and report listeners that exist in foreign network
+/// namespaces but are NOT present in the host namespace inventory.
+///
+/// These sockets are invisible to the host-level port scanner and therefore
+/// absent from `network.listening_ports`. Raw Truth demands they be surfaced;
+/// they are returned as a Vec of `ForeignNetnsListener` for integration into
+/// `NetworkInfo`.
+///
+/// Aggregated per network namespace: a Docker host has many processes sharing
+/// one netns, but only one entry per unique socket is returned.
+///
+/// `host_sockets` must be the already-collected host inventory. Do NOT
+/// re-read `/proc/net/*` here; the caller has it (M4-01).
+pub fn report_foreign_netns_listeners(
+    host_sockets: &HashMap<u64, SocketMeta>,
+) -> Vec<ForeignNetnsListener> {
+    let host_ns = match std::fs::read_link("/proc/1/ns/net") {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            coverage::record(format!(
+                "netns visibility: /proc/1/ns/net unreadable ({}) — foreign-namespace \
+                 listeners NOT enumerated; the port inventory may be missing sockets",
+                e.kind()
+            ));
+            return Vec::new();
+        }
+    };
+
+    let host_keys: HashSet<(String, String, u16)> = host_sockets
+        .values()
+        .map(|s| (s.proto.to_string(), s.bind_address.clone(), s.port))
+        .collect();
+
+    let entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(e) => {
+            coverage::record(format!(
+                "netns visibility: /proc unreadable ({}) — foreign-namespace \
+                 listeners NOT enumerated",
+                e.kind()
+            ));
+            return Vec::new();
+        }
+    };
+
+    // netns_inode -> (non-host-visible listeners, example process name)
+    let mut ns_cache: HashMap<String, (Vec<SocketMeta>, String)> = HashMap::new();
+    // M4-02: reading /proc/<pid>/ns/net requires ptrace_may_access. Without
+    // root or CAP_SYS_PTRACE every foreign process is skipped and an empty
+    // result reads as "no hidden listeners" when it means "not checked".
+    let mut ns_denied = 0usize;
+    let mut ns_over_cap = 0usize;
+
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+
+        let Some(ns) = netns_inode(pid) else {
+            ns_denied += 1;
+            continue;
+        };
+        if ns == host_ns {
+            continue;
+        }
+
+        // The insert path below always writes a non-empty name, so a cached
+        // entry never needs backfilling — just skip (M4-04).
+        if ns_cache.contains_key(&ns) {
+            continue;
+        }
+        if ns_cache.len() >= MAX_FOREIGN_NETNS {
+            ns_over_cap += 1;
+            continue;
+        }
+
+        let base = format!("/proc/{pid}");
+        let mut foreign = HashMap::new();
+        for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
+            parse_proc_net(p, &mut foreign, &base);
+        }
+
+        let mut invisible = Vec::new();
+        for meta in foreign.values() {
+            let key = (meta.proto.to_string(), meta.bind_address.clone(), meta.port);
+            if !host_keys.contains(&key) {
+                invisible.push(meta.clone());
+            }
+        }
+
+        let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
+            .ok()
+            .map(|(c, _)| c.trim().to_string())
+            .unwrap_or_else(|| "?".to_string());
+
+        ns_cache.insert(ns, (invisible, comm));
+    }
+
+    let mut result = Vec::new();
+    for (ns, (sockets, comm)) in ns_cache {
+        for meta in sockets {
+            result.push(ForeignNetnsListener {
+                netns: ns.clone(),
+                protocol: meta.proto.to_string(),
+                bind_address: meta.bind_address.clone(),
+                port: meta.port.to_string(),
+                example_process: Some(comm.clone()),
+                container: None, // filled later by runner
+                runtime_infrastructure: meta.bind_address == "127.0.0.11",
+            });
+        }
+    }
+
+    // Deterministic order: R29-02, same principle as R28-11.
+    result.sort_by(|a, b| {
+        a.netns
+            .cmp(&b.netns)
+            .then_with(|| a.protocol.cmp(&b.protocol))
+            .then_with(|| a.bind_address.cmp(&b.bind_address))
+            .then_with(|| {
+                a.port
+                    .parse::<u16>()
+                    .unwrap_or(0)
+                    .cmp(&b.port.parse::<u16>().unwrap_or(0))
+            })
+    });
+
+    if ns_denied > 0 {
+        coverage::record(format!(
+            "netns visibility: /proc/<pid>/ns/net unreadable for {ns_denied} process(es) \
+             (needs root/CAP_SYS_PTRACE) — foreign-namespace listeners are a LOWER BOUND"
+        ));
+    }
+    if ns_over_cap > 0 {
+        coverage::record(format!(
+            "netns visibility: cap ({MAX_FOREIGN_NETNS}) reached; {ns_over_cap} further \
+             process(es) in unprobed namespaces — foreign listeners are a LOWER BOUND"
+        ));
+    }
+
+    result
 }
 
 pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, ProcAttr> {

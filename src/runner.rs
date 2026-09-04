@@ -1,6 +1,8 @@
 use crate::cli::{AuditArgs, SnapshotArgs};
 use crate::models::AgentReport;
 #[cfg(feature = "local-scan")]
+use crate::models::{NetworkInfo, TopologyInfo};
+#[cfg(feature = "local-scan")]
 use chrono::Utc;
 #[cfg(feature = "local-scan")]
 use std::collections::BTreeMap;
@@ -103,6 +105,19 @@ struct PersistenceScan {
 const PERSISTENCE_IDS: &str = "SEC-042/043/044/049/050/051/052/053/054/055/056/057";
 
 #[cfg(feature = "local-scan")]
+fn link_foreign_netns_to_containers(network: &mut NetworkInfo, topology: &TopologyInfo) {
+    for listener in &mut network.foreign_netns_listeners {
+        if let Some(mapping) = topology
+            .container_netns
+            .iter()
+            .find(|m| m.netns == listener.netns)
+        {
+            listener.container = Some(mapping.name.clone());
+        }
+    }
+}
+
+#[cfg(feature = "local-scan")]
 pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let scan_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
@@ -201,7 +216,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             failed_scanners.push("databases".to_string());
             vec![]
         });
-        let network_info = network_res.unwrap_or_else(|e| {
+        let mut network_info = network_res.unwrap_or_else(|e| {
             warn!(scanner = "network", error = ?e, "scanner panicked");
             scan_warnings.push("network scanner panicked".to_string());
             failed_scanners.push("network".to_string());
@@ -234,6 +249,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             failed_scanners.push("docker".to_string());
             crate::models::TopologyInfo::default()
         });
+
+        // Enrich foreign netns listeners with container names
+        link_foreign_netns_to_containers(&mut network_info, &topology_info);
 
         let p = persistence_res.unwrap_or_else(|e| {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");

@@ -152,6 +152,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_security_health(report);
     render_storage(report);
     render_network_listeners(report);
+    render_foreign_netns_listeners(report);
     render_ssl_certificates(report);
     render_shell_users(report);
     render_system_internals(report);
@@ -887,6 +888,45 @@ fn render_network_listeners(report: &AgentReport) {
     }
     outln!("Active Network Listeners (Red = Exposed, Yellow = User IPC, Green = System IPC):");
     outln!("{t_ports}\n");
+}
+
+fn render_foreign_netns_listeners(report: &AgentReport) {
+    if report.network.foreign_netns_listeners.is_empty() {
+        return;
+    }
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("Netns")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Proto").add_attribute(Attribute::Bold),
+        Cell::new("Bind Address").add_attribute(Attribute::Bold),
+        Cell::new("Port").add_attribute(Attribute::Bold),
+        Cell::new("Container").add_attribute(Attribute::Bold),
+        Cell::new("Runtime Infra").add_attribute(Attribute::Bold),
+    ]);
+
+    for l in &report.network.foreign_netns_listeners {
+        let container = l.container.as_deref().unwrap_or("unknown");
+        let runtime = if l.runtime_infrastructure {
+            "yes"
+        } else {
+            "no"
+        };
+
+        t.add_row(vec![
+            Cell::new(sanitize_terminal(&l.netns)),
+            Cell::new(sanitize_terminal(&l.protocol)),
+            Cell::new(sanitize_terminal(&l.bind_address)),
+            Cell::new(sanitize_terminal(&l.port)),
+            Cell::new(sanitize_terminal(container)),
+            Cell::new(runtime),
+        ]);
+    }
+
+    outln!("Foreign Network Namespace Listeners:");
+    outln!("{t}\n");
 }
 
 fn render_ssl_certificates(report: &AgentReport) {

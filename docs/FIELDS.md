@@ -113,6 +113,14 @@ An array of objects, one per detected database engine.
 | `listening_ports[].bind_address` | string | IP address the port is bound to |
 | `listening_ports[].pid` | integer \| null | PID of the listening process (requires root) |
 | `listening_ports[].exe_path` | string \| null | Full path to the executable (requires root) |
+| `foreign_netns_listeners` | array of objects | Listening sockets discovered in foreign network namespaces (not visible in the host namespace). Added in R29-02. |
+| `foreign_netns_listeners[].netns` | string | Network namespace inode, e.g. `"net:[4026532914]"`. |
+| `foreign_netns_listeners[].protocol` | string | `"tcp"` or `"udp"`. |
+| `foreign_netns_listeners[].bind_address` | string | IP address the socket is bound to. |
+| `foreign_netns_listeners[].port` | string | Port number. |
+| `foreign_netns_listeners[].example_process` | string \| null | `comm` of an observed process in this namespace. Spoofable — provenance only, never a key. Correlate via `container` instead. |
+| `foreign_netns_listeners[].container` | string \| null | Container name from `topology.containers`, matched by netns. `null` = namespace was not attributable to any known container. |
+| `foreign_netns_listeners[].runtime_infrastructure` | boolean | `true` for Docker's embedded resolver (`127.0.0.11`). Kept, never dropped (Raw Truth), but flagged so consumers can filter runtime artifacts. |
 
 ---
 

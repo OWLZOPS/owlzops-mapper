@@ -1,5 +1,5 @@
 use crate::coverage;
-use crate::models::{ContainerInfo, DanglingImageInfo, TopologyInfo};
+use crate::models::{ContainerInfo, ContainerNetnsMapping, DanglingImageInfo, TopologyInfo};
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
 use bollard::image::ListImagesOptions;
@@ -183,6 +183,7 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
     };
 
     let mut container_list = Vec::new();
+    let mut container_netns_mappings: Vec<ContainerNetnsMapping> = Vec::new();
     let mut images_count = 0;
     let mut dangling_images_count = 0;
     let mut total_images_size_mb = 0;
@@ -428,6 +429,25 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                         .map(|st| st.caps.bounding)
                 });
 
+            // --- Container netns mapping for foreign netns listener enrichment ---
+            let container_netns = inspect
+                .state
+                .as_ref()
+                .and_then(|s| s.pid)
+                .filter(|&pid| pid > 0)
+                .and_then(|pid| {
+                    std::fs::read_link(format!("/proc/{pid}/ns/net"))
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "net:[unknown]".to_string());
+
+            container_netns_mappings.push(ContainerNetnsMapping {
+                name: name.clone(),
+                netns: container_netns,
+                pid: inspect.state.as_ref().and_then(|s| s.pid),
+            });
+
             let rw_size_mb = (container.size_rw.unwrap_or(0).max(0) as u64) / (1024 * 1024);
             let size_mb = (container.size_rw.unwrap_or(0) + container.size_root_fs.unwrap_or(0))
                 as u64
@@ -519,6 +539,7 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
         containers: container_list,
         images_reclaimable_mb,
         build_cache_reclaimable_mb,
+        container_netns: container_netns_mappings,
     }
 }
 
