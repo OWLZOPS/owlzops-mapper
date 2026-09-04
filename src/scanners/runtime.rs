@@ -439,13 +439,11 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                     std::fs::read_link(format!("/proc/{pid}/ns/net"))
                         .ok()
                         .map(|p| p.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "net:[unknown]".to_string());
+                });
 
             container_netns_mappings.push(ContainerNetnsMapping {
                 name: name.clone(),
                 netns: container_netns,
-                pid: inspect.state.as_ref().and_then(|s| s.pid),
             });
 
             let rw_size_mb = (container.size_rw.unwrap_or(0).max(0) as u64) / (1024 * 1024);
