@@ -200,6 +200,9 @@ fn netns_inode(pid: u32) -> Option<String> {
 /// These sockets are invisible to the host-level port scanner and therefore
 /// absent from `network.listening_ports`. Raw Truth demands they be surfaced;
 /// they land in coverage so the operator knows the host view is incomplete.
+///
+/// Aggregated per network namespace: a Docker host has many processes sharing
+/// one netns, but only one coverage record is emitted with example listeners.
 pub fn report_foreign_netns_listeners() {
     let host_ns = match std::fs::read_link("/proc/1/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
@@ -217,6 +220,9 @@ pub fn report_foreign_netns_listeners() {
         return;
     };
 
+    // netns_inode -> (non-host-visible listeners, example process name)
+    let mut ns_cache: HashMap<String, (Vec<SocketMeta>, String)> = HashMap::new();
+
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -230,14 +236,29 @@ pub fn report_foreign_netns_listeners() {
             continue;
         }
 
-        let mut foreign = HashMap::new();
+        if let Some((_, example)) = ns_cache.get_mut(&ns) {
+            if example.is_empty() {
+                let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
+                    .ok()
+                    .map(|(c, _)| c.trim().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                *example = comm;
+            }
+            continue;
+        }
+
         let base = format!("/proc/{pid}");
+        let mut foreign = HashMap::new();
         for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
             parse_proc_net(p, &mut foreign, &base);
         }
 
-        if foreign.is_empty() {
-            continue;
+        let mut invisible = Vec::new();
+        for meta in foreign.values() {
+            let key = (meta.proto.to_string(), meta.bind_address.clone(), meta.port);
+            if !host_keys.contains(&key) {
+                invisible.push(meta.clone());
+            }
         }
 
         let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
@@ -245,15 +266,38 @@ pub fn report_foreign_netns_listeners() {
             .map(|(c, _)| c.trim().to_string())
             .unwrap_or_else(|| "?".to_string());
 
-        for meta in foreign.values() {
-            let key = (meta.proto.to_string(), meta.bind_address.clone(), meta.port);
-            if !host_keys.contains(&key) {
-                coverage::record(format!(
-                    "netns: pid {pid} ({comm}) listens on {}:{}/{} — not visible in host netns",
-                    meta.bind_address, meta.port, meta.proto
-                ));
-            }
+        ns_cache.insert(ns, (invisible, comm));
+    }
+
+    for (ns, (sockets, comm)) in ns_cache {
+        if sockets.is_empty() {
+            continue;
         }
+        let examples: Vec<String> = sockets
+            .iter()
+            .take(3)
+            .map(|s| format!("{}:{}/{}", s.bind_address, s.port, s.proto))
+            .collect();
+        let more = sockets.len().saturating_sub(3);
+        let msg = if more > 0 {
+            format!(
+                "netns {} (example process: {}): {} listener(s) not visible in host netns — e.g. {} (+{} more)",
+                ns,
+                comm,
+                sockets.len(),
+                examples.join(", "),
+                more
+            )
+        } else {
+            format!(
+                "netns {} (example process: {}): {} listener(s) not visible in host netns — {}",
+                ns,
+                comm,
+                sockets.len(),
+                examples.join(", ")
+            )
+        };
+        coverage::record(msg);
     }
 }
 
