@@ -177,7 +177,8 @@ pub fn gather_network_info() -> NetworkInfo {
 
     // ---------- Listening ports via /proc (zero-dependency) ----------
     let sockets = collect_listening_sockets();
-    report_foreign_netns_listeners(); // M-4: surface listeners hidden in other netns
+    // M4-01: pass the inventory we already have — do not re-parse /proc/net/*.
+    report_foreign_netns_listeners(&sockets);
     let attrs = attribute_sockets(&sockets);
 
     let mut listening_ports = Vec::new();

@@ -43,6 +43,12 @@ pub struct ProcAttr {
 const TCP_LISTEN: u8 = 0x0A;
 const TCP_CLOSE: u8 = 0x07;
 
+/// Upper bound on foreign namespaces probed. Every other scanner in this
+/// crate is capped; an uncapped walk on a Kubernetes node with hundreds of
+/// pods would read 4 seq_files per pod, each iterating that netns' socket
+/// tables. Exceeding the cap is a coverage fact, not a silent stop.
+const MAX_FOREIGN_NETNS: usize = 64;
+
 /// Decode an IPv4 address from its little-endian hex representation
 /// (8 hex digits) as found in /proc/net/tcp{,6}.
 pub(crate) fn decode_v4(hex: &str) -> Option<String> {
@@ -203,25 +209,46 @@ fn netns_inode(pid: u32) -> Option<String> {
 ///
 /// Aggregated per network namespace: a Docker host has many processes sharing
 /// one netns, but only one coverage record is emitted with example listeners.
-pub fn report_foreign_netns_listeners() {
+///
+/// `host_sockets` must be the already-collected host inventory. Do NOT
+/// re-read `/proc/net/*` here; the caller has it (M4-01).
+pub fn report_foreign_netns_listeners(host_sockets: &HashMap<u64, SocketMeta>) {
     let host_ns = match std::fs::read_link("/proc/1/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => return,
+        Err(e) => {
+            coverage::record(format!(
+                "netns visibility: /proc/1/ns/net unreadable ({}) — foreign-namespace \
+                 listeners NOT enumerated; the port inventory may be missing sockets",
+                e.kind()
+            ));
+            return;
+        }
     };
 
-    // Host-visible keys: (proto, address, port)
-    let host_sockets = collect_listening_sockets();
     let host_keys: HashSet<(String, String, u16)> = host_sockets
         .values()
         .map(|s| (s.proto.to_string(), s.bind_address.clone(), s.port))
         .collect();
 
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return;
+    let entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(e) => {
+            coverage::record(format!(
+                "netns visibility: /proc unreadable ({}) — foreign-namespace \
+                 listeners NOT enumerated",
+                e.kind()
+            ));
+            return;
+        }
     };
 
     // netns_inode -> (non-host-visible listeners, example process name)
     let mut ns_cache: HashMap<String, (Vec<SocketMeta>, String)> = HashMap::new();
+    // M4-02: reading /proc/<pid>/ns/net requires ptrace_may_access. Without
+    // root or CAP_SYS_PTRACE every foreign process is skipped and an empty
+    // result reads as "no hidden listeners" when it means "not checked".
+    let mut ns_denied = 0usize;
+    let mut ns_over_cap = 0usize;
 
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -231,19 +258,21 @@ pub fn report_foreign_netns_listeners() {
             continue;
         };
 
-        let Some(ns) = netns_inode(pid) else { continue };
+        let Some(ns) = netns_inode(pid) else {
+            ns_denied += 1;
+            continue;
+        };
         if ns == host_ns {
             continue;
         }
 
-        if let Some((_, example)) = ns_cache.get_mut(&ns) {
-            if example.is_empty() {
-                let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
-                    .ok()
-                    .map(|(c, _)| c.trim().to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                *example = comm;
-            }
+        // The insert path below always writes a non-empty name, so a cached
+        // entry never needs backfilling — just skip (M4-04).
+        if ns_cache.contains_key(&ns) {
+            continue;
+        }
+        if ns_cache.len() >= MAX_FOREIGN_NETNS {
+            ns_over_cap += 1;
             continue;
         }
 
@@ -298,6 +327,19 @@ pub fn report_foreign_netns_listeners() {
             )
         };
         coverage::record(msg);
+    }
+
+    if ns_denied > 0 {
+        coverage::record(format!(
+            "netns visibility: /proc/<pid>/ns/net unreadable for {ns_denied} process(es) \
+             (needs root/CAP_SYS_PTRACE) — foreign-namespace listeners are a LOWER BOUND"
+        ));
+    }
+    if ns_over_cap > 0 {
+        coverage::record(format!(
+            "netns visibility: cap ({MAX_FOREIGN_NETNS}) reached; {ns_over_cap} further \
+             process(es) in unprobed namespaces — foreign listeners are a LOWER BOUND"
+        ));
     }
 }
 
