@@ -26,6 +26,10 @@ pub enum Commands {
     Snapshot(SnapshotArgs),
     /// Compare the two most recent snapshots in a directory
     DirCompare(DirCompareArgs),
+    /// Sign a report with an Ed25519 private key (LT-1)
+    Sign(SignArgs),
+    /// Verify a signed report (LT-1)
+    Verify(VerifyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -145,6 +149,29 @@ pub struct CompareArgs {
     /// Treat the input files as arrays of host reports (multi-host)
     #[arg(long, default_value_t = false)]
     pub multi_host: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SignArgs {
+    /// Path to private key file (PEM or OpenSSH)
+    #[arg(long)]
+    pub key: PathBuf,
+    /// Input report JSON (AgentReport)
+    #[arg(long)]
+    pub input: PathBuf,
+    /// Output signed report JSON
+    #[arg(long, default_value = "signed.json")]
+    pub output: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// Path to public key file (OpenSSH format)
+    #[arg(long)]
+    pub key: PathBuf,
+    /// Input signed report JSON
+    #[arg(long)]
+    pub input: PathBuf,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]

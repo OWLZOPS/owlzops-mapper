@@ -13,6 +13,7 @@ mod scanners;
 mod scoring;
 mod secrets;
 mod self_identity;
+mod signing;
 mod ssh_engine;
 mod ui;
 mod utils;
@@ -513,7 +514,10 @@ async fn run_command(
     let (ask_sudo_pass, sudo_pass_fd) = match &cli.command {
         Commands::Audit(a) => (a.ask_sudo_pass, a.sudo_pass_fd),
         Commands::Snapshot(s) => (s.audit.ask_sudo_pass, s.audit.sudo_pass_fd),
-        Commands::Compare(_) | Commands::DirCompare(_) => (false, None),
+        Commands::Compare(_)
+        | Commands::DirCompare(_)
+        | Commands::Sign(_)
+        | Commands::Verify(_) => (false, None),
     };
     if sudo_from_env.is_some() && !ask_sudo_pass && sudo_pass_fd.is_none() {
         eprintln!(
@@ -1604,6 +1608,148 @@ async fn run_command(
                 }
             }
             0
+        }
+
+        Commands::Sign(args) => {
+            use crate::signing::sign_report;
+            use russh::keys::load_secret_key;
+
+            let report_data = match crate::safe_io::read_file_capped_regular(
+                &args.input.to_string_lossy(),
+                64 * 1024 * 1024,
+            ) {
+                Ok((data, truncated)) => {
+                    if truncated {
+                        eprintln!(
+                            "warning: input file {} exceeded cap and was truncated",
+                            args.input.display()
+                        );
+                    }
+                    data
+                }
+                Err(e) => {
+                    eprintln!("Cannot read input file {}: {}", args.input.display(), e);
+                    return 1;
+                }
+            };
+            let report: AgentReport = match serde_json::from_str(&report_data) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Invalid report JSON: {e}");
+                    return 1;
+                }
+            };
+
+            let key_path = args.key.to_string_lossy().to_string();
+            let private_key = match load_secret_key(&key_path, None) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Cannot load private key {}: {}", key_path, e);
+                    return 1;
+                }
+            };
+
+            let signed = match sign_report(&report, &private_key) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Signing failed: {e}");
+                    return 1;
+                }
+            };
+
+            let json = match serde_json::to_string_pretty(&signed) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize signed report: {e}");
+                    return 1;
+                }
+            };
+
+            if let Err(e) = std::fs::write(&args.output, &json) {
+                eprintln!("Cannot write output file {}: {}", args.output.display(), e);
+                return 1;
+            }
+
+            println!("Signed report written to {}", args.output.display());
+            0
+        }
+
+        Commands::Verify(args) => {
+            use crate::signing::{SignedReport, verify_report};
+            use base64::Engine;
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use russh::keys::ssh_key::PublicKey;
+
+            let signed_data = match crate::safe_io::read_file_capped_regular(
+                &args.input.to_string_lossy(),
+                64 * 1024 * 1024,
+            ) {
+                Ok((data, truncated)) => {
+                    if truncated {
+                        eprintln!(
+                            "warning: input file {} exceeded cap and was truncated",
+                            args.input.display()
+                        );
+                    }
+                    data
+                }
+                Err(e) => {
+                    eprintln!("Cannot read input file {}: {}", args.input.display(), e);
+                    return 1;
+                }
+            };
+
+            let signed: SignedReport = match serde_json::from_str(&signed_data) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Invalid signed report JSON: {e}");
+                    return 1;
+                }
+            };
+
+            let key_path = args.key.to_string_lossy().to_string();
+            let expected_key = match PublicKey::read_openssh_file(&key_path) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Cannot load public key {}: {}", key_path, e);
+                    return 1;
+                }
+            };
+
+            let embedded_bytes = match BASE64.decode(&signed.public_key) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("Invalid public key encoding in signed report: {e}");
+                    return 1;
+                }
+            };
+            let embedded_key = match PublicKey::from_bytes(&embedded_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("Invalid public key bytes in signed report: {e}");
+                    return 1;
+                }
+            };
+
+            if expected_key != embedded_key {
+                eprintln!("Public key in report does not match provided public key");
+                return 1;
+            }
+
+            match verify_report(&signed) {
+                Ok(true) => {
+                    println!("Signature VALID");
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("Signature INVALID");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("Verification failed: {e}");
+                    1
+                }
+            }
         }
     }
 }

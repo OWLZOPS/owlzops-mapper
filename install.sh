@@ -43,8 +43,8 @@ BASE_URL="https://github.com/${REPO}/releases/latest/download"
 GPG_KEY_URL="https://raw.githubusercontent.com/${REPO}/main/gpg-public-key.asc"
 
 echo "→ Downloading ${BIN} for ${OS} (${SUFFIX})..."
-curl -sSLO "${BASE_URL}/${TARBALL}"
-curl -sSLO "${BASE_URL}/${CHECKSUM}"
+curl -fsSLO "${BASE_URL}/${TARBALL}"
+curl -fsSLO "${BASE_URL}/${CHECKSUM}"
 
 # ---- SHA256 verification ----
 echo "→ Verifying SHA256..."
@@ -70,8 +70,8 @@ if command -v gpg >/dev/null 2>&1; then
     echo "→ GPG available – verifying signature..."
 
     # Download signature and public key
-    curl -sSLO "${BASE_URL}/${SIGNATURE}"
-    curl -sSL "$GPG_KEY_URL" | gpg --import >/dev/null 2>&1
+    curl -fsSLO "${BASE_URL}/${SIGNATURE}"
+    curl -fsSL "$GPG_KEY_URL" | gpg --import >/dev/null 2>&1
 
     # Verify fingerprint of the imported key
     EXPECTED_FPR="63C349F81ACBB9929EF8E73EB47BCE304E7C265E"

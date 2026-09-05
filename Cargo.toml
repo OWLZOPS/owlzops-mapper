@@ -40,6 +40,7 @@ sha1 = "0.11"
 hmac = "0.13"
 data-encoding = "2"
 subtle = "2"
+base64 = "0.22.1"
 
 # io‑uring is Linux‑only and fully stubbed on musl — restrict dependency cfg accordingly
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
