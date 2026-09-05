@@ -1614,8 +1614,19 @@ async fn run_command(
             use crate::signing::sign_report;
             use russh::keys::load_secret_key;
 
-            let report_data = match std::fs::read_to_string(&args.input) {
-                Ok(d) => d,
+            let report_data = match crate::safe_io::read_file_capped_regular(
+                &args.input.to_string_lossy(),
+                64 * 1024 * 1024,
+            ) {
+                Ok((data, truncated)) => {
+                    if truncated {
+                        eprintln!(
+                            "warning: input file {} exceeded cap and was truncated",
+                            args.input.display()
+                        );
+                    }
+                    data
+                }
                 Err(e) => {
                     eprintln!("Cannot read input file {}: {}", args.input.display(), e);
                     return 1;
@@ -1669,13 +1680,25 @@ async fn run_command(
             use base64::engine::general_purpose::STANDARD as BASE64;
             use russh::keys::ssh_key::PublicKey;
 
-            let signed_data = match std::fs::read_to_string(&args.input) {
-                Ok(d) => d,
+            let signed_data = match crate::safe_io::read_file_capped_regular(
+                &args.input.to_string_lossy(),
+                64 * 1024 * 1024,
+            ) {
+                Ok((data, truncated)) => {
+                    if truncated {
+                        eprintln!(
+                            "warning: input file {} exceeded cap and was truncated",
+                            args.input.display()
+                        );
+                    }
+                    data
+                }
                 Err(e) => {
                     eprintln!("Cannot read input file {}: {}", args.input.display(), e);
                     return 1;
                 }
             };
+
             let signed: SignedReport = match serde_json::from_str(&signed_data) {
                 Ok(s) => s,
                 Err(e) => {
