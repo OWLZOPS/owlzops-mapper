@@ -13,6 +13,8 @@ mod scanners;
 mod scoring;
 mod secrets;
 mod self_identity;
+#[allow(dead_code)] // TODO: remove after CLI integration (LT-1)
+mod signing;
 mod ssh_engine;
 mod ui;
 mod utils;
