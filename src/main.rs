@@ -1707,7 +1707,7 @@ async fn run_command(
             use crate::signing::{SignedReport, verify_report};
             use base64::Engine;
             use base64::engine::general_purpose::STANDARD as BASE64;
-            use russh::keys::ssh_key::{HashAlg, PublicKey};
+            use russh::keys::ssh_key::PublicKey;
 
             let signed_data = match crate::safe_io::read_file_capped_regular(
                 &args.input.to_string_lossy(),
@@ -1773,7 +1773,10 @@ async fn run_command(
                 }
                 None => {
                     let embedded_keys = crate::signing::embedded_public_keys();
-                    match embedded_keys.into_iter().find(|k| *k == embedded_key) {
+                    match embedded_keys
+                        .into_iter()
+                        .find(|k| k.key_data() == embedded_key.key_data())
+                    {
                         Some(k) => k,
                         None => {
                             eprintln!(
@@ -1786,29 +1789,14 @@ async fn run_command(
                 }
             };
 
-            if expected_key != embedded_key {
+            if expected_key.key_data() != embedded_key.key_data() {
                 eprintln!("Public key in report does not match provided public key");
                 return 1;
             }
 
             match verify_report(&signed) {
                 Ok(true) => {
-                    let r = &signed.report;
                     println!("Signature VALID");
-                    println!(
-                        "  host:      {}",
-                        crate::ui::sanitize_terminal(&r.host.hostname)
-                    );
-                    println!("  scan_id:   {}", crate::ui::sanitize_terminal(&r.scan_id));
-                    println!(
-                        "  scanned:   {}",
-                        crate::ui::sanitize_terminal(&r.timestamp)
-                    );
-                    println!(
-                        "  binary:    owlzops-mapper {}",
-                        crate::ui::sanitize_terminal(&r.version)
-                    );
-                    println!("  signed by: {}", embedded_key.fingerprint(HashAlg::Sha256));
                     0
                 }
                 Ok(false) => {
