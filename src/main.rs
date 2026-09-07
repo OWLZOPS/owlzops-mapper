@@ -1707,7 +1707,7 @@ async fn run_command(
             use crate::signing::{SignedReport, verify_report};
             use base64::Engine;
             use base64::engine::general_purpose::STANDARD as BASE64;
-            use russh::keys::ssh_key::PublicKey;
+            use russh::keys::ssh_key::{HashAlg, PublicKey};
 
             let signed_data = match crate::safe_io::read_file_capped_regular(
                 &args.input.to_string_lossy(),
@@ -1745,15 +1745,6 @@ async fn run_command(
                 return 1;
             }
 
-            let key_path = args.key.to_string_lossy().to_string();
-            let expected_key = match PublicKey::read_openssh_file(&key_path) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Cannot load public key {}: {}", key_path, e);
-                    return 1;
-                }
-            };
-
             let embedded_bytes = match BASE64.decode(&signed.public_key) {
                 Ok(b) => b,
                 Err(e) => {
@@ -1769,6 +1760,32 @@ async fn run_command(
                 }
             };
 
+            let expected_key = match &args.key {
+                Some(key_path) => {
+                    let key_path = key_path.to_string_lossy().to_string();
+                    match PublicKey::read_openssh_file(&key_path) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("Cannot load public key {}: {}", key_path, e);
+                            return 1;
+                        }
+                    }
+                }
+                None => {
+                    let embedded_keys = crate::signing::embedded_public_keys();
+                    match embedded_keys.into_iter().find(|k| *k == embedded_key) {
+                        Some(k) => k,
+                        None => {
+                            eprintln!(
+                                "The public key in the report is not one of the built-in \
+                                 Owlzops keys. Pass --key to provide an explicit public key."
+                            );
+                            return 1;
+                        }
+                    }
+                }
+            };
+
             if expected_key != embedded_key {
                 eprintln!("Public key in report does not match provided public key");
                 return 1;
@@ -1776,7 +1793,22 @@ async fn run_command(
 
             match verify_report(&signed) {
                 Ok(true) => {
+                    let r = &signed.report;
                     println!("Signature VALID");
+                    println!(
+                        "  host:      {}",
+                        crate::ui::sanitize_terminal(&r.host.hostname)
+                    );
+                    println!("  scan_id:   {}", crate::ui::sanitize_terminal(&r.scan_id));
+                    println!(
+                        "  scanned:   {}",
+                        crate::ui::sanitize_terminal(&r.timestamp)
+                    );
+                    println!(
+                        "  binary:    owlzops-mapper {}",
+                        crate::ui::sanitize_terminal(&r.version)
+                    );
+                    println!("  signed by: {}", embedded_key.fingerprint(HashAlg::Sha256));
                     0
                 }
                 Ok(false) => {

@@ -21,6 +21,26 @@ use crate::models::AgentReport;
 /// one purpose from being replayed in another.
 pub const REPORT_SIGNING_NAMESPACE: &str = "owlzops-mapper-report";
 
+/// Owlzops report-signing public keys, in OpenSSH one-line format.
+///
+/// PUBLIC keys only. The private half never ships: a signing key present on
+/// the audited host would make the signature producible by anyone who has the
+/// binary, which is everyone — a credential that proves nothing while looking
+/// like it proves provenance.
+///
+/// A list, not a single key, so rotation is additive: append the new key,
+/// keep the old one until the reports it signed are out of retention.
+pub const OWLZOPS_PUBLIC_KEYS: &[&str] =
+    &[include_str!("../assets/owlzops-report-signing-2026.pub")];
+
+/// Parse the built-in verification keys.
+pub fn embedded_public_keys() -> Vec<PublicKey> {
+    OWLZOPS_PUBLIC_KEYS
+        .iter()
+        .filter_map(|s| PublicKey::from_openssh(s.trim()).ok())
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
     #[error("failed to serialize report: {0}")]
