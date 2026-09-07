@@ -166,9 +166,10 @@ pub struct SignArgs {
 
 #[derive(Args, Debug)]
 pub struct VerifyArgs {
-    /// Path to public key file (OpenSSH format)
+    /// Path to public key file (OpenSSH format). If omitted, use built-in
+    /// owlzops public keys.
     #[arg(long)]
-    pub key: PathBuf,
+    pub key: Option<PathBuf>,
     /// Input signed report JSON
     #[arg(long)]
     pub input: PathBuf,

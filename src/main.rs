@@ -1641,11 +1641,40 @@ async fn run_command(
             };
 
             let key_path = args.key.to_string_lossy().to_string();
+            // R30-04: this key authenticates client deliverables, so it should be
+            // passphrase-protected. load_secret_key(.., None) rejects an encrypted key
+            // outright — ask for the passphrase instead of pushing the operator toward
+            // a bare key on disk.
             let private_key = match load_secret_key(&key_path, None) {
                 Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Cannot load private key {}: {}", key_path, e);
-                    return 1;
+                Err(_) => {
+                    let pass = match dialoguer::Password::new()
+                        .with_prompt(format!("passphrase for {key_path} (empty if none): "))
+                        .interact()
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Cannot read passphrase: {e}");
+                            return 1;
+                        }
+                    };
+                    if pass.is_empty() {
+                        match load_secret_key(&key_path, None) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                eprintln!("Cannot load private key {key_path}: {e}");
+                                return 1;
+                            }
+                        }
+                    } else {
+                        match load_secret_key(&key_path, Some(pass.as_str())) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                eprintln!("Cannot load private key {key_path}: {e}");
+                                return 1;
+                            }
+                        }
+                    }
                 }
             };
 
@@ -1707,14 +1736,14 @@ async fn run_command(
                 }
             };
 
-            let key_path = args.key.to_string_lossy().to_string();
-            let expected_key = match PublicKey::read_openssh_file(&key_path) {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("Cannot load public key {}: {}", key_path, e);
-                    return 1;
-                }
-            };
+            if signed.signature.is_empty() || signed.public_key.is_empty() {
+                eprintln!(
+                    "{} is not a signed report (no signature envelope) — \
+                     run `owlzops-mapper sign` first",
+                    args.input.display()
+                );
+                return 1;
+            }
 
             let embedded_bytes = match BASE64.decode(&signed.public_key) {
                 Ok(b) => b,
@@ -1731,7 +1760,36 @@ async fn run_command(
                 }
             };
 
-            if expected_key != embedded_key {
+            let expected_key = match &args.key {
+                Some(key_path) => {
+                    let key_path = key_path.to_string_lossy().to_string();
+                    match PublicKey::read_openssh_file(&key_path) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("Cannot load public key {}: {}", key_path, e);
+                            return 1;
+                        }
+                    }
+                }
+                None => {
+                    let embedded_keys = crate::signing::embedded_public_keys();
+                    match embedded_keys
+                        .into_iter()
+                        .find(|k| k.key_data() == embedded_key.key_data())
+                    {
+                        Some(k) => k,
+                        None => {
+                            eprintln!(
+                                "The public key in the report is not one of the built-in \
+                                 Owlzops keys. Pass --key to provide an explicit public key."
+                            );
+                            return 1;
+                        }
+                    }
+                }
+            };
+
+            if expected_key.key_data() != embedded_key.key_data() {
                 eprintln!("Public key in report does not match provided public key");
                 return 1;
             }

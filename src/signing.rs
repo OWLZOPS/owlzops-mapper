@@ -21,6 +21,26 @@ use crate::models::AgentReport;
 /// one purpose from being replayed in another.
 pub const REPORT_SIGNING_NAMESPACE: &str = "owlzops-mapper-report";
 
+/// Owlzops report-signing public keys, in OpenSSH one-line format.
+///
+/// PUBLIC keys only. The private half never ships: a signing key present on
+/// the audited host would make the signature producible by anyone who has the
+/// binary, which is everyone — a credential that proves nothing while looking
+/// like it proves provenance.
+///
+/// A list, not a single key, so rotation is additive: append the new key,
+/// keep the old one until the reports it signed are out of retention.
+pub const OWLZOPS_PUBLIC_KEYS: &[&str] =
+    &[include_str!("../assets/owlzops-report-signing-2026.pub")];
+
+/// Parse the built-in verification keys.
+pub fn embedded_public_keys() -> Vec<PublicKey> {
+    OWLZOPS_PUBLIC_KEYS
+        .iter()
+        .filter_map(|s| PublicKey::from_openssh(s.trim()).ok())
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
     #[error("failed to serialize report: {0}")]
@@ -121,8 +141,20 @@ pub fn sign_report(
 /// Verify a signed report.
 ///
 /// The signature is checked against the canonical bytes of the embedded
-/// report using the namespace stored in `signed.namespace`.
+/// report using the fixed `REPORT_SIGNING_NAMESPACE`; the namespace stored
+/// in the document is validated and must match.
 pub fn verify_report(signed: &SignedReport) -> Result<bool, SigningError> {
+    // R30-01: the namespace is the domain separator. Taking it from the
+    // document under verification lets the document choose what its own
+    // signature means — the separation is then no separation at all.
+    if signed.namespace != REPORT_SIGNING_NAMESPACE {
+        return Err(SigningError::Verify(format!(
+            "namespace is '{}', expected '{}' — this signature was not made \
+             over an owlzops-mapper report",
+            signed.namespace, REPORT_SIGNING_NAMESPACE
+        )));
+    }
+
     let canonical = canonicalize(&signed.report)?;
 
     let sig_bytes = BASE64.decode(&signed.signature)?;
@@ -135,7 +167,7 @@ pub fn verify_report(signed: &SignedReport) -> Result<bool, SigningError> {
         .map_err(|e| SigningError::SignatureFormat(e.to_string()))?;
 
     public_key
-        .verify(&signed.namespace, &canonical, &sig)
+        .verify(REPORT_SIGNING_NAMESPACE, &canonical, &sig)
         .map(|_| true)
         .map_err(|e| SigningError::Verify(e.to_string()))
 }
@@ -221,6 +253,29 @@ mod tests {
         let mut signed = sign_report(&report, &key1).expect("sign");
 
         signed.public_key = BASE64.encode(key2.public_key().to_bytes().expect("pub bytes"));
+
+        assert!(verify_report(&signed).is_err());
+    }
+
+    #[test]
+    fn a_foreign_namespace_is_refused_even_with_a_valid_signature() {
+        // R30-01: a signature made under another namespace must not be accepted
+        // by relabelling the document.
+        let mut rng = rand::rng();
+        let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("keygen");
+        let report = test_report();
+        let canonical = canonicalize(&report).expect("canonical");
+
+        let sig = key.sign("git", HashAlg::Sha512, &canonical).expect("sign");
+        let mut sig_bytes = Vec::new();
+        sig.encode(&mut sig_bytes).expect("encode");
+
+        let signed = SignedReport {
+            report,
+            signature: BASE64.encode(sig_bytes),
+            public_key: BASE64.encode(key.public_key().to_bytes().expect("pub")),
+            namespace: "git".into(),
+        };
 
         assert!(verify_report(&signed).is_err());
     }
