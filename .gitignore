@@ -8,3 +8,5 @@
 *.asc
 !gpg-public-key.asc
 .idea/
+assets/*signing*
+!assets/*signing*.pub
