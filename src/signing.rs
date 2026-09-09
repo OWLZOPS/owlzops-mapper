@@ -279,4 +279,16 @@ mod tests {
 
         assert!(verify_report(&signed).is_err());
     }
+
+    #[test]
+    fn every_embedded_public_key_parses() {
+        // R30-05: filter_map drops a malformed key silently. An empty list makes
+        // `verify` without --key reject every genuine report, blaming the report.
+        assert!(!OWLZOPS_PUBLIC_KEYS.is_empty());
+        assert_eq!(
+            embedded_public_keys().len(),
+            OWLZOPS_PUBLIC_KEYS.len(),
+            "an embedded verification key failed to parse"
+        );
+    }
 }

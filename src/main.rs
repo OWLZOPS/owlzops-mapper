@@ -1707,7 +1707,7 @@ async fn run_command(
             use crate::signing::{SignedReport, verify_report};
             use base64::Engine;
             use base64::engine::general_purpose::STANDARD as BASE64;
-            use russh::keys::ssh_key::PublicKey;
+            use russh::keys::ssh_key::{HashAlg, PublicKey};
 
             let signed_data = match crate::safe_io::read_file_capped_regular(
                 &args.input.to_string_lossy(),
@@ -1796,7 +1796,22 @@ async fn run_command(
 
             match verify_report(&signed) {
                 Ok(true) => {
+                    let r = &signed.report;
                     println!("Signature VALID");
+                    println!(
+                        "  host:      {}",
+                        crate::ui::sanitize_terminal(&r.host.hostname)
+                    );
+                    println!("  scan_id:   {}", crate::ui::sanitize_terminal(&r.scan_id));
+                    println!(
+                        "  scanned:   {}",
+                        crate::ui::sanitize_terminal(&r.timestamp)
+                    );
+                    println!(
+                        "  binary:    owlzops-mapper {}",
+                        crate::ui::sanitize_terminal(&r.version)
+                    );
+                    println!("  signed by: {}", embedded_key.fingerprint(HashAlg::Sha256));
                     0
                 }
                 Ok(false) => {
