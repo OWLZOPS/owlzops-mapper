@@ -1641,16 +1641,24 @@ async fn run_command(
             };
 
             let key_path = args.key.to_string_lossy().to_string();
-            // R30-04: this key authenticates client deliverables, so it should be
-            // passphrase-protected. load_secret_key(.., None) rejects an encrypted key
-            // outright — ask for the passphrase instead of pushing the operator toward
-            // a bare key on disk.
+            if !std::path::Path::new(&key_path).is_file() {
+                eprintln!("Private key {key_path} does not exist or is not a regular file");
+                return 1;
+            }
+
+            // R30-07: prompt only when the key is actually encrypted. A missing
+            // file, a bad mode or an unsupported type must report itself, not
+            // turn into a passphrase prompt for a key that isn't there.
             let private_key = match load_secret_key(&key_path, None) {
                 Ok(k) => k,
-                Err(_) => {
+                Err(first_err) => {
+                    // R30-06: same handling as the sudo prompt. dialoguer's own
+                    // buffers are outside our control, but our copy is not — and
+                    // this key signs client deliverables.
                     let pass = match dialoguer::Password::new()
                         .with_prompt(format!("passphrase for {key_path} (empty if none): "))
                         .interact()
+                        .map(zeroize::Zeroizing::new)
                     {
                         Ok(p) => p,
                         Err(e) => {
@@ -1658,21 +1666,15 @@ async fn run_command(
                             return 1;
                         }
                     };
-                    if pass.is_empty() {
-                        match load_secret_key(&key_path, None) {
-                            Ok(k) => k,
-                            Err(e) => {
-                                eprintln!("Cannot load private key {key_path}: {e}");
-                                return 1;
-                            }
-                        }
-                    } else {
-                        match load_secret_key(&key_path, Some(pass.as_str())) {
-                            Ok(k) => k,
-                            Err(e) => {
-                                eprintln!("Cannot load private key {key_path}: {e}");
-                                return 1;
-                            }
+
+                    match load_secret_key(&key_path, Some(pass.as_str())) {
+                        Ok(k) => k,
+                        Err(second_err) => {
+                            eprintln!(
+                                "Cannot load private key {key_path}. \
+                                 Without passphrase: {first_err}; with passphrase: {second_err}"
+                            );
+                            return 1;
                         }
                     }
                 }
