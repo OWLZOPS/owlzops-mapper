@@ -444,6 +444,11 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
             container_netns_mappings.push(ContainerNetnsMapping {
                 name: name.clone(),
                 netns: container_netns,
+                pid: inspect
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.pid)
+                    .and_then(|p| u32::try_from(p).ok()),
             });
 
             let rw_size_mb = (container.size_rw.unwrap_or(0).max(0) as u64) / (1024 * 1024);

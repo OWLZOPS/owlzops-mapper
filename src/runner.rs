@@ -5,7 +5,7 @@ use crate::models::{NetworkInfo, TopologyInfo};
 #[cfg(feature = "local-scan")]
 use chrono::Utc;
 #[cfg(feature = "local-scan")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 #[cfg(feature = "local-scan")]
 use tracing::{Instrument, info, warn};
@@ -253,7 +253,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             failed_scanners.push("storage".to_string());
             crate::models::StorageInfo::default()
         });
-        let security_info = security_res.unwrap_or_else(|e| {
+        let mut security_info = security_res.unwrap_or_else(|e| {
             warn!(scanner = "security", error = ?e, "scanner panicked");
             scan_warnings.push(
                 "security scanner panicked — SSH/sudo/sysctl fields NOT verified".to_string(),
@@ -277,6 +277,15 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
 
         // Enrich foreign netns listeners with container names
         link_foreign_netns_to_containers(&mut network_info, &topology_info);
+
+        // Collect mount namespace anomalies not belonging to known containers
+        let known_pids: HashSet<u32> = topology_info
+            .container_netns
+            .iter()
+            .filter_map(|m| m.pid)
+            .collect();
+        security_info.mount_namespace_anomalies =
+            crate::scanners::mount_namespace::scan_mount_namespace_anomalies(&known_pids);
 
         let p = persistence_res.unwrap_or_else(|e| {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");
