@@ -268,6 +268,41 @@ mutable tag, and runs `cargo audit` and `cargo deny` on each build.
 
 ---
 
+## Verifying a report
+
+Reports produced for a client can be signed by Owlzops and verified offline:
+
+```bash
+owlzops-mapper verify --input report.signed.json
+```
+
+The verification key is built into the binary. Its fingerprint:
+
+```
+SHA256:F6JLwkd/E+FVIqVmlZIuEdj7c/3da7eKcHNudPWqjIM
+```
+
+The same caveat applies as with the release signing key: a key that ships with
+the binary is worth exactly as much as the binary. What makes it worth anything
+is the chain — the release is GPG signed with `63C3 49F8 1ACB B992 9EF8 E73E
+B47B CE30 4E7C 265E`, and that release contains this report-signing key. Verify
+the release signature first, then the report.
+
+The private half never leaves Owlzops and is never present on a scanned host.
+A report is signed after it reaches us, not by the scanner on your machine — a
+scanner that signed its own output on a host under audit would attest only that
+it faithfully recorded whatever that host told it.
+
+If you want to check the key independently:
+
+```bash
+ssh-keygen -lf assets/owlzops-report-signing-2026.pub
+```
+
+Compare the fingerprint against the value above.
+
+---
+
 ## Design commitments
 
 These are properties of the tool, not aspirations. If you find one of them
