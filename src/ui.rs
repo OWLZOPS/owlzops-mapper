@@ -153,6 +153,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_storage(report);
     render_network_listeners(report);
     render_foreign_netns_listeners(report);
+    render_mount_namespace_anomalies(report);
     render_ssl_certificates(report);
     render_shell_users(report);
     render_system_internals(report);
@@ -926,6 +927,34 @@ fn render_foreign_netns_listeners(report: &AgentReport) {
     }
 
     outln!("Foreign Network Namespace Listeners:");
+    outln!("{t}\n");
+}
+
+fn render_mount_namespace_anomalies(report: &AgentReport) {
+    if report.security.mount_namespace_anomalies.is_empty() {
+        return;
+    }
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("PID")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Process").add_attribute(Attribute::Bold),
+        Cell::new("Mount NS").add_attribute(Attribute::Bold),
+        Cell::new("Exe Path").add_attribute(Attribute::Bold),
+    ]);
+
+    for a in &report.security.mount_namespace_anomalies {
+        t.add_row(vec![
+            Cell::new(a.pid.to_string()),
+            Cell::new(sanitize_terminal(&a.comm)),
+            Cell::new(sanitize_terminal(&a.mnt_ns)),
+            Cell::new(a.exe_path.as_deref().unwrap_or("?")),
+        ]);
+    }
+
+    outln!("Foreign Mount Namespace Processes:");
     outln!("{t}\n");
 }
 
