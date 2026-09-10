@@ -14,6 +14,36 @@ fn mnt_ns_inode(pid: u32) -> Option<String> {
         .map(str::to_string)
 }
 
+/// True when the process is managed by systemd. Modern systemd runs most
+/// services in their own mount namespace as a hardening measure
+/// (`ProtectSystem`, `PrivateMounts`, `DynamicUser`). Flagging those would
+/// drown the report in noise — they are the platform, not a drift.
+fn is_systemd_managed(pid: u32) -> bool {
+    let Ok((cgroup, _)) = safe_io::read_procfs_capped(&format!("/proc/{pid}/cgroup"), 8192) else {
+        return false;
+    };
+    cgroup.contains("system.slice/")
+        || cgroup.contains("user.slice/")
+        || cgroup.contains("machine.slice/")
+}
+
+/// True when the executable lives in a path owned by the package manager
+/// or a known sandbox runtime. Such a binary can only be placed there by
+/// root or by the platform itself, so a namespace anomaly around it is not
+/// the signal we are hunting.
+fn is_system_path(exe: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        "/usr/",
+        "/opt/",
+        "/nix/store/",
+        "/app/",             // Flatpak /app prefix
+        "/snap/",            // Snap
+        "/var/lib/flatpak/", // Flatpak store on the host
+        "/run/wrappers/",    // NixOS setuid/capability wrappers
+    ];
+    ROOTS.iter().any(|p| exe.starts_with(p))
+}
+
 pub fn scan_mount_namespace_anomalies(
     known_container_pids: &HashSet<u32>,
 ) -> Vec<MountNamespaceAnomaly> {
@@ -48,6 +78,9 @@ pub fn scan_mount_namespace_anomalies(
         if ns == host_ns || known_container_pids.contains(&pid) {
             continue;
         }
+        if is_systemd_managed(pid) {
+            continue;
+        }
 
         let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
             .ok()
@@ -57,6 +90,15 @@ pub fn scan_mount_namespace_anomalies(
         let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
+
+        // Variant B: skip processes whose binary lives in a system-managed
+        // prefix. Anything else here — /tmp, /dev/shm, /home, /run/user,
+        // memfd — is what the scanner is actually for.
+        if let Some(ref exe) = exe_path
+            && is_system_path(exe)
+        {
+            continue;
+        }
 
         result.push(MountNamespaceAnomaly {
             pid,
