@@ -91,19 +91,26 @@ pub fn scan_mount_namespace_anomalies(
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
 
+        // Kernel worker threads have no user-space image: readlink on
+        // /proc/<pid>/exe returns ENOENT. They cannot execute attacker code
+        // and their mount namespace is inherited from the kernel at boot,
+        // so they are noise in this list. `kdevtmpfs` is the canonical
+        // example seen on every Fedora/Ubuntu host.
+        let Some(exe_path) = exe_path else {
+            continue;
+        };
+
         // Variant B: skip processes whose binary lives in a system-managed
         // prefix. Anything else here — /tmp, /dev/shm, /home, /run/user,
         // memfd — is what the scanner is actually for.
-        if let Some(ref exe) = exe_path
-            && is_system_path(exe)
-        {
+        if is_system_path(&exe_path) {
             continue;
         }
 
         result.push(MountNamespaceAnomaly {
             pid,
             comm,
-            exe_path,
+            exe_path: Some(exe_path),
             mnt_ns: ns,
             known_container: false,
         });
