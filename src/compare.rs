@@ -1,6 +1,7 @@
 use crate::models::{
     AgentReport, Change, DiffReport, ExecStartFinding, ExecWritability, FileCapFinding,
-    HostDiffStatus, MultiHostDiff, PortInfo, SetuidFinding, Severity, SnapshotMeta,
+    HostDiffStatus, MountNamespaceAnomaly, MultiHostDiff, PortInfo, SetuidFinding, Severity,
+    SnapshotMeta,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -36,6 +37,10 @@ fn foreign_netns_key(l: &crate::models::ForeignNetnsListener) -> (&str, &str, &s
         l.bind_address.as_str(),
         l.port.as_str(),
     )
+}
+
+fn mount_namespace_anomaly_key(a: &MountNamespaceAnomaly) -> (u32, &str) {
+    (a.pid, a.mnt_ns.as_str())
 }
 
 /// Symmetric set diff over string vectors. Appearance is Degraded,
@@ -480,6 +485,39 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             changes.push(Change {
                 field: "network.foreign_netns_listeners".into(),
                 before: Some(format!("{} {} {}:{}", k.0, k.1, k.2, k.3)),
+                after: None,
+                severity: Severity::Changed,
+            });
+        }
+    }
+
+    // --- security.mount_namespace_anomalies (R31-01) ---
+    {
+        let before_set: HashSet<_> = before
+            .security
+            .mount_namespace_anomalies
+            .iter()
+            .map(mount_namespace_anomaly_key)
+            .collect();
+        let after_set: HashSet<_> = after
+            .security
+            .mount_namespace_anomalies
+            .iter()
+            .map(mount_namespace_anomaly_key)
+            .collect();
+
+        for added in after_set.difference(&before_set) {
+            changes.push(Change {
+                field: "security.mount_namespace_anomalies".into(),
+                before: None,
+                after: Some(format!("pid {} in {}", added.0, added.1)),
+                severity: Severity::Degraded,
+            });
+        }
+        for removed in before_set.difference(&after_set) {
+            changes.push(Change {
+                field: "security.mount_namespace_anomalies".into(),
+                before: Some(format!("pid {} in {}", removed.0, removed.1)),
                 after: None,
                 severity: Severity::Changed,
             });

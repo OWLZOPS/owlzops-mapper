@@ -276,6 +276,28 @@ pub struct ForeignNetnsListener {
 pub struct ContainerNetnsMapping {
     pub name: String,
     pub netns: Option<String>,
+    pub pid: Option<u32>,
+}
+
+// ── Mount namespace anomalies ─────────────────────────────────────────
+
+/// A process running in a mount namespace other than the host's and not
+/// attributable to a known container. Inventory, not a verdict: it may be a
+/// legitimate systemd service, a snap/flatpak sandbox, or a manual unshare.
+/// Raw Truth demands it be visible.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct MountNamespaceAnomaly {
+    pub pid: u32,
+    /// comm of the process, spoofable — provenance only.
+    pub comm: String,
+    /// Resolved executable path, if readable.
+    pub exe_path: Option<String>,
+    /// Mount namespace inode, e.g. "mnt:[4026531840]".
+    pub mnt_ns: String,
+    /// True when the process is in a known container (should be excluded from
+    /// this list, but kept as a field for completeness if ever needed).
+    pub known_container: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -500,6 +522,12 @@ pub struct SecurityInfo {
     // ── SEC-055/056/057: PAM stack injection ──────────────────────────────
     #[serde(default)]
     pub pam_injections: Vec<PamFinding>,
+
+    // ── R31-01: mount namespace anomalies ──────────────────────────────
+    /// Processes in a foreign mount namespace not attributed to known
+    /// containers.
+    #[serde(default)]
+    pub mount_namespace_anomalies: Vec<MountNamespaceAnomaly>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -661,6 +661,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         one_way_switches: BTreeMap::new(),
         // ── SEC-055
         pam_injections: Vec::new(),
+        mount_namespace_anomalies: Vec::new(),
     }
 }
 
