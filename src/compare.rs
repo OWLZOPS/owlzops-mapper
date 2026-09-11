@@ -39,8 +39,12 @@ fn foreign_netns_key(l: &crate::models::ForeignNetnsListener) -> (&str, &str, &s
     )
 }
 
-fn mount_namespace_anomaly_key(a: &MountNamespaceAnomaly) -> (u32, &str) {
-    (a.pid, a.mnt_ns.as_str())
+/// R31-03: pid and namespace inode are per-instance — both change on every
+/// restart, so keying on them turns each restart into a Degraded + Changed
+/// pair. What the finding is about is WHICH BINARY runs outside the host
+/// mount namespace, and that survives a restart.
+fn mount_namespace_anomaly_key(a: &MountNamespaceAnomaly) -> &str {
+    a.exe_path.as_deref().unwrap_or("?")
 }
 
 /// Symmetric set diff over string vectors. Appearance is Degraded,
@@ -493,13 +497,13 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
 
     // --- security.mount_namespace_anomalies (R31-01) ---
     {
-        let before_set: HashSet<_> = before
+        let before_set: HashSet<&str> = before
             .security
             .mount_namespace_anomalies
             .iter()
             .map(mount_namespace_anomaly_key)
             .collect();
-        let after_set: HashSet<_> = after
+        let after_set: HashSet<&str> = after
             .security
             .mount_namespace_anomalies
             .iter()
@@ -510,14 +514,14 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             changes.push(Change {
                 field: "security.mount_namespace_anomalies".into(),
                 before: None,
-                after: Some(format!("pid {} in {}", added.0, added.1)),
+                after: Some((*added).to_string()),
                 severity: Severity::Degraded,
             });
         }
         for removed in before_set.difference(&after_set) {
             changes.push(Change {
                 field: "security.mount_namespace_anomalies".into(),
-                before: Some(format!("pid {} in {}", removed.0, removed.1)),
+                before: Some((*removed).to_string()),
                 after: None,
                 severity: Severity::Changed,
             });
@@ -2521,6 +2525,30 @@ mod tests {
             c.severity,
             Severity::Improved,
             "the user is still enumerated — this is a genuine revocation"
+        );
+    }
+
+    #[test]
+    fn a_restarted_sandbox_is_not_drift() {
+        // R31-03: same binary, new pid and new namespace inode after a restart.
+        let mk = |pid: u32, ns: &str| MountNamespaceAnomaly {
+            pid,
+            comm: "sandbox".into(),
+            exe_path: Some("/opt/vendor/sandbox".into()),
+            mnt_ns: ns.into(),
+            ..Default::default()
+        };
+        let mut before = test_report();
+        before.security.mount_namespace_anomalies = vec![mk(1234, "mnt:[4026532100]")];
+        let mut after = test_report();
+        after.security.mount_namespace_anomalies = vec![mk(98765, "mnt:[4026532999]")];
+
+        assert!(
+            !compare_reports(&before, &after)
+                .changes
+                .iter()
+                .any(|c| c.field == "security.mount_namespace_anomalies"),
+            "a restart must not read as a new finding plus a removal"
         );
     }
 }

@@ -153,7 +153,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_storage(report);
     render_network_listeners(report);
     render_foreign_netns_listeners(report);
-    render_mount_namespace_anomalies(report);
+    render_mount_namespace_anomalies(report, verbose);
     render_ssl_certificates(report);
     render_shell_users(report);
     render_system_internals(report);
@@ -930,8 +930,30 @@ fn render_foreign_netns_listeners(report: &AgentReport) {
     outln!("{t}\n");
 }
 
-fn render_mount_namespace_anomalies(report: &AgentReport) {
+fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
     if report.security.mount_namespace_anomalies.is_empty() {
+        return;
+    }
+
+    // R31-01: on a modern systemd host most services run in their own
+    // mount namespace as declared hardening. The scanner labels those
+    // instead of dropping them; the terminal shows only the rows the
+    // label does not explain. `--verbose` shows all.
+    let rows: Vec<_> = report
+        .security
+        .mount_namespace_anomalies
+        .iter()
+        .filter(|a| {
+            verbose
+                || a.systemd_unit
+                    .as_deref()
+                    .map(|u| !u.ends_with(".service"))
+                    .unwrap_or(true)
+                || !a.system_path
+        })
+        .collect();
+
+    if rows.is_empty() {
         return;
     }
 
@@ -941,16 +963,23 @@ fn render_mount_namespace_anomalies(report: &AgentReport) {
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
         Cell::new("Process").add_attribute(Attribute::Bold),
-        Cell::new("Mount NS").add_attribute(Attribute::Bold),
         Cell::new("Exe Path").add_attribute(Attribute::Bold),
+        Cell::new("systemd unit").add_attribute(Attribute::Bold),
+        Cell::new("Mount NS").add_attribute(Attribute::Bold),
     ]);
 
-    for a in &report.security.mount_namespace_anomalies {
+    for a in rows {
         t.add_row(vec![
             Cell::new(a.pid.to_string()),
             Cell::new(sanitize_terminal(&a.comm)),
+            Cell::new(sanitize_terminal(a.exe_path.as_deref().unwrap_or("?"))),
+            Cell::new(
+                a.systemd_unit
+                    .as_deref()
+                    .map(sanitize_terminal)
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
             Cell::new(sanitize_terminal(&a.mnt_ns)),
-            Cell::new(a.exe_path.as_deref().unwrap_or("?")),
         ]);
     }
 
