@@ -282,22 +282,25 @@ pub struct ContainerNetnsMapping {
 // ── Mount namespace anomalies ─────────────────────────────────────────
 
 /// A process running in a mount namespace other than the host's and not
-/// attributable to a known container. Inventory, not a verdict: it may be a
-/// legitimate systemd service, a snap/flatpak sandbox, or a manual unshare.
-/// Raw Truth demands it be visible.
+/// attributable to a known container. Inventory, not a verdict.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct MountNamespaceAnomaly {
     pub pid: u32,
-    /// comm of the process, spoofable — provenance only.
     pub comm: String,
-    /// Resolved executable path, if readable.
     pub exe_path: Option<String>,
-    /// Mount namespace inode, e.g. "mnt:[4026531840]".
     pub mnt_ns: String,
-    /// True when the process is in a known container (should be excluded from
-    /// this list, but kept as a field for completeness if ever needed).
-    pub known_container: bool,
+    /// systemd unit or scope owning the pid, from its cgroup:
+    /// "nginx.service", "session-3.scope", None if not under systemd.
+    /// Provenance, not a verdict — a .service explains the namespace as
+    /// declared hardening, a .scope does not explain anything.
+    #[serde(default)]
+    pub systemd_unit: Option<String>,
+    /// True when the exe lives in a package-manager or sandbox prefix.
+    /// Labelled, never dropped: `unshare -m` runs /usr/bin/bash, so
+    /// excluding system paths excludes the attack too (R31-01).
+    #[serde(default)]
+    pub system_path: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

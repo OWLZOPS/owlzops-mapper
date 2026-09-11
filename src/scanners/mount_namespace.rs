@@ -14,32 +14,30 @@ fn mnt_ns_inode(pid: u32) -> Option<String> {
         .map(str::to_string)
 }
 
-/// True when the process is managed by systemd. Modern systemd runs most
-/// services in their own mount namespace as a hardening measure
-/// (`ProtectSystem`, `PrivateMounts`, `DynamicUser`). Flagging those would
-/// drown the report in noise — they are the platform, not a drift.
-fn is_systemd_managed(pid: u32) -> bool {
-    let Ok((cgroup, _)) = safe_io::read_procfs_capped(&format!("/proc/{pid}/cgroup"), 8192) else {
-        return false;
-    };
-    cgroup.contains("system.slice/")
-        || cgroup.contains("user.slice/")
-        || cgroup.contains("machine.slice/")
+/// The systemd unit or scope owning this pid, taken from its cgroup path.
+/// cgroup v2 line: "0::/system.slice/nginx.service".
+fn systemd_unit(pid: u32) -> Option<String> {
+    let (cgroup, _) = safe_io::read_procfs_capped(&format!("/proc/{pid}/cgroup"), 8192).ok()?;
+    cgroup
+        .lines()
+        .filter_map(|l| l.rsplit(':').next())
+        .flat_map(|p| p.rsplit('/'))
+        .find(|c| c.ends_with(".service") || c.ends_with(".scope"))
+        .map(str::to_string)
 }
 
 /// True when the executable lives in a path owned by the package manager
-/// or a known sandbox runtime. Such a binary can only be placed there by
-/// root or by the platform itself, so a namespace anomaly around it is not
-/// the signal we are hunting.
+/// or a known sandbox runtime. Reported as a label, never used to drop
+/// the row: `unshare -m` from a shell runs /usr/bin/bash.
 fn is_system_path(exe: &str) -> bool {
     const ROOTS: &[&str] = &[
         "/usr/",
         "/opt/",
         "/nix/store/",
-        "/app/",             // Flatpak /app prefix
-        "/snap/",            // Snap
-        "/var/lib/flatpak/", // Flatpak store on the host
-        "/run/wrappers/",    // NixOS setuid/capability wrappers
+        "/app/",
+        "/snap/",
+        "/var/lib/flatpak/",
+        "/run/wrappers/",
     ];
     ROOTS.iter().any(|p| exe.starts_with(p))
 }
@@ -67,6 +65,7 @@ pub fn scan_mount_namespace_anomalies(
     };
     pids.sort_unstable();
 
+    let total_pids = pids.len();
     let mut result = Vec::new();
     let mut denied = 0usize;
 
@@ -78,41 +77,34 @@ pub fn scan_mount_namespace_anomalies(
         if ns == host_ns || known_container_pids.contains(&pid) {
             continue;
         }
-        if is_systemd_managed(pid) {
-            continue;
-        }
 
         let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
             .ok()
             .map(|(c, _)| c.trim().to_string())
             .unwrap_or_else(|| "?".to_string());
 
-        let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
-
         // Kernel worker threads have no user-space image: readlink on
         // /proc/<pid>/exe returns ENOENT. They cannot execute attacker code
         // and their mount namespace is inherited from the kernel at boot,
-        // so they are noise in this list. `kdevtmpfs` is the canonical
-        // example seen on every Fedora/Ubuntu host.
-        let Some(exe_path) = exe_path else {
+        // so they are noise in this list.
+        let Some(exe_path) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
             continue;
         };
 
-        // Variant B: skip processes whose binary lives in a system-managed
-        // prefix. Anything else here — /tmp, /dev/shm, /home, /run/user,
-        // memfd — is what the scanner is actually for.
-        if is_system_path(&exe_path) {
-            continue;
-        }
-
+        // R31-01: label system-managed prefixes and systemd units, never
+        // drop them. `unshare -m` from a shell runs /usr/bin/bash under
+        // session-N.scope — the case this scanner exists for. Consumers
+        // filter by policy (ui.rs default; JSON always carries all).
         result.push(MountNamespaceAnomaly {
             pid,
             comm,
-            exe_path: Some(exe_path),
+            exe_path: Some(exe_path.clone()),
             mnt_ns: ns,
-            known_container: false,
+            systemd_unit: systemd_unit(pid),
+            system_path: is_system_path(&exe_path),
         });
     }
 
@@ -121,6 +113,16 @@ pub fn scan_mount_namespace_anomalies(
     if denied > 0 {
         coverage::record(format!(
             "mount namespace scan: /proc/<pid>/ns/mnt unreadable for {denied} process(es)"
+        ));
+    }
+    if total_pids > MAX_PIDS {
+        // R31-02: pids are ascending, so take() drops the NEWEST processes —
+        // exactly where a fresh `unshare` lands. Report the cap; the list
+        // is a lower bound.
+        coverage::record(format!(
+            "mount namespace scan: {total_pids} processes, cap is {MAX_PIDS} — the \
+             {} newest were NOT examined; this list is a LOWER BOUND",
+            total_pids - MAX_PIDS
         ));
     }
 
