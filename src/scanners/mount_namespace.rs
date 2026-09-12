@@ -32,6 +32,11 @@ fn systemd_unit(pid: u32) -> Option<String> {
 fn is_system_path(exe: &str) -> bool {
     const ROOTS: &[&str] = &[
         "/usr/",
+        // Aligned with utils.rs::SYSTEM_BIN. On usrmerge systems /bin and
+        // /sbin are symlinks into /usr, but a container's namespace may
+        // predate that — the paths here are namespace-relative.
+        "/bin/",
+        "/sbin/",
         "/opt/",
         "/nix/store/",
         "/app/",

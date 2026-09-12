@@ -933,17 +933,28 @@ fn render_foreign_netns_listeners(report: &AgentReport) {
 /// Does the owning systemd unit account for the process having its own
 /// mount namespace?
 ///
-/// `app-*.scope` is how systemd launches a sandboxed desktop application
-/// (flatpak → bwrap creates the namespace by design). `*.service` is
-/// declared hardening (PrivateMounts/ProtectSystem). A `session-N.scope`
-/// is a plain login session and has NO reason to be in its own mount
-/// namespace — that is the manual `unshare` this scanner exists for.
+/// Container runtimes put every container in its own mount namespace by
+/// definition: `docker-<hash>.scope` (docker/moby), `libpod-*` (podman),
+/// `crio-*` (CRI-O), `machine-*` (systemd-nspawn). `app-*.scope` is how
+/// systemd launches a sandboxed desktop application (flatpak → bwrap).
+/// `*.service` is declared hardening (PrivateMounts/ProtectSystem).
 ///
-/// Display policy only. A user can create `app-anything.scope` with
-/// `systemd-run --scope`, so this must never move into the scanner: the
-/// JSON keeps every row, and compare.rs diffs every row (R31-05/06).
+/// A `session-N.scope` is a plain login session and has NO reason to be in
+/// its own mount namespace — that is the manual `unshare` this scanner
+/// exists for.
+///
+/// Display policy only. Any of these prefixes can be produced by an
+/// unprivileged `systemd-run --scope`, so this must never move into the
+/// scanner: JSON keeps every row, and `compare.rs` diffs every row.
 fn unit_explains_namespace(unit: Option<&str>) -> bool {
-    unit.is_some_and(|u| u.ends_with(".service") || u.starts_with("app-"))
+    unit.is_some_and(|u| {
+        u.ends_with(".service")
+            || u.starts_with("app-")     // flatpak / desktop sandbox
+            || u.starts_with("docker-")  // docker / moby
+            || u.starts_with("libpod-")  // podman
+            || u.starts_with("crio-")    // CRI-O
+            || u.starts_with("machine-") // systemd-nspawn
+    })
 }
 
 fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
