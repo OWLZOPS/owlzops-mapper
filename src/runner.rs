@@ -143,6 +143,45 @@ fn link_foreign_netns_to_containers(network: &mut NetworkInfo, topology: &Topolo
 }
 
 #[cfg(feature = "local-scan")]
+fn link_mount_ns_to_containers(
+    security: &mut crate::models::SecurityInfo,
+    topology: &TopologyInfo,
+) {
+    // R31-07: a container's children share the init process's mount namespace
+    // but have their own pids. Filtering the scan by pid alone misses them;
+    // attribute by mnt_ns instead. Attribution, not filter: a container process
+    // running an unpackaged binary from /tmp stays visible.
+    let mut by_mnt_ns: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for m in &topology.container_netns {
+        if let Some(ns) = &m.mnt_ns {
+            by_mnt_ns
+                .entry(ns.as_str())
+                .or_default()
+                .push(m.name.as_str());
+        }
+    }
+
+    for (ns, names) in by_mnt_ns.iter_mut() {
+        names.sort_unstable();
+        if names.len() > 1 {
+            crate::coverage::record(format!(
+                "mount ns {ns} is shared by {} containers ({}) — anomalies in it are \
+                 attributed to '{}' only; the namespace belongs to more than one container",
+                names.len(),
+                names.join(", "),
+                names[0]
+            ));
+        }
+    }
+
+    for a in &mut security.mount_namespace_anomalies {
+        if let Some(names) = by_mnt_ns.get(a.mnt_ns.as_str()) {
+            a.container = Some(names[0].to_string());
+        }
+    }
+}
+
+#[cfg(feature = "local-scan")]
 pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
     let scan_id = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!("scan", scan_id = %scan_id, host = "local");
@@ -286,6 +325,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             .collect();
         security_info.mount_namespace_anomalies =
             crate::scanners::mount_namespace::scan_mount_namespace_anomalies(&known_pids);
+        // R31-07: attribute the survivors to their container by mnt_ns, not by
+        // pid — a container's children share its mount namespace.
+        link_mount_ns_to_containers(&mut security_info, &topology_info);
 
         let p = persistence_res.unwrap_or_else(|e| {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");

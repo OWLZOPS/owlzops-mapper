@@ -32,6 +32,11 @@ fn systemd_unit(pid: u32) -> Option<String> {
 fn is_system_path(exe: &str) -> bool {
     const ROOTS: &[&str] = &[
         "/usr/",
+        // Aligned with utils.rs::SYSTEM_BIN. On usrmerge systems /bin and
+        // /sbin are symlinks into /usr, but a container's namespace may
+        // predate that — the paths here are namespace-relative.
+        "/bin/",
+        "/sbin/",
         "/opt/",
         "/nix/store/",
         "/app/",
@@ -98,13 +103,16 @@ pub fn scan_mount_namespace_anomalies(
         // drop them. `unshare -m` from a shell runs /usr/bin/bash under
         // session-N.scope — the case this scanner exists for. Consumers
         // filter by policy (ui.rs default; JSON always carries all).
+        let sys_path = is_system_path(&exe_path);
+
         result.push(MountNamespaceAnomaly {
             pid,
             comm,
-            exe_path: Some(exe_path.clone()),
+            exe_path: Some(exe_path),
             mnt_ns: ns,
+            container: None, // filled later by runner (R31-07)
             systemd_unit: systemd_unit(pid),
-            system_path: is_system_path(&exe_path),
+            system_path: sys_path,
         });
     }
 

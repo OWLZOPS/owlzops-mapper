@@ -161,7 +161,11 @@ fn map_path(line: &str) -> Option<&str> {
 /// This grants nothing that a non-deleted mapping at the same path does not
 /// already get: it only stops the window after an upgrade from being treated
 /// as more suspicious than the steady state.
-fn mapping_is_attributable(field: &str) -> bool {
+///
+/// R31-08: for a container process the path is namespace-relative. `ns_root`
+/// is the process's own root (`/proc/<pid>/root`), so the stat is resolved
+/// against the namespace the path actually lives in. Empty for the host.
+fn mapping_is_attributable(field: &str, ns_root: &str) -> bool {
     let (clean, deleted) = split_deleted(field);
     if !clean.starts_with('/') {
         return false;
@@ -169,19 +173,27 @@ fn mapping_is_attributable(field: &str) -> bool {
     if !deleted {
         return true;
     }
-    !clean.starts_with("/memfd:")
-        && !is_volatile_lib_path(clean)
-        // stat only on deleted lines — rare, so this is not a per-VMA syscall.
-        && std::fs::metadata(clean).is_ok_and(|m| m.is_file())
+    if clean.starts_with("/memfd:") || is_volatile_lib_path(clean) {
+        return false;
+    }
+    // stat only on deleted lines — rare, so this is not a per-VMA syscall.
+    let full = format!("{ns_root}{clean}");
+    std::fs::metadata(full).is_ok_and(|m| m.is_file())
 }
 
 /// True when an exe path carries `(deleted)` but the path still exists on disk.
 /// This is the signature of an in-place package upgrade followed by a missing
 /// reboot: the process holds the old inode, the filesystem has new bytes.
 /// Hiding would have removed the path entirely.
-fn is_stale_after_upgrade(exe_path: &str) -> bool {
+///
+/// R31-08: same namespace-relative concern as `mapping_is_attributable`.
+fn is_stale_after_upgrade(exe_path: &str, ns_root: &str) -> bool {
     let (clean, deleted) = split_deleted(exe_path);
-    deleted && clean.starts_with('/') && std::fs::metadata(clean).is_ok_and(|m| m.is_file())
+    if !deleted || !clean.starts_with('/') {
+        return false;
+    }
+    let full = format!("{ns_root}{clean}");
+    std::fs::metadata(full).is_ok_and(|m| m.is_file())
 }
 
 struct RuntimeTrust {
@@ -191,18 +203,19 @@ struct RuntimeTrust {
     file_text_anchored: bool,
 }
 
-fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
+fn assess_runtime(maps: &str, exe_path: Option<&str>, ns_root: &str) -> RuntimeTrust {
     let exe_ok = exe_path.is_some_and(|e| {
         let (clean, _) = split_deleted(e);
         let is_vendor = VENDOR_ROOTS.iter().any(|r| clean.contains(*r));
-        mapping_is_attributable(e) && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
+        mapping_is_attributable(e, ns_root)
+            && (!crate::utils::is_ephemeral_exec_path(clean) || is_vendor)
     });
 
     let runtime_libs = maps.lines().any(|l| {
         let Some(field) = map_path(l) else {
             return false;
         };
-        if !mapping_is_attributable(field) {
+        if !mapping_is_attributable(field, ns_root) {
             return false;
         }
         let (clean, _) = split_deleted(field);
@@ -218,7 +231,7 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
                     let Some(field) = map_path(l) else {
                         return false;
                     };
-                    if !mapping_is_attributable(field) {
+                    if !mapping_is_attributable(field, ns_root) {
                         return false;
                     }
                     let (clean, _) = split_deleted(field);
@@ -252,7 +265,7 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
             continue;
         };
         let backed = path.map(str::trim).is_some_and(|p| {
-            mapping_is_attributable(p) && !is_volatile_lib_path(split_deleted(p).0)
+            mapping_is_attributable(p, ns_root) && !is_volatile_lib_path(split_deleted(p).0)
         });
         if backed {
             file_exec = file_exec.saturating_add(sz);
@@ -263,7 +276,7 @@ fn assess_runtime(maps: &str, exe_path: Option<&str>) -> RuntimeTrust {
     // Intentionally NOT using exe_ok/is_ephemeral_exec_path: standalone lives
     // in /home, and the whole point of the anchor is to bypass that overly
     // broad heuristic. A live main image is the sole extra condition.
-    let main_exe_present = exe_path.is_some_and(mapping_is_attributable);
+    let main_exe_present = exe_path.is_some_and(|e| mapping_is_attributable(e, ns_root));
     let file_text_anchored = main_exe_present
         && file_exec >= FILE_TEXT_ANCHOR_MIN
         && anon_exec.saturating_mul(FILE_TEXT_ANON_RATIO) <= file_exec;
@@ -466,7 +479,12 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
             let exe_path = fs::read_link(format!("{proc_root}/{pid}/exe"))
                 .map(|p| p.to_string_lossy().to_string())
                 .ok();
-            let trust = assess_runtime(&content, exe_path.as_deref());
+            // R31-08: paths inside /proc/<pid>/maps are namespace-relative for
+            // a container process. Resolve every stat through the process's
+            // own root, so `is_stale_after_upgrade` sees the file that the
+            // process actually maps. Empty for the host namespace.
+            let ns_root = format!("{proc_root}/{pid}/root");
+            let trust = assess_runtime(&content, exe_path.as_deref(), &ns_root);
 
             let start = findings.len();
 
@@ -476,6 +494,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 &comm,
                 &trust,
                 exe_path.as_deref(),
+                &ns_root,
                 &cache,
                 &mut findings,
             );
@@ -517,12 +536,14 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
     findings
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_maps(
     content: &str,
     pid: u32,
     comm: &str,
     trust: &RuntimeTrust,
     exe_path: Option<&str>,
+    ns_root: &str,
     cache: &VerdictCache,
     findings: &mut Vec<LibraryInjectionFinding>,
 ) {
@@ -674,7 +695,9 @@ fn scan_maps(
                         Some("maps-rwx-provisional")
                     }
                     // R29-01: deleted-after-upgrade is pending reboot, not hiding.
-                    _ if exe_path.is_some_and(is_stale_after_upgrade) => {
+                    // R31-08: resolved through ns_root, so a container's exe
+                    // sees its own filesystem, not the host's.
+                    _ if exe_path.is_some_and(|e| is_stale_after_upgrade(e, ns_root)) => {
                         Some("maps-rwx-stale-after-upgrade")
                     }
                     // Heavy standalone (Telegram/AppImage): trust from
@@ -764,10 +787,10 @@ mod tests {
     }
 
     fn scan(maps: &str, exe: Option<&str>) -> Vec<LibraryInjectionFinding> {
-        let trust = assess_runtime(maps, exe);
+        let trust = assess_runtime(maps, exe, "");
         let cache = VerdictCache::default();
         let mut out = Vec::new();
-        scan_maps(maps, 4242, "java", &trust, exe, &cache, &mut out);
+        scan_maps(maps, 4242, "java", &trust, exe, "", &cache, &mut out);
         out
     }
 
@@ -813,7 +836,7 @@ mod tests {
     #[test]
     fn runtime_libs_accepts_non_usr_paths() {
         let maps = jvm_maps("r-xp");
-        let trust = assess_runtime(&maps, Some("/opt/kafka/jdk/bin/java"));
+        let trust = assess_runtime(&maps, Some("/opt/kafka/jdk/bin/java"), "");
         assert!(
             trust.runtime_libs,
             "bundled/opt JDK must satisfy runtime_libs"
@@ -841,13 +864,14 @@ mod tests {
     }
 
     fn scan_into(maps: &str, out: &mut Vec<LibraryInjectionFinding>) {
-        let trust = assess_runtime(maps, EXE);
+        let trust = assess_runtime(maps, EXE, "");
         scan_maps(
             maps,
             4242,
             "java",
             &trust,
             EXE,
+            "",
             &VerdictCache::default(),
             out,
         );
@@ -920,7 +944,7 @@ mod tests {
 7f0000000000-7f0000004000 r--p 00000000 08:01 999 /tmp/x.so (deleted)
 7f0000004000-7f0000010000 r-xp 00004000 08:01 999 /tmp/x.so (deleted)
 ";
-        let trust = assess_runtime(maps, Some("/opt/app/mystery-bin"));
+        let trust = assess_runtime(maps, Some("/opt/app/mystery-bin"), "");
         let mut out = Vec::new();
         scan_maps(
             maps,
@@ -928,6 +952,7 @@ mod tests {
             "app",
             &trust,
             Some("/opt/app/mystery-bin"),
+            "",
             &VerdictCache::default(),
             &mut out,
         );
@@ -961,10 +986,10 @@ mod tests {
     // ── SEC-026 fast-path tests (ExecHeap & file_text_anchored) ──
 
     fn scan_with(maps: &str, exe: Option<&str>) -> Vec<LibraryInjectionFinding> {
-        let trust = assess_runtime(maps, exe);
+        let trust = assess_runtime(maps, exe, "");
         let cache = VerdictCache::default();
         let mut out = Vec::new();
-        scan_maps(maps, 4242, "app", &trust, exe, &cache, &mut out);
+        scan_maps(maps, 4242, "app", &trust, exe, "", &cache, &mut out);
         out
     }
 
@@ -1045,18 +1070,18 @@ mod tests {
         // trust anchors on that is why a patched-but-not-rebooted host lights up.
         // Use a real non-volatile path to avoid /tmp being volatile.
         assert!(
-            mapping_is_attributable("/usr/bin/env (deleted)"),
+            mapping_is_attributable("/usr/bin/env (deleted)", ""),
             "path still on disk = patched, not hidden"
         );
         assert!(
-            !mapping_is_attributable("/usr/bin/definitely_not_existing (deleted)"),
+            !mapping_is_attributable("/usr/bin/definitely_not_existing (deleted)", ""),
             "unlinked and gone is the actual IOC and must stay untrusted"
         );
-        assert!(!mapping_is_attributable("/memfd:payload (deleted)"));
-        assert!(!mapping_is_attributable("/dev/shm/x.so (deleted)"));
+        assert!(!mapping_is_attributable("/memfd:payload (deleted)", ""));
+        assert!(!mapping_is_attributable("/dev/shm/x.so (deleted)", ""));
 
         // Non-deleted existing path should always be attributable.
-        assert!(mapping_is_attributable("/usr/bin/env"));
+        assert!(mapping_is_attributable("/usr/bin/env", ""));
     }
 
     #[test]
