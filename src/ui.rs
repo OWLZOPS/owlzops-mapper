@@ -985,8 +985,10 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
 
     // R31-05: one sandbox is one finding. A browser puts a dozen child
     // processes in the same namespace running the same binary; printing a
-    // row each buries the single row that matters. compare.rs keys on
-    // (container, exe_path), so it counts them as one — the table agrees.
+    // row each buries the single row that matters. Grouping is by
+    // (mnt_ns, exe_path) — narrower than the diff key, which is
+    // (container, exe_path): here the goal is to collapse the workers of
+    // one sandbox, not to match the diff.
     let mut groups: BTreeMap<(&str, &str), Vec<&crate::models::MountNamespaceAnomaly>> =
         BTreeMap::new();
     for a in rows {
