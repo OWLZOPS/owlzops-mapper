@@ -967,7 +967,15 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
         .mount_namespace_anomalies
         .iter()
         .filter(|a| {
-            verbose || !(unit_explains_namespace(a.systemd_unit.as_deref()) && a.system_path)
+            if verbose {
+                return true;
+            }
+            // R31-07: hide only when BOTH the unit and (if present) the
+            // container fully explain the namespace. A container running an
+            // unpackaged binary from /tmp stays visible.
+            let unit_ok = unit_explains_namespace(a.systemd_unit.as_deref()) && a.system_path;
+            let container_ok = a.container.is_some() && a.system_path;
+            !unit_ok && !container_ok
         })
         .collect();
 
@@ -977,8 +985,8 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
 
     // R31-05: one sandbox is one finding. A browser puts a dozen child
     // processes in the same namespace running the same binary; printing a
-    // row each buries the single row that matters. compare.rs already keys
-    // on exe_path, so it counts them as one — the table should agree.
+    // row each buries the single row that matters. compare.rs keys on
+    // (container, exe_path), so it counts them as one — the table agrees.
     let mut groups: BTreeMap<(&str, &str), Vec<&crate::models::MountNamespaceAnomaly>> =
         BTreeMap::new();
     for a in rows {
@@ -995,7 +1003,7 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
             .fg(Color::Cyan),
         Cell::new("Process").add_attribute(Attribute::Bold),
         Cell::new("Exe Path").add_attribute(Attribute::Bold),
-        Cell::new("systemd unit").add_attribute(Attribute::Bold),
+        Cell::new("Container").add_attribute(Attribute::Bold),
         Cell::new("Mount NS").add_attribute(Attribute::Bold),
     ]);
 
@@ -1014,7 +1022,7 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
             Cell::new(sanitize_terminal(&a.comm)),
             Cell::new(sanitize_terminal(exe)),
             Cell::new(
-                a.systemd_unit
+                a.container
                     .as_deref()
                     .map(sanitize_terminal)
                     .unwrap_or_else(|| "-".to_string()),

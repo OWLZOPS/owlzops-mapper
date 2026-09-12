@@ -277,6 +277,10 @@ pub struct ContainerNetnsMapping {
     pub name: String,
     pub netns: Option<String>,
     pub pid: Option<u32>,
+    /// Mount namespace of the container's init process. Container children
+    /// share this but have their own pids; filtering the scan by pid alone
+    /// misses them (R31-07).
+    pub mnt_ns: Option<String>,
 }
 
 // ── Mount namespace anomalies ─────────────────────────────────────────
@@ -301,6 +305,12 @@ pub struct MountNamespaceAnomaly {
     /// excluding system paths excludes the attack too (R31-01).
     #[serde(default)]
     pub system_path: bool,
+    /// Container name from topology.containers, matched by mount namespace.
+    /// None = the namespace was not attributable to any known container.
+    /// Attribution, not filter: a container process running an unpackaged
+    /// binary stays visible (R31-07).
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

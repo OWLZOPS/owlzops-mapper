@@ -441,6 +441,20 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                         .map(|p| p.to_string_lossy().into_owned())
                 });
 
+            // R31-07: mount namespace of the container's init process. Container
+            // children share this but have their own pids; filtering the mount
+            // namespace anomaly scan by pid alone misses them.
+            let container_mnt_ns = inspect
+                .state
+                .as_ref()
+                .and_then(|s| s.pid)
+                .filter(|&pid| pid > 0)
+                .and_then(|pid| {
+                    std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                });
+
             container_netns_mappings.push(ContainerNetnsMapping {
                 name: name.clone(),
                 netns: container_netns,
@@ -449,6 +463,7 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
                     .as_ref()
                     .and_then(|s| s.pid)
                     .and_then(|p| u32::try_from(p).ok()),
+                mnt_ns: container_mnt_ns,
             });
 
             let rw_size_mb = (container.size_rw.unwrap_or(0).max(0) as u64) / (1024 * 1024);

@@ -39,12 +39,14 @@ fn foreign_netns_key(l: &crate::models::ForeignNetnsListener) -> (&str, &str, &s
     )
 }
 
-/// R31-03: pid and namespace inode are per-instance — both change on every
-/// restart, so keying on them turns each restart into a Degraded + Changed
-/// pair. What the finding is about is WHICH BINARY runs outside the host
-/// mount namespace, and that survives a restart.
-fn mount_namespace_anomaly_key(a: &MountNamespaceAnomaly) -> &str {
-    a.exe_path.as_deref().unwrap_or("?")
+/// R31-07: (container, exe_path) — container name is stable between
+/// snapshots; pid is not; mnt_ns inode is not. Same binary in two
+/// containers must not collapse into one entry (docker-gen case).
+fn mount_namespace_anomaly_key(a: &MountNamespaceAnomaly) -> (&str, &str) {
+    (
+        a.container.as_deref().unwrap_or("-"),
+        a.exe_path.as_deref().unwrap_or("?"),
+    )
 }
 
 /// Symmetric set diff over string vectors. Appearance is Degraded,
@@ -495,15 +497,15 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // --- security.mount_namespace_anomalies (R31-01) ---
+    // --- security.mount_namespace_anomalies (R31-07) ---
     {
-        let before_set: HashSet<&str> = before
+        let before_set: HashSet<_> = before
             .security
             .mount_namespace_anomalies
             .iter()
             .map(mount_namespace_anomaly_key)
             .collect();
-        let after_set: HashSet<&str> = after
+        let after_set: HashSet<_> = after
             .security
             .mount_namespace_anomalies
             .iter()
@@ -514,14 +516,14 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
             changes.push(Change {
                 field: "security.mount_namespace_anomalies".into(),
                 before: None,
-                after: Some((*added).to_string()),
+                after: Some(format!("container={} binary={}", added.0, added.1)),
                 severity: Severity::Degraded,
             });
         }
         for removed in before_set.difference(&after_set) {
             changes.push(Change {
                 field: "security.mount_namespace_anomalies".into(),
-                before: Some((*removed).to_string()),
+                before: Some(format!("container={} binary={}", removed.0, removed.1)),
                 after: None,
                 severity: Severity::Changed,
             });

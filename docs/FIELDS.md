@@ -236,6 +236,14 @@ An array of objects, one per detected database engine.
 | `mount_masking[].mount_source` | string | Mount source (e.g. `tmpfs`, `/dev/sda1`) |
 | `mount_masking[].fstype` | string | Filesystem type (e.g. `tmpfs`, `ext4`) |
 | `mount_masking[].reason` | string | Why this was flagged (evidence hiding, process masking) |
+| `mount_namespace_anomalies` | array of objects | Processes running in a mount namespace other than the host's, not attributable to a known container. Inventory, not a verdict: may be a legitimate sandbox, a manual `unshare -m`, or a container runtime the scanner cannot enumerate. Sorted by PID. Added in R31-01. |
+| `mount_namespace_anomalies[].pid` | integer | PID of the process. |
+| `mount_namespace_anomalies[].comm` | string | Process comm name. Spoofable — provenance only. |
+| `mount_namespace_anomalies[].exe_path` | string \| null | Resolved executable path. **Namespace-relative, not a host path**: for a container process this path exists inside the container's mount namespace, not on the host. To inspect: `sudo nsenter --mount=/proc/<pid>/ns/mnt ls -l <path>`. `null` = kernel worker thread (no userspace image) or unreadable. |
+| `mount_namespace_anomalies[].mnt_ns` | string | Mount namespace inode, e.g. `"mnt:[4026531860]"`. |
+| `mount_namespace_anomalies[].container` | string \| null | Container name from `topology.containers`, matched by `mnt_ns`. `null` = namespace not attributable to any known container. Attribution, not filter: a container process running an unpackaged binary stays visible. Added in R31-07. |
+| `mount_namespace_anomalies[].systemd_unit` | string \| null | systemd unit or scope owning the pid, extracted from its cgroup (`nginx.service`, `session-N.scope`, `docker-<hash>.scope`). Provenance, not a verdict: a `.service` explains the namespace as declared hardening, a `.scope` does not. Added in R31-01. |
+| `mount_namespace_anomalies[].system_path` | boolean | `true` when the executable lives under a package-manager or sandbox prefix (`/usr/`, `/bin/`, `/sbin/`, `/opt/`, `/nix/store/`, `/app/`, `/snap/`, `/var/lib/flatpak/`, `/run/wrappers/`). Labelled, never used to drop the row: `unshare -m` from a shell runs `/usr/bin/bash`. Added in R31-01. |
 | `reverse_shells` | array of objects | Reverse shell / C2 connections detected (SEC‑022) |
 | `reverse_shells[].pid` | integer | PID of the interpreter process |
 | `reverse_shells[].process` | string | Process comm (interpreter name) |
