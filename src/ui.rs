@@ -5,7 +5,7 @@
 //! terminal escape sequence injection (C0/C1 control characters
 //! beyond `\t` are replaced with U+FFFD).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
@@ -930,26 +930,33 @@ fn render_foreign_netns_listeners(report: &AgentReport) {
     outln!("{t}\n");
 }
 
+/// Does the owning systemd unit account for the process having its own
+/// mount namespace?
+///
+/// `app-*.scope` is how systemd launches a sandboxed desktop application
+/// (flatpak → bwrap creates the namespace by design). `*.service` is
+/// declared hardening (PrivateMounts/ProtectSystem). A `session-N.scope`
+/// is a plain login session and has NO reason to be in its own mount
+/// namespace — that is the manual `unshare` this scanner exists for.
+///
+/// Display policy only. A user can create `app-anything.scope` with
+/// `systemd-run --scope`, so this must never move into the scanner: the
+/// JSON keeps every row, and compare.rs diffs every row (R31-05/06).
+fn unit_explains_namespace(unit: Option<&str>) -> bool {
+    unit.is_some_and(|u| u.ends_with(".service") || u.starts_with("app-"))
+}
+
 fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
     if report.security.mount_namespace_anomalies.is_empty() {
         return;
     }
 
-    // R31-01: on a modern systemd host most services run in their own
-    // mount namespace as declared hardening. The scanner labels those
-    // instead of dropping them; the terminal shows only the rows the
-    // label does not explain. `--verbose` shows all.
     let rows: Vec<_> = report
         .security
         .mount_namespace_anomalies
         .iter()
         .filter(|a| {
-            verbose
-                || a.systemd_unit
-                    .as_deref()
-                    .map(|u| !u.ends_with(".service"))
-                    .unwrap_or(true)
-                || !a.system_path
+            verbose || !(unit_explains_namespace(a.systemd_unit.as_deref()) && a.system_path)
         })
         .collect();
 
@@ -957,9 +964,22 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
         return;
     }
 
+    // R31-05: one sandbox is one finding. A browser puts a dozen child
+    // processes in the same namespace running the same binary; printing a
+    // row each buries the single row that matters. compare.rs already keys
+    // on exe_path, so it counts them as one — the table should agree.
+    let mut groups: BTreeMap<(&str, &str), Vec<&crate::models::MountNamespaceAnomaly>> =
+        BTreeMap::new();
+    for a in rows {
+        groups
+            .entry((a.mnt_ns.as_str(), a.exe_path.as_deref().unwrap_or("?")))
+            .or_default()
+            .push(a);
+    }
+
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("PID")
+        Cell::new("PID(s)")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
         Cell::new("Process").add_attribute(Attribute::Bold),
@@ -968,18 +988,27 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
         Cell::new("Mount NS").add_attribute(Attribute::Bold),
     ]);
 
-    for a in rows {
+    for ((mnt_ns, exe), procs) in groups {
+        // Lowest pid: deterministic, and usually the sandbox's own init.
+        // The scanner already returns rows sorted by pid.
+        let a = procs[0];
+        let pids = if procs.len() > 1 {
+            format!("{} (+{} more)", a.pid, procs.len() - 1)
+        } else {
+            a.pid.to_string()
+        };
+
         t.add_row(vec![
-            Cell::new(a.pid.to_string()),
+            Cell::new(pids),
             Cell::new(sanitize_terminal(&a.comm)),
-            Cell::new(sanitize_terminal(a.exe_path.as_deref().unwrap_or("?"))),
+            Cell::new(sanitize_terminal(exe)),
             Cell::new(
                 a.systemd_unit
                     .as_deref()
                     .map(sanitize_terminal)
                     .unwrap_or_else(|| "-".to_string()),
             ),
-            Cell::new(sanitize_terminal(&a.mnt_ns)),
+            Cell::new(sanitize_terminal(mnt_ns)),
         ]);
     }
 
@@ -2131,5 +2160,17 @@ mod tests {
         let output = sanitize_terminal(input);
         assert_eq!(output, "trusted\u{FFFD}host");
         assert!(!output.contains('\u{E0061}'));
+    }
+
+    #[test]
+    fn a_login_session_scope_is_not_explained_by_its_unit() {
+        // R31-06: the empirical case. app-* scopes are flatpak/bwrap by design;
+        // session-N.scope in its own mount namespace is `unshare -m` from a shell.
+        assert!(unit_explains_namespace(Some(
+            "app-flatpak-app.zen_browser.zen-1799784394.scope"
+        )));
+        assert!(unit_explains_namespace(Some("nginx.service")));
+        assert!(!unit_explains_namespace(Some("session-c17.scope")));
+        assert!(!unit_explains_namespace(None));
     }
 }
