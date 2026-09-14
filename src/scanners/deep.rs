@@ -309,7 +309,13 @@ fn attribute_managed_jit(
         .filter(|b| *b)
         .count();
 
-    (signals >= 2).then_some((Origin::ManagedJit, 70 + 15 * (signals as u8 - 2)))
+    // `then_some` evaluates its argument eagerly, so `signals as u8 - 2`
+    // underflowed whenever signals < 2 — i.e. on every exec region that
+    // reached this layer without matching an earlier one. Before
+    // overflow-checks (QW-2) the subtraction wrapped silently and returned
+    // a fabricated ManagedJit origin with a plausible-looking confidence.
+    // `then` is lazy: the arithmetic only runs when the guard is true.
+    (signals >= 2).then(|| (Origin::ManagedJit, 70 + 15 * (signals as u8 - 2)))
 }
 
 /// L1c: libffi trampoline stub signature
