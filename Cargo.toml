@@ -59,6 +59,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+# QW-2 — catch arithmetic overflow in release instead of silently wrapping.
+# Relies on panic = "unwind" below: an overflow raises a normal panic that is
+# intercepted at task boundaries (JoinError::is_panic in main.rs), exactly like
+# any other panic. If panic is ever switched to "abort", QW-2 becomes fatal
+# for the fleet loop — do not change one without the other.
+overflow-checks = true
 # R19-16 — INVARIANT, DO NOT CHANGE TO "abort".
 # Scanner isolation relies on panic interception at task boundaries:
 # JoinError::is_panic() in main.rs (fleet loop, phase‑1 teardown, main).
