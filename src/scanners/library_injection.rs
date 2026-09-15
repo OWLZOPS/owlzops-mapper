@@ -164,7 +164,9 @@ fn map_path(line: &str) -> Option<&str> {
 ///
 /// R31-08: for a container process the path is namespace-relative. `ns_root`
 /// is the process's own root (`/proc/<pid>/root`), so the stat is resolved
-/// against the namespace the path actually lives in. Empty for the host.
+/// against the namespace the path actually lives in. Set for every PID, host
+/// included: for a host PID `/proc/<pid>/root` resolves to "/", so the same
+/// join is correct and costs one extra symlink hop.
 fn mapping_is_attributable(field: &str, ns_root: &str) -> bool {
     let (clean, deleted) = split_deleted(field);
     if !clean.starts_with('/') {
@@ -482,7 +484,9 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
             // R31-08: paths inside /proc/<pid>/maps are namespace-relative for
             // a container process. Resolve every stat through the process's
             // own root, so `is_stale_after_upgrade` sees the file that the
-            // process actually maps. Empty for the host namespace.
+            // process actually maps. Set unconditionally: for a host PID,
+            // /proc/<pid>/root resolves to "/", so the same join works and
+            // costs only one extra symlink hop.
             let ns_root = format!("{proc_root}/{pid}/root");
             let trust = assess_runtime(&content, exe_path.as_deref(), &ns_root);
 
