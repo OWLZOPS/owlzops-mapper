@@ -55,8 +55,8 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-      # R19-16: guard panic=unwind invariant (one-shot, not matrix-duplicated)
-      - name: Guard panic strategy (R19-16)
+      # R19-16 + QW-2/R32-01: guard release-profile invariants (one-shot, not matrix-duplicated)
+      - name: Guard release-profile invariants (R19-16, QW-2/R32-01)
         if: matrix.os == 'ubuntu-24.04'
         run: |
           grep -qE '^\s*panic\s*=\s*"unwind"' Cargo.toml \
@@ -65,6 +65,11 @@ jobs:
             echo "::error file=Cargo.toml::panic=\"abort\" reintroduced — scanner isolation depends on JoinError::is_panic(); see v0.5.4 revert"
             exit 1
           fi
+          # QW-2 / R32-01: the other half of the same invariant. overflow-checks
+          # turns a silent wraparound in a /proc parser into a scanner panic,
+          # which is only survivable because panic=unwind is enforced above.
+          grep -qE '^\s*overflow-checks\s*=\s*true' Cargo.toml \
+            || { echo "::error file=Cargo.toml::overflow-checks=true missing from [profile.release] — arithmetic overflow in a parser would wrap silently into a verdict"; exit 1; }
 
       - name: Install ripgrep
         if: matrix.os == 'ubuntu-24.04'
