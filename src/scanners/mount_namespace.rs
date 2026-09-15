@@ -26,27 +26,6 @@ fn systemd_unit(pid: u32) -> Option<String> {
         .map(str::to_string)
 }
 
-/// True when the executable lives in a path owned by the package manager
-/// or a known sandbox runtime. Reported as a label, never used to drop
-/// the row: `unshare -m` from a shell runs /usr/bin/bash.
-fn is_system_path(exe: &str) -> bool {
-    const ROOTS: &[&str] = &[
-        "/usr/",
-        // Aligned with utils.rs::SYSTEM_BIN. On usrmerge systems /bin and
-        // /sbin are symlinks into /usr, but a container's namespace may
-        // predate that — the paths here are namespace-relative.
-        "/bin/",
-        "/sbin/",
-        "/opt/",
-        "/nix/store/",
-        "/app/",
-        "/snap/",
-        "/var/lib/flatpak/",
-        "/run/wrappers/",
-    ];
-    ROOTS.iter().any(|p| exe.starts_with(p))
-}
-
 pub fn scan_mount_namespace_anomalies(
     known_container_pids: &HashSet<u32>,
 ) -> Vec<MountNamespaceAnomaly> {
@@ -103,7 +82,11 @@ pub fn scan_mount_namespace_anomalies(
         // drop them. `unshare -m` from a shell runs /usr/bin/bash under
         // session-N.scope — the case this scanner exists for. Consumers
         // filter by policy (ui.rs default; JSON always carries all).
-        let sys_path = is_system_path(&exe_path);
+        //
+        // The predicate lives in utils.rs next to SYSTEM_BIN; the two answer
+        // different questions and are deliberately not merged (see
+        // is_system_managed_path docs).
+        let sys_path = crate::utils::is_system_managed_path(&exe_path);
 
         result.push(MountNamespaceAnomaly {
             pid,
