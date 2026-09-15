@@ -663,6 +663,13 @@ const INSTALL_ROOTS: &[&str] = &[
 ];
 
 /// System binary paths — territory of the package manager (root-owned).
+///
+/// Answers: "was this installed by the OS package manager?"
+/// Narrow on purpose. The broader "is this on the system side of the
+/// trust line?" question — used by mount-namespace classification —
+/// is `is_system_managed_path` below. Do not merge the two: snap,
+/// flatpak and nix packages are system-side but not package-manager
+/// territory, and would misclassify provenance if included here.
 const SYSTEM_BIN: &[&str] = &[
     "/usr/bin/",
     "/usr/sbin/",
@@ -672,6 +679,33 @@ const SYSTEM_BIN: &[&str] = &[
     "/usr/local/bin/",
     "/usr/local/sbin/",
 ];
+
+/// System-managed roots for mount-namespace classification.
+///
+/// Answers a *different* question from SYSTEM_BIN: "does this exe live
+/// on the system side, such that a mount-namespace anomaly involving
+/// it is normal rather than suspicious?" Deliberately broader — nix,
+/// snap, flatpak, /app and /opt all run legitimate system-side
+/// processes here, even though none is package-manager territory.
+///
+/// `/usr/` is a prefix, not `/usr/bin/`, because usrmerge unifies the
+/// whole tree; enumerating subdirectories would silently drop binaries
+/// from newer usr layouts. On a pre-usrmerge container namespace the
+/// relative `/bin/` and `/sbin/` still need their own entries.
+pub(crate) fn is_system_managed_path(exe: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/opt/",
+        "/nix/store/",
+        "/app/",
+        "/snap/",
+        "/var/lib/flatpak/",
+        "/run/wrappers/",
+    ];
+    ROOTS.iter().any(|p| exe.starts_with(p))
+}
 
 /// Version-managed runtime roots (nvm/pyenv/rbenv/...). The binary here IS the runtime
 /// by convention. Membership-alone -> NestedUserInstall: the manager's layout keeps files
@@ -1165,5 +1199,60 @@ mod tests {
         assert!(!is_terminal_unsafe('1'));
         // Newline is a control char and must be neutralized by sanitizers.
         assert!(is_terminal_unsafe('\n'));
+    }
+}
+
+#[cfg(test)]
+mod system_path_tests {
+    use super::*;
+
+    #[test]
+    fn system_managed_includes_non_package_manager_roots() {
+        // These are system-side for classification but NOT package-manager
+        // territory. If is_system_managed_path ever narrows to SYSTEM_BIN,
+        // mount-namespace anomalies from nix/snap/flatpak will start
+        // firing on normal processes.
+        for p in [
+            "/nix/store/abc/bin/foo",
+            "/snap/firefox/1/usr/lib/firefox/firefox",
+            "/var/lib/flatpak/app/x/y/z",
+            "/opt/app/bin/server",
+        ] {
+            assert!(is_system_managed_path(p), "expected system-managed: {p}");
+        }
+    }
+
+    #[test]
+    fn system_bin_excludes_non_package_manager_roots() {
+        // The mirror-image invariant. If SYSTEM_BIN ever widens to include
+        // these, provenance will misclassify snap/flatpak/nix installs as
+        // package-manager-owned.
+        for p in [
+            "/nix/store/abc/bin/foo",
+            "/snap/firefox/1/usr/lib/firefox/firefox",
+            "/var/lib/flatpak/app/x/y/z",
+            "/opt/app/bin/server",
+        ] {
+            assert!(
+                !SYSTEM_BIN.iter().any(|s| p.starts_with(s)),
+                "SYSTEM_BIN must not match: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn usr_prefix_covers_modern_usr_layouts() {
+        // /usr/ as a prefix (not /usr/bin/) so future usr layouts
+        // (e.g. /usr/libexec/) don't need manual additions here.
+        for p in ["/usr/bin/ls", "/usr/libexec/x", "/usr/local/bin/y"] {
+            assert!(is_system_managed_path(p), "expected system-managed: {p}");
+        }
+    }
+
+    #[test]
+    fn user_and_temp_paths_are_not_system_managed() {
+        for p in ["/home/user/bin/x", "/tmp/x", "/root/.local/bin/x"] {
+            assert!(!is_system_managed_path(p), "expected non-system: {p}");
+        }
     }
 }
