@@ -276,6 +276,12 @@ pub struct ForeignNetnsListener {
 pub struct ContainerNetnsMapping {
     pub name: String,
     pub netns: Option<String>,
+    /// R33-02: pid used to feed the mount-namespace scanner's container
+    /// prefilter. That filter is gone — attribution is by mnt_ns now
+    /// (R31-07) — so nothing inside the crate reads this field anymore.
+    /// Kept and emitted: it is part of the JSON schema and external
+    /// consumers (Blueprint Engine) may key on it.
+    #[allow(dead_code)]
     pub pid: Option<u32>,
     /// Mount namespace of the container's init process. Container children
     /// share this but have their own pids; filtering the scan by pid alone

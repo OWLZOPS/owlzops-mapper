@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 
 use crate::coverage;
 use crate::models::MountNamespaceAnomaly;
@@ -7,17 +7,15 @@ use crate::safe_io;
 
 const MAX_PIDS: usize = 4096;
 
-fn mnt_ns_inode(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
-        .ok()?
-        .to_str()
-        .map(str::to_string)
+fn mnt_ns_inode(proc_root: &Path, pid: u32) -> std::io::Result<String> {
+    fs::read_link(proc_root.join(format!("{pid}/ns/mnt"))).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// The systemd unit or scope owning this pid, taken from its cgroup path.
 /// cgroup v2 line: "0::/system.slice/nginx.service".
-fn systemd_unit(pid: u32) -> Option<String> {
-    let (cgroup, _) = safe_io::read_procfs_capped(&format!("/proc/{pid}/cgroup"), 8192).ok()?;
+fn systemd_unit(proc_root: &Path, pid: u32) -> Option<String> {
+    let p = proc_root.join(format!("{pid}/cgroup"));
+    let (cgroup, _) = safe_io::read_procfs_capped(&p.to_string_lossy(), 8192).ok()?;
     cgroup
         .lines()
         .filter_map(|l| l.rsplit(':').next())
@@ -26,24 +24,40 @@ fn systemd_unit(pid: u32) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn scan_mount_namespace_anomalies(
-    known_container_pids: &HashSet<u32>,
-) -> Vec<MountNamespaceAnomaly> {
-    let host_ns = match mnt_ns_inode(1) {
-        Some(ns) => ns,
-        None => {
-            coverage::record("mount namespace scan: /proc/1/ns/mnt unreadable".to_string());
+pub fn scan_mount_namespace_anomalies() -> Vec<MountNamespaceAnomaly> {
+    scan_mount_namespace_anomalies_from(Path::new("/proc"))
+}
+
+/// R33-02: no container-pid filter. A container's init is attributed by
+/// `mnt_ns` in `runner::link_mount_ns_to_containers` exactly like its
+/// children; dropping it here hid a single-process container running
+/// `/tmp/evil`. "Attribution, not filter" (R31-07) applies to init too.
+///
+/// Parameterized on `proc_root` so the scanner is testable against a
+/// tempdir; callers pass `/proc`.
+pub fn scan_mount_namespace_anomalies_from(proc_root: &Path) -> Vec<MountNamespaceAnomaly> {
+    let host_ns = match mnt_ns_inode(proc_root, 1) {
+        Ok(ns) => ns,
+        Err(e) => {
+            coverage::record(format!(
+                "mount namespace scan: {}/1/ns/mnt unreadable ({})",
+                proc_root.display(),
+                e.kind()
+            ));
             return Vec::new();
         }
     };
 
-    let mut pids: Vec<u32> = match fs::read_dir("/proc") {
+    let mut pids: Vec<u32> = match fs::read_dir(proc_root) {
         Ok(entries) => entries
             .flatten()
             .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
             .collect(),
         Err(e) => {
-            coverage::record(format!("mount namespace scan: /proc unreadable ({e})"));
+            coverage::record(format!(
+                "mount namespace scan: {} unreadable ({e})",
+                proc_root.display()
+            ));
             return Vec::new();
         }
     };
@@ -54,15 +68,22 @@ pub fn scan_mount_namespace_anomalies(
     let mut denied = 0usize;
 
     for pid in pids.into_iter().take(MAX_PIDS) {
-        let Some(ns) = mnt_ns_inode(pid) else {
-            denied += 1;
-            continue;
+        let ns = match mnt_ns_inode(proc_root, pid) {
+            Ok(ns) => ns,
+            // R33-05: pid exited between readdir and readlink — a race, not
+            // a permission fact. Do not inflate the "unreadable" counter.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                denied += 1;
+                continue;
+            }
         };
-        if ns == host_ns || known_container_pids.contains(&pid) {
+        if ns == host_ns {
             continue;
         }
 
-        let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
+        let comm_path = proc_root.join(format!("{pid}/comm"));
+        let comm = safe_io::read_procfs_capped(&comm_path.to_string_lossy(), 4096)
             .ok()
             .map(|(c, _)| c.trim().to_string())
             .unwrap_or_else(|| "?".to_string());
@@ -71,7 +92,7 @@ pub fn scan_mount_namespace_anomalies(
         // /proc/<pid>/exe returns ENOENT. They cannot execute attacker code
         // and their mount namespace is inherited from the kernel at boot,
         // so they are noise in this list.
-        let Some(exe_path) = std::fs::read_link(format!("/proc/{pid}/exe"))
+        let Some(exe_path) = fs::read_link(proc_root.join(format!("{pid}/exe")))
             .ok()
             .map(|p| p.to_string_lossy().into_owned())
         else {
@@ -94,7 +115,7 @@ pub fn scan_mount_namespace_anomalies(
             exe_path: Some(exe_path),
             mnt_ns: ns,
             container: None, // filled later by runner (R31-07)
-            systemd_unit: systemd_unit(pid),
+            systemd_unit: systemd_unit(proc_root, pid),
             system_path: sys_path,
         });
     }
@@ -118,4 +139,92 @@ pub fn scan_mount_namespace_anomalies(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn fake_pid(root: &Path, pid: u32, mnt: &str, exe: &str, cgroup: &str) {
+        let d = root.join(pid.to_string());
+        std::fs::create_dir_all(d.join("ns")).unwrap();
+        symlink(mnt, d.join("ns/mnt")).unwrap();
+        symlink(exe, d.join("exe")).unwrap();
+        std::fs::write(d.join("comm"), "x\n").unwrap();
+        std::fs::write(d.join("cgroup"), cgroup).unwrap();
+    }
+
+    #[test]
+    fn a_container_init_in_a_foreign_namespace_is_reported() {
+        // R33-02: init pid used to be dropped by the known-pid filter, so a
+        // single-process container with an unpackaged entrypoint was invisible.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_pid(
+            root,
+            1,
+            "mnt:[4026531840]",
+            "/usr/lib/systemd/systemd",
+            "0::/init.scope\n",
+        );
+        fake_pid(
+            root,
+            4242,
+            "mnt:[4026532999]",
+            "/tmp/evil",
+            "0::/system.slice/docker-abc.scope\n",
+        );
+        fake_pid(
+            root,
+            4243,
+            "mnt:[4026531840]",
+            "/usr/bin/bash",
+            "0::/user.slice/session-1.scope\n",
+        );
+
+        let out = scan_mount_namespace_anomalies_from(root);
+        assert_eq!(out.len(), 1, "only the foreign-ns pid: {out:?}");
+        assert_eq!(out[0].pid, 4242);
+        assert_eq!(out[0].exe_path.as_deref(), Some("/tmp/evil"));
+        assert_eq!(out[0].systemd_unit.as_deref(), Some("docker-abc.scope"));
+        assert!(!out[0].system_path);
+    }
+
+    #[test]
+    fn a_vanished_pid_is_not_counted_as_denied() {
+        // R33-05: a dangling readdir entry (dir without ns/) must not produce
+        // an "unreadable" coverage line. The behavioural guarantee is the
+        // `continue` arm in the loop; we cannot assert on the coverage sink
+        // from here without draining the global state.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_pid(root, 1, "mnt:[1]", "/sbin/init", "0::/init.scope\n");
+        std::fs::create_dir_all(root.join("999")).unwrap(); // exited: no ns/mnt
+
+        let out = scan_mount_namespace_anomalies_from(root);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn system_managed_paths_are_labelled_not_dropped() {
+        // R31-01 invariant: a foreign-ns process running a system binary is
+        // still emitted (system_path = true), because `unshare -m` from a
+        // shell runs /usr/bin/bash and that is exactly the case we detect.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_pid(root, 1, "mnt:[1]", "/sbin/init", "0::/init.scope\n");
+        fake_pid(
+            root,
+            777,
+            "mnt:[2]",
+            "/usr/bin/bash",
+            "0::/user.slice/session-9.scope\n",
+        );
+
+        let out = scan_mount_namespace_anomalies_from(root);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pid, 777);
+        assert!(out[0].system_path);
+    }
 }

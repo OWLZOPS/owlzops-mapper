@@ -5,7 +5,7 @@ use crate::models::{NetworkInfo, TopologyInfo};
 #[cfg(feature = "local-scan")]
 use chrono::Utc;
 #[cfg(feature = "local-scan")]
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[cfg(feature = "local-scan")]
 use tracing::{Instrument, info, warn};
@@ -242,6 +242,17 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             }
         });
 
+        // R33-01: the mount-namespace scan gets the same isolation contract as
+        // every other scanner. Inline it was (a) blocking the runtime thread for
+        // up to ~16k syscalls on the local path and (b) — now that overflow-checks
+        // is on (R32-01) — a panic inside it (any arithmetic overflow in the
+        // parser) took the whole local report down through `select!` in main,
+        // bypassing the `JoinError::is_panic` path that R19-16 established for
+        // every other scanner. spawn_blocking puts it back on that path.
+        let mount_ns_task = tokio::task::spawn_blocking(
+            crate::scanners::mount_namespace::scan_mount_namespace_anomalies,
+        );
+
         let (
             host_res,
             dbs_res,
@@ -251,6 +262,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             topology_info,
             packages_res,
             persistence_res,
+            mount_ns_res,
         ) = tokio::join!(
             host_task,
             dbs_task,
@@ -260,6 +272,7 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             tokio::spawn(crate::scanners::runtime::gather_runtime_topology()),
             packages_task,
             persistence_task,
+            mount_ns_task,
         );
 
         let mut scan_warnings = Vec::new();
@@ -317,14 +330,19 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         // Enrich foreign netns listeners with container names
         link_foreign_netns_to_containers(&mut network_info, &topology_info);
 
-        // Collect mount namespace anomalies not belonging to known containers
-        let known_pids: HashSet<u32> = topology_info
-            .container_netns
-            .iter()
-            .filter_map(|m| m.pid)
-            .collect();
-        security_info.mount_namespace_anomalies =
-            crate::scanners::mount_namespace::scan_mount_namespace_anomalies(&known_pids);
+        // R33-01: mount-namespace scan runs with the other scanners and lands
+        // in failed_scanners on panic, same as host/network/security/…
+        // R33-02: no pid filter — attribution is by mnt_ns (R31-07), so a
+        // container's init stays visible even before link_mount_ns_to_containers.
+        security_info.mount_namespace_anomalies = mount_ns_res.unwrap_or_else(|e| {
+            warn!(scanner = "mount_namespace", error = ?e, "scanner panicked");
+            scan_warnings.push(
+                "mount namespace scanner panicked — mount_namespace_anomalies NOT enumerated"
+                    .to_string(),
+            );
+            failed_scanners.push("mount_namespace".to_string());
+            Vec::new()
+        });
         // R31-07: attribute the survivors to their container by mnt_ns, not by
         // pid — a container's children share its mount namespace.
         link_mount_ns_to_containers(&mut security_info, &topology_info);
