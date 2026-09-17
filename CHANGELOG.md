@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.5.38] - 2026-09-15
+
+
+### Bug Fixes
+
+- **runtime:** Treat deleted-after-upgrade mappings as advisory, not IOC (R29-01)
+- **proc_net:** Avoid double /proc/net parse and surface netns read failures
+- **netns:** R29-03/04/05/06 — dead PID, determinism, sentinel, shared netns
+- **cli:** Wire signed report parsing and capped I/O for sign/verify
+- **install:** Use curl -f so an HTTP error fails loudly instead of piping HTML into sh and gpg
+- **readme:** Use curl -f so an HTTP error fails loudly instead of piping HTML to sh
+- **signing:** Enforce namespace, improve verify output, reject unsigned reports
+- **signing:** Prompt for encrypted private key passphrase (R30-04)
+- **signing:** Compare key data instead of full PublicKey in verify
+- **signing:** Expand verify output, add embedded key parse test
+- **signing:** Harden passphrase handling and key load diagnostics
+- **compare:** Add mount namespace anomaly drift detection
+- **mount-namespace:** Filter systemd services and system binaries
+- **mount-namespace:** Skip kernel worker threads in scan
+- **mount-namespace:** Label systemd/system paths instead of dropping, cap coverage, key diff by exe
+- **ui:** Group mount-namespace rows by namespace+exe, refine systemd filter
+- **ui:** Recognize container scopes and /bin|/sbin prefix
+- **library-injection:** Resolve paths through /proc/<pid>/root
+- **deep:** Use lazy `then` in managed-JIT attribution
+
+### Build System
+
+- **deps:** Bump taiki-e/install-action from 2.87.0 to 2.87.5 (#268)
+- **deps:** Bump russh from 0.63.1 to 0.63.2 (#271)
+- **deps:** Bump base64 from 0.22.1 to 0.23.1 (#272)
+- **deps:** Bump softprops/action-gh-release from 3.0.2 to 3.0.3
+- **deps:** Bump taiki-e/install-action from 2.87.5 to 2.87.11 (#282)
+- **deps:** Bump russh from 0.63.2 to 0.63.3 (#284)
+- **deps:** Bump uuid from 1.26.0 to 1.26.1 (#283)
+
+### CI/CD
+
+- Guard overflow-checks in [profile.release] (R32-01)
+
+### Documentation
+
+- **security:** Document report signature verification chain
+- **ui:** Fix comment describing mount-namespace grouping key
+- **library_injection:** Ns_root is set for all PIDs, not only containers
+
+### Features
+
+- **network:** Surface listeners hidden in foreign netns
+- **network:** Inventory foreign netns listeners (R29-02)
+- **ui:** Render foreign netns listeners in terminal report
+- **signing:** Add Ed25519 report signing and verification
+- **cli:** Add sign/verify subcommands for report signatures
+- **signing:** Allow verify without --key via embedded public keys
+- **security:** Add mount namespace anomaly detection
+- **ui:** Render mount namespace anomalies
+- **mount-namespace:** Attribute anomalies to containers by mnt_ns
+
+### Miscellaneous
+
+- Ignore private signing keys, keep public keys in assets
+
+### Performance Improvements
+
+- **proc_net:** Aggregate foreign-netns listeners per namespace
+
+### Refactoring
+
+- **utils:** Share is_system_managed_path with mount_namespace
+
 ## [0.5.37] - 2026-09-02
 
 
