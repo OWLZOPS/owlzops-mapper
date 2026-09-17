@@ -448,6 +448,83 @@ pub fn entry_has_nopasswd(entry: &str) -> bool {
     contains_icase(entry, "nopasswd")
 }
 
+/// Command tokens of an entry's Cmnd_Spec_List: everything after the first
+/// `=` with Runas_Specs and Tag_Specs stripped. Negations are kept as-is.
+///
+/// R33-03: `self_sudo_target` split on the LAST colon and lost every command
+/// before a trailing tag — the same shape R26-27 fixed in `is_nopasswd_all`.
+/// The two now share this tokenizer so they cannot drift again.
+//
+// TODO(R33-03): remove the `allow(dead_code)` once security.rs calls this.
+// The attribute is here only so the file compiles standalone while the
+// callers land in the same commit; the final commit has no `allow`.
+#[allow(dead_code)]
+pub fn command_tokens(entry: &str) -> Vec<&str> {
+    let Some((_, rhs)) = entry.split_once('=') else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut paren = 0i32;
+    // Tag state is not read here; only stripping matters. `apply_tag` is
+    // reused so the tokenizer and `is_nopasswd_all` agree on what a tag is.
+    let mut sink = false;
+    for raw in rhs.split([',', ' ', '\t']) {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        // A parenthesised Runas_Spec may hold commas and colons: `(ALL:ALL)`.
+        let opens = tok.matches('(').count() as i32;
+        let closes = tok.matches(')').count() as i32;
+        let was_inside = paren > 0;
+        paren = (paren + opens - closes).max(0);
+        if was_inside || opens > 0 {
+            continue;
+        }
+        // A tag may be glued to the command: "NOPASSWD:ALL".
+        let mut rest = tok;
+        while let Some(i) = rest.find(':') {
+            apply_tag(rest[..i].trim(), &mut sink);
+            rest = rest[i + 1..].trim_start();
+        }
+        if rest.is_empty() {
+            continue;
+        }
+        // "NOPASSWD : ALL" — the tag arrives as a standalone token.
+        if apply_tag(rest, &mut sink) {
+            continue;
+        }
+        out.push(rest);
+    }
+    out
+}
+
+/// `Defaults !authenticate` disables the password prompt for every rule the
+/// Defaults line applies to, without any NOPASSWD tag (sudoers(5)).
+/// Returns the scope as written: "ALL" (global), ":user", "@host", "!cmd",
+/// ">runas" (R33-04).
+///
+/// `Defaults:deploy !authenticate` + `deploy ALL=(ALL) ALL` is equivalent to
+/// `deploy ALL=(ALL) NOPASSWD: ALL` and previously passed the audit clean.
+//
+// TODO(R33-04): remove the `allow(dead_code)` once security.rs and access.rs
+// call this. See note on command_tokens above.
+#[allow(dead_code)]
+pub fn defaults_no_authenticate(entry: &str) -> Option<&str> {
+    let rest = entry.strip_prefix("Defaults")?;
+    let i = rest.find(char::is_whitespace)?;
+    let (scope, params) = rest.split_at(i);
+    if !scope.is_empty() && !scope.starts_with([':', '@', '!', '>']) {
+        // "DefaultsFoo …" is not a Defaults line.
+        return None;
+    }
+    params
+        .split(',')
+        .map(str::trim)
+        .any(|p| p.eq_ignore_ascii_case("!authenticate"))
+        .then_some(if scope.is_empty() { "ALL" } else { scope })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +716,86 @@ mod tests {
         let mut a = CmndAliases::default();
         a.absorb("Cmnd_Alias X = DEEP, ALL");
         assert_eq!(a.resolves_to_all("X", 0), Some(true));
+    }
+
+    // ── R33-03/R33-04: tokenizer and Defaults !authenticate ─────
+
+    #[test]
+    fn command_tokens_strips_tags_and_runas() {
+        assert_eq!(
+            command_tokens("deploy ALL=(ALL) NOPASSWD: ALL, NOEXEC: /bin/foo"),
+            vec!["ALL", "/bin/foo"]
+        );
+        assert_eq!(
+            command_tokens("deploy ALL=(ALL:ALL) NOPASSWD:/usr/bin/id"),
+            vec!["/usr/bin/id"]
+        );
+        assert_eq!(
+            command_tokens("deploy ALL=(ALL) NOPASSWD : ALL"),
+            vec!["ALL"]
+        );
+        assert_eq!(
+            command_tokens("deploy ALL=(ALL) /usr/bin/id, /bin/sh"),
+            vec!["/usr/bin/id", "/bin/sh"]
+        );
+    }
+
+    #[test]
+    fn command_tokens_is_empty_without_assignment() {
+        assert!(command_tokens("not a sudoers line").is_empty());
+    }
+
+    #[test]
+    fn defaults_no_authenticate_is_a_passwordless_grant() {
+        assert_eq!(
+            defaults_no_authenticate("Defaults !authenticate"),
+            Some("ALL")
+        );
+        assert_eq!(
+            defaults_no_authenticate("Defaults:deploy !authenticate, env_reset"),
+            Some(":deploy")
+        );
+        assert_eq!(
+            defaults_no_authenticate("Defaults@web01 !authenticate"),
+            Some("@web01")
+        );
+        assert_eq!(
+            defaults_no_authenticate("Defaults env_reset, authenticate"),
+            None
+        );
+        assert_eq!(
+            defaults_no_authenticate("Defaults:deploy !requiretty"),
+            None
+        );
+        assert_eq!(defaults_no_authenticate("deploy ALL=(ALL) ALL"), None);
+        // Near-misses that must not be mistaken for a Defaults directive.
+        assert_eq!(defaults_no_authenticate("DefaultsFoo !authenticate"), None);
+        assert_eq!(defaults_no_authenticate("Defaults"), None);
+    }
+
+    #[test]
+    fn defaults_no_authenticate_survives_the_file_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("sudoers.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("10-deploy"), "deploy ALL=(ALL) ALL\n").unwrap();
+        std::fs::write(d.join("20-auth"), "Defaults:deploy !authenticate\n").unwrap();
+
+        let roots = vec![d.to_string_lossy().to_string()];
+        let scan = scan_sudoers_from(&roots);
+
+        assert!(
+            scan.entries
+                .iter()
+                .any(|(_, e)| defaults_no_authenticate(e).is_some()),
+            "the Defaults line must surface"
+        );
+        assert!(
+            !scan
+                .entries
+                .iter()
+                .any(|(_, e)| is_nopasswd_all(e, &scan.aliases)),
+            "the rule itself carries no NOPASSWD — only the Defaults line grants it"
+        );
     }
 }
