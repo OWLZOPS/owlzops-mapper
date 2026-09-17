@@ -454,11 +454,6 @@ pub fn entry_has_nopasswd(entry: &str) -> bool {
 /// R33-03: `self_sudo_target` split on the LAST colon and lost every command
 /// before a trailing tag — the same shape R26-27 fixed in `is_nopasswd_all`.
 /// The two now share this tokenizer so they cannot drift again.
-//
-// TODO(R33-03): remove the `allow(dead_code)` once security.rs calls this.
-// The attribute is here only so the file compiles standalone while the
-// callers land in the same commit; the final commit has no `allow`.
-#[allow(dead_code)]
 pub fn command_tokens(entry: &str) -> Vec<&str> {
     let Some((_, rhs)) = entry.split_once('=') else {
         return Vec::new();
@@ -506,10 +501,6 @@ pub fn command_tokens(entry: &str) -> Vec<&str> {
 ///
 /// `Defaults:deploy !authenticate` + `deploy ALL=(ALL) ALL` is equivalent to
 /// `deploy ALL=(ALL) NOPASSWD: ALL` and previously passed the audit clean.
-//
-// TODO(R33-04): remove the `allow(dead_code)` once security.rs and access.rs
-// call this. See note on command_tokens above.
-#[allow(dead_code)]
 pub fn defaults_no_authenticate(entry: &str) -> Option<&str> {
     let rest = entry.strip_prefix("Defaults")?;
     let i = rest.find(char::is_whitespace)?;
