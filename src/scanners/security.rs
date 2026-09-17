@@ -231,6 +231,20 @@ fn gather_sudo_nopasswd(scan: &sudoers::SudoersScan) -> Vec<String> {
         }
     }
 
+    // R33-04: `Defaults !authenticate` (global, per-user, per-host) removes
+    // the password prompt for every rule in scope — equivalent to
+    // NOPASSWD: ALL but without any tag. `entry_has_nopasswd` will not match
+    // it, so scan separately. The marker routes it through scoring the same
+    // way as the NOPASSWD: ALL branch above.
+    for (file, entry) in &scan.entries {
+        if let Some(scope) = sudoers::defaults_no_authenticate(entry) {
+            entries.push(format!(
+                "{file}: {entry} {} (passwordless sudo for {scope} via Defaults !authenticate)",
+                crate::models::SUDO_ALL_MARKER
+            ));
+        }
+    }
+
     entries
 }
 
@@ -247,17 +261,20 @@ pub fn self_sudo_target(line: &str) -> Option<&str> {
     if !line.contains(SELF_BASENAME) {
         return None;
     }
-    let mut cmds = line.rsplit(':').next()?.split(',').map(str::trim);
-    let first = cmds.next()?;
-    // "NOPASSWD: /path/owlzops-mapper, /usr/bin/other" grants more than us.
-    if cmds.next().is_some() {
+    // R33-03: exactly ONE command in the WHOLE Cmnd_Spec_List. The pre-R33
+    // form split on the LAST ':' and lost every command before a trailing
+    // tag: "NOPASSWD: ALL, NOEXEC: /usr/local/bin/owlzops-mapper" looked
+    // like a self-only rule while granting ALL. Same shape R26-27 fixed in
+    // is_nopasswd_all — now both share the same tokenizer.
+    let cmds = sudoers::command_tokens(line);
+    let [first] = cmds.as_slice() else {
         return None;
-    }
+    };
     let p = std::path::Path::new(first);
     (p.is_absolute()
         && p.file_name().is_some_and(|f| f == SELF_BASENAME)
         && !first.contains(['*', '?', ' ']))
-    .then_some(first)
+    .then_some(*first)
 }
 
 /// Excludable only when no unprivileged user can replace the binary: every path
@@ -775,5 +792,57 @@ mod tests {
         let err = crate::safe_io::read_file_capped_regular(p.to_str().unwrap(), 1024)
             .expect_err("FIFO must be refused, not opened");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // ── R33-03/R33-04: sudo audit gaps ─────────────────────
+
+    #[test]
+    fn a_trailing_self_spec_does_not_hide_an_all_grant() {
+        // R33-03: the pre-R33 implementation split on the last ':' and read
+        // this as one command (our path), excluding the rule from the audit
+        // as "self-only". The real grant is ALL.
+        assert_eq!(
+            self_sudo_target(
+                "deploy ALL=(ALL) NOPASSWD: ALL, NOEXEC: /usr/local/bin/owlzops-mapper"
+            ),
+            None
+        );
+        assert_eq!(
+            self_sudo_target("deploy ALL=(ALL) NOPASSWD: /usr/local/bin/owlzops-mapper, /bin/sh"),
+            None
+        );
+        // Genuinely self-only, runas with a colon: still recognised.
+        assert_eq!(
+            self_sudo_target("deploy ALL=(ALL:ALL) NOPASSWD:/usr/local/bin/owlzops-mapper"),
+            Some("/usr/local/bin/owlzops-mapper")
+        );
+    }
+
+    #[test]
+    fn defaults_no_authenticate_lands_in_sudo_nopasswd_entries() {
+        let scan = sudoers::SudoersScan {
+            aliases: sudoers::CmndAliases::default(),
+            entries: vec![
+                (
+                    "/etc/sudoers.d/10-rule".into(),
+                    "deploy ALL=(ALL) ALL".into(),
+                ),
+                (
+                    "/etc/sudoers.d/20-auth".into(),
+                    "Defaults:deploy !authenticate".into(),
+                ),
+            ],
+        };
+        let entries = gather_sudo_nopasswd(&scan);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.contains("Defaults") && e.contains("!authenticate")),
+            "Defaults !authenticate must land in sudo_nopasswd_entries: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.contains("10-rule")),
+            "the rule carries no NOPASSWD and must not be reported: {entries:?}"
+        );
     }
 }
