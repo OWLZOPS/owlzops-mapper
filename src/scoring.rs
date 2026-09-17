@@ -78,6 +78,10 @@ pub enum Scanner {
     Packages,
     Databases,
     Docker,
+    /// R33-01: inventory-only scanner, spawned alongside the others so a
+    /// panic is a recorded coverage fact instead of an "unmapped scanner"
+    /// warning in `warn_unmapped_scanners`.
+    MountNamespace,
     /// Added by the orchestrator, not produced by a host scanner.
     Orchestrator,
 }
@@ -93,6 +97,7 @@ impl Scanner {
             "packages" => Some(Self::Packages),
             "databases" => Some(Self::Databases),
             "docker" => Some(Self::Docker),
+            "mount_namespace" => Some(Self::MountNamespace),
             _ => None,
         }
     }
@@ -4082,6 +4087,7 @@ mod tests {
             "security",
             "packages",
             "docker",
+            "mount_namespace",
             "persistence",
         ] {
             assert!(
