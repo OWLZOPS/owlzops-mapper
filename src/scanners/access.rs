@@ -193,6 +193,21 @@ pub fn gather_access_alignment(
                 scope: "ALL".into(),
             });
         }
+        // R33-04: passwordless sudo declared as a Defaults parameter. The
+        // rule itself may carry no NOPASSWD tag at all, so is_nopasswd_all
+        // never sees it. `Defaults:deploy !authenticate` + `deploy ALL=(ALL)
+        // ALL` is equivalent to `deploy ALL=(ALL) NOPASSWD: ALL`.
+        if let Some(scope) = sudoers::defaults_no_authenticate(entry) {
+            let principal = match scope {
+                "ALL" => "ALL".to_string(),
+                s => s.trim_start_matches([':', '@', '!', '>']).to_string(),
+            };
+            result.sudoers_nopasswd_all.push(SudoersEntry {
+                principal,
+                source_file: file.clone(),
+                scope: format!("ALL (Defaults{scope} !authenticate)"),
+            });
+        }
     }
 
     result
@@ -215,5 +230,44 @@ mod tests {
         let aliases = sudoers::CmndAliases::default();
         let entry = "deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl";
         assert!(!sudoers::is_nopasswd_all(entry, &aliases));
+    }
+
+    #[test]
+    fn defaults_no_authenticate_emits_sudoers_entry() {
+        let scan = sudoers::SudoersScan {
+            aliases: sudoers::CmndAliases::default(),
+            entries: vec![(
+                "/etc/sudoers.d/20-auth".into(),
+                "Defaults:deploy !authenticate".into(),
+            )],
+        };
+        // gather_access_alignment also walks /etc/passwd; we only check our entry.
+        let result = gather_access_alignment(&scan, &KeyPolicy::default());
+        let hit = result
+            .sudoers_nopasswd_all
+            .iter()
+            .find(|e| e.scope.contains("Defaults"));
+        assert!(
+            hit.is_some(),
+            "Defaults !authenticate must emit a SudoersEntry"
+        );
+        let hit = hit.unwrap();
+        assert_eq!(hit.principal, "deploy");
+        assert_eq!(hit.source_file, "/etc/sudoers.d/20-auth");
+    }
+
+    #[test]
+    fn defaults_no_authenticate_global_scope_is_all() {
+        let scan = sudoers::SudoersScan {
+            aliases: sudoers::CmndAliases::default(),
+            entries: vec![("/etc/sudoers".into(), "Defaults !authenticate".into())],
+        };
+        let result = gather_access_alignment(&scan, &KeyPolicy::default());
+        let hit = result
+            .sudoers_nopasswd_all
+            .iter()
+            .find(|e| e.scope.contains("Defaults"));
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().principal, "ALL");
     }
 }
