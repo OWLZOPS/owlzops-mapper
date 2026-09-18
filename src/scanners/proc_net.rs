@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::coverage;
@@ -202,11 +202,18 @@ pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
 }
 
 /// Read the network namespace inode for a process.
-fn netns_inode(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/ns/net"))
-        .ok()?
-        .to_str()
-        .map(str::to_string)
+///
+/// R33-05: returns `io::Result` so the caller can distinguish a vanished
+/// pid (ENOENT, a race) from a permission failure (EACCES, a real
+/// coverage fact). The pre-R33-05 `Option` collapsed both into one.
+fn netns_inode(pid: u32) -> io::Result<String> {
+    let link = fs::read_link(format!("/proc/{pid}/ns/net"))?;
+    link.to_str().map(str::to_string).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ns/net link target is not valid UTF-8",
+        )
+    })
 }
 
 /// Walk all processes and report listeners that exist in foreign network
@@ -274,9 +281,19 @@ pub fn report_foreign_netns_listeners(
     let mut ns_over_cap = 0usize;
 
     for pid in pids {
-        let Some(ns) = netns_inode(pid) else {
-            ns_denied += 1;
-            continue;
+        let ns = match netns_inode(pid) {
+            Ok(ns) => ns,
+            // R33-05: the pid exited between readdir and readlink. A race,
+            // not a permission fact — do not count it as "unreadable (needs
+            // root)". On a busy host this used to inflate the coverage line
+            // on every single scan. See safe_io::ProcMiss.
+            Err(e) => match safe_io::proc_miss(&e) {
+                safe_io::ProcMiss::Vanished => continue,
+                _ => {
+                    ns_denied += 1;
+                    continue;
+                }
+            },
         };
         if ns == host_ns {
             continue;
@@ -393,9 +410,19 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
         }
 
         let fd_dir = format!("/proc/{pid}/fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            denied += 1;
-            continue;
+        let fds = match fs::read_dir(&fd_dir) {
+            Ok(f) => f,
+            // R33-05: the pid exited between the outer readdir("/proc") and
+            // this readdir. A race, not a permission fact. Before this fix
+            // every vanishing pid on a busy host bumped `denied` and inflated
+            // the "port attribution incomplete" line.
+            Err(e) => match safe_io::proc_miss(&e) {
+                safe_io::ProcMiss::Vanished => continue,
+                _ => {
+                    denied += 1;
+                    continue;
+                }
+            },
         };
 
         let mut exe_cache: Option<Option<String>> = None;
