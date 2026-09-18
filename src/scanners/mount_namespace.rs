@@ -13,15 +13,45 @@ fn mnt_ns_inode(proc_root: &Path, pid: u32) -> std::io::Result<String> {
 
 /// The systemd unit or scope owning this pid, taken from its cgroup path.
 /// cgroup v2 line: "0::/system.slice/nginx.service".
+///
+/// R33-10: on hybrid / cgroup v1 hosts the same pid appears once per
+/// controller hierarchy, each with its own path. A delegated `pids` or
+/// `cpu` tree can lead with a path that contains a `.scope` suffix — the
+/// systemd controller (`name=systemd` on v1, `0::` on v2) carries the
+/// authoritative unit. Prefer it; fall back to the first path that
+/// matches a unit suffix if the systemd hierarchy is not present.
 fn systemd_unit(proc_root: &Path, pid: u32) -> Option<String> {
     let p = proc_root.join(format!("{pid}/cgroup"));
     let (cgroup, _) = safe_io::read_procfs_capped(&p.to_string_lossy(), 8192).ok()?;
-    cgroup
-        .lines()
-        .filter_map(|l| l.rsplit(':').next())
-        .flat_map(|p| p.rsplit('/'))
-        .find(|c| c.ends_with(".service") || c.ends_with(".scope"))
-        .map(str::to_string)
+
+    fn find_unit(path: &str) -> Option<String> {
+        path.rsplit('/')
+            .find(|c| c.ends_with(".service") || c.ends_with(".scope"))
+            .map(str::to_string)
+    }
+
+    let mut fallback: Option<String> = None;
+    for line in cgroup.lines() {
+        // Format: <hierarchy-id>:<controllers>:<path>.
+        // v2: "0::/path" (empty controller list).
+        // v1: "1:name=systemd:/path", "12:pids:/path".
+        let Some((_, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((controllers, path)) = rest.split_once(':') else {
+            continue;
+        };
+        let path = path.trim();
+        if (controllers.is_empty() || controllers == "name=systemd")
+            && let Some(u) = find_unit(path)
+        {
+            return Some(u);
+        }
+        if fallback.is_none() {
+            fallback = find_unit(path);
+        }
+    }
+    fallback
 }
 
 pub fn scan_mount_namespace_anomalies() -> Vec<MountNamespaceAnomaly> {
@@ -231,5 +261,31 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].pid, 777);
         assert!(out[0].system_path);
+    }
+
+    #[test]
+    fn cgroup_v1_prefers_the_systemd_hierarchy() {
+        // R33-10: on a hybrid host the delegated `pids` controller can expose
+        // a path with a `.scope` suffix that is not the unit that owns the
+        // pid. Only the `name=systemd` hierarchy is authoritative; prefer it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_pid(root, 1, "mnt:[1]", "/sbin/init", "0::/init.scope\n");
+        fake_pid(
+            root,
+            777,
+            "mnt:[2]",
+            "/usr/bin/bash",
+            "12:pids:/user.slice/session-1.scope\n\
+             1:name=systemd:/system.slice/nginx.service\n",
+        );
+
+        let out = scan_mount_namespace_anomalies_from(root);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].systemd_unit.as_deref(),
+            Some("nginx.service"),
+            "must pick the systemd hierarchy, not the first line with a unit suffix"
+        );
     }
 }
