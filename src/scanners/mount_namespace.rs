@@ -70,13 +70,18 @@ pub fn scan_mount_namespace_anomalies_from(proc_root: &Path) -> Vec<MountNamespa
     for pid in pids.into_iter().take(MAX_PIDS) {
         let ns = match mnt_ns_inode(proc_root, pid) {
             Ok(ns) => ns,
-            // R33-05: pid exited between readdir and readlink — a race, not
-            // a permission fact. Do not inflate the "unreadable" counter.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                denied += 1;
-                continue;
-            }
+            // R33-05: route every /proc/<pid> miss through the shared
+            // classifier so the taxonomy lives in exactly one place
+            // (safe_io::ProcMiss). Vanished = the pid exited between readdir
+            // and readlink, a race, not a permission fact; Denied = the kernel
+            // refused, a real coverage fact.
+            Err(e) => match safe_io::proc_miss(&e) {
+                safe_io::ProcMiss::Vanished => continue,
+                _ => {
+                    denied += 1;
+                    continue;
+                }
+            },
         };
         if ns == host_ns {
             continue;
