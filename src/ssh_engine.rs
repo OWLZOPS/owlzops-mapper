@@ -179,6 +179,17 @@ pub enum RemoteError {
     Ssh { host: String, source: russh::Error },
     #[error("authentication failed for {user}@{host}")]
     Auth { host: String, user: String },
+    /// R33-07: a local key problem is not a remote authentication failure.
+    ///
+    /// Before this variant existed, every error out of `load_secret_key`
+    /// was collapsed into `Auth`, so ENOENT (`wrong path`), EACCES
+    /// (`chmod 600`), encrypted key without passphrase, and unsupported
+    /// format all read as "authentication failed as user on host" — one
+    /// such message per host on the fleet. The operator then looks for
+    /// the problem in `authorized_keys` on 5000 machines instead of in
+    /// the permissions of their own `~/.ssh/id_ed25519`.
+    #[error("cannot load SSH private key {path}: {detail}")]
+    KeyLoad { path: String, detail: String },
     #[error("sudo authentication failed on {host}: {detail}")]
     SudoAuth { host: String, detail: String },
     #[error("sudo not permitted for {host}: {detail}")]
@@ -1245,17 +1256,26 @@ pub async fn run_remote_scan_russh(
         known_hosts_checker: known_hosts_checker.clone(),
     };
 
-    let ssh_key_path = ssh_key_path.to_string();
-    let key = tokio::task::spawn_blocking(move || load_secret_key(&ssh_key_path, None))
-        .await
-        .map_err(|_| RemoteError::Auth {
-            host: hostname.clone(),
-            user: ssh_user.to_string(),
-        })?
-        .map_err(|_| RemoteError::Auth {
-            host: hostname.clone(),
-            user: ssh_user.to_string(),
-        })?;
+    // R33-07: the key path is a LOCAL fact — ENOENT, EACCES, encrypted key,
+    // unsupported format are all "cannot load my private key", not
+    // "authentication failed on the remote side". Collapsing them into
+    // `RemoteError::Auth` (as before) sent the operator looking at
+    // authorized_keys on every host on the fleet instead of at
+    // `chmod 600 ~/.ssh/id_ed25519` on their own machine.
+    let key_path = ssh_key_path.to_string();
+    let key = {
+        let p = key_path.clone();
+        tokio::task::spawn_blocking(move || load_secret_key(&p, None))
+            .await
+            .map_err(|e| RemoteError::KeyLoad {
+                path: key_path.clone(),
+                detail: format!("key loader task failed: {e}"),
+            })?
+            .map_err(|e| RemoteError::KeyLoad {
+                path: key_path,
+                detail: e.to_string(),
+            })?
+    };
 
     const HANDSHAKE_AUTH_BUDGET: Duration = Duration::from_secs(30);
     let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
@@ -1684,6 +1704,44 @@ mod tests {
         let p = SecretString::new("пароль".to_string());
         let l = sudo_stdin_line(&p);
         assert_eq!(l.capacity(), p.len() + 1, "capacity is in bytes, not chars");
+    }
+
+    // ── R33-07: KeyLoad is not Auth ─────────────────────────────
+
+    #[test]
+    fn key_load_renders_the_path_and_detail() {
+        // The operator must see the LOCAL fact (the file path and the
+        // underlying reason), not "authentication failed on host".
+        let e = RemoteError::KeyLoad {
+            path: "/home/u/.ssh/id_ed25519".into(),
+            detail: "Permission denied (os error 13)".into(),
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("/home/u/.ssh/id_ed25519"),
+            "message must name the key file: {msg}"
+        );
+        assert!(
+            msg.contains("Permission denied"),
+            "message must carry the underlying error: {msg}"
+        );
+    }
+
+    #[test]
+    fn key_load_is_distinct_from_auth() {
+        let k = RemoteError::KeyLoad {
+            path: "/tmp/k".into(),
+            detail: "d".into(),
+        };
+        let a = RemoteError::Auth {
+            host: "h".into(),
+            user: "u".into(),
+        };
+        assert_ne!(
+            std::mem::discriminant(&k),
+            std::mem::discriminant(&a),
+            "KeyLoad must not be Auth: the fix differs"
+        );
     }
 
     #[cfg(unix)]
