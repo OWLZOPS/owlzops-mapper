@@ -175,6 +175,43 @@ pub fn read_file_capped_regular_strict(path: &str, max_bytes: usize) -> io::Resu
     })
 }
 
+// ── R33-05: classify a /proc/<pid> miss ─────────────────────────────────
+
+/// What kind of "we could not read `/proc/<pid>/...`" failure this is.
+///
+/// The three cases have different meanings and must not be collapsed:
+///
+/// - `Vanished`: the pid exited between `readdir` and the read. A race,
+///   not a permission fact. On any busy host this fires constantly, and
+///   counting it as "unreadable (needs root)" poisons the coverage line
+///   the operator is supposed to trust. Callers `continue`.
+/// - `Denied`: EACCES/EPERM. The process is alive and the kernel is
+///   refusing — we are not root or lack CAP_SYS_PTRACE. This IS a coverage
+///   fact and belongs in the operator-facing warnings.
+/// - `Other`: anything else (I/O error, malformed link, ...). Same as
+///   `Denied` for counting purposes, but kept distinct so callers can log
+///   the raw kind.
+///
+/// Before R33-05 every `/proc/<pid>` walk in this crate reimplemented
+/// this match (or, worse, skipped it and counted ENOENT as EACCES). One
+/// helper, one place to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcMiss {
+    Vanished,
+    Denied,
+    Other(io::ErrorKind),
+}
+
+/// Classify an error from a `/proc/<pid>/...` read. See `ProcMiss`.
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+pub fn proc_miss(e: &io::Error) -> ProcMiss {
+    match e.kind() {
+        io::ErrorKind::NotFound => ProcMiss::Vanished,
+        io::ErrorKind::PermissionDenied => ProcMiss::Denied,
+        k => ProcMiss::Other(k),
+    }
+}
+
 #[cfg(feature = "local-scan")]
 pub const CAP_PROC_NET: usize = 16 * 1024 * 1024;
 #[cfg(feature = "local-scan")]
@@ -245,5 +282,26 @@ mod tests {
         let (buf, truncated) = read_reader_capped(cursor, 100);
         assert_eq!(buf.len(), 100);
         assert!(!truncated);
+    }
+
+    // ── R33-05: proc_miss classification ──────────────────────
+
+    #[test]
+    fn proc_miss_classifies_the_three_cases() {
+        assert_eq!(
+            proc_miss(&io::Error::from(io::ErrorKind::NotFound)),
+            ProcMiss::Vanished,
+            "ENOENT on /proc/<pid> is a race, not a denial"
+        );
+        assert_eq!(
+            proc_miss(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            ProcMiss::Denied,
+            "EACCES is a real coverage fact"
+        );
+        assert_eq!(
+            proc_miss(&io::Error::from(io::ErrorKind::InvalidData)),
+            ProcMiss::Other(io::ErrorKind::InvalidData),
+            "anything else is kept distinct so callers can log the kind"
+        );
     }
 }
