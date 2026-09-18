@@ -304,6 +304,16 @@ fn outcome_for_writer_failure(
     outcome
 }
 
+/// R33-11: single source for "requested hosts that produced no report".
+///
+/// The same `hosts.iter().filter(!ok.contains).cloned().collect()` pattern
+/// was inlined in six return paths of the fleet branch. One definition, one
+/// place to change the semantics (the comparison key is the CLI input string,
+/// not `report.host.hostname` — see R25-97).
+fn missing_of(hosts: &[String], ok: &HashSet<String>) -> Vec<String> {
+    hosts.iter().filter(|h| !ok.contains(*h)).cloned().collect()
+}
+
 /// Strict JSONL parser for `compare --multi-host`.
 /// Accepts either a JSON array, a single JSON object, or newline-delimited
 /// JSON records. Unlike the previous permissive version, any unreadable line
@@ -1166,22 +1176,14 @@ async fn run_command(
                                 if interrupted
                                     && outcome.verdict == Some(SecurityVerdict::Compromised)
                                 {
-                                    let missing_hosts: Vec<String> = hosts
-                                        .iter()
-                                        .filter(|h| !successful_hosts.contains(*h))
-                                        .cloned()
-                                        .collect();
+                                    let missing_hosts = missing_of(&hosts, &successful_hosts);
                                     warn_for_coverage(&outcome.coverage, &missing_hosts);
                                     return EXIT_COMPROMISED;
                                 }
                                 if interrupted {
                                     return EXIT_INTERRUPT;
                                 }
-                                let missing_hosts: Vec<String> = hosts
-                                    .iter()
-                                    .filter(|h| !successful_hosts.contains(*h))
-                                    .cloned()
-                                    .collect();
+                                let missing_hosts = missing_of(&hosts, &successful_hosts);
                                 warn_for_coverage(&outcome.coverage, &missing_hosts);
                                 return exit_code(&outcome, fail_on_incomplete);
                             }
@@ -1204,11 +1206,7 @@ async fn run_command(
 
                             if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
                             {
-                                let missing_hosts: Vec<String> = hosts
-                                    .iter()
-                                    .filter(|h| !successful_hosts.contains(*h))
-                                    .cloned()
-                                    .collect();
+                                let missing_hosts = missing_of(&hosts, &successful_hosts);
                                 warn_for_coverage(&outcome.coverage, &missing_hosts);
                                 return EXIT_COMPROMISED;
                             }
@@ -1216,11 +1214,7 @@ async fn run_command(
                                 return EXIT_INTERRUPT;
                             }
 
-                            let missing_hosts: Vec<String> = hosts
-                                .iter()
-                                .filter(|h| !successful_hosts.contains(*h))
-                                .cloned()
-                                .collect();
+                            let missing_hosts = missing_of(&hosts, &successful_hosts);
                             warn_for_coverage(&outcome.coverage, &missing_hosts);
                             return exit_code(&outcome, fail_on_incomplete);
                         }
@@ -1230,22 +1224,14 @@ async fn run_command(
                                 outcome_for_writer_failure(agg, hosts_requested, send_failures);
                             if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised)
                             {
-                                let missing_hosts: Vec<String> = hosts
-                                    .iter()
-                                    .filter(|h| !successful_hosts.contains(*h))
-                                    .cloned()
-                                    .collect();
+                                let missing_hosts = missing_of(&hosts, &successful_hosts);
                                 warn_for_coverage(&outcome.coverage, &missing_hosts);
                                 return EXIT_COMPROMISED;
                             }
                             if interrupted {
                                 return EXIT_INTERRUPT;
                             }
-                            let missing_hosts: Vec<String> = hosts
-                                .iter()
-                                .filter(|h| !successful_hosts.contains(*h))
-                                .cloned()
-                                .collect();
+                            let missing_hosts = missing_of(&hosts, &successful_hosts);
                             warn_for_coverage(&outcome.coverage, &missing_hosts);
                             return exit_code(&outcome, fail_on_incomplete);
                         }
@@ -1257,11 +1243,7 @@ async fn run_command(
                 let mut outcome = agg.finish(hosts_requested, 0);
 
                 if interrupted && outcome.verdict == Some(SecurityVerdict::Compromised) {
-                    let missing_hosts: Vec<String> = hosts
-                        .iter()
-                        .filter(|h| !successful_hosts.contains(*h))
-                        .cloned()
-                        .collect();
+                    let missing_hosts = missing_of(&hosts, &successful_hosts);
                     warn_for_coverage(&outcome.coverage, &missing_hosts);
                     return EXIT_COMPROMISED;
                 }
@@ -1280,7 +1262,7 @@ async fn run_command(
                     ) {
                         warn!("output error: {e}");
                     }
-                    warn_for_coverage(&outcome.coverage, &hosts);
+                    warn_for_coverage(&outcome.coverage, &missing_of(&hosts, &successful_hosts));
                     return exit_code(&outcome, fail_on_incomplete);
                 }
 
@@ -1294,11 +1276,7 @@ async fn run_command(
                     outcome.coverage.output_failed = true;
                 }
 
-                let missing_hosts: Vec<String> = hosts
-                    .iter()
-                    .filter(|h| !successful_hosts.contains(*h))
-                    .cloned()
-                    .collect();
+                let missing_hosts = missing_of(&hosts, &successful_hosts);
                 warn_for_coverage(&outcome.coverage, &missing_hosts);
                 // Computed AFTER delivery, so a render failure degrades the
                 // code without ever outranking Compromised.
@@ -2188,5 +2166,44 @@ mod tests {
         let input = format!("{good}\n{good}\n");
         let reports = parse_jsonl_strict(&input, "test").unwrap();
         assert_eq!(reports.len(), 2);
+    }
+
+    // ── R33-11: missing_of ──────────────────────────────────────
+
+    #[test]
+    fn missing_of_returns_inputs_without_a_report() {
+        let hosts = vec![
+            "a.example".to_string(),
+            "b.example".to_string(),
+            "c.example".to_string(),
+        ];
+        let ok: HashSet<String> = ["a.example".to_string(), "c.example".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(missing_of(&hosts, &ok), vec!["b.example".to_string()]);
+    }
+
+    #[test]
+    fn missing_of_is_empty_when_every_host_answered() {
+        let hosts = vec!["a.example".to_string(), "b.example".to_string()];
+        let ok: HashSet<String> = hosts.iter().cloned().collect();
+        assert!(missing_of(&hosts, &ok).is_empty());
+    }
+
+    #[test]
+    fn missing_of_keeps_input_order() {
+        // Output order is the CLI input order, not the order reports arrived.
+        // That is what makes the warn line readable to the operator who typed
+        // the list in the first place.
+        let hosts = vec![
+            "z.example".to_string(),
+            "m.example".to_string(),
+            "a.example".to_string(),
+        ];
+        let ok: HashSet<String> = std::iter::once("m.example".to_string()).collect();
+        assert_eq!(
+            missing_of(&hosts, &ok),
+            vec!["z.example".to_string(), "a.example".to_string()]
+        );
     }
 }
