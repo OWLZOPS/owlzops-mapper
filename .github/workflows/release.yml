@@ -74,7 +74,7 @@ jobs:
 
       # R27-04: SBOM per target, not per builder environment
       - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af  # Release 2.87.11
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # Release 2.87.15
         with:
           tool: cargo-cyclonedx
 
@@ -194,7 +194,7 @@ jobs:
           name: signed-artifacts
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af  # Release 2.87.11
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908  # Release 2.87.15
         with:
           tool: git-cliff
 
