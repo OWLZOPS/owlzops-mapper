@@ -44,7 +44,12 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 /// semantics change, not reported as real drift (R27-24).
 /// v14 (0.5.36): split short-lived secret leaks out of SEC-014 into SEC-059
 /// (weight 0), evidence now includes the age threshold.
-pub const SCORING_VERSION: u8 = 14;
+/// v15 (unreleased): SEC-005 now fires on `Defaults !authenticate` (R33-04)
+/// and `self_sudo_target` no longer excludes multi-command rules (R33-03) —
+/// the same sudoers input can score differently, so pairs spanning this
+/// version are a collection-semantics change, not drift (R33-12). Tag the
+/// release number when the version actually ships; do not backfill it here.
+pub const SCORING_VERSION: u8 = 15;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -3171,7 +3176,24 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (14, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (15, 15));
+    }
+
+    #[test]
+    fn defaults_no_authenticate_scores_as_nopasswd_all() {
+        // R33-12: the new SEC-005 input is why v15 exists; pin it here so the
+        // next semantics change trips this guard the same way.
+        let mut r = minimal_report();
+        r.security.sudo_nopasswd_entries = vec![format!(
+            "/etc/sudoers.d/20-auth: Defaults:deploy !authenticate {} \
+         (passwordless sudo for :deploy via Defaults !authenticate)",
+            crate::models::SUDO_ALL_MARKER
+        )];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-005")
+            .expect("SEC-005 fires");
+        assert_eq!((SCORING_VERSION, f.weight), (15, 15));
     }
 
     #[test]
