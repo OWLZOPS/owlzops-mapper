@@ -338,6 +338,73 @@ fn gather_process_and_tech(
     (process_list, zombie_processes, tech_stack, zombie_details)
 }
 
+// R33-QW-2: `/proc/vmstat` `oom_kill` (kernel ≥ 4.13): exact, monotonic since
+// boot. The dmesg grep undercounts once the ring wraps and overcounts on
+// kernels that log both the invocation and the kill.
+fn parse_oom_kill(vmstat: &str) -> Option<usize> {
+    vmstat
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+fn oom_kills_from_vmstat() -> Option<usize> {
+    let (v, _) = crate::safe_io::read_procfs_capped("/proc/vmstat", 64 * 1024).ok()?;
+    parse_oom_kill(&v)
+}
+
+/// Ring is log_buf_len (≤ a few MiB), records ~100 B: this bounds memory.
+const MAX_KMSG_RECORDS: usize = 32_768;
+
+/// One /dev/kmsg record → "[secs.usec] message". Format:
+/// "<prio>,<seq>,<ts_us>,<flags>;<message>\n SUBSYSTEM=…\n DEVICE=…"
+fn kmsg_record_to_line(rec: &str) -> Option<String> {
+    let (prefix, body) = rec.split_once(';').unwrap_or(("", rec));
+    let ts_us: u64 = prefix
+        .split(',')
+        .nth(2)
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+    let msg = body.lines().next()?.trim();
+    (!msg.is_empty()).then(|| format!("[{:>5}.{:06}] {msg}", ts_us / 1_000_000, ts_us % 1_000_000))
+}
+
+/// The same source dmesg reads. O_NONBLOCK: every read(2) returns exactly one
+/// record, EAGAIN at the end, EPIPE when the ring overran our cursor (skip on).
+/// Needs CAP_SYSLOG or dmesg_restrict=0 — EACCES goes back to the caller as
+/// a coverage fact.
+#[cfg(target_os = "linux")]
+fn read_kmsg(max_records: usize) -> std::io::Result<Vec<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // CAPPED_IO_OK: kernel character device, record-sized reads, bounded by max_records.
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open("/dev/kmsg")?;
+    let mut out = Vec::new();
+    // LOG_LINE_MAX + prefix + dictionary; a shorter buffer is refused with EINVAL.
+    let mut buf = vec![0u8; 8192];
+    while out.len() < max_records {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(line) = kmsg_record_to_line(&String::from_utf8_lossy(&buf[..n])) {
+                    out.push(line);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+#[cfg(not(target_os = "linux"))]
+fn read_kmsg(_max_records: usize) -> std::io::Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
 fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec<String>) {
     let open_files_limit = std::fs::read_to_string("/proc/self/limits")
         .ok()
@@ -348,17 +415,37 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let dmesg_raw = crate::utils::run_with_timeout("dmesg", &["--ctime"], 5)
-        .or_else(|| crate::utils::run_with_timeout("dmesg", &["-T"], 5))
-        .unwrap_or_default();
+    // R33-QW-2: dmesg_errors and the pre-4.13 OOM fallback come from /dev/kmsg,
+    // the same source `dmesg` reads, without the exec.
+    let kmsg = match read_kmsg(MAX_KMSG_RECORDS) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            crate::coverage::record(
+                "/dev/kmsg unreadable (EACCES: dmesg_restrict=1 or no CAP_SYSLOG) — \
+                 dmesg_errors NOT collected"
+                    .to_string(),
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            crate::coverage::record(format!(
+                "/dev/kmsg unreadable ({}) — dmesg_errors NOT collected",
+                e.kind()
+            ));
+            Vec::new()
+        }
+    };
 
-    let oom_kills = dmesg_raw
-        .lines()
-        .filter(|l| l.to_lowercase().contains("killed process"))
-        .count();
+    // Exact counter first; the grep is the pre-4.13 fallback only.
+    let oom_kills = oom_kills_from_vmstat().unwrap_or_else(|| {
+        kmsg.iter()
+            .filter(|l| l.to_lowercase().contains("killed process"))
+            .count()
+    });
 
-    let dmesg_errors: Vec<String> = dmesg_raw
-        .lines()
+    let dmesg_errors: Vec<String> = kmsg
+        .iter()
+        .map(String::as_str)
         .filter(|l| {
             let lower = l.to_lowercase();
             lower.contains("error")
@@ -840,5 +927,33 @@ mod tests {
         // Shape contract only: the value depends on the host.
         let (_synced, offset) = kernel_time_sync().expect("clock_adjtime(modes=0) never fails");
         assert!(offset.is_some_and(|ms| ms >= 0.0));
+    }
+
+    #[test]
+    fn vmstat_oom_kill_is_parsed_exactly() {
+        assert_eq!(
+            parse_oom_kill("nr_free_pages 1\noom_kill 7\npgfault 2\n"),
+            Some(7)
+        );
+        assert_eq!(
+            parse_oom_kill("oom_kill_x 7\n"),
+            None,
+            "prefix must be a whole key"
+        );
+        assert_eq!(parse_oom_kill(""), None);
+    }
+
+    #[test]
+    fn kmsg_record_keeps_message_and_timestamp() {
+        let rec = "6,1234,5000123,-;Out of memory: Killed process 42 (x)\n SUBSYSTEM=mm\n";
+        assert_eq!(
+            kmsg_record_to_line(rec).as_deref(),
+            Some("[    5.000123] Out of memory: Killed process 42 (x)")
+        );
+        assert_eq!(
+            kmsg_record_to_line("6,1,2,-;\n"),
+            None,
+            "empty message is dropped"
+        );
     }
 }
