@@ -376,6 +376,20 @@ fn render_header(report: &AgentReport, theme: &Theme) {
     }
 }
 
+/// R33-QW-4: dashboard shows the day only; time-of-day is noise here.
+/// Both formats — RFC 3339 (`2024-03-15T10:22:31…`, post QW-4) and the
+/// legacy `stat -c %w` output (`2024-03-15 10:22:31… +0000`) — start
+/// with `YYYY-MM-DD`. `None` for `"unknown"` or anything unexpected:
+/// the row is skipped rather than rendered as noise.
+fn format_install_date(raw: &str) -> Option<String> {
+    let prefix = raw.get(..10)?;
+    let bytes = prefix.as_bytes();
+    if bytes[4] == b'-' && bytes[7] == b'-' && bytes.iter().all(|b| b.is_ascii()) {
+        return Some(prefix.to_string());
+    }
+    None
+}
+
 fn render_system_overview(report: &AgentReport) {
     let mut t_sys = Table::new();
     t_sys
@@ -408,6 +422,10 @@ fn render_system_overview(report: &AgentReport) {
         ),
     ]);
     t_sys.add_row(vec!["Uptime", &format!("{} days", report.host.uptime_days)]);
+    // R33-QW-4: date-only; skipped when no birth time is available.
+    if let Some(install) = format_install_date(&report.host.os_install_date) {
+        t_sys.add_row(vec![Cell::new("OS Install Date"), Cell::new(install)]);
+    }
     t_sys.add_row(vec!["CPU Cores", &report.host.cpu_cores.to_string()]);
     t_sys.add_row(vec![
         "RAM (Total/Swap)",
@@ -482,6 +500,19 @@ fn render_system_overview(report: &AgentReport) {
         Cell::new("Security Modules (LSM)"),
         Cell::new(sec_mod_str),
     ]);
+
+    // R33-QW-3: inventory from sysfs; empty on hosts without a display
+    // controller (typical cloud VM), in which case the row is skipped.
+    if !report.host.gpu_devices.is_empty() {
+        let gpus = report
+            .host
+            .gpu_devices
+            .iter()
+            .map(|g| sanitize_terminal(g))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t_sys.add_row(vec![Cell::new("GPU"), Cell::new(gpus)]);
+    }
 
     outln!("{t_sys}\n");
 }

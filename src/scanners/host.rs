@@ -149,6 +149,19 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
 
 // ── sub‑collectors for gather_host_info ────────────────────
 
+// R33-QW-4: created() is statx(STATX_BTIME); Err on filesystems without a
+// birth time (old XFS, some tmpfs) — the caller falls through to the mtime
+// fact. Replaces `stat -c %w /` + `stat -c %y /etc/machine-id`.
+fn fs_time_rfc3339(path: &str, birth: bool) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    let t = if birth {
+        md.created().ok()?
+    } else {
+        md.modified().ok()?
+    };
+    Some(chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+}
+
 fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemBasics {
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
     let os_version = System::long_os_version().unwrap_or_else(|| "unknown".to_string());
@@ -185,17 +198,11 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
         hosting_provider = product.trim().to_string();
     }
 
-    let mut os_install_date = crate::utils::run_with_timeout("stat", &["-c", "%w", "/"], 3)
-        .map(|s| s.trim().to_string())
-        .filter(|s| s != "-" && !s.is_empty())
+    // R33-QW-4: same two facts `stat %w /` and `stat %y /etc/machine-id` gave
+    // — root birth (install/image build) then first-boot mtime — as RFC 3339.
+    let os_install_date = fs_time_rfc3339("/", true)
+        .or_else(|| fs_time_rfc3339("/etc/machine-id", false))
         .unwrap_or_else(|| "unknown".to_string());
-    if os_install_date == "unknown" || os_install_date == "-" {
-        os_install_date =
-            crate::utils::run_with_timeout("stat", &["-c", "%y", "/etc/machine-id"], 3)
-                .map(|s| s.trim().to_string())
-                .filter(|s| s != "-" && !s.is_empty())
-                .unwrap_or_else(|| "unknown".to_string());
-    }
 
     SystemBasics {
         hostname,
@@ -338,6 +345,139 @@ fn gather_process_and_tech(
     (process_list, zombie_processes, tech_stack, zombie_details)
 }
 
+// R33-QW-2: `/proc/vmstat` `oom_kill` (kernel ≥ 4.13): exact, monotonic since
+// boot. The dmesg grep undercounts once the ring wraps and overcounts on
+// kernels that log both the invocation and the kill.
+fn parse_oom_kill(vmstat: &str) -> Option<usize> {
+    vmstat
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+fn oom_kills_from_vmstat() -> Option<usize> {
+    let (v, _) = crate::safe_io::read_procfs_capped("/proc/vmstat", 64 * 1024).ok()?;
+    parse_oom_kill(&v)
+}
+
+/// Ring is log_buf_len (≤ a few MiB), records ~100 B: this bounds memory.
+const MAX_KMSG_RECORDS: usize = 32_768;
+
+/// One /dev/kmsg record → "[YYYY-MM-DD HH:MM:SS] message". Record format:
+/// "<prio>,<seq>,<ts_us>,<flags>;<message>\n SUBSYSTEM=…\n DEVICE=…"
+///
+/// `ts_us` is monotonic since boot, not wall-clock. `boot_unix_secs` is the
+/// Unix time of the last boot (`now - uptime`), reconstructed in `read_kmsg`;
+/// adding it recovers the same wall-clock `dmesg --ctime` prints (same
+/// ±1 s precision — the kernel gives us µs since boot, and the boot instant
+/// is only known to the second).
+fn kmsg_record_to_line(rec: &str, boot_unix_secs: i64) -> Option<String> {
+    let (prefix, body) = rec.split_once(';').unwrap_or(("", rec));
+    let ts_us: u64 = prefix
+        .split(',')
+        .nth(2)
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0);
+    let msg = body.lines().next()?.trim();
+    (!msg.is_empty()).then(|| {
+        let wall = boot_unix_secs + (ts_us / 1_000_000) as i64;
+        // from_timestamp returns None only for absurd values; 0 is a safe
+        // fallback that keeps the row visible rather than dropping it.
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(wall, 0)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap());
+        format!("[{}] {msg}", dt.format("%Y-%m-%d %H:%M:%S"))
+    })
+}
+
+/// The same source dmesg reads. O_NONBLOCK: every read(2) returns exactly one
+/// record, EAGAIN at the end, EPIPE when the ring overran our cursor (skip on).
+/// Needs CAP_SYSLOG or dmesg_restrict=0 — EACCES goes back to the caller as
+/// a coverage fact.
+#[cfg(target_os = "linux")]
+fn read_kmsg(max_records: usize) -> std::io::Result<Vec<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // CAPPED_IO_OK: kernel character device, record-sized reads, bounded by max_records.
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open("/dev/kmsg")?;
+
+    // Correlate monotonic kmsg timestamps to wall-clock once, up front.
+    let now_unix = chrono::Utc::now().timestamp();
+    let boot_unix_secs = now_unix - System::uptime() as i64;
+
+    let mut out = Vec::new();
+    // LOG_LINE_MAX + prefix + dictionary; a shorter buffer is refused with EINVAL.
+    let mut buf = vec![0u8; 8192];
+    while out.len() < max_records {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(line) =
+                    kmsg_record_to_line(&String::from_utf8_lossy(&buf[..n]), boot_unix_secs)
+                {
+                    out.push(line);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+#[cfg(not(target_os = "linux"))]
+fn read_kmsg(_max_records: usize) -> std::io::Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+// R33-QW-3: PCI class 0x03xxxx = display controller. The vendor id names the
+// big three without shipping pci.ids; everything else is reported as
+// "PCI vvvv:dddd" instead of being filtered out — the old lspci grep hid
+// ASPEED BMC VGA and virtio-gpu, which is inventory a consultant wants.
+fn gpu_devices_from_sysfs() -> Vec<String> {
+    gpu_devices_from(std::path::Path::new("/sys/bus/pci/devices"))
+}
+
+fn gpu_devices_from(root: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let read_hex = |p: std::path::PathBuf| -> Option<u32> {
+        let (s, _) = crate::safe_io::read_procfs_capped(&p.to_string_lossy(), 64).ok()?;
+        u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let class = read_hex(p.join("class"))?;
+            if class >> 16 != 0x03 {
+                return None;
+            }
+            let vendor = read_hex(p.join("vendor")).unwrap_or(0);
+            let device = read_hex(p.join("device")).unwrap_or(0);
+            let name = match vendor {
+                0x10de => "NVIDIA",
+                0x1002 => "AMD",
+                0x8086 => "Intel",
+                0x1a03 => "ASPEED",
+                0x15ad => "VMware",
+                0x1af4 => "virtio",
+                0x1234 => "QEMU",
+                _ => "PCI",
+            };
+            Some(format!(
+                "{name} {vendor:04x}:{device:04x} ({})",
+                e.file_name().to_string_lossy()
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec<String>) {
     let open_files_limit = std::fs::read_to_string("/proc/self/limits")
         .ok()
@@ -348,17 +488,37 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let dmesg_raw = crate::utils::run_with_timeout("dmesg", &["--ctime"], 5)
-        .or_else(|| crate::utils::run_with_timeout("dmesg", &["-T"], 5))
-        .unwrap_or_default();
+    // R33-QW-2: dmesg_errors and the pre-4.13 OOM fallback come from /dev/kmsg,
+    // the same source `dmesg` reads, without the exec.
+    let kmsg = match read_kmsg(MAX_KMSG_RECORDS) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            crate::coverage::record(
+                "/dev/kmsg unreadable (EACCES: dmesg_restrict=1 or no CAP_SYSLOG) — \
+                 dmesg_errors NOT collected"
+                    .to_string(),
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            crate::coverage::record(format!(
+                "/dev/kmsg unreadable ({}) — dmesg_errors NOT collected",
+                e.kind()
+            ));
+            Vec::new()
+        }
+    };
 
-    let oom_kills = dmesg_raw
-        .lines()
-        .filter(|l| l.to_lowercase().contains("killed process"))
-        .count();
+    // Exact counter first; the grep is the pre-4.13 fallback only.
+    let oom_kills = oom_kills_from_vmstat().unwrap_or_else(|| {
+        kmsg.iter()
+            .filter(|l| l.to_lowercase().contains("killed process"))
+            .count()
+    });
 
-    let dmesg_errors: Vec<String> = dmesg_raw
-        .lines()
+    let dmesg_errors: Vec<String> = kmsg
+        .iter()
+        .map(String::as_str)
         .filter(|l| {
             let lower = l.to_lowercase();
             lower.contains("error")
@@ -375,18 +535,9 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         .rev()
         .collect();
 
-    let gpu_devices = crate::utils::run_with_timeout("lspci", &[], 5)
-        .map(|s| {
-            s.lines()
-                .filter(|l| {
-                    let l = l.to_lowercase();
-                    (l.contains("vga") || l.contains("3d controller"))
-                        && (l.contains("nvidia") || l.contains("amd") || l.contains("intel"))
-                })
-                .filter_map(|l| l.split(": ").nth(1).map(|s| s.trim().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // R33-QW-3: one sysfs walk replaces lspci + grep. All class-0x03
+    // controllers, including BMC and virtual displays the grep hid.
+    let gpu_devices = gpu_devices_from_sysfs();
 
     let mut security_modules = Vec::new();
     if let Ok(lsm) = fs::read_to_string("/sys/kernel/security/lsm") {
@@ -703,89 +854,55 @@ fn last_backup_run_utc() -> Option<String> {
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
 }
 
-fn parse_offset_to_ms(raw: &str) -> Option<f64> {
-    let s = raw.trim();
-    if s.is_empty() {
+// R33-QW-1: kernel time-sync state. Every NTP client (timesyncd, chrony, ntpd)
+// drives the kernel PLL: STA_UNSYNC stays set until the first successful
+// sync, `offset` is the residual error. One read-only syscall, no privilege,
+// replaces timedatectl ×2 / chronyc / ntpq whose formats differ per distro.
+// Constants are local: libc's TIME_*/STA_* coverage differs between gnu and
+// musl targets; the ABI values are stable (linux/timex.h).
+#[cfg(target_os = "linux")]
+const STA_UNSYNC: libc::c_int = 0x0040;
+#[cfg(target_os = "linux")]
+const STA_NANO: libc::c_int = 0x2000;
+#[cfg(target_os = "linux")]
+const TIME_ERROR: libc::c_int = 5;
+
+#[cfg(target_os = "linux")]
+fn kernel_time_sync() -> Option<(bool, Option<f64>)> {
+    // SAFETY: `timex` is plain data; with modes == 0 the kernel only fills it
+    // in. The pointer is valid for the duration of the call.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    let state = unsafe { libc::clock_adjtime(libc::CLOCK_REALTIME, &mut tx) };
+    if state < 0 {
         return None;
     }
-
-    let (sign, rest) = if let Some(stripped) = s.strip_prefix('-') {
-        (-1.0, stripped)
-    } else if let Some(stripped) = s.strip_prefix('+') {
-        (1.0, stripped)
+    let synced = state != TIME_ERROR && tx.status & STA_UNSYNC == 0;
+    // `offset` is microseconds, or nanoseconds when STA_NANO is set.
+    let per_ms = if tx.status & STA_NANO != 0 {
+        1_000_000.0
     } else {
-        (1.0, s)
+        1_000.0
     };
+    Some((synced, Some((tx.offset as f64 / per_ms).abs())))
+}
 
-    let (num_str, unit) = if let Some(pos) = rest.find(|c: char| !c.is_ascii_digit() && c != '.') {
-        (&rest[..pos], &rest[pos..])
-    } else {
-        (rest, "")
-    };
-
-    let value: f64 = num_str.parse().ok()?;
-    let ms = match unit.to_lowercase().as_str() {
-        "s" | "sec" | "seconds" => value * 1000.0,
-        "ms" | "msec" | "milliseconds" => value,
-        "us" | "usec" | "microseconds" => value / 1000.0,
-        "ns" | "nsec" | "nanoseconds" => value / 1_000_000.0,
-        _ => return None,
-    };
-    Some((sign * ms).abs())
+#[cfg(not(target_os = "linux"))]
+fn kernel_time_sync() -> Option<(bool, Option<f64>)> {
+    None
 }
 
 fn gather_ntp_info() -> (bool, Option<f64>) {
-    if let Some(td_out) = crate::utils::run_with_timeout("timedatectl", &["status"], 5) {
-        let synchronized = td_out.lines().any(|l| {
-            (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
-        });
-        if synchronized {
-            let offset = crate::utils::run_with_timeout("timedatectl", &["timesync-status"], 5)
-                .and_then(|ts_out| {
-                    ts_out.lines().find_map(|line| {
-                        let rest = line.trim().strip_prefix("Offset:")?;
-                        parse_offset_to_ms(rest.trim())
-                    })
-                });
-            return (true, offset);
+    match kernel_time_sync() {
+        Some(v) => v,
+        None => {
+            crate::coverage::record(
+                "clock_adjtime(2) failed — kernel time-sync state UNKNOWN; \
+                 reported as NOT synchronized"
+                    .to_string(),
+            );
+            (false, None)
         }
     }
-
-    if let Some(chrony_out) = crate::utils::run_with_timeout("chronyc", &["tracking"], 5) {
-        let synced = chrony_out
-            .lines()
-            .find_map(|l| l.strip_prefix("Leap status"))
-            .map(|v| v.trim_start_matches(':').trim() == "Normal")
-            .unwrap_or(false);
-        let mut offset = None;
-        for line in chrony_out.lines() {
-            if line.contains("System time") {
-                offset = line
-                    .split_whitespace()
-                    .nth(3)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(|v| v.abs() * 1000.0);
-                break;
-            }
-        }
-        return (synced, offset);
-    }
-
-    if let Some(ntpq_out) = crate::utils::run_with_timeout("ntpq", &["-p", "-n"], 5) {
-        for line in ntpq_out.lines() {
-            if line.starts_with('*') {
-                let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() >= 9
-                    && let Ok(offset) = cols[8].parse::<f64>()
-                {
-                    return (true, Some(offset.abs()));
-                }
-            }
-        }
-        return (false, None);
-    }
-
-    (false, None)
 }
 
 // ── main host info collector ───────────────────────────────
@@ -861,5 +978,71 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
         time_offset_ms,
         reboot_required_pkgs,
         zombie_details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clock_adjtime_is_readable_without_privilege() {
+        // Shape contract only: the value depends on the host.
+        let (_synced, offset) = kernel_time_sync().expect("clock_adjtime(modes=0) never fails");
+        assert!(offset.is_some_and(|ms| ms >= 0.0));
+    }
+
+    #[test]
+    fn vmstat_oom_kill_is_parsed_exactly() {
+        assert_eq!(
+            parse_oom_kill("nr_free_pages 1\noom_kill 7\npgfault 2\n"),
+            Some(7)
+        );
+        assert_eq!(
+            parse_oom_kill("oom_kill_x 7\n"),
+            None,
+            "prefix must be a whole key"
+        );
+        assert_eq!(parse_oom_kill(""), None);
+    }
+
+    #[test]
+    fn kmsg_record_keeps_message_and_uses_wall_clock() {
+        // boot at 1_700_000_000 (2023-11-14 22:13:20 UTC), record at +5.000123 s
+        let rec = "6,1234,5000123,-;Out of memory: Killed process 42 (x)\n SUBSYSTEM=mm\n";
+        let line = kmsg_record_to_line(rec, 1_700_000_000).expect("non-empty");
+        assert!(
+            line.starts_with("[2023-11-14 22:13:25]"),
+            "wall-clock prefix, got {line:?}"
+        );
+        assert!(line.ends_with("Out of memory: Killed process 42 (x)"));
+        assert_eq!(
+            kmsg_record_to_line("6,1,2,-;\n", 1_700_000_000),
+            None,
+            "empty message is dropped"
+        );
+    }
+
+    #[test]
+    fn gpu_inventory_reads_pci_class_from_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |addr: &str, class: &str, vendor: &str, device: &str| {
+            let d = tmp.path().join(addr);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("class"), class).unwrap();
+            std::fs::write(d.join("vendor"), vendor).unwrap();
+            std::fs::write(d.join("device"), device).unwrap();
+        };
+        mk("0000:01:00.0", "0x030000\n", "0x10de\n", "0x2204\n"); // NVIDIA VGA
+        mk("0000:00:1f.3", "0x040300\n", "0x8086\n", "0xa170\n"); // audio: skipped
+        mk("0000:03:00.0", "0x030200\n", "0x1a03\n", "0x2000\n"); // ASPEED 3D
+        assert_eq!(
+            gpu_devices_from(tmp.path()),
+            vec![
+                "ASPEED 1a03:2000 (0000:03:00.0)".to_string(),
+                "NVIDIA 10de:2204 (0000:01:00.0)".to_string()
+            ]
+        );
     }
 }
