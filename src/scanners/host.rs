@@ -703,89 +703,55 @@ fn last_backup_run_utc() -> Option<String> {
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
 }
 
-fn parse_offset_to_ms(raw: &str) -> Option<f64> {
-    let s = raw.trim();
-    if s.is_empty() {
+// R33-QW-1: kernel time-sync state. Every NTP client (timesyncd, chrony, ntpd)
+// drives the kernel PLL: STA_UNSYNC stays set until the first successful
+// sync, `offset` is the residual error. One read-only syscall, no privilege,
+// replaces timedatectl ×2 / chronyc / ntpq whose formats differ per distro.
+// Constants are local: libc's TIME_*/STA_* coverage differs between gnu and
+// musl targets; the ABI values are stable (linux/timex.h).
+#[cfg(target_os = "linux")]
+const STA_UNSYNC: libc::c_int = 0x0040;
+#[cfg(target_os = "linux")]
+const STA_NANO: libc::c_int = 0x2000;
+#[cfg(target_os = "linux")]
+const TIME_ERROR: libc::c_int = 5;
+
+#[cfg(target_os = "linux")]
+fn kernel_time_sync() -> Option<(bool, Option<f64>)> {
+    // SAFETY: `timex` is plain data; with modes == 0 the kernel only fills it
+    // in. The pointer is valid for the duration of the call.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    let state = unsafe { libc::clock_adjtime(libc::CLOCK_REALTIME, &mut tx) };
+    if state < 0 {
         return None;
     }
-
-    let (sign, rest) = if let Some(stripped) = s.strip_prefix('-') {
-        (-1.0, stripped)
-    } else if let Some(stripped) = s.strip_prefix('+') {
-        (1.0, stripped)
+    let synced = state != TIME_ERROR && tx.status & STA_UNSYNC == 0;
+    // `offset` is microseconds, or nanoseconds when STA_NANO is set.
+    let per_ms = if tx.status & STA_NANO != 0 {
+        1_000_000.0
     } else {
-        (1.0, s)
+        1_000.0
     };
+    Some((synced, Some((tx.offset as f64 / per_ms).abs())))
+}
 
-    let (num_str, unit) = if let Some(pos) = rest.find(|c: char| !c.is_ascii_digit() && c != '.') {
-        (&rest[..pos], &rest[pos..])
-    } else {
-        (rest, "")
-    };
-
-    let value: f64 = num_str.parse().ok()?;
-    let ms = match unit.to_lowercase().as_str() {
-        "s" | "sec" | "seconds" => value * 1000.0,
-        "ms" | "msec" | "milliseconds" => value,
-        "us" | "usec" | "microseconds" => value / 1000.0,
-        "ns" | "nsec" | "nanoseconds" => value / 1_000_000.0,
-        _ => return None,
-    };
-    Some((sign * ms).abs())
+#[cfg(not(target_os = "linux"))]
+fn kernel_time_sync() -> Option<(bool, Option<f64>)> {
+    None
 }
 
 fn gather_ntp_info() -> (bool, Option<f64>) {
-    if let Some(td_out) = crate::utils::run_with_timeout("timedatectl", &["status"], 5) {
-        let synchronized = td_out.lines().any(|l| {
-            (l.contains("synchronized:") || l.contains("NTP synchronized:")) && l.contains("yes")
-        });
-        if synchronized {
-            let offset = crate::utils::run_with_timeout("timedatectl", &["timesync-status"], 5)
-                .and_then(|ts_out| {
-                    ts_out.lines().find_map(|line| {
-                        let rest = line.trim().strip_prefix("Offset:")?;
-                        parse_offset_to_ms(rest.trim())
-                    })
-                });
-            return (true, offset);
+    match kernel_time_sync() {
+        Some(v) => v,
+        None => {
+            crate::coverage::record(
+                "clock_adjtime(2) failed — kernel time-sync state UNKNOWN; \
+                 reported as NOT synchronized"
+                    .to_string(),
+            );
+            (false, None)
         }
     }
-
-    if let Some(chrony_out) = crate::utils::run_with_timeout("chronyc", &["tracking"], 5) {
-        let synced = chrony_out
-            .lines()
-            .find_map(|l| l.strip_prefix("Leap status"))
-            .map(|v| v.trim_start_matches(':').trim() == "Normal")
-            .unwrap_or(false);
-        let mut offset = None;
-        for line in chrony_out.lines() {
-            if line.contains("System time") {
-                offset = line
-                    .split_whitespace()
-                    .nth(3)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(|v| v.abs() * 1000.0);
-                break;
-            }
-        }
-        return (synced, offset);
-    }
-
-    if let Some(ntpq_out) = crate::utils::run_with_timeout("ntpq", &["-p", "-n"], 5) {
-        for line in ntpq_out.lines() {
-            if line.starts_with('*') {
-                let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() >= 9
-                    && let Ok(offset) = cols[8].parse::<f64>()
-                {
-                    return (true, Some(offset.abs()));
-                }
-            }
-        }
-        return (false, None);
-    }
-
-    (false, None)
 }
 
 // ── main host info collector ───────────────────────────────
@@ -861,5 +827,18 @@ pub fn gather_host_info(sys: &System, fetch_external_ip: bool) -> HostInfo {
         time_offset_ms,
         reboot_required_pkgs,
         zombie_details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clock_adjtime_is_readable_without_privilege() {
+        // Shape contract only: the value depends on the host.
+        let (_synced, offset) = kernel_time_sync().expect("clock_adjtime(modes=0) never fails");
+        assert!(offset.is_some_and(|ms| ms >= 0.0));
     }
 }
