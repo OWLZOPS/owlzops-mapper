@@ -405,6 +405,52 @@ fn read_kmsg(_max_records: usize) -> std::io::Result<Vec<String>> {
     Ok(Vec::new())
 }
 
+// R33-QW-3: PCI class 0x03xxxx = display controller. The vendor id names the
+// big three without shipping pci.ids; everything else is reported as
+// "PCI vvvv:dddd" instead of being filtered out — the old lspci grep hid
+// ASPEED BMC VGA and virtio-gpu, which is inventory a consultant wants.
+fn gpu_devices_from_sysfs() -> Vec<String> {
+    gpu_devices_from(std::path::Path::new("/sys/bus/pci/devices"))
+}
+
+fn gpu_devices_from(root: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let read_hex = |p: std::path::PathBuf| -> Option<u32> {
+        let (s, _) = crate::safe_io::read_procfs_capped(&p.to_string_lossy(), 64).ok()?;
+        u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let class = read_hex(p.join("class"))?;
+            if class >> 16 != 0x03 {
+                return None;
+            }
+            let vendor = read_hex(p.join("vendor")).unwrap_or(0);
+            let device = read_hex(p.join("device")).unwrap_or(0);
+            let name = match vendor {
+                0x10de => "NVIDIA",
+                0x1002 => "AMD",
+                0x8086 => "Intel",
+                0x1a03 => "ASPEED",
+                0x15ad => "VMware",
+                0x1af4 => "virtio",
+                0x1234 => "QEMU",
+                _ => "PCI",
+            };
+            Some(format!(
+                "{name} {vendor:04x}:{device:04x} ({})",
+                e.file_name().to_string_lossy()
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec<String>) {
     let open_files_limit = std::fs::read_to_string("/proc/self/limits")
         .ok()
@@ -462,18 +508,9 @@ fn gather_kernel_and_hardware() -> (String, usize, Vec<String>, Vec<String>, Vec
         .rev()
         .collect();
 
-    let gpu_devices = crate::utils::run_with_timeout("lspci", &[], 5)
-        .map(|s| {
-            s.lines()
-                .filter(|l| {
-                    let l = l.to_lowercase();
-                    (l.contains("vga") || l.contains("3d controller"))
-                        && (l.contains("nvidia") || l.contains("amd") || l.contains("intel"))
-                })
-                .filter_map(|l| l.split(": ").nth(1).map(|s| s.trim().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // R33-QW-3: one sysfs walk replaces lspci + grep. All class-0x03
+    // controllers, including BMC and virtual displays the grep hid.
+    let gpu_devices = gpu_devices_from_sysfs();
 
     let mut security_modules = Vec::new();
     if let Ok(lsm) = fs::read_to_string("/sys/kernel/security/lsm") {
@@ -954,6 +991,28 @@ mod tests {
             kmsg_record_to_line("6,1,2,-;\n"),
             None,
             "empty message is dropped"
+        );
+    }
+
+    #[test]
+    fn gpu_inventory_reads_pci_class_from_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |addr: &str, class: &str, vendor: &str, device: &str| {
+            let d = tmp.path().join(addr);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("class"), class).unwrap();
+            std::fs::write(d.join("vendor"), vendor).unwrap();
+            std::fs::write(d.join("device"), device).unwrap();
+        };
+        mk("0000:01:00.0", "0x030000\n", "0x10de\n", "0x2204\n"); // NVIDIA VGA
+        mk("0000:00:1f.3", "0x040300\n", "0x8086\n", "0xa170\n"); // audio: skipped
+        mk("0000:03:00.0", "0x030200\n", "0x1a03\n", "0x2000\n"); // ASPEED 3D
+        assert_eq!(
+            gpu_devices_from(tmp.path()),
+            vec![
+                "ASPEED 1a03:2000 (0000:03:00.0)".to_string(),
+                "NVIDIA 10de:2204 (0000:01:00.0)".to_string()
+            ]
         );
     }
 }
