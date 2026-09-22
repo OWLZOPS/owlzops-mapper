@@ -483,6 +483,19 @@ fn render_system_overview(report: &AgentReport) {
         Cell::new(sec_mod_str),
     ]);
 
+    // R33-QW-3: inventory from sysfs; empty on hosts without a display
+    // controller (typical cloud VM), in which case the row is skipped.
+    if !report.host.gpu_devices.is_empty() {
+        let gpus = report
+            .host
+            .gpu_devices
+            .iter()
+            .map(|g| sanitize_terminal(g))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t_sys.add_row(vec![Cell::new("GPU"), Cell::new(gpus)]);
+    }
+
     outln!("{t_sys}\n");
 }
 
