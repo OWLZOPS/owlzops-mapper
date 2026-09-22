@@ -363,9 +363,15 @@ fn oom_kills_from_vmstat() -> Option<usize> {
 /// Ring is log_buf_len (≤ a few MiB), records ~100 B: this bounds memory.
 const MAX_KMSG_RECORDS: usize = 32_768;
 
-/// One /dev/kmsg record → "[secs.usec] message". Format:
+/// One /dev/kmsg record → "[YYYY-MM-DD HH:MM:SS] message". Record format:
 /// "<prio>,<seq>,<ts_us>,<flags>;<message>\n SUBSYSTEM=…\n DEVICE=…"
-fn kmsg_record_to_line(rec: &str) -> Option<String> {
+///
+/// `ts_us` is monotonic since boot, not wall-clock. `boot_unix_secs` is the
+/// Unix time of the last boot (`now - uptime`), reconstructed in `read_kmsg`;
+/// adding it recovers the same wall-clock `dmesg --ctime` prints (same
+/// ±1 s precision — the kernel gives us µs since boot, and the boot instant
+/// is only known to the second).
+fn kmsg_record_to_line(rec: &str, boot_unix_secs: i64) -> Option<String> {
     let (prefix, body) = rec.split_once(';').unwrap_or(("", rec));
     let ts_us: u64 = prefix
         .split(',')
@@ -373,7 +379,14 @@ fn kmsg_record_to_line(rec: &str) -> Option<String> {
         .and_then(|t| t.trim().parse().ok())
         .unwrap_or(0);
     let msg = body.lines().next()?.trim();
-    (!msg.is_empty()).then(|| format!("[{:>5}.{:06}] {msg}", ts_us / 1_000_000, ts_us % 1_000_000))
+    (!msg.is_empty()).then(|| {
+        let wall = boot_unix_secs + (ts_us / 1_000_000) as i64;
+        // from_timestamp returns None only for absurd values; 0 is a safe
+        // fallback that keeps the row visible rather than dropping it.
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(wall, 0)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap());
+        format!("[{}] {msg}", dt.format("%Y-%m-%d %H:%M:%S"))
+    })
 }
 
 /// The same source dmesg reads. O_NONBLOCK: every read(2) returns exactly one
@@ -389,6 +402,11 @@ fn read_kmsg(max_records: usize) -> std::io::Result<Vec<String>> {
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
         .open("/dev/kmsg")?;
+
+    // Correlate monotonic kmsg timestamps to wall-clock once, up front.
+    let now_unix = chrono::Utc::now().timestamp();
+    let boot_unix_secs = now_unix - System::uptime() as i64;
+
     let mut out = Vec::new();
     // LOG_LINE_MAX + prefix + dictionary; a shorter buffer is refused with EINVAL.
     let mut buf = vec![0u8; 8192];
@@ -396,7 +414,9 @@ fn read_kmsg(max_records: usize) -> std::io::Result<Vec<String>> {
         match f.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if let Some(line) = kmsg_record_to_line(&String::from_utf8_lossy(&buf[..n])) {
+                if let Some(line) =
+                    kmsg_record_to_line(&String::from_utf8_lossy(&buf[..n]), boot_unix_secs)
+                {
                     out.push(line);
                 }
             }
@@ -988,14 +1008,17 @@ mod tests {
     }
 
     #[test]
-    fn kmsg_record_keeps_message_and_timestamp() {
+    fn kmsg_record_keeps_message_and_uses_wall_clock() {
+        // boot at 1_700_000_000 (2023-11-14 22:13:20 UTC), record at +5.000123 s
         let rec = "6,1234,5000123,-;Out of memory: Killed process 42 (x)\n SUBSYSTEM=mm\n";
-        assert_eq!(
-            kmsg_record_to_line(rec).as_deref(),
-            Some("[    5.000123] Out of memory: Killed process 42 (x)")
+        let line = kmsg_record_to_line(rec, 1_700_000_000).expect("non-empty");
+        assert!(
+            line.starts_with("[2023-11-14 22:13:25]"),
+            "wall-clock prefix, got {line:?}"
         );
+        assert!(line.ends_with("Out of memory: Killed process 42 (x)"));
         assert_eq!(
-            kmsg_record_to_line("6,1,2,-;\n"),
+            kmsg_record_to_line("6,1,2,-;\n", 1_700_000_000),
             None,
             "empty message is dropped"
         );
