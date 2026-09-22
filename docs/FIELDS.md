@@ -38,7 +38,7 @@ Use it to build integrations, dashboards, or alerting rules.
 | `hostname` | string | Hostname of the scanned machine |
 | `external_ipv4` | string | Public IP (or `"unknown"`) |
 | `hosting_provider` | string | Provider from DMI (or `"unknown"`) |
-| `os_install_date` | string | Date OS was installed (or `"unknown"`) |
+| `os_install_date` | string | RFC 3339 timestamp of the root filesystem birth time (`statx` `STATX_BTIME`); falls back to the mtime of `/etc/machine-id` on filesystems without a birth time. `"unknown"` when neither is available. Was the raw `stat -c %w /` output before R33-QW-4 — a one-time `~ Changed` in drift across that boundary is expected. |
 | `os_version` | string | Long OS version string |
 | `kernel` | string | Kernel release string |
 | `uptime_days` | integer | System uptime in days |
@@ -49,7 +49,7 @@ Use it to build integrations, dashboards, or alerting rules.
 | `swap_used_mb` | integer | Used swap in MB |
 | `load_average` | array of 3 floats | 1, 5, 15 min load averages |
 | `open_files_limit` | string | Max open files (or `"unknown"`) |
-| `oom_kills` | integer | OOM kill count from dmesg |
+| `oom_kills` | integer | Exact OOM kill counter from `/proc/vmstat` `oom_kill` (kernel ≥ 4.13); falls back to a `dmesg`-style grep over `/dev/kmsg` for older kernels. R33-QW-2. |
 | `zombie_processes` | integer | Number of zombie processes |
 | `zombie_details` | array of objects | Details about zombie processes (up to 10) |
 | `zombie_details[].pid` | integer | Zombie PID |
@@ -57,8 +57,8 @@ Use it to build integrations, dashboards, or alerting rules.
 | `zombie_details[].ppid` | integer | Parent PID |
 | `zombie_details[].parent_name` | string | Parent process name |
 | `security_modules` | array of strings | Active Linux Security Modules (e.g., `"apparmor"`) |
-| `dmesg_errors` | array of strings | Last 5 critical dmesg lines |
-| `gpu_devices` | array of strings | GPU names from lspci |
+| `dmesg_errors` | array of strings | Last 5 critical kernel log lines, read directly from `/dev/kmsg` (needs `CAP_SYSLOG` or `dmesg_restrict=0`; unreadable → empty + coverage note). R33-QW-2. |
+| `gpu_devices` | array of strings | Display controllers (PCI class `0x03xxxx`) read from sysfs: `"<vendor> vvvv:dddd (<pci-address>)"`. Includes BMC (ASPEED) and virtual (virtio, QEMU) display controllers — the old lspci grep filtered them out. R33-QW-3. |
 | `native_services` | array of strings | Running systemd services without `.service` suffix |
 | `cron_jobs` | array of objects | All discovered cron jobs with severity classification |
 | `cron_jobs[].command` | string | Cron job command line |
@@ -73,8 +73,8 @@ Use it to build integrations, dashboards, or alerting rules.
 | `failed_services` | array of strings | Failed systemd units |
 | `backup_tools` | array of strings | Detected backup tools |
 | `last_restic_snapshot` | string \| null | Last local backup cache activity (mtime of `/root/.cache/restic` or `/root/.cache/borg`); null means no cache activity was found, not that no snapshots exist |
-| `ntp_synchronized` | boolean | Whether time is synchronized |
-| `time_offset_ms` | float \| null | Offset from NTP in milliseconds |
+| `ntp_synchronized` | boolean | Whether the kernel PLL reports the clock as synchronized (`clock_adjtime(2)`, `STA_UNSYNC` clear, no `TIME_ERROR`). Same fact `timedatectl`/`chronyc`/`ntpq` approximated; no CLI dependency. R33-QW-1. |
+| `time_offset_ms` | float \| null | Residual kernel PLL offset in milliseconds (`clock_adjtime(2)`). Not the NTP peer offset. R33-QW-1. |
 | `reboot_required_pkgs` | array of strings | Packages that triggered reboot requirement |
 
 ---

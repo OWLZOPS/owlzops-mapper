@@ -149,6 +149,19 @@ pub fn gather_databases_info() -> Vec<DatabaseInfo> {
 
 // ── sub‑collectors for gather_host_info ────────────────────
 
+// R33-QW-4: created() is statx(STATX_BTIME); Err on filesystems without a
+// birth time (old XFS, some tmpfs) — the caller falls through to the mtime
+// fact. Replaces `stat -c %w /` + `stat -c %y /etc/machine-id`.
+fn fs_time_rfc3339(path: &str, birth: bool) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    let t = if birth {
+        md.created().ok()?
+    } else {
+        md.modified().ok()?
+    };
+    Some(chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+}
+
 fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemBasics {
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
     let os_version = System::long_os_version().unwrap_or_else(|| "unknown".to_string());
@@ -185,17 +198,11 @@ fn gather_system_basics_values(sys: &System, fetch_external_ip: bool) -> SystemB
         hosting_provider = product.trim().to_string();
     }
 
-    let mut os_install_date = crate::utils::run_with_timeout("stat", &["-c", "%w", "/"], 3)
-        .map(|s| s.trim().to_string())
-        .filter(|s| s != "-" && !s.is_empty())
+    // R33-QW-4: same two facts `stat %w /` and `stat %y /etc/machine-id` gave
+    // — root birth (install/image build) then first-boot mtime — as RFC 3339.
+    let os_install_date = fs_time_rfc3339("/", true)
+        .or_else(|| fs_time_rfc3339("/etc/machine-id", false))
         .unwrap_or_else(|| "unknown".to_string());
-    if os_install_date == "unknown" || os_install_date == "-" {
-        os_install_date =
-            crate::utils::run_with_timeout("stat", &["-c", "%y", "/etc/machine-id"], 3)
-                .map(|s| s.trim().to_string())
-                .filter(|s| s != "-" && !s.is_empty())
-                .unwrap_or_else(|| "unknown".to_string());
-    }
 
     SystemBasics {
         hostname,
