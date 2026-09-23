@@ -330,6 +330,7 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | No backup tools detected | +20 |
 | SSL certificate expires within 7 days | +15 (max) |
 | Sudo NOPASSWD entries found | +5 (restricted commands) / +15 (ALL) |
+| **SEC-061** – Root-equivalent group membership outside sudoers policy | **+10** |
 | SSH password authentication enabled | +10 |
 | Failed systemd services | +10 |
 | OOM kills present | +10 |
@@ -380,6 +381,7 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 
 | Finding | Penalty |
 | --- | --- |
+| **SEC-060** – CPU speculative-execution mitigations disabled or absent | 0 informational (escalates as drift: on→off = Degraded) |
 | **SEC-041** – Unexplained ftrace syscall hook (visible module) | +30 (verify EDR?) |
 | **SEC-039** – SELinux running permissive | +15 |
 | **SEC-038** – Kernel tainted by unsigned / force-loaded module | 0 informational (e.g. NVIDIA driver) / 10 forced load-unload / 25 correlated with SEC-040 |
