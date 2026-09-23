@@ -734,10 +734,14 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
         })
         .collect();
 
-    // systemd timers
+    // QW-5: `--all` used to list inactive timers too, which FIELDS.md never
+    // promised ("Active systemd timer units"). Without `--all` systemctl
+    // gives exactly that set — unlike /run/systemd/units, whose
+    // `invocation:` symlinks exist only for units in `running` state;
+    // a timer in its normal `active (waiting)` has no invocation ID.
     let systemd_timers = crate::utils::run_with_timeout(
         "systemctl",
-        &["list-timers", "--all", "--no-pager", "--no-legend"],
+        &["list-timers", "--no-pager", "--no-legend"],
         10,
     )
     .map(|s| {
