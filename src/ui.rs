@@ -161,6 +161,9 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_runtime(report);
     render_capability_audit(report);
 
+    render_cpu_vulnerabilities(report, &theme);
+    render_root_equivalent_groups(report, &theme);
+
     render_mount_masking(report, &theme);
     render_reverse_shells(report, &theme);
     render_library_injections(report, verbose, &theme);
@@ -1537,6 +1540,95 @@ fn render_capability_audit(report: &AgentReport) {
 
     outln!("Non-root processes with elevated capabilities:");
     outln!("{t_caps}\n");
+}
+
+// ── SEC-060: CPU speculative-execution mitigations ────────────────────────
+
+/// Only unmitigated entries are actionable. If every mitigation is on
+/// (or sysfs is absent — pre-4.15 kernel without the export), the section
+/// is silent: the finding is informational, weight 0, and printing "all
+/// clear" every scan would be noise. Drift is what matters, and drift is
+/// surfaced by `compare`, not by this dashboard.
+fn render_cpu_vulnerabilities(report: &AgentReport, theme: &Theme) {
+    let vulns: Vec<_> = report
+        .security
+        .cpu_vulnerabilities
+        .iter()
+        .filter(|v| v.vulnerable)
+        .collect();
+    if vulns.is_empty() {
+        return;
+    }
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("CVE family")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Kernel verdict").add_attribute(Attribute::Bold),
+    ]);
+    for v in vulns {
+        t.add_row(vec![
+            Cell::new(sanitize_terminal(&v.name)),
+            Cell::new(sanitize_terminal(&v.status)).fg(Color::Yellow),
+        ]);
+    }
+
+    outln!(
+        "{}CPU Speculative-Execution Mitigations (SEC-060, informational):",
+        theme.warn_sm
+    );
+    outln!("{t}\n");
+}
+
+// ── SEC-061: Root-equivalent groups ───────────────────────────────────────
+
+/// Only groups with `bypasses_sudo = true` are shown. `sudo` and `wheel`
+/// are inventoried but already gated by the sudoers audit and are not
+/// weighted by SEC-061 — putting them in the same table would dilute the
+/// signal.
+fn render_root_equivalent_groups(report: &AgentReport, theme: &Theme) {
+    let groups: Vec<_> = report
+        .security
+        .access_alignment
+        .root_equivalent_groups
+        .iter()
+        .filter(|g| g.bypasses_sudo)
+        .collect();
+    if groups.is_empty() {
+        return;
+    }
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        Cell::new("Group")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Members").add_attribute(Attribute::Bold),
+    ]);
+    for g in groups {
+        let members = if g.members.is_empty() {
+            "(no explicit members)".to_string()
+        } else {
+            g.members
+                .iter()
+                .map(|m| sanitize_terminal(m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        t.add_row(vec![
+            Cell::new(sanitize_terminal(&g.group))
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold),
+            Cell::new(members),
+        ]);
+    }
+
+    outln!(
+        "{}Root-Equivalent Groups Outside Sudoers Policy (SEC-061):",
+        theme.alert
+    );
+    outln!("{t}\n");
 }
 
 // ── SEC-021: Bind‑Mount Masking ───────────────────────────────────────────
