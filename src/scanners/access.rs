@@ -18,6 +18,9 @@ const KEY_TYPES: &[&str] = &[
 /// ~4000 keys at 256 B — anything larger is either abuse or a typo.
 pub(crate) const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
 
+/// /etc/group is small; 1 MiB is generous and matches the capped-I/O doctrine.
+const CAP_GROUP_FILE: usize = 1024 * 1024;
+
 fn strip_options(line: &str) -> Option<String> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     let pos = toks.iter().position(|t| KEY_TYPES.contains(t))?;
@@ -129,13 +132,15 @@ const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
 ];
 
 pub fn root_equivalent_groups() -> Vec<RootEquivalentGroup> {
-    root_equivalent_groups_from(std::path::Path::new("/etc/group"))
+    root_equivalent_groups_from("/etc/group")
 }
 
-pub(crate) fn root_equivalent_groups_from(path: &std::path::Path) -> Vec<RootEquivalentGroup> {
-    let Ok(content) = std::fs::read_to_string(path) else {
+pub(crate) fn root_equivalent_groups_from(path: &str) -> Vec<RootEquivalentGroup> {
+    let Ok((content, _truncated)) = crate::safe_io::read_file_capped_regular(path, CAP_GROUP_FILE)
+    else {
         return Vec::new();
     };
+
     let mut out: Vec<RootEquivalentGroup> = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -346,7 +351,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("group");
         std::fs::write(&p, "docker:x:999:alice,bob\nnotroot:x:1000:carol\n").unwrap();
-        let groups = root_equivalent_groups_from(&p);
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group, "docker");
         assert_eq!(groups[0].members, vec!["alice", "bob"]);
@@ -358,7 +363,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("group");
         std::fs::write(&p, "sudo:x:27:deploy\nwheel:x:10:ops\n").unwrap();
-        let groups = root_equivalent_groups_from(&p);
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|g| !g.bypasses_sudo));
     }
@@ -368,7 +373,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("group");
         std::fs::write(&p, "docker:x:999:\n").unwrap();
-        let groups = root_equivalent_groups_from(&p);
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
         assert_eq!(groups.len(), 1);
         assert!(groups[0].members.is_empty());
     }
@@ -377,16 +382,15 @@ mod tests {
     fn skips_malformed_and_comments() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("group");
-        // empty line, comment, too-few-columns, no-newline-at-eof
+        // empty line, comment, too-few-columns, then a valid entry
         std::fs::write(&p, "\n#docker:x:1:\nbroken\ndocker:x:999:\n").unwrap();
-        let groups = root_equivalent_groups_from(&p);
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group, "docker");
     }
 
     #[test]
     fn missing_file_is_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(root_equivalent_groups_from(&tmp.path().join("nope")).is_empty());
+        assert!(root_equivalent_groups_from("/nonexistent/group").is_empty());
     }
 }
