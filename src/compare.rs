@@ -285,6 +285,41 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // --- security.access_alignment.root_equivalent_groups (R-33-QW-7 drift) ---
+    {
+        use std::collections::BTreeSet;
+        let index = |r: &AgentReport| -> BTreeSet<(String, bool)> {
+            r.security
+                .access_alignment
+                .root_equivalent_groups
+                .iter()
+                .map(|g| (g.group.clone(), g.bypasses_sudo))
+                .collect()
+        };
+        let (b, a) = (index(before), index(after));
+        let added: Vec<String> = a
+            .difference(&b)
+            .map(|(n, p)| format!("{n}{}", if *p { " (bypasses sudo)" } else { "" }))
+            .collect();
+        let removed: Vec<String> = b.difference(&a).map(|(n, _)| n.clone()).collect();
+        if !added.is_empty() {
+            changes.push(Change {
+                field: "security.access_alignment.root_equivalent_groups".into(),
+                before: None,
+                after: Some(added.join(", ")),
+                severity: Severity::Degraded,
+            });
+        }
+        if !removed.is_empty() {
+            changes.push(Change {
+                field: "security.access_alignment.root_equivalent_groups".into(),
+                before: Some(removed.join(", ")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // Sudden package count change (possible supply-chain signal)
     if before.packages.installed_count != after.packages.installed_count {
         let sev = if after.packages.installed_count > before.packages.installed_count + 50 {

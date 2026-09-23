@@ -1,4 +1,4 @@
-use crate::models::{AccessAuditResult, SshKeyAudit, SudoersEntry};
+use crate::models::{AccessAuditResult, RootEquivalentGroup, SshKeyAudit, SudoersEntry};
 use russh::keys::ssh_key::{Algorithm, EcdsaCurve, PublicKey};
 
 // ── Unified sudoers parser (R16 hardening) ────────────────────────────────
@@ -100,6 +100,73 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
         compliant,
         reason,
     })
+}
+
+// ── R33-QW-7: root-equivalent groups ──────────────────────────────────────
+//
+// Inventory of /etc/group memberships that grant root-equivalent access.
+// `bypasses_sudo = true` entries are weighted by SEC-061: membership is
+// root by another name, no sudoers policy involved. `false` entries (sudo,
+// wheel) are inventoried for completeness but gated by sudoers, which is
+// already audited separately.
+const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
+    (
+        "sudo",
+        false,
+        "sudoers policy — inventoried, gated by sudoers",
+    ),
+    (
+        "wheel",
+        false,
+        "BSD-style admin group — inventoried, gated by sudoers",
+    ),
+    ("docker", true, "docker socket is root-equivalent"),
+    ("podman", true, "podman socket is root-equivalent"),
+    ("lxd", true, "lxd daemon is root-equivalent"),
+    ("libvirt", true, "libvirt/qemu is root-equivalent"),
+    ("disk", true, "raw block device read/write"),
+    ("shadow", true, "read access to /etc/shadow (hashes)"),
+];
+
+pub fn root_equivalent_groups() -> Vec<RootEquivalentGroup> {
+    root_equivalent_groups_from(std::path::Path::new("/etc/group"))
+}
+
+pub(crate) fn root_equivalent_groups_from(path: &std::path::Path) -> Vec<RootEquivalentGroup> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<RootEquivalentGroup> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // name:passwd:gid:member1,member2,...
+        let cols: Vec<&str> = line.splitn(4, ':').collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let name = cols[0];
+        let Some((_, bypasses, _)) = ROOT_EQUIVALENT.iter().find(|(n, _, _)| *n == name) else {
+            continue;
+        };
+        let mut members: Vec<String> = cols[3]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        members.sort();
+        out.push(RootEquivalentGroup {
+            group: name.to_string(),
+            members,
+            bypasses_sudo: *bypasses,
+            ..Default::default()
+        });
+    }
+    out.sort_by(|a, b| a.group.cmp(&b.group));
+    out
 }
 
 pub fn gather_access_alignment(
@@ -210,6 +277,9 @@ pub fn gather_access_alignment(
         }
     }
 
+    // R33-QW-7: inventory root-equivalent group memberships.
+    result.root_equivalent_groups = root_equivalent_groups();
+
     result
 }
 
@@ -269,5 +339,54 @@ mod tests {
             .find(|e| e.scope.contains("Defaults"));
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().principal, "ALL");
+    }
+
+    #[test]
+    fn finds_known_group_with_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "docker:x:999:alice,bob\nnotroot:x:1000:carol\n").unwrap();
+        let groups = root_equivalent_groups_from(&p);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "docker");
+        assert_eq!(groups[0].members, vec!["alice", "bob"]);
+        assert!(groups[0].bypasses_sudo);
+    }
+
+    #[test]
+    fn sudo_and_wheel_are_inventoried_but_not_weighted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "sudo:x:27:deploy\nwheel:x:10:ops\n").unwrap();
+        let groups = root_equivalent_groups_from(&p);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| !g.bypasses_sudo));
+    }
+
+    #[test]
+    fn empty_members_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "docker:x:999:\n").unwrap();
+        let groups = root_equivalent_groups_from(&p);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn skips_malformed_and_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        // empty line, comment, too-few-columns, no-newline-at-eof
+        std::fs::write(&p, "\n#docker:x:1:\nbroken\ndocker:x:999:\n").unwrap();
+        let groups = root_equivalent_groups_from(&p);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "docker");
+    }
+
+    #[test]
+    fn missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(root_equivalent_groups_from(&tmp.path().join("nope")).is_empty());
     }
 }
