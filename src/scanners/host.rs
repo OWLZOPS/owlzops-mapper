@@ -734,23 +734,28 @@ fn gather_services() -> (Vec<String>, Vec<String>, Vec<CronJob>, Vec<String>) {
         })
         .collect();
 
-    // systemd timers
-    let systemd_timers = crate::utils::run_with_timeout(
-        "systemctl",
-        &["list-timers", "--all", "--no-pager", "--no-legend"],
-        10,
-    )
-    .map(|s| {
-        let mut timers: Vec<String> = s
-            .lines()
-            .flat_map(|l| l.split_whitespace().map(|w| w.to_string()))
-            .filter(|w| w.ends_with(".timer"))
-            .collect();
-        timers.sort();
-        timers.dedup();
-        timers
-    })
-    .unwrap_or_default();
+    // QW-5: active timers from the invocation export; `--all` used to list
+    // inactive timers too, which FIELDS.md never promised ("Active systemd
+    // timer units").
+    let systemd_timers =
+        crate::scanners::systemd_state::active_units(".timer").unwrap_or_else(|| {
+            crate::utils::run_with_timeout(
+                "systemctl",
+                &["list-timers", "--all", "--no-pager", "--no-legend"],
+                10,
+            )
+            .map(|s| {
+                let mut timers: Vec<String> = s
+                    .lines()
+                    .flat_map(|l| l.split_whitespace().map(|w| w.to_string()))
+                    .filter(|w| w.ends_with(".timer"))
+                    .collect();
+                timers.sort();
+                timers.dedup();
+                timers
+            })
+            .unwrap_or_default()
+        });
 
     (native_services, failed_services, cron_jobs, systemd_timers)
 }

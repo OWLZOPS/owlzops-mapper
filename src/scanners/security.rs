@@ -558,13 +558,16 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         .collect();
 
     // --- Fail2Ban and Auditd (with timeout wrapper) ------------------------
-    let fail2ban_active =
-        crate::utils::run_with_timeout("systemctl", &["is-active", "--quiet", "fail2ban"], 5)
-            .is_some();
-
-    let auditd_active =
-        crate::utils::run_with_timeout("systemctl", &["is-active", "--quiet", "auditd"], 5)
-            .is_some();
+    // QW-5: /run/systemd/units first; systemctl only where that export is
+    // absent (pre-v232 systemd, or no systemd at all → stays false).
+    let unit_active = |unit: &str| -> bool {
+        crate::scanners::systemd_state::unit_is_active(unit).unwrap_or_else(|| {
+            crate::utils::run_with_timeout("systemctl", &["is-active", "--quiet", unit], 5)
+                .is_some()
+        })
+    };
+    let fail2ban_active = unit_active("fail2ban.service");
+    let auditd_active = unit_active("auditd.service");
 
     // --- Sudo and Sysctl audits --------------------------------------------
     let sudoers_scan = sudoers::scan_sudoers();
