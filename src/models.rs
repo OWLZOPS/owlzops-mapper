@@ -548,6 +548,12 @@ pub struct SecurityInfo {
     /// containers.
     #[serde(default)]
     pub mount_namespace_anomalies: Vec<MountNamespaceAnomaly>,
+
+    // ── QW-6: CPU vulnerabilities ────────────────────────────────────────
+    /// QW-6: speculative-execution mitigation state. Empty = sysfs directory
+    /// absent (pre-4.15 kernel or an architecture without the export).
+    #[serde(default)]
+    pub cpu_vulnerabilities: Vec<CpuVulnerability>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -847,6 +853,24 @@ pub struct SudoersEntry {
     pub scope: String,
 }
 
+/// R33-QW-7: a group whose membership effectively grants root-equivalent
+/// access outside the sudoers policy. Deliberately narrow — `sudo` and
+/// `wheel` are recorded for inventory but never carry `bypasses_sudo`,
+/// because membership there is already gated by the sudoers rules that
+/// SEC-005/SEC-061 read separately.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct RootEquivalentGroup {
+    pub group: String,
+    /// Members from /etc/group plus users whose primary gid is this group.
+    /// `root` itself is never listed — root in `docker` is not an escalation.
+    pub members: Vec<String>,
+    pub reason: String,
+    /// false for sudo/wheel: those are policy-gated by sudoers and already
+    /// audited there; inventory only.
+    pub bypasses_sudo: bool,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct AccessAuditResult {
@@ -856,6 +880,9 @@ pub struct AccessAuditResult {
     pub coverage_warnings: Vec<String>,
     #[serde(default)]
     pub sudoers_nopasswd_all: Vec<SudoersEntry>,
+    /// R33-QW-7: root-equivalent groups whose membership bypasses sudoers.
+    #[serde(default)]
+    pub root_equivalent_groups: Vec<RootEquivalentGroup>,
 }
 
 // DLP & Secret Hygiene Models
@@ -1285,6 +1312,20 @@ pub struct TaintFlag {
     /// True only for module-integrity bits that scoring escalates.
     #[serde(default)]
     pub security_relevant: bool,
+}
+
+// ── CPU vulnerabilities (QW-6) ────────────────────────────────────────────
+
+/// One entry of /sys/devices/system/cpu/vulnerabilities (QW-6).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct CpuVulnerability {
+    /// File name: "spectre_v2", "mds", "retbleed", …
+    pub name: String,
+    /// Kernel text verbatim: "Not affected" / "Mitigation: …" / "Vulnerable…".
+    pub status: String,
+    /// `status` starts with "Vulnerable": mitigation off or absent.
+    pub vulnerable: bool,
 }
 
 // ── LSM confinement (SEC-039) ─────────────────────────────────────────────

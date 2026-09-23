@@ -250,6 +250,41 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
+    // --- security.cpu_vulnerabilities (R33-QW-6) ---
+    {
+        fn index(r: &AgentReport) -> HashMap<&str, bool> {
+            r.security
+                .cpu_vulnerabilities
+                .iter()
+                .map(|v| (v.name.as_str(), v.vulnerable))
+                .collect()
+        }
+        let (b, a) = (index(before), index(after));
+        for (name, &now) in &a {
+            if let Some(&was) = b.get(name)
+                && was != now
+            {
+                changes.push(Change {
+                    field: "security.cpu_vulnerabilities".into(),
+                    before: Some(format!(
+                        "{name}: {}",
+                        if was { "vulnerable" } else { "mitigated" }
+                    )),
+                    after: Some(if now {
+                        "vulnerable".into()
+                    } else {
+                        "mitigated".into()
+                    }),
+                    severity: if now {
+                        Severity::Degraded
+                    } else {
+                        Severity::Improved
+                    },
+                });
+            }
+        }
+    }
+
     // Sudden package count change (possible supply-chain signal)
     if before.packages.installed_count != after.packages.installed_count {
         let sev = if after.packages.installed_count > before.packages.installed_count + 50 {

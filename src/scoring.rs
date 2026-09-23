@@ -415,6 +415,34 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // R33-QW-7: SEC-061 — root-equivalent groups whose membership bypasses
+    // the sudoers policy entirely (docker/lxd/disk/shadow). sudo/wheel are
+    // inventoried in `root_equivalent_groups` but are policy-gated by
+    // sudoers, already audited there; only the `bypasses_sudo` set is
+    // weighted.
+    {
+        let escalations: Vec<String> = report
+            .security
+            .access_alignment
+            .root_equivalent_groups
+            .iter()
+            .filter(|g| g.bypasses_sudo)
+            .map(|g| format!("{}: {}", g.group, g.members.join(", ")))
+            .collect();
+        if !escalations.is_empty() {
+            findings.push(Finding {
+                id: "SEC-061",
+                source: Scanner::Security,
+                title: "Root-equivalent group membership outside sudoers policy".to_string(),
+                category: Category::Security,
+                weight: 10,
+                evidence: evidence_list(&escalations, 6),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
     if !tiers.suspicious.is_empty() {
@@ -1355,6 +1383,40 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     "Unsigned or out-of-tree modules are normal for third-party drivers \
                      (nvidia, dkms, virtualbox). This escalates to a weighted finding only when \
                      correlated with a hidden module (SEC-040) or when it appears as drift."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
+    }
+
+    // R33-QW-6: SEC-060 — CPU speculative-execution mitigations. Weight 0:
+    // `mitigations=off` is a deliberate performance trade on some fleets.
+    // A mitigation that was on at baseline and is off now is what matters,
+    // and that is a drift signal, not a point-in-time weight.
+    {
+        let unmitigated: Vec<String> = report
+            .security
+            .cpu_vulnerabilities
+            .iter()
+            .filter(|v| v.vulnerable)
+            .map(|v| format!("{}: {}", v.name, v.status))
+            .collect();
+        if !unmitigated.is_empty() {
+            findings.push(Finding {
+                id: "SEC-060",
+                source: Scanner::Security,
+                title: "CPU speculative-execution mitigations disabled or absent".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} unmitigated: {}",
+                    unmitigated.len(),
+                    evidence_list(&unmitigated, 6)
+                ),
+                suppressed: Some(
+                    "Informational: `mitigations=off` is a deliberate performance trade on \
+                     some fleets. Escalates only as drift (a mitigation that was on and went off)."
                         .to_string(),
                 ),
                 cis_ref: None,
