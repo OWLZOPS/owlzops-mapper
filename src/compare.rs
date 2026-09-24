@@ -285,23 +285,84 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
-    // --- security.access_alignment.root_equivalent_groups (R-33-QW-7 drift) ---
+    // --- security.access_alignment.root_equivalent_groups (R33-QW-7 drift) ---
+    //
+    // Only groups with bypasses_sudo=true are tracked: they are the ones
+    // that grant root without going through sudoers. An empty bypassing
+    // group (see scanners::access) is inventoried with bypasses_sudo=false
+    // and is not a security event on its own — it becomes one the moment
+    // a member is added, which flips the group into this map.
     {
-        use std::collections::BTreeSet;
-        let index = |r: &AgentReport| -> BTreeSet<(String, bool)> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let index = |r: &AgentReport| -> BTreeMap<String, BTreeSet<String>> {
             r.security
                 .access_alignment
                 .root_equivalent_groups
                 .iter()
-                .map(|g| (g.group.clone(), g.bypasses_sudo))
+                .filter(|g| g.bypasses_sudo)
+                .map(|g| (g.group.clone(), g.members.iter().cloned().collect()))
                 .collect()
         };
         let (b, a) = (index(before), index(after));
+
+        // Group entered the weighted set: either genuinely new, or it was
+        // inventoried empty and gained its first member.
         let added: Vec<String> = a
-            .difference(&b)
-            .map(|(n, p)| format!("{n}{}", if *p { " (bypasses sudo)" } else { "" }))
+            .iter()
+            .filter(|(name, _)| !b.contains_key(*name))
+            .map(|(name, members)| {
+                if members.is_empty() {
+                    name.clone()
+                } else {
+                    format!(
+                        "{name} [{}]",
+                        members.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                }
+            })
             .collect();
-        let removed: Vec<String> = b.difference(&a).map(|(n, _)| n.clone()).collect();
+
+        // Group left the weighted set: removed entirely, or emptied out.
+        let removed: Vec<String> = b
+            .keys()
+            .filter(|name| !a.contains_key(*name))
+            .cloned()
+            .collect();
+
+        // Weighted group whose membership list changed.
+        let changed: Vec<String> = a
+            .iter()
+            .filter_map(|(name, now)| {
+                let was = b.get(name)?;
+                if was == now {
+                    return None;
+                }
+                let grew: Vec<&String> = now.difference(was).collect();
+                let shrank: Vec<&String> = was.difference(now).collect();
+                let mut parts = Vec::new();
+                if !grew.is_empty() {
+                    parts.push(format!(
+                        "+{}",
+                        grew.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !shrank.is_empty() {
+                    parts.push(format!(
+                        "-{}",
+                        shrank
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Some(format!("{name} {}", parts.join(" ")))
+            })
+            .collect();
+
         if !added.is_empty() {
             changes.push(Change {
                 field: "security.access_alignment.root_equivalent_groups".into(),
@@ -316,6 +377,14 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
                 before: Some(removed.join(", ")),
                 after: None,
                 severity: Severity::Improved,
+            });
+        }
+        if !changed.is_empty() {
+            changes.push(Change {
+                field: "security.access_alignment.root_equivalent_groups".into(),
+                before: None,
+                after: Some(changed.join(", ")),
+                severity: Severity::Changed,
             });
         }
     }

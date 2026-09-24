@@ -112,6 +112,11 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
 // root by another name, no sudoers policy involved. `false` entries (sudo,
 // wheel) are inventoried for completeness but gated by sudoers, which is
 // already audited separately.
+//
+// A group with no members grants root to nobody. It is still inventoried
+// (present in JSON, drift-tracked), but `bypasses_sudo` stays false until
+// someone is actually added — otherwise an empty `disk` or `lxd` fires
+// SEC-061 for a risk that does not exist yet.
 const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
     (
         "sudo",
@@ -163,10 +168,13 @@ pub(crate) fn root_equivalent_groups_from(path: &str) -> Vec<RootEquivalentGroup
             .map(String::from)
             .collect();
         members.sort();
+        // Empty group → inventoried, not weighted. Same treatment as
+        // sudo/wheel: present in the report, absent from SEC-061.
+        let effective_bypasses = *bypasses && !members.is_empty();
         out.push(RootEquivalentGroup {
             group: name.to_string(),
             members,
-            bypasses_sudo: *bypasses,
+            bypasses_sudo: effective_bypasses,
             ..Default::default()
         });
     }
@@ -376,6 +384,21 @@ mod tests {
         let groups = root_equivalent_groups_from(p.to_str().unwrap());
         assert_eq!(groups.len(), 1);
         assert!(groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn bypassing_group_with_no_members_is_not_weighted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "disk:x:6:\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "disk");
+        assert!(groups[0].members.is_empty());
+        assert!(
+            !groups[0].bypasses_sudo,
+            "empty group grants root to nobody — must not be weighted by SEC-061"
+        );
     }
 
     #[test]
