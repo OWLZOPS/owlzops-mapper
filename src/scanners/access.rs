@@ -117,6 +117,12 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
 // (present in JSON, drift-tracked), but `bypasses_sudo` stays false until
 // someone is actually added — otherwise an empty `disk` or `lxd` fires
 // SEC-061 for a risk that does not exist yet.
+//
+// R34-01: `shadow` is inventoried but not weighted. Reading /etc/shadow
+// is credential exposure (offline cracking), not a path into root: the
+// class SEC-061 models is "passwordless root", and a hash read does not
+// belong to it. Kept in the inventory for drift (R34-02 tracks every
+// inventoried group), just not charged as root-equivalent.
 const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
     (
         "sudo",
@@ -133,7 +139,11 @@ const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
     ("lxd", true, "lxd daemon is root-equivalent"),
     ("libvirt", true, "libvirt/qemu is root-equivalent"),
     ("disk", true, "raw block device read/write"),
-    ("shadow", true, "read access to /etc/shadow (hashes)"),
+    (
+        "shadow",
+        false,
+        "read access to /etc/shadow (hashes) — credential exposure, not a root path",
+    ),
 ];
 
 pub fn root_equivalent_groups() -> Vec<RootEquivalentGroup> {
@@ -374,6 +384,24 @@ mod tests {
         let groups = root_equivalent_groups_from(p.to_str().unwrap());
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|g| !g.bypasses_sudo));
+    }
+
+    #[test]
+    fn shadow_is_inventoried_but_not_weighted() {
+        // R34-01: reading /etc/shadow hashes is credential exposure, not a
+        // passwordless-root path. Membership must appear in the inventory
+        // (Raw Truth) but never carry SEC-061 weight.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "shadow:x:42:ops\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "shadow");
+        assert_eq!(groups[0].members, vec!["ops"]);
+        assert!(
+            !groups[0].bypasses_sudo,
+            "shadow membership is credential exposure, not a root path"
+        );
     }
 
     #[test]
