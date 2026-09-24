@@ -209,7 +209,7 @@ An array of objects, one per detected database engine.
 | `access_alignment.root_equivalent_groups` | array of objects | Groups from `/etc/group` whose membership grants root-equivalent access. R33-QW-7. |
 | `access_alignment.root_equivalent_groups[].group` | string | Group name as it appears in `/etc/group` |
 | `access_alignment.root_equivalent_groups[].members` | array of strings | Supplementary members, sorted |
-| `access_alignment.root_equivalent_groups[].bypasses_sudo` | boolean | `true` = root-equivalent without sudoers, weighted by SEC-061. `false` = inventoried only (sudo, wheel) |
+| `access_alignment.root_equivalent_groups[].bypasses_sudo` | boolean | `true` = membership grants passwordless root without sudoers, so SEC-061 weighs it: docker, podman, lxd, libvirt, disk. `false` = inventoried only: empty groups (nobody has root), sudo/wheel (gated by sudoers), shadow (hash read is credential exposure, not a root path). R34-01: SEC-061 carries the class weight only when SEC-005/SEC-012 do not. |
 | `access_alignment.coverage_warnings` | array of strings | Warnings from access audit |
 | `secret_hygiene` | array of objects | Detected secret leaks in process memory |
 | `secret_hygiene[].pid` | integer | PID of the process |

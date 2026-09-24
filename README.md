@@ -329,8 +329,8 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Pending security updates | +20 (stepped: 10/15/20 by count) |
 | No backup tools detected | +20 |
 | SSL certificate expires within 7 days | +15 (max) |
-| Sudo NOPASSWD entries found | +5 (restricted commands) / +15 (ALL) |
-| **SEC-061** – Root-equivalent group membership outside sudoers policy | **+10** |
+| Sudo NOPASSWD entries found | +5 (restricted commands) / +15 (ALL). R34-01: when SEC-012 also fires on the same sudoers line, SEC-005 drops to +5 (plain tier) — the passwordless-root class is charged once |
+| **SEC-061** – Passwordless root via group membership (bypasses sudo auth) | **+15** (weight 0 when SEC-005 or SEC-012 already carry the same class) |
 | SSH password authentication enabled | +10 |
 | Failed systemd services | +10 |
 | OOM kills present | +10 |
