@@ -14,6 +14,11 @@ pub const RISK_NO_BACKUP: u8 = 20;
 pub const RISK_NTP_NOT_SYNCED: u8 = 10;
 pub const RISK_SUDOERS_MODE: u8 = 5;
 pub const RISK_SYSCTL_PER_ISSUE: u8 = 5;
+/// R34-01: one risk class — a non-root principal holds a passwordless root
+/// path (sudoers NOPASSWD: ALL / privesc-capable NOPASSWD, or a group whose
+/// socket/device bypasses sudoers). Carried by exactly one weighted finding
+/// per host, priority SEC-012 > SEC-005 > SEC-061. Flat, like every class.
+pub const RISK_PASSWORDLESS_ROOT: u8 = 15;
 
 pub const SYSCTL_CRITICAL_THRESHOLD: usize = 3;
 
@@ -47,8 +52,12 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 /// v15 (unreleased): SEC-005 now fires on `Defaults !authenticate` (R33-04)
 /// and `self_sudo_target` no longer excludes multi-command rules (R33-03) —
 /// the same sudoers input can score differently, so pairs spanning this
-/// version are a collection-semantics change, not drift (R33-12). Tag the
-/// release number when the version actually ships; do not backfill it here.
+/// version are a collection-semantics change, not drift (R33-12). Also:
+/// SEC-061 added (R33-QW-7); SEC-005's ALL/PRIVESC tier, SEC-012 and SEC-061
+/// form one passwordless-root class carried by a single weighted finding
+/// (R34-01) — multi-carrier hosts score lower, SEC-061-only hosts +5. Tag
+/// the release number when the version actually ships; do not backfill it
+/// here.
 pub const SCORING_VERSION: u8 = 15;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
@@ -264,13 +273,45 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // R34-01: passwordless-root class carriers, computed once. SEC-012 is the
+    // principal-attributed carrier; SEC-005's ALL/PRIVESC tier carries the
+    // class only when SEC-012 is silent; SEC-061 only when both are.
+    let prp_sec012 = !report
+        .security
+        .access_alignment
+        .sudoers_nopasswd_all
+        .is_empty();
+    // R26-19: scanner already resolved aliases; do not re-parse.
+    let is_root_path = |entry: &String| {
+        entry.contains(crate::models::SUDO_ALL_MARKER)
+            || entry.contains(crate::models::SUDO_PRIVESC_MARKER)
+    };
+    let prp_sec005 = report
+        .security
+        .sudo_nopasswd_entries
+        .iter()
+        .any(is_root_path);
+
     if !report.security.sudo_nopasswd_entries.is_empty() {
-        let has_all = report.security.sudo_nopasswd_entries.iter().any(|entry| {
-            // R26-19: scanner already resolved aliases; do not re-parse.
-            entry.contains(crate::models::SUDO_ALL_MARKER)
-                || entry.contains(crate::models::SUDO_PRIVESC_MARKER)
-        });
-        let weight = if has_all { 15 } else { 5 };
+        let has_plain = report
+            .security
+            .sudo_nopasswd_entries
+            .iter()
+            .any(|e| !is_root_path(e));
+        let (weight, suppressed) = match (prp_sec005, prp_sec012, has_plain) {
+            (false, _, _) => (5, None),
+            (true, false, _) => (RISK_PASSWORDLESS_ROOT, None),
+            // Class carried by SEC-012; plain NOPASSWD entries keep the base tier.
+            (true, true, true) => (5, None),
+            (true, true, false) => (
+                0,
+                Some(
+                    "Every NOPASSWD entry is a passwordless-root path already weighted \
+                     by SEC-012 for the same sudoers input (R34-01)."
+                        .to_string(),
+                ),
+            ),
+        };
         findings.push(Finding {
             id: "SEC-005",
             source: Scanner::Security,
@@ -281,7 +322,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 "{} NOPASSWD entries in sudoers",
                 report.security.sudo_nopasswd_entries.len()
             ),
-            suppressed: None,
+            suppressed,
             cis_ref: Some("CIS 5.4.2"),
         });
     }
@@ -405,7 +446,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             source: Scanner::Security,
             title: "Passwordless sudo to ALL commands".to_string(),
             category: Category::Security,
-            weight: 15,
+            weight: RISK_PASSWORDLESS_ROOT,
             evidence: format!(
                 "{} principal(s) with NOPASSWD: ALL",
                 report.security.access_alignment.sudoers_nopasswd_all.len()
@@ -413,6 +454,55 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
             suppressed: None,
             cis_ref: Some("CIS 5.3"),
         });
+    }
+
+    // R33-QW-7 / R34-01: SEC-061 — membership in a group whose control socket
+    // or device bypasses sudoers. Same capability as `NOPASSWD: ALL` without
+    // sudo's audit trail, so it shares the class weight and carries it only
+    // when no sudoers carrier did. Suppressed ≠ hidden: the inventory table
+    // and JSON are unaffected; new members surface as Degraded drift.
+    {
+        let escalations: Vec<String> = report
+            .security
+            .access_alignment
+            .root_equivalent_groups
+            .iter()
+            .filter(|g| g.bypasses_sudo)
+            .map(|g| format!("{}: {}", g.group, g.members.join(", ")))
+            .collect();
+        if !escalations.is_empty() {
+            let carrier = if prp_sec012 {
+                Some("SEC-012")
+            } else if prp_sec005 {
+                Some("SEC-005")
+            } else {
+                None
+            };
+            let (weight, suppressed) = match carrier {
+                None => (RISK_PASSWORDLESS_ROOT, None),
+                Some(id) => (
+                    0,
+                    Some(format!(
+                        "Passwordless-root class already weighted by {id} on this host \
+                         (R34-01); members listed for review, additions tracked as drift."
+                    )),
+                ),
+            };
+            findings.push(Finding {
+                id: "SEC-061",
+                source: Scanner::Security,
+                title: "Passwordless root via group membership (bypasses sudo auth)".to_string(),
+                category: Category::Security,
+                weight,
+                evidence: format!(
+                    "{} — members get root through the group's socket/device without \
+                     sudo authentication",
+                    evidence_list(&escalations, 6)
+                ),
+                suppressed,
+                cis_ref: None,
+            });
+        }
     }
 
     let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
@@ -1355,6 +1445,40 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                     "Unsigned or out-of-tree modules are normal for third-party drivers \
                      (nvidia, dkms, virtualbox). This escalates to a weighted finding only when \
                      correlated with a hidden module (SEC-040) or when it appears as drift."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
+    }
+
+    // R33-QW-6: SEC-060 — CPU speculative-execution mitigations. Weight 0:
+    // `mitigations=off` is a deliberate performance trade on some fleets.
+    // A mitigation that was on at baseline and is off now is what matters,
+    // and that is a drift signal, not a point-in-time weight.
+    {
+        let unmitigated: Vec<String> = report
+            .security
+            .cpu_vulnerabilities
+            .iter()
+            .filter(|v| v.vulnerable)
+            .map(|v| format!("{}: {}", v.name, v.status))
+            .collect();
+        if !unmitigated.is_empty() {
+            findings.push(Finding {
+                id: "SEC-060",
+                source: Scanner::Security,
+                title: "CPU speculative-execution mitigations disabled or absent".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: format!(
+                    "{} unmitigated: {}",
+                    unmitigated.len(),
+                    evidence_list(&unmitigated, 6)
+                ),
+                suppressed: Some(
+                    "Informational: `mitigations=off` is a deliberate performance trade on \
+                     some fleets. Escalates only as drift (a mitigation that was on and went off)."
                         .to_string(),
                 ),
                 cis_ref: None,
@@ -2820,7 +2944,9 @@ impl CriticalFlags {
             critical_ssl: has("SEC-004"),
             failed_services: has("REL-001"),
             no_backups: has("REL-002"),
-            sudo_nopasswd: has("SEC-005"),
+            // R34-01: SEC-005 is suppressed when SEC-012 carries the same
+            // sudoers input; the exit-code flag must not flip with it.
+            sudo_nopasswd: has("SEC-005") || has("SEC-012"),
             ntp_not_synced: has("HYG-001"),
             sysctl_issues_count: count_sysctl,
             compromised_host: IOC_IDS.iter().any(|&id| has(id)),
@@ -2962,6 +3088,101 @@ mod tests {
             packages: PackagesInfo::default(),
         }
     }
+
+    // ── R34-01: passwordless-root class carried once ───────────────────
+    fn prp_weight(r: &AgentReport) -> u32 {
+        evaluate(r)
+            .iter()
+            .filter(|f| matches!(f.id, "SEC-005" | "SEC-012" | "SEC-061"))
+            .filter(|f| f.suppressed.is_none())
+            .map(|f| u32::from(f.weight))
+            .sum()
+    }
+
+    fn nopasswd_all(r: &mut AgentReport, principal: &str) {
+        r.security.sudo_nopasswd_entries = vec![format!(
+            "/etc/sudoers.d/90-{principal}: {principal} ALL=(ALL) NOPASSWD: ALL {}",
+            crate::models::SUDO_ALL_MARKER
+        )];
+        r.security.access_alignment.sudoers_nopasswd_all = vec![SudoersEntry {
+            principal: principal.into(),
+            source_file: format!("/etc/sudoers.d/90-{principal}"),
+            scope: "ALL".into(),
+        }];
+    }
+
+    fn bypass_group(r: &mut AgentReport, group: &str, members: &[&str]) {
+        r.security
+            .access_alignment
+            .root_equivalent_groups
+            .push(RootEquivalentGroup {
+                group: group.into(),
+                members: members.iter().map(|m| (*m).into()).collect(),
+                bypasses_sudo: true,
+                ..Default::default()
+            });
+    }
+
+    #[test]
+    fn three_carriers_pay_the_class_once() {
+        let mut r = minimal_report();
+        nopasswd_all(&mut r, "deploy");
+        bypass_group(&mut r, "docker", &["matrix", "veri_deploy"]);
+        assert_eq!(prp_weight(&r), u32::from(RISK_PASSWORDLESS_ROOT));
+        let findings = evaluate(&r);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.id == "SEC-061" && f.suppressed.is_some()),
+            "SEC-061 still emitted, carried by SEC-012"
+        );
+        assert!(
+            CriticalFlags::from_findings(&findings).sudo_nopasswd,
+            "suppressing SEC-005 must not flip the exit-code flag"
+        );
+    }
+
+    #[test]
+    fn sec005_privesc_tier_carries_and_sec061_yields() {
+        let mut r = minimal_report();
+        r.security.sudo_nopasswd_entries = vec![format!(
+            "/etc/sudoers.d/svc: svc ALL=NOPASSWD: /opt/svc/bin/* {}",
+            crate::models::SUDO_PRIVESC_MARKER
+        )];
+        bypass_group(&mut r, "docker", &["ops"]);
+        assert_eq!(prp_weight(&r), u32::from(RISK_PASSWORDLESS_ROOT));
+    }
+
+    #[test]
+    fn bypass_group_alone_carries_the_class() {
+        let mut r = minimal_report();
+        bypass_group(&mut r, "libvirt", &["ops"]);
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-061")
+            .expect("SEC-061 fires");
+        assert_eq!(
+            (f.weight, f.suppressed.is_none()),
+            (RISK_PASSWORDLESS_ROOT, true)
+        );
+    }
+
+    #[test]
+    fn plain_nopasswd_keeps_base_tier_when_sec012_carries() {
+        let mut r = minimal_report();
+        nopasswd_all(&mut r, "deploy");
+        r.security.sudo_nopasswd_entries.push(
+            "/etc/sudoers.d/10-ops: ops ALL=NOPASSWD: /usr/bin/systemctl restart nginx".into(),
+        );
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-005")
+            .expect("SEC-005 fires");
+        assert_eq!((f.weight, f.suppressed.is_none()), (5, true));
+        assert_eq!(prp_weight(&r), u32::from(RISK_PASSWORDLESS_ROOT) + 5);
+    }
+
+    // ── existing tests below ────────────────────────────────────────────
 
     fn rel_container(name: &str) -> ContainerInfo {
         ContainerInfo {

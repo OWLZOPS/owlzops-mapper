@@ -250,6 +250,145 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         });
     }
 
+    // --- security.cpu_vulnerabilities (R33-QW-6) ---
+    {
+        fn index(r: &AgentReport) -> HashMap<&str, bool> {
+            r.security
+                .cpu_vulnerabilities
+                .iter()
+                .map(|v| (v.name.as_str(), v.vulnerable))
+                .collect()
+        }
+        let (b, a) = (index(before), index(after));
+        for (name, &now) in &a {
+            if let Some(&was) = b.get(name)
+                && was != now
+            {
+                changes.push(Change {
+                    field: "security.cpu_vulnerabilities".into(),
+                    before: Some(format!(
+                        "{name}: {}",
+                        if was { "vulnerable" } else { "mitigated" }
+                    )),
+                    after: Some(if now {
+                        "vulnerable".into()
+                    } else {
+                        "mitigated".into()
+                    }),
+                    severity: if now {
+                        Severity::Degraded
+                    } else {
+                        Severity::Improved
+                    },
+                });
+            }
+        }
+    }
+
+    // --- security.access_alignment.root_equivalent_groups (R33-QW-7 drift) ---
+    //
+    // Only groups with bypasses_sudo=true are tracked: they are the ones
+    // that grant root without going through sudoers. An empty bypassing
+    // group (see scanners::access) is inventoried with bypasses_sudo=false
+    // and is not a security event on its own — it becomes one the moment
+    // a member is added, which flips the group into this map.
+    {
+        use std::collections::{BTreeMap, BTreeSet};
+        let index = |r: &AgentReport| -> BTreeMap<String, BTreeSet<String>> {
+            r.security
+                .access_alignment
+                .root_equivalent_groups
+                .iter()
+                .filter(|g| g.bypasses_sudo)
+                .map(|g| (g.group.clone(), g.members.iter().cloned().collect()))
+                .collect()
+        };
+        let (b, a) = (index(before), index(after));
+
+        // Group entered the weighted set: either genuinely new, or it was
+        // inventoried empty and gained its first member.
+        let added: Vec<String> = a
+            .iter()
+            .filter(|(name, _)| !b.contains_key(*name))
+            .map(|(name, members)| {
+                if members.is_empty() {
+                    name.clone()
+                } else {
+                    format!(
+                        "{name} [{}]",
+                        members.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                }
+            })
+            .collect();
+
+        // Group left the weighted set: removed entirely, or emptied out.
+        let removed: Vec<String> = b
+            .keys()
+            .filter(|name| !a.contains_key(*name))
+            .cloned()
+            .collect();
+
+        // Weighted group whose membership list changed.
+        let changed: Vec<String> = a
+            .iter()
+            .filter_map(|(name, now)| {
+                let was = b.get(name)?;
+                if was == now {
+                    return None;
+                }
+                let grew: Vec<&String> = now.difference(was).collect();
+                let shrank: Vec<&String> = was.difference(now).collect();
+                let mut parts = Vec::new();
+                if !grew.is_empty() {
+                    parts.push(format!(
+                        "+{}",
+                        grew.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !shrank.is_empty() {
+                    parts.push(format!(
+                        "-{}",
+                        shrank
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Some(format!("{name} {}", parts.join(" ")))
+            })
+            .collect();
+
+        if !added.is_empty() {
+            changes.push(Change {
+                field: "security.access_alignment.root_equivalent_groups".into(),
+                before: None,
+                after: Some(added.join(", ")),
+                severity: Severity::Degraded,
+            });
+        }
+        if !removed.is_empty() {
+            changes.push(Change {
+                field: "security.access_alignment.root_equivalent_groups".into(),
+                before: Some(removed.join(", ")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+        if !changed.is_empty() {
+            changes.push(Change {
+                field: "security.access_alignment.root_equivalent_groups".into(),
+                before: None,
+                after: Some(changed.join(", ")),
+                severity: Severity::Changed,
+            });
+        }
+    }
+
     // Sudden package count change (possible supply-chain signal)
     if before.packages.installed_count != after.packages.installed_count {
         let sev = if after.packages.installed_count > before.packages.installed_count + 50 {

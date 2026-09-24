@@ -206,6 +206,10 @@ An array of objects, one per detected database engine.
 | `access_alignment.sudoers_nopasswd_all[].principal` | string | User or group |
 | `access_alignment.sudoers_nopasswd_all[].source_file` | string | Sudoers file path |
 | `access_alignment.sudoers_nopasswd_all[].scope` | string | Command scope |
+| `access_alignment.root_equivalent_groups` | array of objects | Groups from `/etc/group` whose membership grants root-equivalent access. R33-QW-7. |
+| `access_alignment.root_equivalent_groups[].group` | string | Group name as it appears in `/etc/group` |
+| `access_alignment.root_equivalent_groups[].members` | array of strings | Supplementary members, sorted |
+| `access_alignment.root_equivalent_groups[].bypasses_sudo` | boolean | `true` = root-equivalent without sudoers, weighted by SEC-061. `false` = inventoried only (sudo, wheel) |
 | `access_alignment.coverage_warnings` | array of strings | Warnings from access audit |
 | `secret_hygiene` | array of objects | Detected secret leaks in process memory |
 | `secret_hygiene[].pid` | integer | PID of the process |
@@ -314,6 +318,10 @@ An array of objects, one per detected database engine.
 | `kernel_taint.flags[].name` | string | Human description |
 | `kernel_taint.flags[].security_relevant` | boolean | Whether the flag is security‑relevant |
 | `kernel_taint.unavailable` | boolean | True if the file was unreadable |
+| `cpu_vulnerabilities` | array of objects | One entry per file under `/sys/devices/system/cpu/vulnerabilities/`. R33-QW-6. |
+| `cpu_vulnerabilities[].name` | string | CVE-family from the filename: `spectre_v2`, `mds`, `retbleed`, ... |
+| `cpu_vulnerabilities[].status` | string | Kernel verdict verbatim: `"Not affected"` / `"Mitigation: ..."` / `"Vulnerable..."` |
+| `cpu_vulnerabilities[].vulnerable` | boolean | `true` when `status` starts with `"Vulnerable"` - mitigation off or absent. Drift: on→off = Degraded, off→on = Improved. Finding SEC-060, weight 0. |
 | `confinement` | object | LSM confinement state |
 | `confinement.lsms` | array of strings | Active LSMs |
 | `confinement.selinux_permissive` | boolean | SELinux is loaded but in permissive mode |

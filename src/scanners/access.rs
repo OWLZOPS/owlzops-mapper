@@ -1,4 +1,4 @@
-use crate::models::{AccessAuditResult, SshKeyAudit, SudoersEntry};
+use crate::models::{AccessAuditResult, RootEquivalentGroup, SshKeyAudit, SudoersEntry};
 use russh::keys::ssh_key::{Algorithm, EcdsaCurve, PublicKey};
 
 // ── Unified sudoers parser (R16 hardening) ────────────────────────────────
@@ -17,6 +17,9 @@ const KEY_TYPES: &[&str] = &[
 
 /// ~4000 keys at 256 B — anything larger is either abuse or a typo.
 pub(crate) const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
+
+/// /etc/group is small; 1 MiB is generous and matches the capped-I/O doctrine.
+const CAP_GROUP_FILE: usize = 1024 * 1024;
 
 fn strip_options(line: &str) -> Option<String> {
     let toks: Vec<&str> = line.split_whitespace().collect();
@@ -100,6 +103,93 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
         compliant,
         reason,
     })
+}
+
+// ── R33-QW-7: root-equivalent groups ──────────────────────────────────────
+//
+// Inventory of /etc/group memberships that grant root-equivalent access.
+// `bypasses_sudo = true` entries are weighted by SEC-061: membership is
+// root by another name, no sudoers policy involved. `false` entries (sudo,
+// wheel) are inventoried for completeness but gated by sudoers, which is
+// already audited separately.
+//
+// A group with no members grants root to nobody. It is still inventoried
+// (present in JSON, drift-tracked), but `bypasses_sudo` stays false until
+// someone is actually added — otherwise an empty `disk` or `lxd` fires
+// SEC-061 for a risk that does not exist yet.
+//
+// R34-01: `shadow` is inventoried but not weighted. Reading /etc/shadow
+// is credential exposure (offline cracking), not a path into root: the
+// class SEC-061 models is "passwordless root", and a hash read does not
+// belong to it. Kept in the inventory for drift (R34-02 tracks every
+// inventoried group), just not charged as root-equivalent.
+const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
+    (
+        "sudo",
+        false,
+        "sudoers policy — inventoried, gated by sudoers",
+    ),
+    (
+        "wheel",
+        false,
+        "BSD-style admin group — inventoried, gated by sudoers",
+    ),
+    ("docker", true, "docker socket is root-equivalent"),
+    ("podman", true, "podman socket is root-equivalent"),
+    ("lxd", true, "lxd daemon is root-equivalent"),
+    ("libvirt", true, "libvirt/qemu is root-equivalent"),
+    ("disk", true, "raw block device read/write"),
+    (
+        "shadow",
+        false,
+        "read access to /etc/shadow (hashes) — credential exposure, not a root path",
+    ),
+];
+
+pub fn root_equivalent_groups() -> Vec<RootEquivalentGroup> {
+    root_equivalent_groups_from("/etc/group")
+}
+
+pub(crate) fn root_equivalent_groups_from(path: &str) -> Vec<RootEquivalentGroup> {
+    let Ok((content, _truncated)) = crate::safe_io::read_file_capped_regular(path, CAP_GROUP_FILE)
+    else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<RootEquivalentGroup> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // name:passwd:gid:member1,member2,...
+        let cols: Vec<&str> = line.splitn(4, ':').collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let name = cols[0];
+        let Some((_, bypasses, _)) = ROOT_EQUIVALENT.iter().find(|(n, _, _)| *n == name) else {
+            continue;
+        };
+        let mut members: Vec<String> = cols[3]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        members.sort();
+        // Empty group → inventoried, not weighted. Same treatment as
+        // sudo/wheel: present in the report, absent from SEC-061.
+        let effective_bypasses = *bypasses && !members.is_empty();
+        out.push(RootEquivalentGroup {
+            group: name.to_string(),
+            members,
+            bypasses_sudo: effective_bypasses,
+            ..Default::default()
+        });
+    }
+    out.sort_by(|a, b| a.group.cmp(&b.group));
+    out
 }
 
 pub fn gather_access_alignment(
@@ -210,6 +300,9 @@ pub fn gather_access_alignment(
         }
     }
 
+    // R33-QW-7: inventory root-equivalent group memberships.
+    result.root_equivalent_groups = root_equivalent_groups();
+
     result
 }
 
@@ -269,5 +362,86 @@ mod tests {
             .find(|e| e.scope.contains("Defaults"));
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().principal, "ALL");
+    }
+
+    #[test]
+    fn finds_known_group_with_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "docker:x:999:alice,bob\nnotroot:x:1000:carol\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "docker");
+        assert_eq!(groups[0].members, vec!["alice", "bob"]);
+        assert!(groups[0].bypasses_sudo);
+    }
+
+    #[test]
+    fn sudo_and_wheel_are_inventoried_but_not_weighted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "sudo:x:27:deploy\nwheel:x:10:ops\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| !g.bypasses_sudo));
+    }
+
+    #[test]
+    fn shadow_is_inventoried_but_not_weighted() {
+        // R34-01: reading /etc/shadow hashes is credential exposure, not a
+        // passwordless-root path. Membership must appear in the inventory
+        // (Raw Truth) but never carry SEC-061 weight.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "shadow:x:42:ops\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "shadow");
+        assert_eq!(groups[0].members, vec!["ops"]);
+        assert!(
+            !groups[0].bypasses_sudo,
+            "shadow membership is credential exposure, not a root path"
+        );
+    }
+
+    #[test]
+    fn empty_members_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "docker:x:999:\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn bypassing_group_with_no_members_is_not_weighted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        std::fs::write(&p, "disk:x:6:\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "disk");
+        assert!(groups[0].members.is_empty());
+        assert!(
+            !groups[0].bypasses_sudo,
+            "empty group grants root to nobody — must not be weighted by SEC-061"
+        );
+    }
+
+    #[test]
+    fn skips_malformed_and_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        // empty line, comment, too-few-columns, then a valid entry
+        std::fs::write(&p, "\n#docker:x:1:\nbroken\ndocker:x:999:\n").unwrap();
+        let groups = root_equivalent_groups_from(p.to_str().unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group, "docker");
+    }
+
+    #[test]
+    fn missing_file_is_empty() {
+        assert!(root_equivalent_groups_from("/nonexistent/group").is_empty());
     }
 }

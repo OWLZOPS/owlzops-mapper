@@ -664,6 +664,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         provenance_source,
         // ── NEW (SEC-038/039/040) ──
         kernel_taint: crate::scanners::kernel_taint::gather_kernel_taint(),
+        cpu_vulnerabilities: crate::scanners::kernel_facts::gather_cpu_vulnerabilities(),
         confinement: crate::scanners::confinement::gather_confinement(),
         kernel_modules: crate::scanners::kernel_modules::gather_kernel_modules(),
         // ── NEW (SEC-041) ──

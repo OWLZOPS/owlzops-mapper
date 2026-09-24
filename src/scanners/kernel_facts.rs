@@ -1,10 +1,12 @@
 // src/scanners/kernel_facts.rs
-// Collects three low-cost kernel security facts that are valuable for audit
+// Collects low-cost kernel security facts that are valuable for audit
 // reports and directly feed into the risk scoring.
 
 use crate::coverage;
+use crate::models::CpuVulnerability;
 use crate::safe_io;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Sysctls that can only become stricter (or stay the same) without a reboot.
 /// Weakening any of them between snapshots is either /proc tampering or a
@@ -115,4 +117,82 @@ pub fn gather_kernel_facts() -> (Option<String>, Option<bool>, Option<String>) {
     }
 
     (core_pattern, modules_disabled, lockdown)
+}
+
+// ── R33-QW-6: CPU speculative-execution mitigations ────────────────────────
+
+const CPU_VULN_DIR: &str = "/sys/devices/system/cpu/vulnerabilities";
+
+/// Read the kernel's own verdict for every CPU vulnerability family it
+/// exposes (`spectre_v2`, `mds`, `retbleed`, …). The file name is the
+/// family; the content is the kernel text — "Not affected", "Mitigation: …",
+/// or "Vulnerable…". We key on the `Vulnerable` prefix only; everything else
+/// is context a reader may want but the drift/scoring layer does not.
+pub fn gather_cpu_vulnerabilities() -> Vec<CpuVulnerability> {
+    gather_cpu_vulnerabilities_from(Path::new(CPU_VULN_DIR))
+}
+
+pub(crate) fn gather_cpu_vulnerabilities_from(dir: &Path) -> Vec<CpuVulnerability> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            coverage::record(format!(
+                "cpu vulnerabilities: {} unreadable ({}) — mitigation state UNKNOWN",
+                dir.display(),
+                e.kind()
+            ));
+            return Vec::new();
+        }
+    };
+    let mut out: Vec<CpuVulnerability> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let (status, _) = safe_io::read_procfs_capped(&e.path().to_string_lossy(), 512).ok()?;
+            let status = status.trim().to_string();
+            let vulnerable = status.starts_with("Vulnerable");
+            Some(CpuVulnerability {
+                name,
+                status,
+                vulnerable,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vulnerable_prefix_is_the_only_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("mds"),
+            "Vulnerable: Clear CPU buffers attempted, no microcode\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("meltdown"), "Mitigation: PTI\n").unwrap();
+        std::fs::write(tmp.path().join("l1tf"), "Not affected\n").unwrap();
+        let v = gather_cpu_vulnerabilities_from(tmp.path());
+        assert_eq!(
+            v.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
+            ["l1tf", "mds", "meltdown"]
+        );
+        assert!(
+            v.iter()
+                .filter(|x| x.vulnerable)
+                .map(|x| x.name.as_str())
+                .eq(["mds"])
+        );
+    }
+
+    #[test]
+    fn absent_directory_is_empty_not_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(gather_cpu_vulnerabilities_from(&tmp.path().join("none")).is_empty());
+    }
 }
