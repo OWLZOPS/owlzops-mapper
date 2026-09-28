@@ -464,6 +464,17 @@ pub struct SshdDirective {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
+pub struct ImmutableFlag {
+    /// Anchor as listed (may be a symlink, e.g. /etc/resolv.conf).
+    pub path: String,
+    /// Where the flags were actually read.
+    pub resolved: String,
+    pub immutable: bool,
+    pub append_only: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
 pub struct SecurityInfo {
     pub ssh_password_auth_enabled: bool,
     pub ssh_root_login_enabled: bool,
@@ -579,6 +590,12 @@ pub struct SecurityInfo {
     /// target is the finding (SEC-062).
     #[serde(default)]
     pub sshd_sensitive_directives: Vec<SshdDirective>,
+
+    /// QW-10: trust anchors carrying FS_IMMUTABLE_FL / FS_APPEND_FL.
+    /// Label, never a verdict: hardening guides set +i on purpose;
+    /// rootkits set it on /etc/ld.so.preload to survive remediation.
+    #[serde(default)]
+    pub immutable_anchors: Vec<ImmutableFlag>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
