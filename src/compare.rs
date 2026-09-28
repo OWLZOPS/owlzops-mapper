@@ -493,6 +493,34 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // --- security.sshd_sensitive_directives (QW-8 drift) ---
+    {
+        let index = |r: &AgentReport| -> HashSet<(String, String)> {
+            r.security
+                .sshd_sensitive_directives
+                .iter()
+                .map(|d| (d.directive.clone(), d.value.clone()))
+                .collect()
+        };
+        let (b, a) = (index(before), index(after));
+        for (k, v) in a.difference(&b) {
+            changes.push(Change {
+                field: "security.sshd_sensitive_directives".into(),
+                before: None,
+                after: Some(format!("{k} {v}")),
+                severity: Severity::Degraded,
+            });
+        }
+        for (k, v) in b.difference(&a) {
+            changes.push(Change {
+                field: "security.sshd_sensitive_directives".into(),
+                before: Some(format!("{k} {v}")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // R28-02: `process` is comm — mutable and spoofable (prctl(PR_SET_NAME)).
     // exe_path is the structural identity of the listener and must be diffed
     // independently. None = NOT OBSERVED (non-root scan), never "no path":

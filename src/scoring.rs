@@ -505,6 +505,58 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // QW-8 / SEC-062: sshd directives that let a non-root principal replace
+    // what sshd executes at login. Same class as a non-root-writable sudo
+    // target (SEC-005 PRIVESC tier): whoever can write the file root runs
+    // becomes root. Root-only targets are inventory.
+    {
+        let mut replaceable = Vec::new();
+        let mut present = Vec::new();
+        for d in &report.security.sshd_sensitive_directives {
+            let line = format!("{} {}", d.directive, d.value);
+            match d.writability {
+                Some(crate::models::ExecWritability::NonRootWritable) => replaceable.push(line),
+                // A free name under AuthorizedKeysCommand is the same class
+                // as a free NOPASSWD sudo target: whoever creates it gets in.
+                Some(crate::models::ExecWritability::Missing)
+                    if d.directive == "authorizedkeyscommand" =>
+                {
+                    replaceable.push(line)
+                }
+                _ => present.push(line),
+            }
+        }
+        if !replaceable.is_empty() {
+            findings.push(Finding {
+                id: "SEC-062",
+                source: Scanner::Security,
+                title: "sshd executes or trusts a target replaceable by a non-root user"
+                    .to_string(),
+                category: Category::Security,
+                weight: 30,
+                evidence: evidence_list(&replaceable, 4),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+        if !present.is_empty() {
+            findings.push(Finding {
+                id: "SEC-062",
+                source: Scanner::Security,
+                title: "sshd login-path directives present (inventory)".to_string(),
+                category: Category::Security,
+                weight: 0,
+                evidence: evidence_list(&present, 4),
+                suppressed: Some(
+                    "Root-only targets. AuthorizedKeysCommand/TrustedUserCAKeys are normal \
+                     with SSO or an SSH CA; review that the operator expects them."
+                        .to_string(),
+                ),
+                cis_ref: None,
+            });
+        }
+    }
+
     let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
     if !tiers.suspicious.is_empty() {
@@ -3180,6 +3232,31 @@ mod tests {
             .expect("SEC-005 fires");
         assert_eq!((f.weight, f.suppressed.is_none()), (5, true));
         assert_eq!(prp_weight(&r), u32::from(RISK_PASSWORDLESS_ROOT) + 5);
+    }
+
+    // ── QW-8 / SEC-062 ─────────────────────────────────────
+    #[test]
+    fn sec062_fires_on_non_root_writable_sshd_target() {
+        use crate::models::{ExecWritability, SshdDirective};
+        let mut r = minimal_report();
+        r.security.sshd_sensitive_directives = vec![SshdDirective {
+            directive: "authorizedkeyscommand".into(),
+            value: "/tmp/fetch-keys %u".into(),
+            target: Some("/tmp/fetch-keys".into()),
+            writability: Some(ExecWritability::NonRootWritable),
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-062" && f.suppressed.is_none())
+            .expect("SEC-062 weighted");
+        assert_eq!(f.weight, 30);
+
+        r.security.sshd_sensitive_directives[0].writability = Some(ExecWritability::RootOnly);
+        let inv = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-062" && f.suppressed.is_some())
+            .expect("SEC-062 inventory");
+        assert_eq!(inv.weight, 0);
     }
 
     // ── existing tests below ────────────────────────────────────────────

@@ -444,6 +444,24 @@ pub enum ProvenanceSource {
     Unavailable,
 }
 
+/// QW-8: a sensitive sshd directive found in the effective config, together
+/// with the file it names (when it names one) and how replaceable that file
+/// is by a non-root principal. Presence is inventory; `NonRootWritable` on
+/// the target is the finding (SEC-062).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct SshdDirective {
+    /// Lower-case, as `sshd -T` prints it.
+    pub directive: String,
+    pub value: String,
+    /// Absolute path the directive executes or trusts, when it has one.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Verdict for `target`, from `integrity::assess_writability`.
+    #[serde(default)]
+    pub writability: Option<ExecWritability>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct SecurityInfo {
@@ -554,6 +572,13 @@ pub struct SecurityInfo {
     /// absent (pre-4.15 kernel or an architecture without the export).
     #[serde(default)]
     pub cpu_vulnerabilities: Vec<CpuVulnerability>,
+
+    // ── QW-8: sshd login-path directives ─────────────────────────────────
+    /// QW-8: directives that change who logs in or what runs at login,
+    /// outside authorized_keys and PAM. Presence is inventory; a replaceable
+    /// target is the finding (SEC-062).
+    #[serde(default)]
+    pub sshd_sensitive_directives: Vec<SshdDirective>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1526,7 +1551,7 @@ fn field_level_default_wins_over_container_default() {
     // R28-10: field-level default must survive container-level default (fail-closed)
     // R28-04 gave ExecStartFinding a container-level #[serde(default)], whose
     // Default::default() yields runs_as_root == false. The field-level
-    // `default = "default_true"` must still win: false here is fail-OPEN —
+    // `default = "default_true"` must still win: false here is fail‑OPEN —
     // every pre-R23 snapshot would silently read as non-root and suppress
     // SEC-046. Removing the field attribute as "redundant" must break a test,
     // not a customer's history.
