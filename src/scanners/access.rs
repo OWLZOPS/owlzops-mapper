@@ -146,18 +146,57 @@ const ROOT_EQUIVALENT: &[(&str, bool, &str)] = &[
     ),
 ];
 
-pub fn root_equivalent_groups() -> Vec<RootEquivalentGroup> {
-    root_equivalent_groups_from("/etc/group")
+#[cfg(test)]
+pub(crate) fn root_equivalent_groups_from(path: &str) -> Vec<RootEquivalentGroup> {
+    root_equivalent_groups_scan(path).0
 }
 
-pub(crate) fn root_equivalent_groups_from(path: &str) -> Vec<RootEquivalentGroup> {
-    let Ok((content, _truncated)) = crate::safe_io::read_file_capped_regular(path, CAP_GROUP_FILE)
-    else {
-        return Vec::new();
+/// R34-03: inventory plus the coverage note explaining an empty or partial
+/// one. An unreadable /etc/group must not read as "no privileged groups".
+pub(crate) fn root_equivalent_groups_scan(
+    path: &str,
+) -> (Vec<RootEquivalentGroup>, Option<String>) {
+    use std::io::ErrorKind;
+    let (content, truncated) = match crate::safe_io::read_file_capped_regular(path, CAP_GROUP_FILE)
+    {
+        Ok(v) => v,
+        Err(e) if e.kind() == ErrorKind::InvalidData => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "{path} is NOT a regular file (fifo/device) — root-equivalent \
+                         group inventory refused; treat as tampering"
+                )),
+            );
+        }
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "{path} unreadable ({}) — root-equivalent group inventory EMPTY; \
+                         SEC-061 and group drift blind",
+                    e.kind()
+                )),
+            );
+        }
+    };
+
+    // A capped read can end mid-line: "docker:x:999:alice" cut to
+    // "docker:x:999:ali" would inventory a member that does not exist.
+    let (body, note) = if truncated {
+        (
+            content.rsplit_once('\n').map_or("", |(head, _)| head),
+            Some(format!(
+                "{path} exceeded {CAP_GROUP_FILE} B — root-equivalent group inventory \
+                 PARTIAL (trailing partial line dropped)"
+            )),
+        )
+    } else {
+        (&content[..], None)
     };
 
     let mut out: Vec<RootEquivalentGroup> = Vec::new();
-    for line in content.lines() {
+    for line in body.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -189,7 +228,7 @@ pub(crate) fn root_equivalent_groups_from(path: &str) -> Vec<RootEquivalentGroup
         });
     }
     out.sort_by(|a, b| a.group.cmp(&b.group));
-    out
+    (out, note)
 }
 
 pub fn gather_access_alignment(
@@ -300,8 +339,11 @@ pub fn gather_access_alignment(
         }
     }
 
-    // R33-QW-7: inventory root-equivalent group memberships.
-    result.root_equivalent_groups = root_equivalent_groups();
+    // R33-QW-7 / R34-03: inventory root-equivalent group memberships; an
+    // unreadable or truncated /etc/group is disclosed, never silently empty.
+    let (groups, note) = root_equivalent_groups_scan("/etc/group");
+    result.root_equivalent_groups = groups;
+    result.coverage_warnings.extend(note);
 
     result
 }
@@ -443,5 +485,28 @@ mod tests {
     #[test]
     fn missing_file_is_empty() {
         assert!(root_equivalent_groups_from("/nonexistent/group").is_empty());
+    }
+
+    #[test]
+    fn unreadable_group_file_is_disclosed_not_empty() {
+        let (groups, note) = root_equivalent_groups_scan("/nonexistent/group");
+        assert!(groups.is_empty());
+        assert!(note.is_some_and(|n| n.contains("unreadable")));
+    }
+
+    #[test]
+    fn truncated_group_file_drops_partial_tail_and_discloses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("group");
+        // One comment line ending 16 B before the cap, then a group line the
+        // cap cuts inside its member list.
+        let pad = format!("#{}\n", "x".repeat(CAP_GROUP_FILE - 18));
+        std::fs::write(&p, format!("{pad}docker:x:999:alice,bob\n")).unwrap();
+        let (groups, note) = root_equivalent_groups_scan(p.to_str().unwrap());
+        assert!(note.is_some_and(|n| n.contains("PARTIAL")));
+        assert!(
+            groups.iter().all(|g| g.group != "docker"),
+            "partial trailing line must not yield a fabricated member"
+        );
     }
 }
