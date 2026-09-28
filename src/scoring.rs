@@ -557,6 +557,48 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // QW-9 / SEC-063: authorized_keys environment= combined with
+    // PermitUserEnvironment=yes lets the login session inherit
+    // LD_PRELOAD / LD_LIBRARY_PATH from a key's options.
+    {
+        let pue =
+            report.security.sshd_sensitive_directives.iter().any(|d| {
+                d.directive == "permituserenvironment" && !d.value.eq_ignore_ascii_case("no")
+            });
+        let env_keys: Vec<String> = report
+            .security
+            .access_alignment
+            .keys
+            .iter()
+            .filter(|k| k.options.iter().any(|o| o.starts_with("environment=")))
+            .map(|k| format!("{} ({})", k.user, k.comment))
+            .collect();
+        if !env_keys.is_empty() {
+            let (weight, suppressed) = if pue {
+                (20, None)
+            } else {
+                (
+                    0,
+                    Some(
+                        "PermitUserEnvironment is off: sshd ignores environment= today; \
+                         it becomes live the moment that directive flips."
+                            .to_string(),
+                    ),
+                )
+            };
+            findings.push(Finding {
+                id: "SEC-063",
+                source: Scanner::Security,
+                title: "authorized_keys sets environment= (LD_PRELOAD at login)".to_string(),
+                category: Category::Security,
+                weight,
+                evidence: evidence_list(&env_keys, 6),
+                suppressed,
+                cis_ref: None,
+            });
+        }
+    }
+
     let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
     if !tiers.suspicious.is_empty() {
@@ -3275,6 +3317,42 @@ mod tests {
             // get a value chosen to satisfy an unrelated test.
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sec063_environment_key_fires_only_when_pue_is_on() {
+        use crate::models::{SshKeyAudit, SshdDirective};
+        let mut r = minimal_report();
+        r.security.access_alignment.keys = vec![SshKeyAudit {
+            user: "deploy".into(),
+            algorithm: "ed25519".into(),
+            bits: 256,
+            comment: "ci".into(),
+            compliant: true,
+            reason: None,
+            options: vec![r#"environment="LD_PRELOAD=/tmp/x.so""#.into()],
+        }];
+
+        // PUE off (absent): suppressed, weight 0.
+        let inv = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-063")
+            .expect("SEC-063 emitted");
+        assert_eq!(inv.weight, 0);
+        assert!(inv.suppressed.is_some());
+
+        // PUE on: weighted.
+        r.security.sshd_sensitive_directives = vec![SshdDirective {
+            directive: "permituserenvironment".into(),
+            value: "yes".into(),
+            target: None,
+            writability: None,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-063" && f.suppressed.is_none())
+            .expect("SEC-063 weighted");
+        assert_eq!(f.weight, 20);
     }
 
     #[test]

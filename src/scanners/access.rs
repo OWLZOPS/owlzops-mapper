@@ -21,10 +21,41 @@ pub(crate) const CAP_AUTHORIZED_KEYS: usize = 1024 * 1024;
 /// /etc/group is small; 1 MiB is generous and matches the capped-I/O doctrine.
 const CAP_GROUP_FILE: usize = 1024 * 1024;
 
-fn strip_options(line: &str) -> Option<String> {
+/// (options prefix, "keytype base64 comment"). Whitespace inside a quoted
+/// option value is collapsed to one space — enough to read `command=`.
+fn split_options(line: &str) -> Option<(String, String)> {
     let toks: Vec<&str> = line.split_whitespace().collect();
     let pos = toks.iter().position(|t| KEY_TYPES.contains(t))?;
-    Some(toks[pos..].join(" "))
+    Some((toks[..pos].join(" "), toks[pos..].join(" ")))
+}
+
+/// Split on commas outside double quotes:
+/// `command="echo a,b",no-pty,from="1.2.3.4"` → three options.
+pub(crate) fn parse_key_options(prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut escaped) = (false, false);
+    for c in prefix.chars() {
+        match (c, quoted, escaped) {
+            ('\\', true, false) => escaped = true,
+            ('"', _, false) => quoted = !quoted,
+            (',', false, _) => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+                continue;
+            }
+            _ => escaped = false,
+        }
+        cur.push(c);
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +107,7 @@ impl KeyPolicy {
 }
 
 fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudit> {
-    let stripped = strip_options(line)?;
+    let (opts, stripped) = split_options(line)?;
     let key = PublicKey::from_openssh(&stripped).ok()?;
     let comment = key.comment().to_string();
     let (algorithm, bits) = match key.algorithm() {
@@ -102,6 +133,7 @@ fn classify_key(user: &str, line: &str, policy: &KeyPolicy) -> Option<SshKeyAudi
         comment,
         compliant,
         reason,
+        options: parse_key_options(&opts),
     })
 }
 
@@ -508,5 +540,30 @@ mod tests {
             groups.iter().all(|g| g.group != "docker"),
             "partial trailing line must not yield a fabricated member"
         );
+    }
+
+    #[test]
+    fn key_options_split_respects_quotes() {
+        assert_eq!(
+            parse_key_options(r#"command="echo a,b",no-pty,from="10.0.0.0/8""#),
+            vec![r#"command="echo a,b""#, "no-pty", r#"from="10.0.0.0/8""#]
+        );
+        assert!(parse_key_options("").is_empty());
+        assert_eq!(
+            parse_key_options(r#"environment="LD_PRELOAD=/tmp/x.so""#).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn plain_key_has_no_options_and_still_parses() {
+        let key =
+            russh::keys::ssh_key::PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let line = key.public_key().to_openssh().unwrap();
+        let audit = classify_key("deploy", &line, &KeyPolicy::default()).expect("parses");
+        assert!(audit.options.is_empty());
+        let with = format!(r#"no-pty,command="/bin/false" {line}"#);
+        let audit = classify_key("deploy", &with, &KeyPolicy::default()).expect("parses");
+        assert_eq!(audit.options, vec!["no-pty", r#"command="/bin/false""#]);
     }
 }
