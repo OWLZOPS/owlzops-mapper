@@ -1,4 +1,4 @@
-use crate::models::{SecurityInfo, UserInfo};
+use crate::models::{SecurityInfo, SshdDirective, UserInfo};
 use crate::{coverage, safe_io};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -30,8 +30,73 @@ fn parse_sshd_directive(config: &str, directive: &str) -> Option<String> {
     })
 }
 
-/// Fallback used when `sshd -T` is unavailable.
-fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
+// ── QW-8: sensitive sshd directives ──────────────────────────────────────
+
+/// Directives that change who logs in or what sshd executes at login,
+/// outside authorized_keys and PAM. Presence is inventory; a target
+/// writable by a non-root principal is the finding (SEC-062).
+const SSHD_SENSITIVE: &[&str] = &[
+    "authorizedkeyscommand",
+    "authorizedkeyscommanduser",
+    "forcecommand",
+    "permituserenvironment",
+    "trustedusercakeys",
+    "authorizedprincipalsfile",
+    "subsystem",
+];
+
+fn sshd_directive_target(directive: &str, value: &str) -> Option<String> {
+    match directive {
+        "subsystem" => value.split_whitespace().nth(1),
+        "authorizedkeyscommand"
+        | "forcecommand"
+        | "trustedusercakeys"
+        | "authorizedprincipalsfile" => value.split_whitespace().next(),
+        _ => None,
+    }
+    .filter(|p| p.starts_with('/'))
+    .map(str::to_string)
+}
+
+/// Works on `sshd -T` output and on the fallback line set alike (both are
+/// "key value…"). Match blocks are the caller's problem: the fallback stops
+/// at the first Match, `sshd -T` has already resolved them.
+fn sshd_sensitive_directives<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<SshdDirective> {
+    let mut out = Vec::new();
+    for line in lines {
+        let mut parts = line.trim().splitn(2, char::is_whitespace);
+        let Some(key) = parts.next() else { continue };
+        let key = key.to_ascii_lowercase();
+        if !SSHD_SENSITIVE.contains(&key.as_str()) {
+            continue;
+        }
+        let value = parts.next().unwrap_or("").trim().to_string();
+        // Defaults `sshd -T` always prints are not inventory.
+        if (key == "permituserenvironment" && value.eq_ignore_ascii_case("no"))
+            || (key == "forcecommand" && value.eq_ignore_ascii_case("none"))
+            || (key == "authorizedkeyscommand" && value.eq_ignore_ascii_case("none"))
+            || (key == "trustedusercakeys" && value.eq_ignore_ascii_case("none"))
+        {
+            continue;
+        }
+        let target = sshd_directive_target(&key, &value);
+        let writability = target
+            .as_deref()
+            .map(|t| crate::scanners::integrity::assess_writability(std::path::Path::new(t)));
+        out.push(SshdDirective {
+            directive: key,
+            value,
+            target,
+            writability,
+        });
+    }
+    out
+}
+
+/// Fallback used when `sshd -T` is unavailable. Returns the directive lines
+/// that precede the first `Match` block, so the caller can run the same
+/// sensitive-directive scan over them.
+fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) -> Vec<String> {
     let mut config_lines = Vec::new();
 
     // Read the main config file.
@@ -181,6 +246,20 @@ fn fallback_parse_main_config(pass_auth: &mut bool, root_login: &mut bool) {
             break;
         }
     }
+
+    // QW-8: pre-Match lines only, for the sensitive-directive scan. After
+    // Match, everything is conditional and R22-04's coverage fact already
+    // says the fallback does not evaluate those conditions.
+    let unconditional = config_lines
+        .iter()
+        .position(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|k| k.eq_ignore_ascii_case("match"))
+        })
+        .unwrap_or(config_lines.len());
+    config_lines.truncate(unconditional);
+    config_lines
 }
 
 /// Determine if an IP address is local (loopback, private, unspecified).
@@ -389,6 +468,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         ssh_root_login_enabled,
         ssh_permit_root_detail,
         ssh_config_source,
+        sshd_sensitive,
     ) = match sshd_effective_config() {
         Some(config) => {
             let pwd = parse_sshd_directive(&config, "passwordauthentication")
@@ -398,12 +478,20 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
                 .map(|v| !v.eq_ignore_ascii_case("no"))
                 .unwrap_or(true);
             let root_detail = parse_sshd_directive(&config, "permitrootlogin");
-            (pwd, root, root_detail, "sshd -T (effective)".to_string())
+            let sensitive = sshd_sensitive_directives(config.lines());
+            (
+                pwd,
+                root,
+                root_detail,
+                "sshd -T (effective)".to_string(),
+                sensitive,
+            )
         }
         None => {
             let mut pwd = true;
             let mut root_login = true;
-            fallback_parse_main_config(&mut pwd, &mut root_login);
+            let lines = fallback_parse_main_config(&mut pwd, &mut root_login);
+            let sensitive = sshd_sensitive_directives(lines.iter().map(String::as_str));
             // Fallback does not provide raw value; derive from boolean.
             let root_detail = if root_login {
                 Some("yes".to_string())
@@ -415,6 +503,7 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
                 root_login,
                 root_detail,
                 "fallback (/etc/ssh/sshd_config)".to_string(),
+                sensitive,
             )
         }
     };
@@ -683,6 +772,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         // ── SEC-055
         pam_injections: Vec::new(),
         mount_namespace_anomalies: Vec::new(),
+        // ── QW-8 / SEC-062
+        sshd_sensitive_directives: sshd_sensitive,
     }
 }
 
@@ -847,6 +938,30 @@ mod tests {
         assert!(
             !entries.iter().any(|e| e.contains("10-rule")),
             "the rule carries no NOPASSWD and must not be reported: {entries:?}"
+        );
+    }
+
+    // ── QW-8: sensitive sshd directives ────────────────────
+
+    #[test]
+    fn sshd_sensitive_directives_are_collected_with_targets() {
+        let cfg = "port 22\n\
+                   authorizedkeyscommand /usr/local/bin/fetch-keys %u\n\
+                   permituserenvironment no\n\
+                   forcecommand none\n\
+                   subsystem sftp /usr/lib/openssh/sftp-server\n\
+                   trustedusercakeys /etc/ssh/ca.pub\n";
+        let d = sshd_sensitive_directives(cfg.lines());
+        let names: Vec<&str> = d.iter().map(|x| x.directive.as_str()).collect();
+        assert_eq!(
+            names,
+            ["authorizedkeyscommand", "subsystem", "trustedusercakeys"]
+        );
+        assert_eq!(d[0].target.as_deref(), Some("/usr/local/bin/fetch-keys"));
+        assert_eq!(d[1].target.as_deref(), Some("/usr/lib/openssh/sftp-server"));
+        assert!(
+            d.iter().all(|x| x.writability.is_some()),
+            "every path gets a writability verdict"
         );
     }
 }
