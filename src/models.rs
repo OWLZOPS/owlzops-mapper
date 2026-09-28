@@ -868,6 +868,10 @@ pub struct SshKeyAudit {
     pub comment: String,
     pub compliant: bool,
     pub reason: Option<String>,
+    /// QW-9: leading options as written, split on commas outside quotes.
+    /// `["no-pty", "command=\"/bin/false\"", "environment=\"LD_PRELOAD=/x\""]`.
+    /// Empty for a plain key with no options.
+    pub options: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
