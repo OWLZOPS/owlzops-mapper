@@ -1,6 +1,13 @@
 //! Agentless eBPF inventory.
 //! Scans /proc/<pid>/fd for BPF programs, maps, and links, and /sys/fs/bpf
 //! for pinned objects. No bpf() syscall required – pure VFS reading.
+//!
+//! R35-08: an empty inventory must mean "nothing is there", not "we were not
+//! allowed to look". Every EACCES/EIO on /proc, /proc/<pid>/fd or /sys/fs/bpf
+//! is recorded in coverage — ENOENT stays silent because it really does mean
+//! "no such thing" (a vanished pid, an unmounted bpffs). A pin is a
+//! persistence surface: a pin outlives its creator, so an unread /sys/fs/bpf
+//! is not the same fact as an empty /sys/fs/bpf.
 
 use crate::models::{BpfLinkInfo, BpfMapInfo, BpfPinInfo, BpfProgInfo, EbpfInventory};
 use std::fs;
@@ -119,10 +126,22 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
     let mut maps = Vec::new();
     let mut links = Vec::new();
     let mut dropped = 0usize;
+    // R35-08: separate counter so an EACCES on a process does not disappear
+    // silently. Aggregated once at the end, matching the module's other
+    // coverage patterns.
+    let mut denied = 0usize;
 
     let proc_dir = match fs::read_dir("/proc") {
         Ok(dir) => dir,
-        Err(_) => return (programs, maps, links, dropped),
+        Err(e) => {
+            // R35-08: /proc missing or masked is a real coverage fact, not
+            // "no BPF objects on this host".
+            crate::coverage::record(format!(
+                "ebpf: /proc unreadable ({}) — BPF program/map/link inventory NOT enumerated",
+                e.kind()
+            ));
+            return (programs, maps, links, dropped);
+        }
     };
 
     for entry in proc_dir.flatten() {
@@ -150,7 +169,15 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
 
         let fd_dir = match fs::read_dir(format!("/proc/{}/fd", pid)) {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(e) => {
+                // R35-08: a vanished pid is a race; anything else (EACCES
+                // under LSM/non-root, EIO) is a coverage fact. The inventory
+                // must not look complete when it is a lower bound.
+                if crate::safe_io::proc_miss(&e) != crate::safe_io::ProcMiss::Vanished {
+                    denied += 1;
+                }
+                continue;
+            }
         };
 
         let mut fds_scanned = 0usize;
@@ -242,6 +269,20 @@ fn scan_proc_bpf() -> (Vec<BpfProgInfo>, Vec<BpfMapInfo>, Vec<BpfLinkInfo>, usiz
         }
     }
 
+    if denied > 0 {
+        // R35-08: same shape as the reverse-shell / proc_net coverage lines —
+        // the inventory is a lower bound when /proc/<pid>/fd is unreadable.
+        let hint = if crate::is_running_as_root() {
+            ""
+        } else {
+            " — run as root for full coverage"
+        };
+        crate::coverage::record(format!(
+            "ebpf: /proc/<pid>/fd unreadable for {denied} process(es){hint}; BPF \
+             program/map/link inventory is a LOWER BOUND"
+        ));
+    }
+
     (programs, maps, links, dropped)
 }
 
@@ -274,7 +315,21 @@ fn scan_bpf_dir(dir: &Path, depth: u8, pins: &mut Vec<BpfPinInfo>, dropped: &mut
 
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        // R35-08: bpffs not mounted (ENOENT) means "no pins exist" — silence
+        // is correct and expected on hosts that do not use BPF pins. Anything
+        // else (EACCES on /sys/fs/bpf, which is 0700 root by default; EIO) is
+        // a coverage fact: a pin outlives its creator, so an unread directory
+        // is not the same as an empty one.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            crate::coverage::record(format!(
+                "ebpf: {} unreadable ({}) — pinned objects below it NOT enumerated; a pin \
+                 outlives its creator (persistence surface)",
+                dir.display(),
+                e.kind()
+            ));
+            return;
+        }
     };
 
     for entry in entries.flatten() {

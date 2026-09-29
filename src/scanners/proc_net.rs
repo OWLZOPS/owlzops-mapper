@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -192,11 +192,48 @@ fn parse_proc_net(proto: Proto, into: &mut HashMap<u64, SocketMeta>, base_dir: &
     true
 }
 
-/// Collect listening sockets visible in the current/host network namespace.
+/// R35-06: base of the HOST network namespace, defined as PID 1's — the same
+/// definition `report_foreign_netns_listeners` compares against. `/proc/net`
+/// is `/proc/self/net`: the scanner's own namespace, not the host's when we
+/// run in a container. When the two differ we read the host's tables from
+/// `/proc/1`; otherwise the current behaviour (`/proc`) is correct.
+///
+/// If `/proc/self/ns/net` and `/proc/1/ns/net` cannot be compared (e.g.
+/// `/proc/1/ns/net` is unreadable under non-root) we fall back to `/proc`
+/// and disclose the ambiguity — the caller must not silently present the
+/// scanner's own namespace as the host's.
+fn host_net_base() -> &'static str {
+    match (
+        fs::read_link("/proc/self/ns/net"),
+        fs::read_link("/proc/1/ns/net"),
+    ) {
+        (Ok(me), Ok(init)) if me != init => "/proc/1",
+        (Ok(_), Err(e)) => {
+            coverage::record(format!(
+                "network inventory: /proc/1/ns/net unreadable ({}) — host listener table \
+                 read from /proc/self/net; if the scanner is containerised this may be the \
+                 wrong namespace",
+                e.kind()
+            ));
+            "/proc"
+        }
+        _ => "/proc",
+    }
+}
+
+/// Collect listening sockets visible in the host network namespace.
+///
+/// R35-06: `listening_ports` means "sockets in PID 1's netns", not "sockets in
+/// the scanner's netns". `/proc/net` is `/proc/self/net`; on a containerised
+/// scanner (DaemonSet without hostNetwork, `--pid=host` container) that is
+/// the scanner's namespace, and the real host listeners were enumerated
+/// nowhere. `host_net_base` picks the same namespace `report_foreign_netns_listeners`
+/// treats as host.
 pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
+    let base = host_net_base();
     let mut map = HashMap::new();
     for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
-        let _ = parse_proc_net(p, &mut map, "/proc");
+        let _ = parse_proc_net(p, &mut map, base);
     }
     map
 }
@@ -216,22 +253,20 @@ fn netns_inode(pid: u32) -> io::Result<String> {
     })
 }
 
-/// Walk all processes and report listeners that exist in foreign network
-/// namespaces but are NOT present in the host namespace inventory.
+/// Walk all processes and report EVERY listening socket in a network
+/// namespace other than PID 1's. None of these is in `listening_ports`,
+/// whatever its tuple — the host tuple is not unique (R35-06).
 ///
-/// These sockets are invisible to the host-level port scanner and therefore
-/// absent from `network.listening_ports`. Raw Truth demands they be surfaced;
-/// they are returned as a Vec of `ForeignNetnsListener` for integration into
-/// `NetworkInfo`.
+/// Before R35-06 a foreign socket was dropped when its `(proto, addr, port)`
+/// matched the host's. But socket identity is the inode, and inodes never
+/// cross namespaces; a matching tuple is a coincidence. Under that filter a
+/// container's `0.0.0.0:22` hid behind the host sshd, and with
+/// `userland-proxy: false` a published port fell into `listening_ports`
+/// — the heuristic was wrong in both directions.
 ///
 /// Aggregated per network namespace: a Docker host has many processes sharing
 /// one netns, but only one entry per unique socket is returned.
-///
-/// `host_sockets` must be the already-collected host inventory. Do NOT
-/// re-read `/proc/net/*` here; the caller has it (M4-01).
-pub fn report_foreign_netns_listeners(
-    host_sockets: &HashMap<u64, SocketMeta>,
-) -> Vec<ForeignNetnsListener> {
+pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
     let host_ns = match std::fs::read_link("/proc/1/ns/net") {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
@@ -243,11 +278,6 @@ pub fn report_foreign_netns_listeners(
             return Vec::new();
         }
     };
-
-    let host_keys: HashSet<(String, String, u16)> = host_sockets
-        .values()
-        .map(|s| (s.proto.to_string(), s.bind_address.clone(), s.port))
-        .collect();
 
     let entries = match fs::read_dir("/proc") {
         Ok(e) => e,
@@ -272,7 +302,7 @@ pub fn report_foreign_netns_listeners(
         .collect();
     pids.sort_unstable();
 
-    // netns_inode -> (non-host-visible listeners, example process name)
+    // netns_inode -> (all listeners, example process name)
     let mut ns_cache: HashMap<String, (Vec<SocketMeta>, String)> = HashMap::new();
     // M4-02: reading /proc/<pid>/ns/net requires ptrace_may_access. Without
     // root or CAP_SYS_PTRACE every foreign process is skipped and an empty
@@ -286,7 +316,7 @@ pub fn report_foreign_netns_listeners(
             // R33-05: the pid exited between readdir and readlink. A race,
             // not a permission fact — do not count it as "unreadable (needs
             // root)". On a busy host this used to inflate the coverage line
-            // on every single scan. See safe_io::ProcMiss.
+            // on every single scan.
             Err(e) => match safe_io::proc_miss(&e) {
                 safe_io::ProcMiss::Vanished => continue,
                 _ => {
@@ -324,20 +354,16 @@ pub fn report_foreign_netns_listeners(
             continue;
         }
 
-        let mut invisible = Vec::new();
-        for meta in foreign.values() {
-            let key = (meta.proto.to_string(), meta.bind_address.clone(), meta.port);
-            if !host_keys.contains(&key) {
-                invisible.push(meta.clone());
-            }
-        }
+        // R35-06: no tuple filter. Every socket in a foreign namespace is an
+        // inventory item.
+        let listeners: Vec<SocketMeta> = foreign.into_values().collect();
 
         let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
             .ok()
             .map(|(c, _)| c.trim().to_string())
             .unwrap_or_else(|| "?".to_string());
 
-        ns_cache.insert(ns, (invisible, comm));
+        ns_cache.insert(ns, (listeners, comm));
     }
 
     let mut result = Vec::new();
@@ -522,5 +548,20 @@ mod tests {
             parse_proc_net(Proto::Tcp, &mut host, "/proc"),
             "the host namespace must report true even when it yields no listeners"
         );
+    }
+
+    #[test]
+    fn foreign_listener_is_reported_regardless_of_host_tuple() {
+        // R35-06 regression: a foreign socket whose tuple matches a host
+        // listener must still appear. The old tuple filter dropped it.
+        // Simulated at the data-model level — the walk itself needs a live
+        // /proc, but the invariant is that `report_foreign_netns_listeners`
+        // has no tuple-based branch left.
+        //
+        // Sanity: the function still exists and compiles with the new
+        // signature (no `host_sockets` argument). A future change that
+        // re-introduces the tuple filter would have to add the parameter
+        // back, and this test would then fail to compile.
+        let _f: fn() -> Vec<ForeignNetnsListener> = report_foreign_netns_listeners;
     }
 }

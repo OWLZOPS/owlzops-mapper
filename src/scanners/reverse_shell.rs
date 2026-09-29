@@ -1,9 +1,16 @@
 //! Reverse-shell / C2 detection (SEC-022).
 //!
-//! Correlates ESTABLISHED outbound TCP sockets (`/proc/net/tcp{,6}`) with the
-//! processes that own them (`/proc/<pid>/fd`), and flags the narrow, high-signal
-//! case: an interactive interpreter (bash/sh/python/nc/socat/…) whose socket is
-//! wired to a stdio fd (0/1/2) and points at a PUBLIC remote address.
+//! Correlates ESTABLISHED outbound TCP sockets with the processes that own
+//! them, and flags the narrow, high-signal case: an interactive interpreter
+//! (bash/sh/python/nc/socat/…) whose socket is wired to a stdio fd (0/1/2)
+//! and points at a PUBLIC remote address.
+//!
+//! R35-01: each interpreter is correlated against the table of ITS OWN
+//! network namespace (`/proc/<pid>/net/tcp{,6}`), not the scanner's. The
+//! socket on a containerised shell's fd 0/1/2 is never listed in the host's
+//! `/proc/net/tcp`, so the host-only table made every such shell invisible.
+//! Memory stays flat: candidates are grouped by netns and each table is
+//! dropped before the next namespace is read.
 //!
 //! FP control is by funnel, not exclusion list:
 //!   interpreter allowlist ∧ established outbound ∧ public remote ∧ stdio-fd.
@@ -11,9 +18,9 @@
 //! Internal targets (RFC1918/loopback/CGNAT/ULA) are intentionally NOT flagged
 //! to keep the exit(3) signal near-zero-FP, at the cost of missing LAN-local C2.
 //!
-//! R24-115: the stdio-fd leg of the funnel is now mandatory. Previously a
-//! socket on a HIGH fd (e.g. a python agent making an ordinary HTTPS API call)
-//! still produced a finding, causing exit(3) false positives.
+//! R24-115: the stdio-fd leg of the funnel is mandatory. Previously a socket
+//! on a HIGH fd (e.g. a python agent making an ordinary HTTPS API call) still
+//! produced a finding, causing exit(3) false positives.
 //!
 //! `/proc/net/tcp` line 4 (0-based 3) is `st`; 0x01 = ESTABLISHED. Field 2 is
 //! the remote `addr:port` in the same hex/LE encoding as the local field.
@@ -46,6 +53,10 @@ fn is_shell_comm(comm: &str) -> bool {
 /// Cap on stored findings — a hostile /proc must not drive unbounded growth.
 const MAX_FINDINGS: usize = 64;
 
+/// Distinct network namespaces whose tables are parsed. Exhaustion is
+/// disclosed via coverage (SEC-022 is a LOWER BOUND when reached).
+const MAX_NETNS: usize = 64;
+
 // ── Remote endpoint of an established socket ──────────────────────────────
 
 #[derive(Clone)]
@@ -54,27 +65,226 @@ struct EstSocket {
     public: bool,
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────
+
 pub fn scan_reverse_shells() -> Vec<ReverseShellFinding> {
-    let established = collect_established("/proc/net/tcp", false);
-    let mut all = established;
-    all.extend(collect_established("/proc/net/tcp6", true));
-    correlate_with_processes(&all, "/proc")
+    scan_reverse_shells_from("/proc")
 }
 
-// ── /proc/net/tcp{,6} → inode → established remote ────────────────────────
+/// R35-01: each interpreter is correlated against the table of its own
+/// network namespace. Candidates are grouped by netns; one table is held in
+/// memory at a time.
+fn scan_reverse_shells_from(proc_root: &str) -> Vec<ReverseShellFinding> {
+    let mut findings = Vec::new();
+    let entries = match fs::read_dir(proc_root) {
+        Ok(e) => e,
+        Err(e) => {
+            coverage::record(format!(
+                "reverse-shell scan skipped: {proc_root} unreadable ({}) — SEC-022 NOT performed",
+                e.kind()
+            ));
+            return findings;
+        }
+    };
 
-fn collect_established(path: &str, v6: bool) -> HashMap<u64, EstSocket> {
+    let mut denied = 0usize;
+
+    // Pass 1: interpreters only (cheap comm gate), each tagged with its netns.
+    let mut candidates: Vec<(String, u32, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let comm = match safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
+            Ok((c, _)) => c.trim().to_string(),
+            Err(_) => continue,
+        };
+        if !is_shell_comm(&comm) {
+            continue;
+        }
+        match fs::read_link(format!("{proc_root}/{pid}/ns/net")) {
+            Ok(ns) => candidates.push((ns.to_string_lossy().into_owned(), pid, comm)),
+            // R33-05: a vanished pid is a race, not a denial.
+            Err(e) if safe_io::proc_miss(&e) == safe_io::ProcMiss::Vanished => {}
+            Err(_) => denied += 1,
+        }
+    }
+    // Deterministic: namespace first, then lowest pid (R29-04).
+    candidates.sort_unstable();
+
+    let mut netns_parsed = 0usize;
+    let mut over_netns_cap = 0usize;
+    let mut over_findings_cap = 0usize;
+
+    for group in candidates.chunk_by(|a, b| a.0 == b.0) {
+        if netns_parsed >= MAX_NETNS {
+            over_netns_cap += group.len();
+            continue;
+        }
+        // One table per namespace, read through the first live pid in it.
+        // A pid that exited after pass 1 answers ENOENT: fall through to the
+        // next one instead of treating the namespace as socket-less (R29-03).
+        // An EACCES on the first pid must not blind the rest either.
+        let mut established: Option<HashMap<u64, EstSocket>> = None;
+        for (_, pid, _) in group {
+            match established_in(proc_root, *pid) {
+                NsRead::Ok(m) => {
+                    established = Some(m);
+                    break;
+                }
+                NsRead::Vanished => continue,
+                NsRead::Denied => {
+                    denied += 1;
+                    continue;
+                }
+            }
+        }
+        let Some(established) = established else {
+            continue;
+        };
+        netns_parsed += 1;
+        if established.is_empty() {
+            continue;
+        }
+        for (_, pid, comm) in group {
+            if findings.len() >= MAX_FINDINGS {
+                over_findings_cap += 1;
+                continue;
+            }
+            match correlate_pid(proc_root, *pid, comm, &established) {
+                PidScan::Hit(f) => findings.push(f),
+                PidScan::Clean => {}
+                PidScan::Denied => denied += 1,
+            }
+        }
+    }
+
+    findings.sort_unstable_by_key(|f| f.pid);
+
+    if denied > 0 {
+        let hint = if !crate::is_running_as_root() {
+            " — run as root for full fd visibility"
+        } else {
+            ""
+        };
+        coverage::record(format!(
+            "reverse-shell scan: {denied} process(es) with unreadable /proc/<pid>/ns/net, \
+             net/tcp{{,6}} or fd{hint}"
+        ));
+    }
+    if over_netns_cap > 0 {
+        coverage::record(format!(
+            "reverse-shell scan: namespace cap ({MAX_NETNS}) reached — {over_netns_cap} \
+             interpreter(s) in further namespaces NOT correlated; SEC-022 is a LOWER BOUND"
+        ));
+    }
+    if over_findings_cap > 0 {
+        coverage::record(format!(
+            "reverse-shell scan: finding cap ({MAX_FINDINGS}) reached — {over_findings_cap} \
+             further interpreter(s) NOT correlated; SEC-022 is a LOWER BOUND"
+        ));
+    }
+    findings
+}
+
+// ── /proc/<pid>/net/tcp{,6} → inode → established remote ──────────────────
+
+/// Outcome of reading one pid's namespace table.
+enum NsRead {
+    Ok(HashMap<u64, EstSocket>),
+    /// ENOENT on `net/tcp` — the pid vanished while we were scanning.
+    Vanished,
+    /// Unreadable for any other reason; coverage already recorded.
+    Denied,
+}
+
+/// Established sockets of `pid`'s network namespace. `net/tcp` is mandatory:
+/// ENOENT means the pid is gone. A missing `tcp6` is a kernel without IPv6
+/// and stays silent; a denied `tcp6` degrades to tcp-only.
+fn established_in(proc_root: &str, pid: u32) -> NsRead {
+    let mut map = match collect_established(&format!("{proc_root}/{pid}/net/tcp"), false) {
+        TableRead::Ok(m) => m,
+        TableRead::Missing => return NsRead::Vanished,
+        TableRead::Denied => return NsRead::Denied,
+    };
+    if let TableRead::Ok(v6) = collect_established(&format!("{proc_root}/{pid}/net/tcp6"), true) {
+        map.extend(v6);
+    }
+    NsRead::Ok(map)
+}
+
+enum PidScan {
+    Hit(ReverseShellFinding),
+    Clean,
+    Denied,
+}
+
+/// R24-115 makes the stdio leg mandatory, so read exactly fd/0..=2 instead of
+/// walking /proc/<pid>/fd. Ascending order IS the determinism rule: the
+/// lowest stdio fd wins by construction.
+fn correlate_pid(
+    proc_root: &str,
+    pid: u32,
+    comm: &str,
+    established: &HashMap<u64, EstSocket>,
+) -> PidScan {
+    for fd in 0u8..=2 {
+        let target = match fs::read_link(format!("{proc_root}/{pid}/fd/{fd}")) {
+            Ok(t) => t,
+            // fd closed, or the pid exited: neither is a denial (R33-05).
+            Err(e) if safe_io::proc_miss(&e) == safe_io::ProcMiss::Vanished => continue,
+            Err(_) => return PidScan::Denied,
+        };
+        let Some(inode) = target.to_str().and_then(socket_inode) else {
+            continue;
+        };
+        let Some(sock) = established.get(&inode) else {
+            continue;
+        };
+        if !sock.public {
+            continue; // internal target — not flagged (FP control)
+        }
+        let exe_path = fs::read_link(format!("{proc_root}/{pid}/exe"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        return PidScan::Hit(ReverseShellFinding {
+            pid,
+            process: comm.to_string(),
+            exe_path,
+            remote_address: sock.remote.clone(),
+            stdio_fd: Some(fd),
+        });
+    }
+    PidScan::Clean
+}
+
+// ── Table parser ──────────────────────────────────────────────────────────
+
+/// Outcome of parsing one `net/tcp{,6}` file.
+enum TableRead {
+    Ok(HashMap<u64, EstSocket>),
+    /// ENOENT — the file does not exist. For `tcp` that means the pid
+    /// vanished; for `tcp6`, a kernel without IPv6. The caller decides.
+    Missing,
+    /// Read error other than ENOENT. Coverage already recorded.
+    Denied,
+}
+
+fn collect_established(path: &str, v6: bool) -> TableRead {
     let mut map = HashMap::new();
     let (content, truncated) = match safe_io::read_procfs_capped(path, safe_io::CAP_PROC_NET) {
         Ok(v) => v,
-        // Kernel without IPv6 has no /proc/net/tcp6 – silence is correct.
-        Err(e) if e.kind() == ErrorKind::NotFound => return map,
+        Err(e) if e.kind() == ErrorKind::NotFound => return TableRead::Missing,
         Err(e) => {
             coverage::record(format!(
-                "{path} unreadable ({}) — SEC-022 reverse-shell correlation NOT performed",
+                "{path} unreadable ({}) — SEC-022 correlation NOT performed for this namespace",
                 e.kind()
             ));
-            return map;
+            return TableRead::Denied;
         }
     };
     if truncated {
@@ -95,11 +305,10 @@ fn collect_established(path: &str, v6: bool) -> HashMap<u64, EstSocket> {
         if u8::from_str_radix(st_hex, 16).unwrap_or(0) != TCP_ESTABLISHED {
             continue;
         }
-        // The real /proc/net/tcp layout after st is:
-        // tx_queue:rx_queue  tr:tm->when  retrnsmt  uid  timeout  inode ...
-        // Because the paired fields are separated by ':', not space,
-        // split_ascii_whitespace treats them as single tokens.
-        // So we skip exactly 5 tokens to land on inode.
+        // Layout after st: tx_queue:rx_queue tr:tm->when retrnsmt uid timeout
+        // inode. Because the paired fields are separated by ':' and not space,
+        // split_ascii_whitespace sees them as single tokens — skip 5 to land
+        // on inode.
         for _ in 0..5 {
             p.next();
         }
@@ -123,7 +332,7 @@ fn collect_established(path: &str, v6: bool) -> HashMap<u64, EstSocket> {
             },
         );
     }
-    map
+    TableRead::Ok(map)
 }
 
 /// Decode a `addr:port` hex field (LE) into (ip_string, port).
@@ -157,7 +366,6 @@ fn is_public_addr(ip: &str) -> bool {
         return !internal;
     }
     if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
-        // Unwrap IPv4-mapped addresses (::ffff:a.b.c.d) and classify as IPv4.
         if let Some(v4) = v6.to_ipv4_mapped() {
             return is_public_addr(&v4.to_string());
         }
@@ -168,142 +376,6 @@ fn is_public_addr(ip: &str) -> bool {
         return !internal;
     }
     false // undecodable → don't flag
-}
-
-// ── /proc/<pid>/fd correlation ────────────────────────────────────────────
-
-fn correlate_with_processes(
-    established: &HashMap<u64, EstSocket>,
-    proc_root: &str,
-) -> Vec<ReverseShellFinding> {
-    let mut findings = Vec::new();
-    if established.is_empty() {
-        return findings;
-    }
-
-    let mut denied = 0usize;
-    let entries = match fs::read_dir(proc_root) {
-        Ok(e) => e,
-        Err(_) => {
-            coverage::record(format!(
-                "reverse-shell scan skipped: {proc_root} unreadable"
-            ));
-            return findings;
-        }
-    };
-
-    const MAX_FD_PER_PID: usize = 4096;
-
-    for entry in entries.flatten() {
-        if findings.len() >= MAX_FINDINGS {
-            break;
-        }
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-
-        // Cheap gate: read comm first, skip non-interpreters before the fd walk.
-        let comm = match safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/comm"), 4096) {
-            Ok((c, _)) => c.trim().to_string(),
-            Err(_) => continue,
-        };
-        if !is_shell_comm(&comm) {
-            continue;
-        }
-
-        let fd_dir = format!("{proc_root}/{pid}/fd");
-        let fds = match fs::read_dir(&fd_dir) {
-            Ok(f) => f,
-            Err(_) => {
-                denied += 1;
-                continue;
-            }
-        };
-
-        let mut exe_cache: Option<Option<String>> = None;
-        let mut best: Option<ReverseShellFinding> = None;
-        let mut fd_seen = 0usize;
-
-        for fd in fds.flatten() {
-            fd_seen += 1;
-            if fd_seen > MAX_FD_PER_PID {
-                coverage::record(format!(
-                    "/proc/{pid}/fd exceeded {MAX_FD_PER_PID} entries – reverse-shell correlation for this pid is partial"
-                ));
-                break;
-            }
-
-            // fd number is the file name (0,1,2,…).
-            let fd_num: Option<u8> = fd.file_name().to_str().and_then(|s| s.parse().ok());
-            let Ok(target) = fs::read_link(fd.path()) else {
-                continue;
-            };
-            let Some(inode) = target.to_str().and_then(socket_inode) else {
-                continue;
-            };
-            let Some(sock) = established.get(&inode) else {
-                continue;
-            };
-            if !sock.public {
-                continue; // internal target — not flagged (FP control)
-            }
-
-            // R24-115: the stdio-fd leg of the funnel is mandatory. A socket on
-            // a HIGH fd (e.g. python HTTPS agent) must NOT produce a finding.
-            let stdio_fd = match fd_num {
-                Some(n @ 0..=2) => Some(n),
-                _ => None,
-            };
-            if stdio_fd.is_none() {
-                continue;
-            }
-
-            let exe_path = exe_cache
-                .get_or_insert_with(|| {
-                    fs::read_link(format!("{proc_root}/{pid}/exe"))
-                        .ok()
-                        .map(|p| p.to_string_lossy().into_owned())
-                })
-                .clone();
-
-            let candidate = ReverseShellFinding {
-                pid,
-                process: comm.clone(),
-                exe_path,
-                remote_address: sock.remote.clone(),
-                stdio_fd,
-            };
-
-            // Deterministic: lowest stdio fd wins. readdir order is arbitrary,
-            // and arbitrary evidence produces phantom drift in compare.rs.
-            match &best {
-                None => best = Some(candidate),
-                Some(b) if candidate.stdio_fd < b.stdio_fd => best = Some(candidate),
-                Some(_) => {}
-            }
-        }
-
-        if let Some(f) = best {
-            findings.push(f);
-        }
-    }
-
-    if denied > 0 {
-        let hint = if !crate::is_running_as_root() {
-            " — run as root for full fd visibility"
-        } else {
-            ""
-        };
-        coverage::record(format!(
-            "reverse-shell scan: {denied} /proc/<pid>/fd unreadable{hint}"
-        ));
-    }
-
-    findings
 }
 
 #[cfg(test)]
@@ -365,7 +437,7 @@ mod tests {
         assert!(!is_shell_comm("systemd"));
     }
 
-    // ── /proc/net/tcp parsing ───────────────────────────────
+    // ── helpers ─────────────────────────────────────────────
 
     fn write(dir: &std::path::Path, rel: &str, contents: &str) {
         let p = dir.join(rel);
@@ -374,16 +446,27 @@ mod tests {
         f.write_all(contents.as_bytes()).unwrap();
     }
 
+    fn est_line(inode: u64, remote_hex: &str) -> String {
+        format!(
+            "  0: 0100007F:8000 {remote_hex} 01 00000000:00000000 00:00000000 00000000  1000        0 {inode} 1 0000 0 0 0 0 0"
+        )
+    }
+
+    // ── /proc/net/tcp parsing ───────────────────────────────
+
     #[test]
     fn parses_established_remote_and_inode() {
         let tmp = tempfile::tempdir().unwrap();
-        let line = "  0: 0100007F:8000 08080808:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 555555 1 0000 0 0 0 0 0";
-        write(
-            tmp.path(),
-            "net/tcp",
-            &format!("  sl  local rem st ...\n{line}\n"),
+        let body = format!(
+            "  sl  local rem st ...\n{}\n",
+            est_line(555555, "08080808:01BB")
         );
-        let map = collect_established(tmp.path().join("net/tcp").to_str().unwrap(), false);
+        write(tmp.path(), "net/tcp", &body);
+        let TableRead::Ok(map) =
+            collect_established(tmp.path().join("net/tcp").to_str().unwrap(), false)
+        else {
+            panic!("table should be readable");
+        };
         let s = map.get(&555555).expect("inode parsed");
         assert_eq!(s.remote, "8.8.8.8:443");
         assert!(s.public);
@@ -394,118 +477,196 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let line = "  0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 111 1 0000 0 0 0 0 0";
         write(tmp.path(), "net/tcp", &format!("sl ...\n{line}\n"));
-        let map = collect_established(tmp.path().join("net/tcp").to_str().unwrap(), false);
+        let TableRead::Ok(map) =
+            collect_established(tmp.path().join("net/tcp").to_str().unwrap(), false)
+        else {
+            panic!();
+        };
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_missing_table_is_missing_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("net/tcp");
+        assert!(matches!(
+            collect_established(p.to_str().unwrap(), false),
+            TableRead::Missing
+        ));
     }
 
     // ── End-to-end correlation over a fake /proc ────────────
 
-    fn fake_proc(pid: u32, comm: &str, fd: &str, inode: u64) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join(pid.to_string());
+    fn fake_pid(
+        root: &std::path::Path,
+        pid: u32,
+        comm: &str,
+        netns: &str,
+        sockets: &[(u8, u64)],
+        tcp: Option<&str>,
+    ) {
+        let base = root.join(pid.to_string());
         std::fs::create_dir_all(base.join("fd")).unwrap();
+        std::fs::create_dir_all(base.join("ns")).unwrap();
         std::fs::write(base.join("comm"), format!("{comm}\n")).unwrap();
+        symlink(netns, base.join("ns/net")).unwrap();
         let _ = symlink("/bin/bash", base.join("exe"));
-        symlink(format!("socket:[{inode}]"), base.join("fd").join(fd)).unwrap();
-        tmp
+        for (fd, inode) in sockets {
+            symlink(
+                format!("socket:[{inode}]"),
+                base.join("fd").join(fd.to_string()),
+            )
+            .unwrap();
+        }
+        if let Some(line) = tcp {
+            write(
+                &base,
+                "net/tcp",
+                &format!("  sl  local rem st ...\n{line}\n"),
+            );
+        }
+    }
+
+    fn scan(root: &tempfile::TempDir) -> Vec<ReverseShellFinding> {
+        scan_reverse_shells_from(root.path().to_str().unwrap())
     }
 
     #[test]
-    fn bash_stdio_socket_to_public_is_flagged() {
-        let proc = fake_proc(1337, "bash", "1", 900900); // fd 1 = stdout
-        let mut est = HashMap::new();
-        est.insert(
-            900900,
-            EstSocket {
-                remote: "203.0.113.5:443".into(),
-                public: true,
-            },
+    fn containerised_reverse_shell_is_flagged() {
+        // R35-01: the socket exists only in the container's namespace table.
+        let tmp = tempfile::tempdir().unwrap();
+        fake_pid(tmp.path(), 1, "bash", "net:[4026531840]", &[], Some(""));
+        let est = est_line(777, "08080808:01BB");
+        fake_pid(
+            tmp.path(),
+            4242,
+            "bash",
+            "net:[4026532999]",
+            &[(0, 777), (1, 777)],
+            Some(&est),
         );
-        let out = correlate_with_processes(&est, proc.path().to_str().unwrap());
+        let out = scan(&tmp);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].pid, 4242);
+        assert_eq!(out[0].remote_address, "8.8.8.8:443");
+        assert_eq!(out[0].stdio_fd, Some(0));
+    }
+
+    #[test]
+    fn a_vanished_pid_does_not_blind_its_namespace() {
+        // R29-03 shape: the namespace's first pid exited (no net/tcp).
+        let tmp = tempfile::tempdir().unwrap();
+        fake_pid(tmp.path(), 100, "sh", "net:[1]", &[], None);
+        let est = est_line(900, "08080808:01BB");
+        fake_pid(tmp.path(), 101, "bash", "net:[1]", &[(2, 900)], Some(&est));
+        let out = scan(&tmp);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].pid, 1337);
-        assert_eq!(out[0].process, "bash");
-        assert_eq!(out[0].remote_address, "203.0.113.5:443");
-        assert_eq!(out[0].stdio_fd, Some(1));
+        assert_eq!(out[0].pid, 101);
+        assert_eq!(out[0].stdio_fd, Some(2));
+    }
+
+    #[test]
+    fn a_denied_first_pid_does_not_blind_its_namespace() {
+        // Regression: first pid in the netns is unreadable (EACCES via a
+        // non-readable directory standing in for net/tcp), second one is
+        // readable and holds the socket. Must still fire.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let est = est_line(901, "08080808:01BB");
+        fake_pid(tmp.path(), 100, "sh", "net:[1]", &[], Some(&est));
+        let tcp = tmp.path().join("100/net/tcp");
+        std::fs::remove_file(&tcp).unwrap();
+        std::fs::create_dir(&tcp).unwrap();
+        std::fs::set_permissions(&tcp, std::fs::Permissions::from_mode(0o000)).unwrap();
+        fake_pid(tmp.path(), 101, "bash", "net:[1]", &[(0, 901)], Some(&est));
+        let out = scan(&tmp);
+        // Root can read through 0o000; non-root cannot. Either way the
+        // second pid must be correlated if the first is unreadable.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert_eq!(out[0].pid, 101);
+        }
+        let _ = std::fs::set_permissions(&tcp, std::fs::Permissions::from_mode(0o755));
     }
 
     #[test]
     fn internal_target_is_not_flagged() {
-        let proc = fake_proc(1338, "python3", "0", 900901);
-        let mut est = HashMap::new();
-        est.insert(
-            900901,
-            EstSocket {
-                remote: "10.0.0.9:8080".into(),
-                public: false,
-            },
+        let tmp = tempfile::tempdir().unwrap();
+        let est = est_line(901, "0900000A:1F90"); // 10.0.0.9:8080
+        fake_pid(
+            tmp.path(),
+            1338,
+            "python3",
+            "net:[1]",
+            &[(0, 901)],
+            Some(&est),
         );
-        let out = correlate_with_processes(&est, proc.path().to_str().unwrap());
-        assert!(out.is_empty(), "internal C2 target must not raise SEC-022");
+        assert!(
+            scan(&tmp).is_empty(),
+            "internal C2 target must not raise SEC-022"
+        );
     }
 
     #[test]
     fn non_shell_process_is_not_flagged() {
-        let proc = fake_proc(1339, "nginx", "5", 900902);
-        let mut est = HashMap::new();
-        est.insert(
-            900902,
-            EstSocket {
-                remote: "8.8.8.8:443".into(),
-                public: true,
-            },
+        let tmp = tempfile::tempdir().unwrap();
+        let est = est_line(902, "08080808:01BB");
+        fake_pid(
+            tmp.path(),
+            1339,
+            "nginx",
+            "net:[1]",
+            &[(0, 902)],
+            Some(&est),
         );
-        let out = correlate_with_processes(&est, proc.path().to_str().unwrap());
-        assert!(out.is_empty(), "nginx holding an outbound socket is normal");
+        assert!(
+            scan(&tmp).is_empty(),
+            "nginx holding an outbound socket is normal"
+        );
+    }
+
+    #[test]
+    fn non_stdio_socket_is_not_flagged() {
+        // R24-115 regression: python HTTPS agent with the socket on fd 9.
+        let tmp = tempfile::tempdir().unwrap();
+        let est = est_line(903, "08080808:01BB");
+        fake_pid(
+            tmp.path(),
+            4243,
+            "python3",
+            "net:[1]",
+            &[(9, 903)],
+            Some(&est),
+        );
+        assert!(
+            scan(&tmp).is_empty(),
+            "non-stdio socket must not fire SEC-022"
+        );
     }
 
     #[test]
     fn lowest_stdio_fd_wins_deterministically() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("1340");
-        std::fs::create_dir_all(base.join("fd")).unwrap();
-        std::fs::write(base.join("comm"), "bash\n").unwrap();
-        symlink("socket:[700]", base.join("fd").join("9")).unwrap();
-        symlink("socket:[700]", base.join("fd").join("2")).unwrap();
-        let mut est = HashMap::new();
-        est.insert(
-            700,
-            EstSocket {
-                remote: "8.8.8.8:1337".into(),
-                public: true,
-            },
+        let est = est_line(700, "08080808:0539"); // 8.8.8.8:1337
+        fake_pid(
+            tmp.path(),
+            1340,
+            "bash",
+            "net:[1]",
+            &[(9, 700), (2, 700), (1, 700)],
+            Some(&est),
         );
-        let out = correlate_with_processes(&est, tmp.path().to_str().unwrap());
+        let out = scan(&tmp);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].stdio_fd, Some(2));
-    }
-
-    #[test]
-    fn non_stdio_socket_is_not_flagged() {
-        // R24-115 regression: a python HTTPS agent with the socket on fd 9
-        // must NOT be flagged as a reverse shell.
-        let proc = fake_proc(4242, "python3", "9", 123123);
-        let mut est = HashMap::new();
-        est.insert(
-            123123,
-            EstSocket {
-                remote: "8.8.8.8:443".into(),
-                public: true,
-            },
-        );
-        let out = correlate_with_processes(&est, proc.path().to_str().unwrap());
-        assert!(out.is_empty(), "non-stdio socket must not fire SEC-022");
+        assert_eq!(out[0].stdio_fd, Some(1));
     }
 
     #[test]
     fn non_socket_fds_are_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("1341");
-        std::fs::create_dir_all(base.join("fd")).unwrap();
-        std::fs::write(base.join("comm"), "bash\n").unwrap();
-        symlink("/dev/null", base.join("fd").join("0")).unwrap();
-        let est: HashMap<u64, EstSocket> = HashMap::new();
-        let out = correlate_with_processes(&est, tmp.path().to_str().unwrap());
-        assert!(out.is_empty());
+        let est = est_line(704, "08080808:01BB");
+        fake_pid(tmp.path(), 1341, "bash", "net:[1]", &[], Some(&est));
+        symlink("/dev/null", tmp.path().join("1341/fd/0")).unwrap();
+        assert!(scan(&tmp).is_empty());
     }
 }

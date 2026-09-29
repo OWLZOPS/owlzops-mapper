@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 mod cli;
 mod compare;
 mod coverage;
@@ -20,7 +22,6 @@ mod utils;
 #[cfg(feature = "local-scan")]
 mod verdict_cache;
 
-use crate::utils::host_budget_secs;
 use clap::{CommandFactory, FromArgMatches};
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -539,6 +540,14 @@ async fn run_command(
 
     match cli.command {
         Commands::Audit(args) => {
+            // R35-10: the admission loop relied on CLI validation that did
+            // not exist. `--max-concurrent 0` would scan nothing and mark
+            // every host as missing.
+            if args.max_concurrent == 0 {
+                eprintln!("--max-concurrent must be at least 1");
+                return EXIT_USAGE;
+            }
+
             // R25-12: --keep-binary exists to avoid re-uploading. With mktemp
             // staging the next run picks a fresh random directory, so nothing
             // is ever reused: the flag only accumulates leftovers. Refuse the
@@ -728,7 +737,7 @@ async fn run_command(
                     let local_spinner = ProgressBar::new_spinner();
                     local_spinner.set_style(
                         ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                            .unwrap()
+                            .unwrap_or_else(|_| ProgressStyle::default_spinner())
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
@@ -810,7 +819,7 @@ async fn run_command(
                                 .template(
                                     "{bytes:>9}/{total_bytes:9} [{wide_bar:.cyan/blue}] {msg}",
                                 )
-                                .unwrap()
+                                .unwrap_or_else(|_| ProgressStyle::default_bar())
                                 .progress_chars("##-"),
                         );
                         pb.set_message("uploading binary");
@@ -823,7 +832,7 @@ async fn run_command(
                     let scan_bar = multi.add(ProgressBar::new_spinner());
                     scan_bar.set_style(
                         ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                            .unwrap()
+                            .unwrap_or_else(|_| ProgressStyle::default_spinner())
                             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                     );
                     if args.deep {
@@ -856,7 +865,8 @@ async fn run_command(
                         };
                         let sem = semaphore.clone();
                         // Acquire permit before spawning; this may wait if
-                        // max_concurrent is zero (but CLI validation prevents that).
+                        // max_concurrent is zero — R35-10 rejects 0 at the
+                        // top of this branch, so the semaphore is non-empty.
                         let Ok(permit) = sem.acquire_owned().await else {
                             break; // Semaphore closed; can't happen
                         };
@@ -890,9 +900,11 @@ async fn run_command(
                                 return None;
                             }
 
-                            // R13-02: grace budget for teardown after timeout
-                            let overall =
-                                Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 35);
+                            // R13-02 / R35-10: ceiling derived from ssh_engine's
+                            // per-stage budgets. Must outlive connect + handshake
+                            // + inner scan + cleanup, so it can never drop the
+                            // future before cleanup ran.
+                            let overall = ssh_engine::host_ceiling(a.remote_timeout_secs);
 
                             let result = tokio::time::timeout(overall, async {
                                 let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
@@ -1081,8 +1093,10 @@ async fn run_command(
                                                     warn!("{e}");
                                                     return None;
                                                 }
+                                                // R13-02 / R35-10: same derivation
+                                                // as the initial spawn.
                                                 let overall =
-                                                    Duration::from_secs(host_budget_secs(a.remote_timeout_secs) + 35);
+                                                    ssh_engine::host_ceiling(a.remote_timeout_secs);
                                                 let result = tokio::time::timeout(overall, async {
                                                     let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
                                                     match ssh_engine::run_remote_scan_russh(
@@ -1289,7 +1303,7 @@ async fn run_command(
                 let local_spinner = ProgressBar::new_spinner();
                 local_spinner.set_style(
                     ProgressStyle::with_template("{spinner:.cyan} {msg} [{elapsed_precise}]")
-                        .unwrap()
+                        .unwrap_or_else(|_| ProgressStyle::default_spinner())
                         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
                 );
                 if args.deep {
@@ -1879,10 +1893,30 @@ async fn async_main(sudo_from_env: Option<SecretString>) {
     let notify_sig = shutdown_notify.clone();
     let flag_sig = shutdown.clone();
     tokio::spawn(async move {
-        let mut sig_int = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .expect("failed to install SIGINT handler");
-        let mut sig_term = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
+        // R35-12: install both handlers as one unit. If either fails, restore
+        // SIG_DFL for both and tell the operator what they lose — a
+        // half-installed pair would leave Tokio's handler in place with no
+        // listener, turning Ctrl-C into a no-op.
+        let (mut sig_int, mut sig_term) = match (
+            signal::unix::signal(signal::unix::SignalKind::interrupt()),
+            signal::unix::signal(signal::unix::SignalKind::terminate()),
+        ) {
+            (Ok(i), Ok(t)) => (i, t),
+            (Err(e), _) | (_, Err(e)) => {
+                // SAFETY: signal(2) with valid constants; the process is
+                // single-threaded at this point from libc's perspective and
+                // resetting to SIG_DFL is async-signal-safe.
+                unsafe {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                }
+                eprintln!(
+                    "warning: cannot install SIGINT/SIGTERM handlers ({e}) — an interrupt \
+                     will terminate immediately: no remote cleanup, no JSONL flush"
+                );
+                return;
+            }
+        };
         let mut hits = 0u8;
         loop {
             tokio::select! {

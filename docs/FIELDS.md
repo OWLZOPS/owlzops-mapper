@@ -106,14 +106,14 @@ An array of objects, one per detected database engine.
 | `ssl_certificates[].days_remaining` | integer \| null | Days until expiry |
 | `ssl_certificates[].is_critical` | boolean | Less than 7 days remaining |
 | `ssl_certificates[].is_warning` | boolean | 7–30 days remaining |
-| `listening_ports` | array of objects | Open TCP/UDP ports |
+| `listening_ports` | array of objects | Open TCP/UDP ports. **Definition: listeners in the network namespace of PID 1** (the host), regardless of where the scanner itself runs. Before R35-06 this was `/proc/net/*` = `/proc/self/net`, i.e. the scanner's own namespace — on a containerised scanner (DaemonSet without `hostNetwork`, `--pid=host` container) that was the wrong namespace and the real host listeners were absent from the report. When `/proc/self/ns/net` differs from `/proc/1/ns/net`, the tables are read from `/proc/1`; when `/proc/1/ns/net` is unreadable (non-root), the scanner falls back to `/proc` and records a coverage warning. |
 | `listening_ports[].protocol` | string | `"tcp"` or `"udp"` |
 | `listening_ports[].port` | string | Port number |
 | `listening_ports[].process` | string | Process name (or `"unknown"`) |
 | `listening_ports[].bind_address` | string | IP address the port is bound to |
 | `listening_ports[].pid` | integer \| null | PID of the listening process (requires root) |
 | `listening_ports[].exe_path` | string \| null | Full path to the executable (requires root) |
-| `foreign_netns_listeners` | array of objects | Listening sockets discovered in foreign network namespaces (not visible in the host namespace). Added in R29-02. |
+| `foreign_netns_listeners` | array of objects | **Every** listening socket discovered in a network namespace other than PID 1's. R35-06: no tuple-based suppression — a container's `0.0.0.0:22` is reported even if the host also listens on 22, because socket identity is the inode and inodes never cross namespaces. Before R35-06 a foreign socket was dropped when its `(proto, addr, port)` matched a host tuple; the heuristic was wrong in both directions (with `userland-proxy: false` a published port also fell into `listening_ports`). Added in R29-02. |
 | `foreign_netns_listeners[].netns` | string | Network namespace inode, e.g. `"net:[4026532914]"`. |
 | `foreign_netns_listeners[].protocol` | string | `"tcp"` or `"udp"`. |
 | `foreign_netns_listeners[].bind_address` | string | IP address the socket is bound to. |
@@ -143,25 +143,25 @@ An array of objects, one per detected database engine.
 |-------|------|-------------|
 | `runtime_active` | boolean | Container runtime reachable |
 | `runtime_name` | string | Name of the container runtime (e.g. "Docker") |
-| `images_count` | integer | Total number of images |
-| `dangling_images_count` | integer | Images without tags |
-| `total_images_size_mb` | integer | Real disk size of all images in MB |
-| `total_dangling_size_mb` | integer | Virtual size of dangling images in MB |
-| `images_reclaimable_mb` | integer | Space reclaimable by `docker image prune` |
-| `build_cache_reclaimable_mb` | integer | Space reclaimable by `docker buildx prune` |
-| `dangling_volumes_count` | integer | Number of dangling volumes |
+| `images_count` | integer | Total number of images. R35-02: `0` may mean "list_images failed or timed out" — check `coverage_warnings` for the R35-02 disclosure line. |
+| `dangling_images_count` | integer | Images without tags. Same caveat as `images_count`: a failed `list_images` produces `0` and a coverage warning. |
+| `total_images_size_mb` | integer | Real disk size of all images in MB. R35-02: `0` may mean `system df` failed or timed out (coverage warning). |
+| `total_dangling_size_mb` | integer | Virtual size of dangling images in MB. Same caveat as `images_count`. |
+| `images_reclaimable_mb` | integer | Space reclaimable by `docker image prune`. R35-02: `0` may mean `system df` failed (coverage warning). |
+| `build_cache_reclaimable_mb` | integer | Space reclaimable by `docker buildx prune`. Same caveat as `images_reclaimable_mb`. |
+| `dangling_volumes_count` | integer | Number of dangling volumes. R35-02: `0` may mean `list_volumes` failed or timed out (coverage warning). |
 | `dangling_images` | array of objects | Top dangling images |
 | `dangling_images[].id` | string | Short image ID |
 | `dangling_images[].size_mb` | integer | Virtual image size in MB |
-| `containers` | array of objects | All containers |
+| `containers` | array of objects | All containers. R35-02: the security inventory (`privileged`, `cap_add`, `sensitive_mounts`) is populated from a fast `list_containers` call with `size: false`; container sizes come from a separate, bounded call. If the fast call fails, `containers` is `[]` and a coverage warning names the failed endpoint. If only the size call fails, `containers` is populated but `size_mb` / `rw_size_mb` are `0` and a coverage warning says so. |
 | `containers[].name` | string | Container name |
 | `containers[].image` | string | Image name |
 | `containers[].image_id` | string \| null | Local image ID (config digest, `sha256:...`) as reported by the runtime's inspect API. Identifies the exact image the container is running; differs from `image` (the tag, which can be re-pointed). NOT the registry manifest digest (`RepoDigests`) — do not use it to query a registry. `null` = not provided by runtime or legacy snapshot. Added in R28-14 (M-2). |
 | `containers[].runtime_bounding_caps` | integer \| null | Live CapBnd of the container's init process (host pid), read from the kernel at scan time. `null` = container not running or /proc unreadable (non-root scan). Ground truth for DOCK-010 runtime-tamper delta. |
 | `containers[].state` | string | `"running"`, `"exited"`, etc. |
 | `containers[].status` | string | Human‑readable status |
-| `containers[].size_mb` | integer | Container writable layer size in MB |
-| `containers[].rw_size_mb` | integer | Writable layer size in MB |
+| `containers[].size_mb` | integer | Container writable layer size in MB. R35-02: `0` may mean "size query failed or timed out" — check `coverage_warnings`. |
+| `containers[].rw_size_mb` | integer | Writable layer size in MB. Same caveat as `size_mb`. |
 | `containers[].log_size_mb` | integer | Container log file size in MB |
 | `containers[].ports` | array of strings | Exposed ports |
 | `containers[].mounts` | array of strings | Bind mounts (host → container) |
@@ -191,7 +191,7 @@ An array of objects, one per detected database engine.
 | `shell_users[].authorized_keys_count` | integer | Number of authorized keys |
 | `fail2ban_active` | boolean | fail2ban service active |
 | `auditd_active` | boolean | auditd service active |
-| `sudo_nopasswd_entries` | array of strings | NOPASSWD sudo lines |
+| `sudo_nopasswd_entries` | array of strings | NOPASSWD sudo lines. R35-03: the parser now honours sudoers(5) comment rules — `#1000 ALL=(ALL) NOPASSWD: ALL` (a rule for uid 1000) is reported, and inline `# …` tails inside `Defaults` / `Cmnd_Alias` values no longer break detection. |
 | `sudoers_mode` | integer \| null | Octal permissions of `/etc/sudoers` |
 | `sysctl_issues` | array of strings | Non‑compliant sysctl settings |
 | `access_alignment` | object | IAM & access audit results |
@@ -202,7 +202,7 @@ An array of objects, one per detected database engine.
 | `access_alignment.keys[].comment` | string | Key comment |
 | `access_alignment.keys[].compliant` | boolean | Whether the key meets policy |
 | `access_alignment.keys[].reason` | string \| null | Reason if non‑compliant |
-| `access_alignment.sudoers_nopasswd_all` | array of objects | Sudoers entries with NOPASSWD: ALL |
+| `access_alignment.sudoers_nopasswd_all` | array of objects | Sudoers entries with NOPASSWD: ALL. R35-03: comment handling matches sudoers(5). |
 | `access_alignment.sudoers_nopasswd_all[].principal` | string | User or group |
 | `access_alignment.sudoers_nopasswd_all[].source_file` | string | Sudoers file path |
 | `access_alignment.sudoers_nopasswd_all[].scope` | string | Command scope |
@@ -211,7 +211,7 @@ An array of objects, one per detected database engine.
 | `access_alignment.root_equivalent_groups[].members` | array of strings | Supplementary members, sorted |
 | `access_alignment.root_equivalent_groups[].bypasses_sudo` | boolean | `true` = membership grants passwordless root without sudoers, so SEC-061 weighs it: docker, podman, lxd, libvirt, disk. `false` = inventoried only: empty groups (nobody has root), sudo/wheel (gated by sudoers), shadow (hash read is credential exposure, not a root path). R34-01: SEC-061 carries the class weight only when SEC-005/SEC-012 do not. |
 | `access_alignment.coverage_warnings` | array of strings | Warnings from access audit |
-| `secret_hygiene` | array of objects | Detected secret leaks in process memory |
+| `secret_hygiene` | array of objects | Detected secret leaks in process memory. R35-04: a non-UTF-8 byte anywhere in the value (a legal path for `LD_PRELOAD`, a random byte in an API token) no longer hides the KEY; only the KEY is required to be UTF-8. R35-04 also fixed the cmdline leg — a `--password=<non-UTF-8>` argument now matches the flag. |
 | `secret_hygiene[].pid` | integer | PID of the process |
 | `secret_hygiene[].process` | string | Process name |
 | `secret_hygiene[].source` | string | Source (e.g., `"environ"`, `"cmdline"`) |
@@ -248,13 +248,13 @@ An array of objects, one per detected database engine.
 | `mount_namespace_anomalies[].container` | string \| null | Container name from `topology.containers`, matched by `mnt_ns`. `null` = namespace not attributable to any known container. Attribution, not filter: a container process running an unpackaged binary stays visible. Added in R31-07. |
 | `mount_namespace_anomalies[].systemd_unit` | string \| null | systemd unit or scope owning the pid, extracted from its cgroup (`nginx.service`, `session-N.scope`, `docker-<hash>.scope`). Provenance, not a verdict: a `.service` explains the namespace as declared hardening, a `.scope` does not. Added in R31-01. |
 | `mount_namespace_anomalies[].system_path` | boolean | `true` when the executable lives under a package-manager or sandbox prefix (`/usr/`, `/bin/`, `/sbin/`, `/opt/`, `/nix/store/`, `/app/`, `/snap/`, `/var/lib/flatpak/`, `/run/wrappers/`). Labelled, never used to drop the row: `unshare -m` from a shell runs `/usr/bin/bash`. Added in R31-01. |
-| `reverse_shells` | array of objects | Reverse shell / C2 connections detected (SEC‑022) |
+| `reverse_shells` | array of objects | Reverse shell / C2 connections detected (SEC‑022). R35-01: each interpreter is correlated against the table of **its own** network namespace (`/proc/<pid>/net/tcp{,6}`), not the scanner's `/proc/net/tcp`. On a containerised host the host-only table never listed a containerised shell's socket, so a reverse shell inside any Docker/k8s container was invisible and the scan exited 0. The field schema is unchanged; the population now covers every network namespace up to a cap (exceeding the cap is disclosed in `coverage_warnings`). Only `fd/0..=2` are read (R24-115), so the scan is O(3) readlinks per interpreter instead of O(fd). |
 | `reverse_shells[].pid` | integer | PID of the interpreter process |
 | `reverse_shells[].process` | string | Process comm (interpreter name) |
 | `reverse_shells[].exe_path` | string \| null | Resolved executable path |
 | `reverse_shells[].remote_address` | string | Remote endpoint `ip:port` |
 | `reverse_shells[].stdio_fd` | integer \| null | Which stdio fd (0,1,2) carries the socket, or null if non‑stdio |
-| `library_injections` | array of objects | Userspace rootkit / library injection from ephemeral paths (SEC‑023) |
+| `library_injections` | array of objects | Userspace rootkit / library injection from ephemeral paths (SEC‑023). R35-04: the env leg splits records at the byte level — a non-UTF-8 byte in the value no longer drops the `LD_PRELOAD` / `LD_LIBRARY_PATH` / `LD_AUDIT` / `LD_PROFILE` finding; only the KEY must be UTF-8. R35-11: ENOENT on `/proc/<pid>/maps` (a race, not a denial) no longer inflates the "unreadable maps" counter. |
 | `library_injections[].pid` | integer | PID of the injected process |
 | `library_injections[].process` | string | Process comm |
 | `library_injections[].object_path` | string | The offending .so or LD_* value |
@@ -279,7 +279,7 @@ An array of objects, one per detected database engine.
 | `file_capabilities[].revision` | integer | Capability revision |
 | `file_capabilities[].rootid` | integer \| null | Root user namespace ID |
 | `file_capabilities[].package` | string \| null | Owning package, if resolved |
-| `ebpf_inventory` | object | Loaded eBPF programs, maps, and pinned objects |
+| `ebpf_inventory` | object | Loaded eBPF programs, maps, and pinned objects. R35-08: `/proc`, `/proc/<pid>/fd` and `/sys/fs/bpf` failures other than ENOENT are now recorded in `coverage_warnings`; an empty inventory means "nothing there", not "not looked at". |
 | `ebpf_inventory.programs` | array of objects | Loaded BPF programs |
 | `ebpf_inventory.programs[].prog_id` | integer | Program ID |
 | `ebpf_inventory.programs[].prog_type` | string | Program type |

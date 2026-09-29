@@ -64,8 +64,12 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
 
 const SENSITIVE_FLAGS: &[&str] = &["--password=", "-p=", "--token=", "--secret="];
 
-fn starts_with_icase(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+/// R35-04: flags are ASCII, argv is arbitrary bytes. Compare at the byte
+/// level — a non-UTF-8 byte in the secret must not hide the flag in front
+/// of it (`--password=…\xff` used to be dropped by an earlier `from_utf8`
+/// over the whole argument).
+fn starts_with_icase(s: &[u8], prefix: &str) -> bool {
+    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// Is an EACCES on this /proc entry explainable by our own PR_SET_DUMPABLE(0)?
@@ -218,13 +222,17 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                     coverage::record(format!("{} truncated", path_buf));
                 }
                 for chunk in env_data.split(|&b| b == 0) {
-                    let Ok(env_var) = std::str::from_utf8(chunk) else {
+                    // R35-04: split at the BYTE level. from_utf8 over the whole
+                    // KEY=VALUE record dropped it when any value byte was
+                    // invalid UTF-8 — a legal path for LD_PRELOAD et al. — and
+                    // took the key detection with it. Only the KEY must be
+                    // UTF-8.
+                    let Some(eq) = chunk.iter().position(|&b| b == b'=') else {
                         continue;
                     };
-                    let Some((key, _value)) = env_var.split_once('=') else {
+                    let Ok(key) = std::str::from_utf8(&chunk[..eq]) else {
                         continue;
                     };
-
                     if is_sensitive_key(key) {
                         push_leak("environ", key.to_string());
                     }
@@ -244,21 +252,19 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 if truncated {
                     coverage::record(format!("{} truncated", path_buf));
                 }
-                for chunk in cmd_data.split(|&b| b == 0) {
-                    let Ok(arg) = std::str::from_utf8(chunk) else {
-                        continue;
-                    };
-
+                for arg in cmd_data.split(|&b| b == 0) {
+                    // R35-04: flags are ASCII — a non-UTF-8 byte in the secret
+                    // must not hide the flag in front of it.
                     for &flag in SENSITIVE_FLAGS {
                         if starts_with_icase(arg, flag) {
                             push_leak("cmdline", flag.to_string());
                         }
                     }
 
-                    // Cover `mysql -pSECRET` (without equals sign)
+                    // Cover `mysql -pSECRET` (without equals sign). Byte-level
+                    // for the same reason as above.
                     if (process_name == "mysql" || process_name == "mysqldump")
-                        && let Some(pwd) = arg.strip_prefix("-p")
-                        && !pwd.is_empty()
+                        && arg.strip_prefix(b"-p").is_some_and(|pwd| !pwd.is_empty())
                     {
                         push_leak("cmdline", "mysql-password".to_string());
                     }
@@ -415,5 +421,42 @@ mod tests {
             starttime_ticks("1337 (bash) S x x x x x x x x x x x x x x x x x x x"),
             None
         );
+    }
+
+    // ── R35-04 regression ────────────────────────────────────
+
+    #[test]
+    fn non_utf8_value_does_not_hide_sensitive_key() {
+        // Before R35-04, from_utf8 over the whole KEY=VALUE chunk failed on
+        // an invalid byte in the value and the key was silently dropped.
+        let key = b"AWS_SECRET_ACCESS_KEY";
+        let mut rec = Vec::new();
+        rec.extend_from_slice(key);
+        rec.push(b'=');
+        rec.extend_from_slice(b"\xff\xfe/path");
+        let eq = rec.iter().position(|&b| b == b'=').unwrap();
+        let parsed_key = std::str::from_utf8(&rec[..eq]).unwrap();
+        assert!(is_sensitive_key(parsed_key));
+    }
+
+    #[test]
+    fn non_utf8_arg_still_matches_flag_prefix() {
+        // `--password=\xff` — the flag must fire; only the secret bytes are
+        // invalid UTF-8.
+        let arg: &[u8] = b"--password=\xff\xfe";
+        assert!(starts_with_icase(arg, "--password="));
+
+        // `-p=\xff` — same story for the short form.
+        let short: &[u8] = b"-p=\xff\xfe";
+        assert!(starts_with_icase(short, "-p="));
+
+        // MySQL style `-p<secret>`, no equals sign: byte-level prefix strip.
+        assert!(
+            b"-p\xff\xfe"
+                .strip_prefix(b"-p")
+                .is_some_and(|p| !p.is_empty())
+        );
+        // `-p` alone is not a password — must not fire.
+        assert!(b"-p".strip_prefix(b"-p").is_some_and(|p| p.is_empty()));
     }
 }

@@ -264,7 +264,14 @@ fn render_header(report: &AgentReport, theme: &Theme) {
         ""
     };
 
-    outln!("{}Owlzops Mapper v{}", theme.owl, report.version);
+    // R35-07: a remote report's `version` is host-controlled JSON; an
+    // erase-display sequence here rewrites the header and the operator never
+    // sees what version they are reading.
+    outln!(
+        "{}Owlzops Mapper v{}",
+        theme.owl,
+        sanitize_terminal(&report.version)
+    );
     outln!(
         "{}Scan completed in {:.2}s",
         theme.spy,
@@ -336,7 +343,11 @@ fn render_header(report: &AgentReport, theme: &Theme) {
                     t_cat.add_row(vec![
                         Cell::new(cis_note).fg(Color::DarkGrey),
                         Cell::new(format!("-{}", f.weight)).fg(Color::Red),
-                        Cell::new(&f.title),
+                        // R35-07: `f.title` comes from the scoring engine, but a
+                        // finding's title can embed host-derived text (a unit
+                        // name, an exe path) that was never sanitized. Same
+                        // pass as `evidence`.
+                        Cell::new(sanitize_terminal(&f.title)),
                         Cell::new(sanitize_terminal(&f.evidence)),
                     ]);
                 }
@@ -387,7 +398,11 @@ fn render_header(report: &AgentReport, theme: &Theme) {
 fn format_install_date(raw: &str) -> Option<String> {
     let prefix = raw.get(..10)?;
     let bytes = prefix.as_bytes();
-    if bytes[4] == b'-' && bytes[7] == b'-' && bytes.iter().all(|b| b.is_ascii()) {
+    // R35-07: `is_ascii` admitted ESC and every C0 control; the row prints raw.
+    // Validate the shape `YYYY-MM-DD` position by position so no control byte
+    // survives the parse.
+    let digits = |r: std::ops::Range<usize>| bytes[r].iter().all(u8::is_ascii_digit);
+    if bytes[4] == b'-' && bytes[7] == b'-' && digits(0..4) && digits(5..7) && digits(8..10) {
         return Some(prefix.to_string());
     }
     None
@@ -1335,7 +1350,10 @@ fn render_runtime(report: &AgentReport) {
         return;
     }
 
-    let runtime = &report.topology.runtime_name;
+    // R35-07: printed after the findings table — an erase-scrollback sequence
+    // here wipes ACTIVE COMPROMISE rows the operator has not read yet. The
+    // runtime name comes from the report JSON, i.e. from the audited host.
+    let runtime = sanitize_terminal(&report.topology.runtime_name);
     let total_img_gb = report.topology.total_images_size_mb as f64 / 1024.0;
     let reclaimable_gb = report.topology.images_reclaimable_mb as f64 / 1024.0;
     let build_cache_gb = report.topology.build_cache_reclaimable_mb as f64 / 1024.0;
@@ -1988,7 +2006,12 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         if !traced.is_empty() {
             outln!("  {}Pointer resolution trace (deep forensics):", theme.mag);
             for l in traced.iter().take(5) {
-                let d = l.deep_forensics.as_ref().unwrap();
+                // R35-12: the filter above guarantees Some, but the compiler
+                // does not see through it. `let-else` keeps the invariant
+                // local and satisfies deny(unwrap_used).
+                let Some(d) = l.deep_forensics.as_ref() else {
+                    continue;
+                };
                 outln!(
                     "    pid {} @ {}  origin={} ({}%)  entropy={:.1}",
                     l.pid,
@@ -2316,5 +2339,21 @@ mod tests {
         assert!(unit_explains_namespace(Some("nginx.service")));
         assert!(!unit_explains_namespace(Some("session-c17.scope")));
         assert!(!unit_explains_namespace(None));
+    }
+
+    // ── R35-07 regression ────────────────────────────────────
+
+    #[test]
+    fn install_date_rejects_control_bytes() {
+        // `is_ascii` used to admit ESC and every C0 control. Only the
+        // `YYYY-MM-DD` digit shape survives.
+        assert_eq!(
+            format_install_date("2024-03-15T10:22:31Z").as_deref(),
+            Some("2024-03-15")
+        );
+        assert_eq!(format_install_date("\x1b[2J-\x1b[-xx"), None);
+        assert_eq!(format_install_date("20a4-03-15T10:22:31Z"), None);
+        assert_eq!(format_install_date("2024/03/15T10:22:31Z"), None);
+        assert_eq!(format_install_date("unknown"), None);
     }
 }

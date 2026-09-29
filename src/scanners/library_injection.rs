@@ -429,10 +429,14 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 ));
             }
             for chunk in data.split(|&b| b == 0).filter(|c| !c.is_empty()) {
-                let Ok(kv) = std::str::from_utf8(chunk) else {
+                // R35-04: split at the BYTE level. from_utf8 on the whole
+                // record dropped it when any value byte was invalid UTF-8 —
+                // a legal path ld.so honours — and took the env_ioc gate
+                // down with it.
+                let Some(eq) = chunk.iter().position(|&b| b == b'=') else {
                     continue;
                 };
-                let Some((key, value)) = kv.split_once('=') else {
+                let Ok(key) = std::str::from_utf8(&chunk[..eq]) else {
                     continue;
                 };
                 let Some(&matched_key) =
@@ -440,6 +444,10 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 else {
                     continue;
                 };
+                // Lossy on purpose: the maps leg is lossy too
+                // (read_procfs_capped); both legs must spell the same path
+                // the same way.
+                let value = String::from_utf8_lossy(&chunk[eq + 1..]);
 
                 for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
                     if is_volatile_lib_path(path) {
@@ -469,9 +477,12 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
             continue;
         }
 
-        if let Ok((content, truncated)) =
-            safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS)
-        {
+        let maps = safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/maps"), CAP_PROC_MAPS);
+        // R35-11: ENOENT = the pid exited after its comm/environ read — a
+        // race, not a denial.
+        let vanished =
+            matches!(&maps, Err(e) if safe_io::proc_miss(e) == safe_io::ProcMiss::Vanished);
+        if let Ok((content, truncated)) = maps {
             if truncated {
                 coverage::record(format!(
                     "library_injection: /proc/{pid}/maps truncated at {CAP_PROC_MAPS} B — \
@@ -519,7 +530,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                     }
                 }
             }
-        } else if pid_hits == 0 {
+        } else if pid_hits == 0 && !vanished {
             denied += 1;
         }
     }
@@ -1110,5 +1121,34 @@ mod tests {
             exe_path: Some("/usr/sbin/nginx".into()),
         };
         assert_eq!(f.classify(), InjectionClass::JitAdvisory);
+    }
+
+    // ── R35-04 / R35-11 regression tests ─────────────────────
+
+    #[test]
+    fn non_utf8_ld_preload_is_still_seen() {
+        // R35-04: a non-UTF-8 byte in the VALUE must not drop the record.
+        // Before the fix, from_utf8() over the whole KEY=VALUE chunk failed
+        // and the env_ioc gate for SEC-023 was silently lifted.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("4242");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("comm"), "app\n").unwrap();
+        std::fs::write(
+            d.join("environ"),
+            b"PATH=/usr/bin\0LD_PRELOAD=/dev/shm/\xff/x.so\0",
+        )
+        .unwrap();
+        std::fs::write(d.join("maps"), "").unwrap();
+        let cfg = ScanConfig {
+            verdict_cache_path: tmp.path().join("vc.json"),
+            ..Default::default()
+        };
+        let out = detect_from_proc(tmp.path().to_str().unwrap(), &cfg);
+        assert!(
+            out.iter()
+                .any(|f| f.source == "LD_PRELOAD" && f.object_path.starts_with("/dev/shm/")),
+            "{out:?}"
+        );
     }
 }
