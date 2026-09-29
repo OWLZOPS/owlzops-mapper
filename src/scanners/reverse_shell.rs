@@ -12,6 +12,14 @@
 //! Memory stays flat: candidates are grouped by netns and each table is
 //! dropped before the next namespace is read.
 //!
+//! R35-16: `collect_established` no longer records coverage. It returns
+//! `TableRead::Denied(ErrorKind)` and the CALLER decides whether the denial
+//! is a fact worth reporting — only it knows whether another pid or the
+//! IPv4 table covered the gap. The previous shape wrote "NOT performed for
+//! this namespace" on every per-path failure, which was false for (a) a
+//! namespace whose next pid was readable and (b) a `tcp6` denial while the
+//! IPv4 correlation had succeeded.
+//!
 //! FP control is by funnel, not exclusion list:
 //!   interpreter allowlist ∧ established outbound ∧ public remote ∧ stdio-fd.
 //! A legit `bash` spawning `curl` does NOT match — the socket belongs to curl.
@@ -130,6 +138,10 @@ fn scan_reverse_shells_from(proc_root: &str) -> Vec<ReverseShellFinding> {
         // next one instead of treating the namespace as socket-less (R29-03).
         // An EACCES on the first pid must not blind the rest either.
         let mut established: Option<HashMap<u64, EstSocket>> = None;
+        // R35-16: the "NOT performed for this namespace" line is true only
+        // when no pid in the group yielded a table. Track whether any pid
+        // failed with Denied so that fact can be disclosed below, once.
+        let mut group_denied = false;
         for (_, pid, _) in group {
             match established_in(proc_root, *pid) {
                 NsRead::Ok(m) => {
@@ -139,11 +151,23 @@ fn scan_reverse_shells_from(proc_root: &str) -> Vec<ReverseShellFinding> {
                 NsRead::Vanished => continue,
                 NsRead::Denied => {
                     denied += 1;
+                    group_denied = true;
                     continue;
                 }
             }
         }
         let Some(established) = established else {
+            // R35-16: only now is "NOT performed" true for this namespace —
+            // every pid in it failed with Denied. A namespace whose only
+            // failures were ENOENT (races) is not a coverage gap.
+            if group_denied {
+                coverage::record(format!(
+                    "reverse-shell scan: no readable net/tcp in namespace {} — SEC-022 NOT \
+                     performed for its {} interpreter(s)",
+                    group[0].0,
+                    group.len()
+                ));
+            }
             continue;
         };
         netns_parsed += 1;
@@ -198,21 +222,33 @@ enum NsRead {
     Ok(HashMap<u64, EstSocket>),
     /// ENOENT on `net/tcp` — the pid vanished while we were scanning.
     Vanished,
-    /// Unreadable for any other reason; coverage already recorded.
+    /// Unreadable for any other reason. Coverage is not recorded here: the
+    /// caller decides whether the gap was covered by another pid or by the
+    /// IPv4 table (R35-16).
     Denied,
 }
 
 /// Established sockets of `pid`'s network namespace. `net/tcp` is mandatory:
 /// ENOENT means the pid is gone. A missing `tcp6` is a kernel without IPv6
-/// and stays silent; a denied `tcp6` degrades to tcp-only.
+/// and stays silent; a denied `tcp6` is disclosed here — this is the only
+/// level that knows the IPv4 leg succeeded, so the disclosure is true
+/// ("IPv4 correlated, IPv6 not") instead of the previous "NOT performed for
+/// this namespace" (R35-16).
 fn established_in(proc_root: &str, pid: u32) -> NsRead {
     let mut map = match collect_established(&format!("{proc_root}/{pid}/net/tcp"), false) {
         TableRead::Ok(m) => m,
         TableRead::Missing => return NsRead::Vanished,
-        TableRead::Denied => return NsRead::Denied,
+        TableRead::Denied(_) => return NsRead::Denied,
     };
-    if let TableRead::Ok(v6) = collect_established(&format!("{proc_root}/{pid}/net/tcp6"), true) {
-        map.extend(v6);
+    match collect_established(&format!("{proc_root}/{pid}/net/tcp6"), true) {
+        TableRead::Ok(v6) => map.extend(v6),
+        // Kernel without IPv6: legitimate absence.
+        TableRead::Missing => {}
+        // R35-16: only the tcp6 leg failed. The IPv4 correlation is done.
+        TableRead::Denied(kind) => coverage::record(format!(
+            "{proc_root}/{pid}/net/tcp6 unreadable ({kind}) — IPv6 sockets of this \
+             namespace NOT correlated; SEC-022 is IPv4-only there"
+        )),
     }
     NsRead::Ok(map)
 }
@@ -270,8 +306,9 @@ enum TableRead {
     /// ENOENT — the file does not exist. For `tcp` that means the pid
     /// vanished; for `tcp6`, a kernel without IPv6. The caller decides.
     Missing,
-    /// Read error other than ENOENT. Coverage already recorded.
-    Denied,
+    /// Read error other than ENOENT. The CALLER discloses: only it knows
+    /// whether another pid or the IPv4 table covered the gap (R35-16).
+    Denied(ErrorKind),
 }
 
 fn collect_established(path: &str, v6: bool) -> TableRead {
@@ -279,13 +316,9 @@ fn collect_established(path: &str, v6: bool) -> TableRead {
     let (content, truncated) = match safe_io::read_procfs_capped(path, safe_io::CAP_PROC_NET) {
         Ok(v) => v,
         Err(e) if e.kind() == ErrorKind::NotFound => return TableRead::Missing,
-        Err(e) => {
-            coverage::record(format!(
-                "{path} unreadable ({}) — SEC-022 correlation NOT performed for this namespace",
-                e.kind()
-            ));
-            return TableRead::Denied;
-        }
+        // R35-16: no coverage here. The caller holds the context that makes
+        // the disclosure truthful.
+        Err(e) => return TableRead::Denied(e.kind()),
     };
     if truncated {
         coverage::record(format!(
@@ -570,6 +603,10 @@ mod tests {
         // Regression: first pid in the netns is unreadable (EACCES via a
         // non-readable directory standing in for net/tcp), second one is
         // readable and holds the socket. Must still fire.
+        //
+        // Under root, `open` of a 0o000 directory succeeds but `read` fails
+        // with EISDIR — the same `Denied` path, so the second pid is still
+        // tried. The assertion is unconditional.
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let est = est_line(901, "08080808:01BB");
@@ -580,12 +617,8 @@ mod tests {
         std::fs::set_permissions(&tcp, std::fs::Permissions::from_mode(0o000)).unwrap();
         fake_pid(tmp.path(), 101, "bash", "net:[1]", &[(0, 901)], Some(&est));
         let out = scan(&tmp);
-        // Root can read through 0o000; non-root cannot. Either way the
-        // second pid must be correlated if the first is unreadable.
-        if unsafe { libc::geteuid() } != 0 {
-            assert_eq!(out.len(), 1, "{out:?}");
-            assert_eq!(out[0].pid, 101);
-        }
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].pid, 101);
         let _ = std::fs::set_permissions(&tcp, std::fs::Permissions::from_mode(0o755));
     }
 
