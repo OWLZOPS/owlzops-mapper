@@ -482,23 +482,30 @@ pub fn unregister_child(pid: u32) {
 /// Send SIGTERM to all currently tracked child process groups and clear the list.
 /// Used during graceful shutdown to terminate any remaining `ssh`/`scp`
 /// processes started by the legacy engine.
+///
+/// R35-15: signal **while holding the registry lock**. Workers unregister
+/// before they reap (R35-09), so no pid in this list can be reaped — and its
+/// PGID recycled — until we release. The old shape snapshotted the list,
+/// cleared it under the lock, and only then signalled: a worker could
+/// unregister (no-op on the already-cleared list) and reap in that window,
+/// leaving our SIGTERM to land on a recycled group.
+///
+/// `kill(2)` is non-blocking and the loop is bounded by `max_concurrent`
+/// entries, so holding the lock for the duration is cheap; a worker blocked
+/// on `unregister_child` cannot reach `wait()` until the loop finishes.
 pub fn terminate_registered_children() {
     with_registry(|reg| {
-        let pids: Vec<u32> = {
-            let mut guard = reg
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pids = guard.clone();
-            guard.clear();
-            pids
-        };
-        for pid in pids {
+        let mut guard = reg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &pid in guard.iter() {
             unsafe {
                 // R24-04: whole group — helper processes spawned by the tool
                 // must not survive graceful shutdown as orphans.
                 libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
             }
         }
+        guard.clear();
     });
 }
 
