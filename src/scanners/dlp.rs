@@ -72,6 +72,12 @@ fn starts_with_icase(s: &[u8], prefix: &str) -> bool {
     s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
+/// `mysql -pSECRET` (no `=`). Single byte-level predicate so the production
+/// path and the test that documents it cannot drift (R35-04 verification).
+fn is_mysql_inline_password(arg: &[u8]) -> bool {
+    arg.strip_prefix(b"-p").is_some_and(|pwd| !pwd.is_empty())
+}
+
 /// Is an EACCES on this /proc entry explainable by our own PR_SET_DUMPABLE(0)?
 /// Only for entries the kernel registers 0400: dumpable reassigns the inode
 /// owner to root but never changes the mode, so 0444 entries stay readable.
@@ -222,15 +228,11 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                     coverage::record(format!("{} truncated", path_buf));
                 }
                 for chunk in env_data.split(|&b| b == 0) {
-                    // R35-04: split at the BYTE level. from_utf8 over the whole
-                    // KEY=VALUE record dropped it when any value byte was
-                    // invalid UTF-8 — a legal path for LD_PRELOAD et al. — and
-                    // took the key detection with it. Only the KEY must be
-                    // UTF-8.
-                    let Some(eq) = chunk.iter().position(|&b| b == b'=') else {
-                        continue;
-                    };
-                    let Ok(key) = std::str::from_utf8(&chunk[..eq]) else {
+                    // R35-04: one helper for every environ reader (R35-04
+                    // verification). Only the KEY must be UTF-8; a non-UTF-8
+                    // byte in the VALUE — a legal path for LD_PRELOAD, a
+                    // random byte in an API token — must not drop the record.
+                    let Some((key, _value)) = safe_io::split_env_record(chunk) else {
                         continue;
                     };
                     if is_sensitive_key(key) {
@@ -261,10 +263,10 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                         }
                     }
 
-                    // Cover `mysql -pSECRET` (without equals sign). Byte-level
-                    // for the same reason as above.
+                    // Cover `mysql -pSECRET` (without equals sign). The
+                    // predicate is byte-level for the same reason as above.
                     if (process_name == "mysql" || process_name == "mysqldump")
-                        && arg.strip_prefix(b"-p").is_some_and(|pwd| !pwd.is_empty())
+                        && is_mysql_inline_password(arg)
                     {
                         push_leak("cmdline", "mysql-password".to_string());
                     }
@@ -427,16 +429,14 @@ mod tests {
 
     #[test]
     fn non_utf8_value_does_not_hide_sensitive_key() {
-        // Before R35-04, from_utf8 over the whole KEY=VALUE chunk failed on
-        // an invalid byte in the value and the key was silently dropped.
-        let key = b"AWS_SECRET_ACCESS_KEY";
-        let mut rec = Vec::new();
-        rec.extend_from_slice(key);
-        rec.push(b'=');
-        rec.extend_from_slice(b"\xff\xfe/path");
-        let eq = rec.iter().position(|&b| b == b'=').unwrap();
-        let parsed_key = std::str::from_utf8(&rec[..eq]).unwrap();
-        assert!(is_sensitive_key(parsed_key));
+        // R35-04 verification: this test now drives the shared production
+        // splitter rather than re-implementing it. A change to the split
+        // semantics must be reflected in every environ reader at once.
+        let rec: &[u8] = b"AWS_SECRET_ACCESS_KEY=\xff\xfe/path";
+        let Some((key, _value)) = safe_io::split_env_record(rec) else {
+            panic!("record must split: {rec:?}");
+        };
+        assert!(is_sensitive_key(key));
     }
 
     #[test]
@@ -451,12 +451,11 @@ mod tests {
         assert!(starts_with_icase(short, "-p="));
 
         // MySQL style `-p<secret>`, no equals sign: byte-level prefix strip.
-        assert!(
-            b"-p\xff\xfe"
-                .strip_prefix(b"-p")
-                .is_some_and(|p| !p.is_empty())
-        );
+        assert!(is_mysql_inline_password(b"-p\xff\xfe"));
         // `-p` alone is not a password — must not fire.
-        assert!(b"-p".strip_prefix(b"-p").is_some_and(|p| p.is_empty()));
+        assert!(!is_mysql_inline_password(b"-p"));
+        // `-p=` without a value is caught by the flag list, not by this
+        // predicate — keep them distinct.
+        assert!(is_mysql_inline_password(b"-p="));
     }
 }
