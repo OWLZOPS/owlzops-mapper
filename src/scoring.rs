@@ -58,7 +58,11 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 /// (R34-01) — multi-carrier hosts score lower, SEC-061-only hosts +5. Tag
 /// the release number when the version actually ships; do not backfill it
 /// here.
-pub const SCORING_VERSION: u8 = 15;
+/// v16 (0.5.39): SEC-061 (root-equivalent groups), SEC-062 (sshd
+/// replaceable targets), SEC-063 (authorized_keys environment=),
+/// SEC-064 (immutable trust anchors) — new weighted inputs, same
+/// rule as v15/R33-12.
+pub const SCORING_VERSION: u8 = 16;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -3552,7 +3556,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (15, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (16, 15));
     }
 
     #[test]
@@ -3569,7 +3573,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .expect("SEC-005 fires");
-        assert_eq!((SCORING_VERSION, f.weight), (15, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (16, 15));
     }
 
     #[test]
