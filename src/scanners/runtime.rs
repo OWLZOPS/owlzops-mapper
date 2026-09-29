@@ -200,53 +200,101 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
     )
     .await;
 
-    if let Ok(Ok(images)) = images_result {
-        for img in images {
-            images_count += 1;
+    match images_result {
+        Ok(Ok(images)) => {
+            for img in images {
+                images_count += 1;
 
-            let size_mb = (img.size.max(0) / (1024 * 1024)) as u64;
+                let size_mb = (img.size.max(0) / (1024 * 1024)) as u64;
 
-            total_images_size_mb += size_mb;
+                total_images_size_mb += size_mb;
 
-            if img.repo_tags.is_empty() || img.repo_tags.contains(&"<none>:<none>".to_string()) {
-                dangling_images_count += 1;
-                total_dangling_size_mb += size_mb;
-                let raw_id = img.id.replace("sha256:", "");
-                let short_id = if raw_id.len() > 12 {
-                    raw_id[..12].to_string()
-                } else {
-                    raw_id
-                };
-                dangling_images.push(DanglingImageInfo {
-                    id: short_id,
-                    size_mb,
-                });
+                if img.repo_tags.is_empty() || img.repo_tags.contains(&"<none>:<none>".to_string())
+                {
+                    dangling_images_count += 1;
+                    total_dangling_size_mb += size_mb;
+                    let raw_id = img.id.replace("sha256:", "");
+                    let short_id = if raw_id.len() > 12 {
+                        raw_id[..12].to_string()
+                    } else {
+                        raw_id
+                    };
+                    dangling_images.push(DanglingImageInfo {
+                        id: short_id,
+                        size_mb,
+                    });
+                }
             }
         }
-    } else {
-        warn!("{} list_images timed out or failed", runtime_name);
+        _ => {
+            // R35-02: a failed list_images must be a coverage fact, not a
+            // silent zero. images_count / dangling_* would otherwise look
+            // like a clean state on a host we never read.
+            coverage::record(format!(
+                "runtime: {runtime_name} list_images timed out or failed — images_count / \
+                 dangling_* are 0 because they were NOT read"
+            ));
+            warn!("{} list_images timed out or failed", runtime_name);
+        }
     }
 
     dangling_images.sort_by_key(|b| std::cmp::Reverse(b.size_mb));
 
-    // list_containers with 10s timeout
+    // ── Security inventory: list_containers WITHOUT sizes ────────────────
+    // R35-02: `size: true` makes the daemon walk every writable layer
+    // (overlay2 diff). On a host with many or bloated containers this single
+    // call can exceed the 10 s budget, and the previous `vec![]` fallback
+    // emptied the whole security inventory — no DOCK-* finding could fire,
+    // foreign-listener attribution lost container names, and the exit code
+    // stayed clean. The security list must not depend on a hygiene metric.
     let containers_result = tokio::time::timeout(
         Duration::from_secs(10),
         docker.list_containers(Some(ListContainersOptions::<String> {
             all: true,
-            size: true,
+            size: false,
             ..Default::default()
         })),
     )
     .await;
 
-    let containers = match containers_result {
+    let mut containers = match containers_result {
         Ok(Ok(ctrs)) => ctrs,
-        _ => {
-            warn!("{} list_containers timed out or failed", runtime_name);
+        other => {
+            let why = match other {
+                Ok(Err(e)) => format!("failed ({e})"),
+                _ => "timed out after 10s".to_string(),
+            };
+            coverage::record(format!(
+                "runtime: {runtime_name} list_containers {why} — topology.containers is \
+                 EMPTY because it was NOT read; privileged/cap_add/sensitive_mounts NOT \
+                 evaluated"
+            ));
+            warn!("{} list_containers {}", runtime_name, why);
             vec![]
         }
     };
+
+    // ── Hygiene data: sizes in a separate, bounded call ──────────────────
+    // R35-02: its failure degrades size_mb / rw_size_mb only — and says so.
+    // The merge is id-keyed and testable without a live daemon.
+    if !containers.is_empty() {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            docker.list_containers(Some(ListContainersOptions::<String> {
+                all: true,
+                size: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        {
+            Ok(Ok(sized)) => merge_sizes(&mut containers, sized),
+            _ => coverage::record(format!(
+                "runtime: {runtime_name} container size query failed or timed out — \
+                 size_mb / rw_size_mb are 0 because they were NOT measured"
+            )),
+        }
+    }
 
     if !containers.is_empty() {
         // Spawn inspect tasks with individual 5s timeouts
@@ -505,21 +553,31 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
     let mut dangling_volumes_count = 0;
     let mut filter = HashMap::new();
     filter.insert("dangling".to_string(), vec!["true".to_string()]);
-    if let Ok(Ok(volumes_resp)) = tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(10),
         docker.list_volumes(Some(ListVolumesOptions { filters: filter })),
     )
     .await
-        && let Some(vols) = volumes_resp.volumes
     {
-        dangling_volumes_count = vols.len();
+        Ok(Ok(resp)) => dangling_volumes_count = resp.volumes.map_or(0, |v| v.len()),
+        _ => coverage::record(format!(
+            "runtime: {runtime_name} list_volumes failed or timed out — \
+             dangling_volumes_count is 0 because it was NOT measured"
+        )),
     }
 
     // Fetch reclaimable space via system_info_df
     let mut images_reclaimable_mb = 0u64;
     let mut build_cache_reclaimable_mb = 0u64;
 
-    if let Ok(Ok(df)) = tokio::time::timeout(Duration::from_secs(10), docker.df()).await {
+    let df_res = tokio::time::timeout(Duration::from_secs(10), docker.df()).await;
+    if !matches!(df_res, Ok(Ok(_))) {
+        coverage::record(format!(
+            "runtime: {runtime_name} system df failed or timed out — total_images_size_mb / \
+             *_reclaimable_mb are 0 because they were NOT measured"
+        ));
+    }
+    if let Ok(Ok(df)) = df_res {
         if let Some(layers) = df.layers_size {
             total_images_size_mb = (layers.max(0) / (1024 * 1024)) as u64;
         }
@@ -558,6 +616,38 @@ pub async fn gather_runtime_topology() -> TopologyInfo {
         images_reclaimable_mb,
         build_cache_reclaimable_mb,
         container_netns: container_netns_mappings,
+    }
+}
+
+/// R35-02: copy `size_rw` / `size_root_fs` from the sized listing onto the
+/// fast one, by container id. Pure so it can be tested without a live daemon.
+///
+/// A container that appears in only one of the two listings is not an error
+/// in itself (it can start or stop between the calls). If the sized listing
+/// matched nothing at all — every id differs — that is worth surfacing: the
+/// hygiene columns will read 0 across the board for a reason.
+fn merge_sizes(
+    containers: &mut [bollard::models::ContainerSummary],
+    sized: Vec<bollard::models::ContainerSummary>,
+) {
+    let by_id: HashMap<String, (Option<i64>, Option<i64>)> = sized
+        .into_iter()
+        .filter_map(|c| Some((c.id?, (c.size_rw, c.size_root_fs))))
+        .collect();
+    let mut matched = 0usize;
+    for c in containers.iter_mut() {
+        if let Some(&(rw, root)) = c.id.as_ref().and_then(|id| by_id.get(id)) {
+            c.size_rw = rw;
+            c.size_root_fs = root;
+            matched += 1;
+        }
+    }
+    if matched == 0 && !containers.is_empty() {
+        coverage::record(
+            "runtime: container size listing returned no id matching the fast listing — \
+             size_mb / rw_size_mb left unmeasured"
+                .to_string(),
+        );
     }
 }
 
@@ -618,5 +708,35 @@ mod runtime_tests {
             classify_mount("/etc/passwd", false).as_deref(),
             Some("/etc (ro)")
         );
+    }
+
+    // ── R35-02: size merge is pure and id-keyed ──────────────────────────
+
+    #[test]
+    fn sizes_merge_by_id_and_unknowns_stay_unmeasured() {
+        use bollard::models::ContainerSummary;
+        let mut fast = vec![
+            ContainerSummary {
+                id: Some("a".into()),
+                ..Default::default()
+            },
+            ContainerSummary {
+                id: Some("b".into()),
+                ..Default::default()
+            },
+        ];
+        let sized = vec![ContainerSummary {
+            id: Some("a".into()),
+            size_rw: Some(10),
+            size_root_fs: Some(20),
+            ..Default::default()
+        }];
+        merge_sizes(&mut fast, sized);
+        assert_eq!(
+            (fast[0].size_rw, fast[0].size_root_fs),
+            (Some(10), Some(20))
+        );
+        assert_eq!(fast[1].size_rw, None, "unmatched id must stay unmeasured");
+        assert_eq!(fast[1].size_root_fs, None);
     }
 }
