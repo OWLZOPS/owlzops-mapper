@@ -82,6 +82,17 @@ fn resolve_tool_uncached(tool: &str) -> Option<String> {
     None
 }
 
+/// R35-05: metadata reduced to what the trust check needs. Exists so the
+/// verdicts can be exercised with a fake filesystem in tests — the real
+/// `/root/...` fixture only runs under root and was silently skipped in CI
+/// (R35-05 verification).
+#[derive(Clone, Copy, Debug)]
+struct ExecMeta {
+    uid: u32,
+    mode: u32,
+    is_file: bool,
+}
+
 /// R35-05: may we exec this file with our privileges? The file and every
 /// directory on its lexical AND canonical paths must be owned by root (or our
 /// euid) and not writable by group or other.
@@ -92,26 +103,46 @@ fn resolve_tool_uncached(tool: &str) -> Option<String> {
 /// also verify the lexical ancestors.
 fn is_trusted_exec(path: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid(2) cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    let owned_ok =
-        |md: &std::fs::Metadata| (md.uid() == 0 || md.uid() == euid) && md.mode() & 0o022 == 0;
 
     let lexical = std::path::Path::new(path);
     let Ok(real) = std::fs::canonicalize(lexical) else {
         return false;
     };
-    let Ok(md) = std::fs::metadata(&real) else {
+    // SAFETY: geteuid(2) cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    is_trusted_exec_with(lexical, &real, euid, |p| {
+        std::fs::metadata(p).ok().map(|m| ExecMeta {
+            uid: m.uid(),
+            mode: m.mode(),
+            is_file: m.is_file(),
+        })
+    })
+}
+
+/// R35-05: the pure core of `is_trusted_exec`. Takes the metadata provider
+/// as a parameter so both verdicts (accepted, refused) can be tested without
+/// touching the real filesystem and without depending on root.
+fn is_trusted_exec_with<F>(
+    lexical: &std::path::Path,
+    real: &std::path::Path,
+    euid: u32,
+    meta: F,
+) -> bool
+where
+    F: Fn(&std::path::Path) -> Option<ExecMeta>,
+{
+    let owned_ok = |m: ExecMeta| (m.uid == 0 || m.uid == euid) && m.mode & 0o022 == 0;
+    let Some(file) = meta(real) else {
         return false;
     };
-    md.is_file()
-        && md.mode() & 0o111 != 0
-        && owned_ok(&md)
+    file.is_file
+        && file.mode & 0o111 != 0
+        && owned_ok(file)
         && lexical
             .ancestors()
             .skip(1)
             .chain(real.ancestors().skip(1))
-            .all(|d| std::fs::metadata(d).is_ok_and(|m| owned_ok(&m)))
+            .all(|d| meta(d).is_some_and(owned_ok))
 }
 
 /// R35-05: the single gate for everything `run_*` execs. A bare name goes
@@ -482,23 +513,30 @@ pub fn unregister_child(pid: u32) {
 /// Send SIGTERM to all currently tracked child process groups and clear the list.
 /// Used during graceful shutdown to terminate any remaining `ssh`/`scp`
 /// processes started by the legacy engine.
+///
+/// R35-15: signal **while holding the registry lock**. Workers unregister
+/// before they reap (R35-09), so no pid in this list can be reaped — and its
+/// PGID recycled — until we release. The old shape snapshotted the list,
+/// cleared it under the lock, and only then signalled: a worker could
+/// unregister (no-op on the already-cleared list) and reap in that window,
+/// leaving our SIGTERM to land on a recycled group.
+///
+/// `kill(2)` is non-blocking and the loop is bounded by `max_concurrent`
+/// entries, so holding the lock for the duration is cheap; a worker blocked
+/// on `unregister_child` cannot reach `wait()` until the loop finishes.
 pub fn terminate_registered_children() {
     with_registry(|reg| {
-        let pids: Vec<u32> = {
-            let mut guard = reg
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let pids = guard.clone();
-            guard.clear();
-            pids
-        };
-        for pid in pids {
+        let mut guard = reg
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &pid in guard.iter() {
             unsafe {
                 // R24-04: whole group — helper processes spawned by the tool
                 // must not survive graceful shutdown as orphans.
                 libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
             }
         }
+        guard.clear();
     });
 }
 
@@ -1001,6 +1039,110 @@ mod tests {
 
     // ── R35-05: trusted-exec gate ────────────────────────────
 
+    /// Build a metadata provider from a static table. Any path not present
+    /// maps to `None` — the same shape `std::fs::metadata` returns for a
+    /// missing file.
+    fn fake_meta(
+        entries: &'static [(&'static str, u32, u32, bool)],
+    ) -> impl Fn(&std::path::Path) -> Option<ExecMeta> {
+        move |p| {
+            entries
+                .iter()
+                .find(|(path, _, _, _)| std::path::Path::new(path) == p)
+                .map(|&(_, uid, mode, is_file)| ExecMeta { uid, mode, is_file })
+        }
+    }
+
+    /// R35-05 verification: both verdicts exercised without root.
+    ///
+    /// The previous fixture lived under /root and was skipped under
+    /// `geteuid() != 0`, so the refusal branch of the trust gate had zero
+    /// CI coverage. This test exercises `is_trusted_exec_with` directly on a
+    /// fake filesystem and asserts both accept and refuse.
+    #[test]
+    fn trust_verdicts_without_root() {
+        // A full ancestor chain from the root down to the binary. Each entry
+        // is (path, uid, mode, is_file). Directories are `is_file = false`.
+        const TREE: &[(&str, u32, u32, bool)] = &[
+            ("/", 0, 0o755, false),
+            ("/usr", 0, 0o755, false),
+            ("/usr/local", 0, 0o755, false),
+            ("/usr/local/bin", 0, 0o755, false),
+            ("/usr/local/bin/tool", 0, 0o755, true),
+        ];
+        let bin = std::path::Path::new("/usr/local/bin/tool");
+
+        // Baseline: root-owned file, every ancestor root-owned, no g/o+w.
+        assert!(
+            is_trusted_exec_with(bin, bin, 1000, fake_meta(TREE)),
+            "root-owned, mode 0755, clean ancestors — must be accepted"
+        );
+
+        // Debian layout: /usr/local is root:staff 2775 (group-writable).
+        const DEBIAN: &[(&str, u32, u32, bool)] = &[
+            ("/", 0, 0o755, false),
+            ("/usr", 0, 0o755, false),
+            ("/usr/local", 0, 0o2775, false),
+            ("/usr/local/bin", 0, 0o755, false),
+            ("/usr/local/bin/tool", 0, 0o755, true),
+        ];
+        assert!(
+            !is_trusted_exec_with(bin, bin, 1000, fake_meta(DEBIAN)),
+            "/usr/local at 0o2775 (group-writable) must be refused"
+        );
+
+        // The file itself is group-writable even under a clean tree.
+        const GW_FILE: &[(&str, u32, u32, bool)] = &[
+            ("/", 0, 0o755, false),
+            ("/usr", 0, 0o755, false),
+            ("/usr/local", 0, 0o755, false),
+            ("/usr/local/bin", 0, 0o755, false),
+            ("/usr/local/bin/tool", 0, 0o775, true),
+        ];
+        assert!(
+            !is_trusted_exec_with(bin, bin, 1000, fake_meta(GW_FILE)),
+            "group-writable file must be refused"
+        );
+
+        // Foreign owner: neither root nor our euid.
+        const FOREIGN: &[(&str, u32, u32, bool)] = &[
+            ("/", 0, 0o755, false),
+            ("/usr", 0, 0o755, false),
+            ("/usr/local", 0, 0o755, false),
+            ("/usr/local/bin", 0, 0o755, false),
+            ("/usr/local/bin/tool", 1001, 0o755, true),
+        ];
+        assert!(
+            !is_trusted_exec_with(bin, bin, 1000, fake_meta(FOREIGN)),
+            "binary owned by another user must be refused"
+        );
+
+        // Own euid: allowed by the `uid == euid` branch.
+        const OWN_EUID: &[(&str, u32, u32, bool)] = &[
+            ("/", 0, 0o755, false),
+            ("/usr", 0, 0o755, false),
+            ("/usr/local", 0, 0o755, false),
+            ("/usr/local/bin", 0, 0o755, false),
+            ("/usr/local/bin/tool", 1001, 0o755, true),
+        ];
+        assert!(
+            is_trusted_exec_with(bin, bin, 1001, fake_meta(OWN_EUID)),
+            "binary owned by our euid must be accepted"
+        );
+
+        // Missing ancestor: the walk hits `None` and refuses.
+        const MISSING: &[(&str, u32, u32, bool)] = &[
+            ("/", 0, 0o755, false),
+            // /usr/local deliberately absent
+            ("/usr/local/bin", 0, 0o755, false),
+            ("/usr/local/bin/tool", 0, 0o755, true),
+        ];
+        assert!(
+            !is_trusted_exec_with(bin, bin, 1000, fake_meta(MISSING)),
+            "a missing ancestor must refuse"
+        );
+    }
+
     #[test]
     fn a_packaged_shell_is_trusted() {
         // usrmerge makes either canonical; at least one must exist and pass.
@@ -1016,12 +1158,12 @@ mod tests {
         assert!(exec_target("/nonexistent/absolute/tool").is_none());
     }
 
+    /// Integration smoke test: exercises the real filesystem path of
+    /// `is_trusted_exec` end to end. Skipped without root — the DI test above
+    /// is what covers the refusal branch in CI.
     #[test]
-    fn a_group_writable_binary_is_refused() {
+    fn a_group_writable_binary_is_refused_integration() {
         use std::os::unix::fs::PermissionsExt;
-        // /tmp is o+w, so a fixture there fails the ancestor check for a
-        // reason unrelated to the file's own mode. Use a private tree under
-        // /root, reachable only when running as root.
         if unsafe { libc::geteuid() } != 0 {
             return;
         }

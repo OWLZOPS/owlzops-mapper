@@ -212,6 +212,25 @@ pub fn proc_miss(e: &io::Error) -> ProcMiss {
     }
 }
 
+// ── R35-04: split one NUL-delimited environ record ──────────────────────
+
+/// Split one NUL-delimited `KEY=VALUE` record at the byte level.
+///
+/// R35-04: only the KEY must be UTF-8. A non-UTF-8 byte anywhere in the
+/// VALUE — a legal path for `LD_PRELOAD`, a random byte in an API token —
+/// used to drop the whole record when the caller decoded `KEY=VALUE` as a
+/// single `&str`. Both environ readers (`library_injection` for SEC-023,
+/// `dlp` for SEC-014) now share this helper so their splits cannot drift.
+///
+/// Returns `None` when there is no `=`, or when the key is not valid UTF-8.
+/// The value is returned as raw bytes; the caller decides how to interpret
+/// it (lossy, byte-comparison, …).
+#[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
+pub fn split_env_record(chunk: &[u8]) -> Option<(&str, &[u8])> {
+    let eq = chunk.iter().position(|&b| b == b'=')?;
+    Some((std::str::from_utf8(&chunk[..eq]).ok()?, &chunk[eq + 1..]))
+}
+
 #[cfg(feature = "local-scan")]
 pub const CAP_PROC_NET: usize = 16 * 1024 * 1024;
 #[cfg(feature = "local-scan")]
@@ -303,5 +322,26 @@ mod tests {
             ProcMiss::Other(io::ErrorKind::InvalidData),
             "anything else is kept distinct so callers can log the kind"
         );
+    }
+
+    // ── R35-04: env record split ──────────────────────────────
+
+    #[test]
+    fn env_record_key_survives_a_non_utf8_value() {
+        // R35-04: the KEY must be UTF-8, the VALUE need not.
+        assert_eq!(
+            split_env_record(b"AWS_SECRET_ACCESS_KEY=\xff\xfe/p"),
+            Some(("AWS_SECRET_ACCESS_KEY", &b"\xff\xfe/p"[..]))
+        );
+        // A value containing `=` is preserved verbatim after the first split.
+        assert_eq!(split_env_record(b"K=a=b"), Some(("K", &b"a=b"[..])));
+        // No separator → None.
+        assert_eq!(split_env_record(b"NOEQ"), None);
+        // Non-UTF-8 key → None, even with a separator.
+        assert_eq!(split_env_record(b"\xffK=v"), None);
+        // Empty value is legal (e.g. `PATH=`).
+        assert_eq!(split_env_record(b"EMPTY="), Some(("EMPTY", &b""[..])));
+        // Empty input → None.
+        assert_eq!(split_env_record(b""), None);
     }
 }
