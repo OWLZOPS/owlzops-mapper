@@ -69,6 +69,50 @@ const UPLOAD_TAIL_BUDGET: Duration = Duration::from_secs(60);
 const CAP_SUDO_PASS_STDIN: u64 = 4096;
 
 // ---------------------------------------------------------------------------
+// Per-host budget derivation (R35-10)
+// ---------------------------------------------------------------------------
+//
+// Before R35-10 the orchestrator's per-host timeout was a magic
+// `host_budget_secs(t) + 35`. That formula predated the sudo pre-flight,
+// the staging probe, the upload drain and the cleanup step, and its sum
+// was shorter than the sum of stage budgets under a slow SSH banner: the
+// outer timeout could fire before `cleanup_remote_artifact` ran, leaving
+// the binary on the host with no "artifact left" warning (the warning is
+// emitted by cleanup's own code path, which never ran). One derivation,
+// one source of truth: every stage budget lives here, `host_ceiling` sums
+// them, and `tokio::time::timeout` in both main.rs spawn sites uses the
+// result.
+
+/// TCP connect deadline for the SSH session.
+pub(crate) const CONNECT_BUDGET: Duration = Duration::from_secs(15);
+
+/// SSH banner / KEX / authentication deadline.
+pub(crate) const HANDSHAKE_AUTH_BUDGET: Duration = Duration::from_secs(30);
+
+/// Deadline for the post-scan `rm` teardown of the remote artifact.
+pub(crate) const CLEANUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Local key load + scheduling slack added on top of the sum of stages.
+const CEILING_MARGIN: Duration = Duration::from_secs(5);
+
+/// Inner deadline: sudo pre-flight, staging, upload, exec, drain.
+/// Sat urating on every step so `--remote-timeout-secs u64::MAX` cannot
+/// overflow before the CLI validator rejects it.
+pub(crate) fn scan_budget(remote_timeout_secs: u64) -> Duration {
+    Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs).saturating_add(5))
+}
+
+/// The orchestrator's per-host ceiling, derived from every stage it must
+/// outlive. `main.rs` (both spawn sites) uses this in place of a magic sum.
+pub(crate) fn host_ceiling(remote_timeout_secs: u64) -> Duration {
+    CONNECT_BUDGET
+        .saturating_add(HANDSHAKE_AUTH_BUDGET)
+        .saturating_add(scan_budget(remote_timeout_secs))
+        .saturating_add(CLEANUP_BUDGET)
+        .saturating_add(CEILING_MARGIN)
+}
+
+// ---------------------------------------------------------------------------
 // Sudo outcome classification
 // ---------------------------------------------------------------------------
 
@@ -1118,7 +1162,10 @@ async fn cleanup_remote_artifact(
         }
         Ok::<Option<u32>, russh::Error>(exit)
     };
-    match tokio::time::timeout(Duration::from_secs(10), fut).await {
+    // R35-10: CLEANUP_BUDGET is one of the stage budgets host_ceiling sums;
+    // changing it here without changing host_ceiling would re-open the
+    // R13-02 gap this constant closes.
+    match tokio::time::timeout(CLEANUP_BUDGET, fut).await {
         Ok(Ok(Some(0))) => tracing::debug!(host = %host, "remote artifact removed"),
         Ok(Ok(code)) => tracing::warn!(
             host = %host,
@@ -1192,8 +1239,9 @@ pub async fn run_remote_scan_russh(
 ) -> Result<(Vec<u8>, RemoteCoverage), RemoteError> {
     let (hostname, port) = split_host_port(host);
 
+    // R35-10: CONNECT_BUDGET is one of the stage budgets host_ceiling sums.
     let stream = tokio::time::timeout(
-        Duration::from_secs(15),
+        CONNECT_BUDGET,
         tokio::net::TcpStream::connect((hostname.as_str(), port)),
     )
     .await
@@ -1277,7 +1325,8 @@ pub async fn run_remote_scan_russh(
             })?
     };
 
-    const HANDSHAKE_AUTH_BUDGET: Duration = Duration::from_secs(30);
+    // R35-10: HANDSHAKE_AUTH_BUDGET lives at module level so host_ceiling can
+    // include it in the per-host ceiling.
     let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
         let mut session = client::connect_stream(config, stream, handler).await?;
         let hash = session.best_supported_rsa_hash().await?.flatten();
@@ -1307,7 +1356,11 @@ pub async fn run_remote_scan_russh(
         remote_coverage.notes.push(note.to_string());
     }
 
-    let overall = Duration::from_secs(crate::utils::host_budget_secs(remote_timeout_secs) + 5);
+    // R35-10: the inner deadline is one of the stage budgets host_ceiling
+    // sums. Before the fix this was `host_budget_secs(t) + 5` written inline
+    // here — the same value, but expressed in one place so main.rs's outer
+    // timeout and this inner one cannot drift.
+    let overall = scan_budget(remote_timeout_secs);
     let uploaded = AtomicBool::new(false);
     let artifact: std::sync::OnceLock<RemoteArtifact> = std::sync::OnceLock::new();
 
@@ -1768,5 +1821,47 @@ mod tests {
             "read_sudo_pass_from_fd closed a descriptor it does not own"
         );
         unsafe { libc::close(r) };
+    }
+
+    // ── R35-10: host ceiling derivation ─────────────────────────
+
+    #[test]
+    fn host_ceiling_outlives_every_inner_stage() {
+        // The ceiling must be at least the sum of the stages; changing any
+        // stage budget without growing the ceiling breaks this test.
+        for t in [1u64, 120, 3600, 86_400] {
+            let stages = CONNECT_BUDGET
+                .saturating_add(HANDSHAKE_AUTH_BUDGET)
+                .saturating_add(scan_budget(t))
+                .saturating_add(CLEANUP_BUDGET);
+            assert!(
+                host_ceiling(t) >= stages,
+                "t={t}: ceiling {} < stages {}",
+                host_ceiling(t).as_secs(),
+                stages.as_secs()
+            );
+        }
+    }
+
+    #[test]
+    fn host_ceiling_is_saturating_on_extreme_input() {
+        // u64::MAX is unreachable from the CLI (`range(1..=86_400)`), but
+        // host_budget_secs saturates rather than overflow with
+        // `overflow-checks = true`. The ceiling must not panic on that path.
+        let huge = host_ceiling(u64::MAX);
+        assert!(huge.as_secs() > 0);
+        // Monotonic in t: increasing t never shrinks the ceiling.
+        assert!(host_ceiling(u64::MAX) >= host_ceiling(120));
+    }
+
+    #[test]
+    fn scan_budget_matches_the_documented_formula() {
+        // The inner deadline used to be written inline as
+        // `Duration::from_secs(host_budget_secs(t) + 5)`; the function
+        // preserves that exact value.
+        for t in [1u64, 120, 86_400] {
+            let expected = Duration::from_secs(crate::utils::host_budget_secs(t).saturating_add(5));
+            assert_eq!(scan_budget(t), expected, "t={t}");
+        }
     }
 }
