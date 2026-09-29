@@ -238,13 +238,16 @@ pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
     map
 }
 
-/// Read the network namespace inode for a process.
+/// Read the network namespace inode for a process rooted at `proc_root`.
 ///
 /// R33-05: returns `io::Result` so the caller can distinguish a vanished
 /// pid (ENOENT, a race) from a permission failure (EACCES, a real
 /// coverage fact). The pre-R33-05 `Option` collapsed both into one.
-fn netns_inode(pid: u32) -> io::Result<String> {
-    let link = fs::read_link(format!("/proc/{pid}/ns/net"))?;
+///
+/// R35-06 verification: `proc_root` is parameterised so the walk can be
+/// exercised against a tempdir (see `report_foreign_netns_listeners_from`).
+fn netns_inode(proc_root: &str, pid: u32) -> io::Result<String> {
+    let link = fs::read_link(format!("{proc_root}/{pid}/ns/net"))?;
     link.to_str().map(str::to_string).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -267,11 +270,19 @@ fn netns_inode(pid: u32) -> io::Result<String> {
 /// Aggregated per network namespace: a Docker host has many processes sharing
 /// one netns, but only one entry per unique socket is returned.
 pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
-    let host_ns = match std::fs::read_link("/proc/1/ns/net") {
+    report_foreign_netns_listeners_from("/proc")
+}
+
+/// R35-06 verification: same walk, but rooted at `proc_root`. Production
+/// calls `report_foreign_netns_listeners` (`/proc`); tests call this against
+/// a tempdir so the tuple-filter regression has a real behavioural check
+/// instead of a signature check.
+fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListener> {
+    let host_ns = match fs::read_link(format!("{proc_root}/1/ns/net")) {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
             coverage::record(format!(
-                "netns visibility: /proc/1/ns/net unreadable ({}) — foreign-namespace \
+                "netns visibility: {proc_root}/1/ns/net unreadable ({}) — foreign-namespace \
                  listeners NOT enumerated; the port inventory may be missing sockets",
                 e.kind()
             ));
@@ -279,11 +290,11 @@ pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
         }
     };
 
-    let entries = match fs::read_dir("/proc") {
+    let entries = match fs::read_dir(proc_root) {
         Ok(e) => e,
         Err(e) => {
             coverage::record(format!(
-                "netns visibility: /proc unreadable ({}) — foreign-namespace \
+                "netns visibility: {proc_root} unreadable ({}) — foreign-namespace \
                  listeners NOT enumerated",
                 e.kind()
             ));
@@ -311,7 +322,7 @@ pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
     let mut ns_over_cap = 0usize;
 
     for pid in pids {
-        let ns = match netns_inode(pid) {
+        let ns = match netns_inode(proc_root, pid) {
             Ok(ns) => ns,
             // R33-05: the pid exited between readdir and readlink. A race,
             // not a permission fact — do not count it as "unreadable (needs
@@ -339,7 +350,7 @@ pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
             continue;
         }
 
-        let base = format!("/proc/{pid}");
+        let base = format!("{proc_root}/{pid}");
         let mut foreign = HashMap::new();
         let mut any_read = false;
         for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
@@ -358,7 +369,7 @@ pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
         // inventory item.
         let listeners: Vec<SocketMeta> = foreign.into_values().collect();
 
-        let comm = safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096)
+        let comm = safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/comm"), 4096)
             .ok()
             .map(|(c, _)| c.trim().to_string())
             .unwrap_or_else(|| "?".to_string());
@@ -397,7 +408,7 @@ pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
 
     if ns_denied > 0 {
         coverage::record(format!(
-            "netns visibility: /proc/<pid>/ns/net unreadable for {ns_denied} process(es) \
+            "netns visibility: {proc_root}/<pid>/ns/net unreadable for {ns_denied} process(es) \
              (needs root/CAP_SYS_PTRACE) — foreign-namespace listeners are a LOWER BOUND"
         ));
     }
@@ -550,18 +561,46 @@ mod tests {
         );
     }
 
+    // ── R35-06 regression: tuple filter is gone ──────────────────────────
+
+    /// One fake PID with its netns symlink, comm, and a single TCP listener
+    /// line. `inode` distinguishes the socket inside its namespace.
+    fn fake_ns_pid(root: &std::path::Path, pid: u32, netns: &str, inode: u64) {
+        let base = root.join(pid.to_string());
+        std::fs::create_dir_all(base.join("ns")).unwrap();
+        std::fs::create_dir_all(base.join("net")).unwrap();
+        std::os::unix::fs::symlink(netns, base.join("ns/net")).unwrap();
+        std::fs::write(base.join("comm"), "sshd\n").unwrap();
+        // 0.0.0.0:22 in the tcp/LE hex encoding, state 0A = LISTEN.
+        let line = format!(
+            "   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 \
+             00000000     0        0 {inode} 1 0000 0 0 0 0 0"
+        );
+        std::fs::write(
+            base.join("net/tcp"),
+            format!("  sl  local rem st\n{line}\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn foreign_listener_is_reported_regardless_of_host_tuple() {
-        // R35-06 regression: a foreign socket whose tuple matches a host
-        // listener must still appear. The old tuple filter dropped it.
-        // Simulated at the data-model level — the walk itself needs a live
-        // /proc, but the invariant is that `report_foreign_netns_listeners`
-        // has no tuple-based branch left.
-        //
-        // Sanity: the function still exists and compiles with the new
-        // signature (no `host_sockets` argument). A future change that
-        // re-introduces the tuple filter would have to add the parameter
-        // back, and this test would then fail to compile.
-        let _f: fn() -> Vec<ForeignNetnsListener> = report_foreign_netns_listeners;
+    fn a_foreign_listener_survives_a_matching_host_tuple() {
+        // R35-06: the host sshd and a container sshd both on 0.0.0.0:22.
+        // Under the old tuple filter the container listener was dropped —
+        // it looked like the host's. Identity is the inode, and inodes never
+        // cross namespaces.
+        let tmp = tempfile::tempdir().unwrap();
+        fake_ns_pid(tmp.path(), 1, "net:[1]", 5001);
+        fake_ns_pid(tmp.path(), 4242, "net:[2]", 6001);
+        let out = report_foreign_netns_listeners_from(tmp.path().to_str().unwrap());
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (
+                out[0].netns.as_str(),
+                out[0].bind_address.as_str(),
+                out[0].port.as_str()
+            ),
+            ("net:[2]", "0.0.0.0", "22")
+        );
     }
 }
