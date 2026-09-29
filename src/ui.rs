@@ -7,8 +7,13 @@
 //!
 //! R35-14: the only way a value reaches a table cell is through [`cell()`],
 //! which sanitizes by construction. This structural rule is enforced by the
-//! CI gate in `check_doctrine_gates.sh` (bare `Cell::new(` is rejected in
-//! this file).
+//! CI gate in `check_doctrine_gates.sh` (the bare comfy_table constructor
+//! is rejected in this file).
+//!
+//! R35-14 follow-up: a cell whose value is *our own* `\n`-joined string uses
+//! [`cell_multiline()`], which sanitizes each line independently and rejoins
+//! with a real newline. A host-supplied `\n` inside a line is still
+//! neutralized.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -146,6 +151,30 @@ pub fn sanitize_terminal(s: &str) -> String {
 /// this function, where the path is written `comfy_table::Cell::new`.
 fn cell<T: ToString>(content: T) -> Cell {
     comfy_table::Cell::new(sanitize_terminal(&content.to_string()))
+}
+
+/// R35-14 follow-up: a variant of [`cell()`] that preserves *our own* `\n`.
+///
+/// Two call sites deliberately build multi-line cells by joining with `\n`
+/// (`flags.join("\n")` in the capability audit, `mounts.join("\n")` in the
+/// runtime containers table). U+000A there is a layout separator, not host
+/// data; `cell()` neutralises it into U+FFFD and comfy_table can no longer
+/// render the multi-line layout.
+///
+/// This function splits on `\n`, sanitizes **each line independently**, and
+/// rejoins with a real newline. A host-supplied `\n` inside a line is still
+/// neutralised by `sanitize_terminal`. The "every cell goes through
+/// `cell()`/`cell_multiline()`" invariant is preserved.
+///
+/// Use `cell()` unless the value is your own `\n`-joined string.
+fn cell_multiline<T: ToString>(content: T) -> Cell {
+    let joined: String = content
+        .to_string()
+        .split('\n')
+        .map(sanitize_terminal)
+        .collect::<Vec<_>>()
+        .join("\n");
+    comfy_table::Cell::new(joined)
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,6 +1354,9 @@ fn render_packages(report: &AgentReport) {
     }
 }
 
+/// Join the mount list into a multi-line string. Each entry goes through
+/// `sanitize_terminal` on its own; the joining `\n` is ours (see
+/// `cell_multiline`).
 fn truncate_docker_mounts(mounts: &[String], max_width: usize) -> String {
     mounts
         .iter()
@@ -1478,8 +1510,11 @@ fn render_runtime(report: &AgentReport) {
                     .add_attribute(Attribute::Bold)
             };
 
+            // R35-14 follow-up: `truncate_docker_mounts` joins entries with
+            // `\n` — that is *our* separator, not host data. `cell()` would
+            // have neutralized it into U+FFFD; `cell_multiline` preserves it.
             let mounts_display = truncate_docker_mounts(&c.mounts, 80);
-            let mounts_cell = cell(mounts_display).fg(Color::DarkGrey);
+            let mounts_cell = cell_multiline(mounts_display).fg(Color::DarkGrey);
 
             t_docker.add_row(vec![
                 cell(sanitize_terminal(&c.name)),
@@ -1545,12 +1580,16 @@ fn render_capability_audit(report: &AgentReport) {
             flags.join("\n")
         };
 
+        // R35-14 follow-up: `flags.join("\n")` produces a multi-line cell
+        // whose separator is *ours*, not host data. `cell()` would have
+        // neutralized the `\n` into U+FFFD (visible as `NNP=1�Seccomp=2`);
+        // `cell_multiline` preserves the intended line break.
         t_caps.add_row(vec![
             cell(sanitize_terminal(&f.comm)),
             cell(format!("{} / {}", f.pid, f.euid)),
             // R35-14: `cap_list` comes from remote JSON; `cell()` sanitizes it.
             cell(cap_list).fg(Color::Red),
-            cell(flags_display).fg(Color::DarkGrey),
+            cell_multiline(flags_display).fg(Color::DarkGrey),
         ]);
     }
 
@@ -2360,6 +2399,23 @@ mod tests {
         assert_eq!(
             cell(sanitize_terminal("\x1b[2Jevil")).content(),
             "\u{FFFD}[2Jevil"
+        );
+    }
+
+    // ── R35-14 follow-up: multi-line cells keep our `\n` ─────
+
+    #[test]
+    fn cell_multiline_preserves_our_newlines_but_not_host_ones() {
+        // Our own `\n` (from `join`) is a layout separator, kept as-is.
+        assert_eq!(cell_multiline("a\nb").content(), "a\nb");
+        // A host-supplied control byte inside a line is still neutralised.
+        assert_eq!(cell_multiline("a\x1b[2J\nb").content(), "a\u{FFFD}[2J\nb");
+        // Single-line values behave exactly like cell().
+        assert_eq!(cell_multiline("plain").content(), "plain");
+        // The exact shape that produced the regression: flags joined with `\n`.
+        assert_eq!(
+            cell_multiline("NNP=1\nSeccomp=2").content(),
+            "NNP=1\nSeccomp=2"
         );
     }
 }
