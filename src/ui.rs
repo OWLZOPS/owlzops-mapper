@@ -2006,7 +2006,12 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         if !traced.is_empty() {
             outln!("  {}Pointer resolution trace (deep forensics):", theme.mag);
             for l in traced.iter().take(5) {
-                let d = l.deep_forensics.as_ref().unwrap();
+                // R35-12: the filter above guarantees Some, but the compiler
+                // does not see through it. `let-else` keeps the invariant
+                // local and satisfies deny(unwrap_used).
+                let Some(d) = l.deep_forensics.as_ref() else {
+                    continue;
+                };
                 outln!(
                     "    pid {} @ {}  origin={} ({}%)  entropy={:.1}",
                     l.pid,

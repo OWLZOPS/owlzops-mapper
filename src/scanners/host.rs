@@ -384,7 +384,7 @@ fn kmsg_record_to_line(rec: &str, boot_unix_secs: i64) -> Option<String> {
         // from_timestamp returns None only for absurd values; 0 is a safe
         // fallback that keeps the row visible rather than dropping it.
         let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(wall, 0)
-            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap());
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
         format!("[{}] {msg}", dt.format("%Y-%m-%d %H:%M:%S"))
     })
 }

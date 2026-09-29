@@ -1,6 +1,17 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+/// R35-10: `--max-concurrent` must be ≥ 1. `0` would scan nothing and mark
+/// every host as missing. clap's `.range()` only exists for u64/i64, not
+/// usize, so this is a tiny local validator.
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 // =====================================================================
 // CLI structure with subcommands
 // =====================================================================
@@ -76,7 +87,15 @@ pub struct AuditArgs {
     #[arg(long)]
     pub local_binary: Option<String>,
 
-    #[arg(long, default_value = "120")]
+    /// Remote per-host deadline (s). Every host budget — the inner scan
+    /// deadline and the orchestrator's per-host ceiling — derives from it
+    /// (R35-10). The upper bound keeps `host_ceiling` from overflowing
+    /// `Instant` on platforms where `tokio::time::timeout` saturates.
+    #[arg(
+        long,
+        default_value = "120",
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
     pub remote_timeout_secs: u64,
 
     /// Ask for sudo password interactively and use russh engine (no NOPASSWD required).
@@ -90,8 +109,10 @@ pub struct AuditArgs {
     #[arg(long, value_name = "FD", conflicts_with = "ask_sudo_pass")]
     pub sudo_pass_fd: Option<i32>,
 
-    /// Maximum concurrent SSH sessions (default: 50).
-    #[arg(long, default_value_t = 50)]
+    /// Maximum concurrent SSH sessions (default: 50). Rejected at the
+    /// parser level: `0` would scan nothing and mark every host as missing
+    /// (R35-10).
+    #[arg(long, default_value_t = 50, value_parser = parse_positive_usize)]
     pub max_concurrent: usize,
 
     /// Exit 4 when coverage was incomplete (a scanner failed, a host did not
