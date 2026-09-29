@@ -14,6 +14,50 @@ use crate::{coverage, safe_io};
 /// negative answer that hides a passwordless grant.
 const MAX_ALIAS_DEPTH: u8 = 16;
 
+/// R35-03: strip a sudoers comment per sudoers(5). `#` starts a comment unless
+/// (a) the line is an `#include`/`#includedir` directive, or (b) it begins a
+/// user/runas/group ID — `#` followed by a digit at a token start
+/// (`#1000 ALL=…`, `%#1000`, `(#0)`, `root:#0`). A `#` inside a double-quoted
+/// Defaults value or after a backslash is literal.
+///
+/// Before this, `line.starts_with('#')` classified the whole line as a comment
+/// and threw away `#1001 ALL=(ALL) NOPASSWD: ALL` — a valid rule granting
+/// passwordless root to uid 1001, and a well-known masking technique — while
+/// leaving `# …` tails inside `Defaults` / `Cmnd_Alias` values untouched,
+/// producing both FN and FP.
+pub(crate) fn strip_comment(line: &str) -> &str {
+    if include_target(line).is_some() {
+        return line;
+    }
+    let b = line.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                // Skip the escaped byte. Inside double quotes this also covers
+                // `\"` — the quote does not toggle in_quotes.
+                i += 2;
+                continue;
+            }
+            b'"' => in_quotes = !in_quotes,
+            b'#' if !in_quotes => {
+                let token_start = i == 0
+                    || matches!(
+                        b[i - 1],
+                        b' ' | b'\t' | b',' | b'(' | b':' | b'!' | b'=' | b'%'
+                    );
+                if !(token_start && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+                    return line[..i].trim_end();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
 /// Yield logical (continuation-joined) lines from sudoers content.
 /// Lines ending with a backslash are joined with the next line, preserving
 /// a single space between them (after stripping trailing whitespace).
@@ -21,8 +65,17 @@ pub fn logical_lines(content: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut continuation = String::new();
     for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let trimmed = raw.trim();
+        // R35-03: include directives are consumed by the walker, never
+        // emitted; everything else follows sudoers(5) comment rules.
+        // `starts_with('#')` dropped `#1000 ALL=(ALL) NOPASSWD: ALL` and
+        // kept `# …` tails inside Defaults / Cmnd_Alias values.
+        let line = if include_target(trimmed).is_some() {
+            ""
+        } else {
+            strip_comment(trimmed)
+        };
+        if line.is_empty() {
             if !continuation.is_empty() {
                 result.push(std::mem::take(&mut continuation));
             }
@@ -788,5 +841,71 @@ mod tests {
                 .any(|(_, e)| is_nopasswd_all(e, &scan.aliases)),
             "the rule itself carries no NOPASSWD — only the Defaults line grants it"
         );
+    }
+
+    // ── R35-03: sudoers(5) comment rules ─────────────────────
+
+    #[test]
+    fn a_uid_rule_is_an_entry_not_a_comment() {
+        // `#1001 ALL=(ALL) NOPASSWD: ALL` is a valid rule granting
+        // passwordless root to uid 1001. `starts_with('#')` threw it away.
+        let lines = logical_lines("#1001 ALL=(ALL) NOPASSWD: ALL\n");
+        assert_eq!(lines, vec!["#1001 ALL=(ALL) NOPASSWD: ALL".to_string()]);
+        assert!(is_nopasswd_all(&lines[0], &CmndAliases::default()));
+    }
+
+    #[test]
+    fn inline_comments_no_longer_break_defaults_and_aliases() {
+        let d = logical_lines("Defaults:deploy !authenticate # CI runner\n");
+        assert_eq!(defaults_no_authenticate(&d[0]), Some(":deploy"));
+
+        let mut a = CmndAliases::default();
+        for l in logical_lines("Cmnd_Alias MAINT = ALL # everything\n") {
+            a.absorb(&l);
+        }
+        assert_eq!(a.resolves_to_all("MAINT", 0), Some(true));
+    }
+
+    #[test]
+    fn a_comment_that_mentions_nopasswd_is_not_a_grant() {
+        let l = logical_lines("deploy ALL=(ALL) ALL # was NOPASSWD: ALL until 2024\n");
+        assert!(!is_nopasswd_all(&l[0], &CmndAliases::default()));
+    }
+
+    #[test]
+    fn ids_quotes_escapes_and_includes_survive_stripping() {
+        assert_eq!(
+            strip_comment("%#1000 ALL=(#0) NOPASSWD: ALL"),
+            "%#1000 ALL=(#0) NOPASSWD: ALL"
+        );
+        assert_eq!(
+            strip_comment("root ALL=(root:#0) ALL"),
+            "root ALL=(root:#0) ALL"
+        );
+        assert_eq!(
+            strip_comment(r#"Defaults lecture_file="/etc/a#b""#),
+            r#"Defaults lecture_file="/etc/a#b""#
+        );
+        assert_eq!(
+            strip_comment(r"Cmnd_Alias E = /bin/echo \# x"),
+            r"Cmnd_Alias E = /bin/echo \# x"
+        );
+        assert_eq!(
+            strip_comment("#includedir /etc/sudoers.d"),
+            "#includedir /etc/sudoers.d"
+        );
+        assert_eq!(strip_comment("#includes are handled below"), "");
+        // token-start rule: `#` glued to a word is not a comment starter.
+        assert_eq!(strip_comment("foo#bar"), "foo");
+    }
+
+    #[test]
+    fn include_lines_do_not_emit_an_entry() {
+        // `#include` is consumed by the walker; emitting it as an entry would
+        // make it look like a rule. `logical_lines` drops it.
+        let lines = logical_lines("#include /etc/sudoers.d/local\n");
+        assert!(lines.is_empty(), "{lines:?}");
+        let lines = logical_lines("#includedir /etc/sudoers.d\n");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 }
