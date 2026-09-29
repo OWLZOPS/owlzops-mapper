@@ -379,7 +379,37 @@ pub fn scan_library_injections(cfg: &ScanConfig) -> Vec<LibraryInjectionFinding>
     detect_from_proc("/proc", cfg)
 }
 
+/// Public-facing entry: writes the aggregate coverage lines for `denied` and
+/// `unscanned_pids` and returns the findings only. The counters themselves
+/// stay inside `detect_from_proc_counted` so a test can observe them without
+/// looking at the coverage sink (R35-11 verification).
 fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFinding> {
+    let (findings, denied, unscanned_pids) = detect_from_proc_counted(proc_root, cfg);
+    if denied > 0 {
+        coverage::record(format!(
+            "library-injection scan: {denied} process(es) with unreadable maps"
+        ));
+    }
+    if unscanned_pids > 0 {
+        coverage::record(format!(
+            "library-injection scan: finding cap ({MAX_FINDINGS}) reached; \
+             memory maps of {unscanned_pids} further process(es) not scanned \
+             (LD_* environment still checked) — findings are a LOWER BOUND"
+        ));
+    }
+    findings
+}
+
+/// The scanner proper: returns `(findings, denied_maps_count, unscanned_pids)`.
+///
+/// `denied_maps_count` counts PIDs whose `/proc/<pid>/maps` failed with
+/// anything other than ENOENT — i.e. real refusals, not vanished pids
+/// (R35-11). Kept as a return value so a test can assert the classification
+/// without the coverage sink being the sole evidence.
+fn detect_from_proc_counted(
+    proc_root: &str,
+    cfg: &ScanConfig,
+) -> (Vec<LibraryInjectionFinding>, usize, usize) {
     let mut findings = Vec::new();
     let mut denied = 0usize;
     let mut unscanned_pids = 0usize;
@@ -391,7 +421,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
             coverage::record(format!(
                 "library-injection scan skipped: {proc_root} unreadable"
             ));
-            return findings;
+            return (findings, denied, unscanned_pids);
         }
     };
 
@@ -429,14 +459,12 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 ));
             }
             for chunk in data.split(|&b| b == 0).filter(|c| !c.is_empty()) {
-                // R35-04: split at the BYTE level. from_utf8 on the whole
-                // record dropped it when any value byte was invalid UTF-8 —
-                // a legal path ld.so honours — and took the env_ioc gate
-                // down with it.
-                let Some(eq) = chunk.iter().position(|&b| b == b'=') else {
-                    continue;
-                };
-                let Ok(key) = std::str::from_utf8(&chunk[..eq]) else {
+                // R35-04: one helper for every environ reader (R35-04
+                // verification). Only the KEY must be UTF-8; the value is
+                // opaque bytes and goes through lossy conversion because the
+                // maps leg is lossy too (`read_procfs_capped`) — both must
+                // spell the same path the same way.
+                let Some((key, raw_value)) = safe_io::split_env_record(chunk) else {
                     continue;
                 };
                 let Some(&matched_key) =
@@ -444,10 +472,7 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
                 else {
                     continue;
                 };
-                // Lossy on purpose: the maps leg is lossy too
-                // (read_procfs_capped); both legs must spell the same path
-                // the same way.
-                let value = String::from_utf8_lossy(&chunk[eq + 1..]);
+                let value = String::from_utf8_lossy(raw_value);
 
                 for path in value.split([':', ' ']).filter(|p| !p.is_empty()) {
                     if is_volatile_lib_path(path) {
@@ -535,20 +560,8 @@ fn detect_from_proc(proc_root: &str, cfg: &ScanConfig) -> Vec<LibraryInjectionFi
         }
     }
 
-    if denied > 0 {
-        coverage::record(format!(
-            "library-injection scan: {denied} process(es) with unreadable maps"
-        ));
-    }
-    if unscanned_pids > 0 {
-        coverage::record(format!(
-            "library-injection scan: finding cap ({MAX_FINDINGS}) reached; \
-             memory maps of {unscanned_pids} further process(es) not scanned \
-             (LD_* environment still checked) — findings are a LOWER BOUND"
-        ));
-    }
     cache.persist();
-    findings
+    (findings, denied, unscanned_pids)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1150,5 +1163,28 @@ mod tests {
                 .any(|f| f.source == "LD_PRELOAD" && f.object_path.starts_with("/dev/shm/")),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn vanished_pid_is_not_counted_as_denied() {
+        // R35-11: a pid that exited between the `comm` read and the `maps`
+        // read returns ENOENT on `maps`. That is a race, not a permission
+        // fact, and must not increment the aggregate "unreadable maps"
+        // counter — otherwise a busy host produces a sporadic Degraded exit
+        // with nothing the operator can act on.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("4242");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("comm"), "sh\n").unwrap();
+        // No LD_* in environ → pid_hits stays 0. `maps` deliberately absent.
+        std::fs::write(d.join("environ"), b"PATH=/usr/bin\0").unwrap();
+        // No `maps` file → ENOENT, exactly the race R35-11 is about.
+        let cfg = ScanConfig {
+            verdict_cache_path: tmp.path().join("vc.json"),
+            ..Default::default()
+        };
+        let (_findings, denied, _unscanned) =
+            detect_from_proc_counted(tmp.path().to_str().unwrap(), &cfg);
+        assert_eq!(denied, 0, "ENOENT on maps is a race (R35-11), not a denial");
     }
 }
