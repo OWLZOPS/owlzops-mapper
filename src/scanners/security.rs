@@ -774,6 +774,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         mount_namespace_anomalies: Vec::new(),
         // ── QW-8 / SEC-062
         sshd_sensitive_directives: sshd_sensitive,
+        // ── QW-10 / SEC-064
+        immutable_anchors: crate::scanners::immutable::scan_immutable_anchors(),
     }
 }
 
