@@ -4,6 +4,11 @@
 //! [`sanitize_terminal`] before being printed, mitigating
 //! terminal escape sequence injection (C0/C1 control characters
 //! beyond `\t` are replaced with U+FFFD).
+//!
+//! R35-14: the only way a value reaches a table cell is through [`cell()`],
+//! which sanitizes by construction. This structural rule is enforced by the
+//! CI gate in `check_doctrine_gates.sh` (bare `Cell::new(` is rejected in
+//! this file).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -127,6 +132,23 @@ pub fn sanitize_terminal(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// R35-14: cell — the only entry for text into a table cell
+// ---------------------------------------------------------------------------
+
+/// The ONLY way text enters a table cell in this module. Sanitizing is a
+/// property of the constructor, not of each call site — per-site discipline
+/// missed four sinks in R35-07 and nine more after it. Static ASCII headers
+/// pass through unchanged. Double sanitization on already-sanitized inputs is
+/// idempotent.
+///
+/// Do not call `Cell::new` directly in this file; the CI gate
+/// (`check_doctrine_gates.sh`) rejects it. The only exception is the body of
+/// this function, where the path is written `comfy_table::Cell::new`.
+fn cell<T: ToString>(content: T) -> Cell {
+    comfy_table::Cell::new(sanitize_terminal(&content.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Helper: table with dynamic column width
 // ---------------------------------------------------------------------------
 
@@ -190,13 +212,11 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
     let mut t = Table::new();
     t.load_preset(UTF8_FULL).apply_modifier(UTF8_ROUND_CORNERS);
     t.set_header(vec![
-        Cell::new("Host")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Risk Score").add_attribute(Attribute::Bold),
-        Cell::new("Firewall").add_attribute(Attribute::Bold),
-        Cell::new("SSH Root").add_attribute(Attribute::Bold),
-        Cell::new("Security Updates").add_attribute(Attribute::Bold),
+        cell("Host").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Risk Score").add_attribute(Attribute::Bold),
+        cell("Firewall").add_attribute(Attribute::Bold),
+        cell("SSH Root").add_attribute(Attribute::Bold),
+        cell("Security Updates").add_attribute(Attribute::Bold),
     ]);
 
     for r in reports {
@@ -204,27 +224,27 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
         let risk_score = scored.total;
 
         let score_cell = if risk_score >= 70 {
-            Cell::new(risk_score.to_string()).fg(Color::Red)
+            cell(risk_score.to_string()).fg(Color::Red)
         } else if risk_score >= 40 {
-            Cell::new(risk_score.to_string()).fg(Color::Yellow)
+            cell(risk_score.to_string()).fg(Color::Yellow)
         } else {
-            Cell::new(risk_score.to_string()).fg(Color::Green)
+            cell(risk_score.to_string()).fg(Color::Green)
         };
 
         t.add_row(vec![
-            Cell::new(sanitize_terminal(&r.host.hostname)),
+            cell(sanitize_terminal(&r.host.hostname)),
             score_cell,
-            Cell::new(if r.network.firewall_active {
+            cell(if r.network.firewall_active {
                 "on"
             } else {
                 "OFF"
             }),
-            Cell::new(if r.security.ssh_root_login_enabled {
+            cell(if r.security.ssh_root_login_enabled {
                 "OPEN"
             } else {
                 "disabled"
             }),
-            Cell::new(if r.packages.upgradable.iter().any(|p| p.is_security) {
+            cell(if r.packages.upgradable.iter().any(|p| p.is_security) {
                 "YES"
             } else {
                 "no"
@@ -328,27 +348,27 @@ fn render_header(report: &AgentReport, theme: &Theme) {
 
                 let mut t_cat = create_dynamic_table();
                 t_cat.set_header(vec![
-                    Cell::new("CIS / Ref")
+                    cell("CIS / Ref")
                         .add_attribute(Attribute::Bold)
                         .fg(Color::Cyan),
-                    Cell::new("Penalty")
+                    cell("Penalty")
                         .add_attribute(Attribute::Bold)
                         .fg(Color::Red),
-                    Cell::new("Finding").add_attribute(Attribute::Bold),
-                    Cell::new("Evidence").add_attribute(Attribute::Bold),
+                    cell("Finding").add_attribute(Attribute::Bold),
+                    cell("Evidence").add_attribute(Attribute::Bold),
                 ]);
 
                 for f in cat_findings {
                     let cis_note = f.cis_ref.unwrap_or("-");
                     t_cat.add_row(vec![
-                        Cell::new(cis_note).fg(Color::DarkGrey),
-                        Cell::new(format!("-{}", f.weight)).fg(Color::Red),
+                        cell(cis_note).fg(Color::DarkGrey),
+                        cell(format!("-{}", f.weight)).fg(Color::Red),
                         // R35-07: `f.title` comes from the scoring engine, but a
                         // finding's title can embed host-derived text (a unit
                         // name, an exe path) that was never sanitized. Same
                         // pass as `evidence`.
-                        Cell::new(sanitize_terminal(&f.title)),
-                        Cell::new(sanitize_terminal(&f.evidence)),
+                        cell(sanitize_terminal(&f.title)),
+                        cell(sanitize_terminal(&f.evidence)),
                     ]);
                 }
                 outln!("{t_cat}");
@@ -414,10 +434,10 @@ fn render_system_overview(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_sys.set_header(vec![
-        Cell::new("System Overview")
+        cell("System Overview")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Details").add_attribute(Attribute::Bold),
+        cell("Details").add_attribute(Attribute::Bold),
     ]);
     t_sys.add_row(vec![
         "Hostname",
@@ -442,7 +462,7 @@ fn render_system_overview(report: &AgentReport) {
     t_sys.add_row(vec!["Uptime", &format!("{} days", report.host.uptime_days)]);
     // R33-QW-4: date-only; skipped when no birth time is available.
     if let Some(install) = format_install_date(&report.host.os_install_date) {
-        t_sys.add_row(vec![Cell::new("OS Install Date"), Cell::new(install)]);
+        t_sys.add_row(vec![cell("OS Install Date"), cell(install)]);
     }
     t_sys.add_row(vec!["CPU Cores", &report.host.cpu_cores.to_string()]);
     t_sys.add_row(vec![
@@ -473,8 +493,8 @@ fn render_system_overview(report: &AgentReport) {
             .join(", ")
     };
     t_sys.add_row(vec![
-        Cell::new("Detected Tech Stack").fg(Color::Yellow),
-        Cell::new(tech_stack_str),
+        cell("Detected Tech Stack").fg(Color::Yellow),
+        cell(tech_stack_str),
     ]);
 
     let dns_str = if report.network.dns_resolvers.is_empty() {
@@ -497,11 +517,11 @@ fn render_system_overview(report: &AgentReport) {
             .map(|s| sanitize_terminal(s))
             .collect::<Vec<_>>()
             .join(", ");
-        Cell::new(format!("{}  →  {}", dns_str, sanitize_terminal(&upstreams)))
+        cell(format!("{}  →  {}", dns_str, sanitize_terminal(&upstreams)))
     } else {
-        Cell::new(dns_str)
+        cell(dns_str)
     };
-    t_sys.add_row(vec![Cell::new("DNS Resolvers"), dns_cell]);
+    t_sys.add_row(vec![cell("DNS Resolvers"), dns_cell]);
 
     let sec_mod_str = if report.host.security_modules.is_empty() {
         "None".to_string()
@@ -514,10 +534,7 @@ fn render_system_overview(report: &AgentReport) {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    t_sys.add_row(vec![
-        Cell::new("Security Modules (LSM)"),
-        Cell::new(sec_mod_str),
-    ]);
+    t_sys.add_row(vec![cell("Security Modules (LSM)"), cell(sec_mod_str)]);
 
     // R33-QW-3: inventory from sysfs; empty on hosts without a display
     // controller (typical cloud VM), in which case the row is skipped.
@@ -529,7 +546,7 @@ fn render_system_overview(report: &AgentReport) {
             .map(|g| sanitize_terminal(g))
             .collect::<Vec<_>>()
             .join(", ");
-        t_sys.add_row(vec![Cell::new("GPU"), Cell::new(gpus)]);
+        t_sys.add_row(vec![cell("GPU"), cell(gpus)]);
     }
 
     outln!("{t_sys}\n");
@@ -544,14 +561,14 @@ fn render_top_memory(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_mem.set_header(vec![
-        Cell::new("Top 5 Memory Consumers")
+        cell("Top 5 Memory Consumers")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("PID").add_attribute(Attribute::Bold),
-        Cell::new("RAM (MB)").add_attribute(Attribute::Bold),
+        cell("PID").add_attribute(Attribute::Bold),
+        cell("RAM (MB)").add_attribute(Attribute::Bold),
     ]);
     for proc in &report.host.top_memory_processes {
-        let mut mem_cell = Cell::new(proc.memory_mb.to_string());
+        let mut mem_cell = cell(proc.memory_mb.to_string());
         if proc.memory_mb > 1024 {
             mem_cell = mem_cell.fg(Color::Yellow);
         }
@@ -564,11 +581,7 @@ fn render_top_memory(report: &AgentReport) {
         } else {
             sanitize_terminal(&proc.name)
         };
-        t_mem.add_row(vec![
-            Cell::new(name),
-            Cell::new(proc.pid.to_string()),
-            mem_cell,
-        ]);
+        t_mem.add_row(vec![cell(name), cell(proc.pid.to_string()), mem_cell]);
     }
     outln!("{t_mem}\n");
 }
@@ -582,12 +595,12 @@ fn render_databases(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_dbs.set_header(vec![
-        Cell::new("Host Databases")
+        cell("Host Databases")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Version").add_attribute(Attribute::Bold),
-        Cell::new("Data Directory").add_attribute(Attribute::Bold),
-        Cell::new("Size (GB)").add_attribute(Attribute::Bold),
+        cell("Version").add_attribute(Attribute::Bold),
+        cell("Data Directory").add_attribute(Attribute::Bold),
+        cell("Size (GB)").add_attribute(Attribute::Bold),
     ]);
     for db in &report.databases {
         let db_size_gb = db.size_mb as f64 / 1024.0;
@@ -612,71 +625,69 @@ fn render_security_health(report: &AgentReport) {
 
     let mut t_risk = create_dynamic_table();
     t_risk.set_header(vec![
-        Cell::new("Security & Health Checks")
+        cell("Security & Health Checks")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Status").add_attribute(Attribute::Bold),
+        cell("Status").add_attribute(Attribute::Bold),
     ]);
 
     let fw_cell = if report.network.firewall_active {
-        Cell::new("Enabled").fg(Color::Green)
+        cell("Enabled").fg(Color::Green)
     } else {
-        Cell::new("Disabled (CRITICAL)")
+        cell("Disabled (CRITICAL)")
             .fg(Color::Red)
             .add_attribute(Attribute::Bold)
     };
-    t_risk.add_row(vec![Cell::new("Host Firewall"), fw_cell]);
+    t_risk.add_row(vec![cell("Host Firewall"), fw_cell]);
 
     let root_cell = if report.security.ssh_root_login_enabled {
-        Cell::new("Permitted (HIGH RISK)")
+        cell("Permitted (HIGH RISK)")
             .fg(Color::Red)
             .add_attribute(Attribute::Bold)
     } else {
-        Cell::new("Disabled").fg(Color::Green)
+        cell("Disabled").fg(Color::Green)
     };
-    t_risk.add_row(vec![Cell::new("SSH Root Login"), root_cell]);
+    t_risk.add_row(vec![cell("SSH Root Login"), root_cell]);
 
     t_risk.add_row(vec![
-        Cell::new("SSH Config Source"),
-        Cell::new(sanitize_terminal(&report.security.ssh_config_source)),
+        cell("SSH Config Source"),
+        cell(sanitize_terminal(&report.security.ssh_config_source)),
     ]);
 
     let f2b = if report.security.fail2ban_active {
-        Cell::new("Active").fg(Color::Green)
+        cell("Active").fg(Color::Green)
     } else {
-        Cell::new("Inactive").fg(Color::Red)
+        cell("Inactive").fg(Color::Red)
     };
-    t_risk.add_row(vec![Cell::new("Fail2Ban"), f2b]);
+    t_risk.add_row(vec![cell("Fail2Ban"), f2b]);
 
     let audit = if report.security.auditd_active {
-        Cell::new("Active").fg(Color::Green)
+        cell("Active").fg(Color::Green)
     } else {
-        Cell::new("Inactive").fg(Color::Red)
+        cell("Inactive").fg(Color::Red)
     };
-    t_risk.add_row(vec![Cell::new("Auditd"), audit]);
+    t_risk.add_row(vec![cell("Auditd"), audit]);
 
     let ntp_cell = match (report.host.ntp_synchronized, report.host.time_offset_ms) {
         (true, Some(ms)) if ms > 100.0 => {
-            Cell::new(format!("Synced ({:.1}ms — high offset)", ms)).fg(Color::Yellow)
+            cell(format!("Synced ({:.1}ms — high offset)", ms)).fg(Color::Yellow)
         }
-        (true, Some(ms)) => Cell::new(format!("Synced ({:.1}ms)", ms)).fg(Color::Green),
-        (true, None) => Cell::new("Synced").fg(Color::Green),
-        (false, Some(ms)) if ms > 1000.0 => {
-            Cell::new(format!("NOT SYNCED ({:.0}ms — CRITICAL)", ms))
-                .fg(Color::Red)
-                .add_attribute(Attribute::Bold)
-        }
-        (false, Some(ms)) => Cell::new(format!("NOT SYNCED ({:.1}ms)", ms)).fg(Color::Red),
-        (false, None) => Cell::new("NOT SYNCED")
+        (true, Some(ms)) => cell(format!("Synced ({:.1}ms)", ms)).fg(Color::Green),
+        (true, None) => cell("Synced").fg(Color::Green),
+        (false, Some(ms)) if ms > 1000.0 => cell(format!("NOT SYNCED ({:.0}ms — CRITICAL)", ms))
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold),
+        (false, Some(ms)) => cell(format!("NOT SYNCED ({:.1}ms)", ms)).fg(Color::Red),
+        (false, None) => cell("NOT SYNCED")
             .fg(Color::Red)
             .add_attribute(Attribute::Bold),
     };
-    t_risk.add_row(vec![Cell::new("NTP / Time Sync"), ntp_cell]);
+    t_risk.add_row(vec![cell("NTP / Time Sync"), ntp_cell]);
 
     if !report.security.sudo_nopasswd_entries.is_empty() {
         t_risk.add_row(vec![
-            Cell::new("Sudo NOPASSWD"),
-            Cell::new(format!(
+            cell("Sudo NOPASSWD"),
+            cell(format!(
                 "{} entries",
                 report.security.sudo_nopasswd_entries.len()
             ))
@@ -686,13 +697,13 @@ fn render_security_health(report: &AgentReport) {
     }
     if let Some(mode) = report.security.sudoers_mode {
         let sudo_perm = if mode != 0o440 {
-            Cell::new(format!("{:o} (expected 0440)", mode))
+            cell(format!("{:o} (expected 0440)", mode))
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold)
         } else {
-            Cell::new(format!("{:o}", mode)).fg(Color::Green)
+            cell(format!("{:o}", mode)).fg(Color::Green)
         };
-        t_risk.add_row(vec![Cell::new("Sudoers Permissions"), sudo_perm]);
+        t_risk.add_row(vec![cell("Sudoers Permissions"), sudo_perm]);
     }
 
     let visible_sysctl: Vec<&str> = report
@@ -704,8 +715,8 @@ fn render_security_health(report: &AgentReport) {
         .collect();
     if !visible_sysctl.is_empty() {
         t_risk.add_row(vec![
-            Cell::new("Sysctl Issues"),
-            Cell::new(
+            cell("Sysctl Issues"),
+            cell(
                 visible_sysctl
                     .iter()
                     .map(|s| sanitize_terminal(s))
@@ -718,17 +729,17 @@ fn render_security_health(report: &AgentReport) {
     }
 
     let oom_cell = if report.host.oom_kills > 0 {
-        Cell::new(format!("{} Kills (HIGH RISK)", report.host.oom_kills)).fg(Color::Red)
+        cell(format!("{} Kills (HIGH RISK)", report.host.oom_kills)).fg(Color::Red)
     } else {
-        Cell::new("0").fg(Color::Green)
+        cell("0").fg(Color::Green)
     };
-    t_risk.add_row(vec![Cell::new("OOM Kills (Memory)"), oom_cell]);
+    t_risk.add_row(vec![cell("OOM Kills (Memory)"), oom_cell]);
 
     // Zombie processes with parent grouping
     let zombie_cell = if report.host.zombie_processes > 0 {
         let details = &report.host.zombie_details;
         if details.is_empty() {
-            Cell::new(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
+            cell(format!("{} (WARNING)", report.host.zombie_processes)).fg(Color::Yellow)
         } else {
             let mut parent_counts: HashMap<(&str, u32), usize> = HashMap::new();
             for z in details {
@@ -753,7 +764,7 @@ fn render_security_health(report: &AgentReport) {
             } else {
                 String::new()
             };
-            Cell::new(format!(
+            cell(format!(
                 "{} (WARNING: unreaped by: {}{})",
                 report.host.zombie_processes,
                 parts.join(", "),
@@ -762,16 +773,16 @@ fn render_security_health(report: &AgentReport) {
             .fg(Color::Yellow)
         }
     } else {
-        Cell::new("0").fg(Color::Green)
+        cell("0").fg(Color::Green)
     };
-    t_risk.add_row(vec![Cell::new("Zombie Processes"), zombie_cell]);
+    t_risk.add_row(vec![cell("Zombie Processes"), zombie_cell]);
 
     let backup_status = if report.host.backup_tools.is_empty() {
-        Cell::new("None (CRITICAL)")
+        cell("None (CRITICAL)")
             .fg(Color::Red)
             .add_attribute(Attribute::Bold)
     } else {
-        Cell::new(
+        cell(
             report
                 .host
                 .backup_tools
@@ -782,12 +793,12 @@ fn render_security_health(report: &AgentReport) {
         )
         .fg(Color::Green)
     };
-    t_risk.add_row(vec![Cell::new("Backup Tools"), backup_status]);
+    t_risk.add_row(vec![cell("Backup Tools"), backup_status]);
 
     if !report.host.failed_services.is_empty() {
         t_risk.add_row(vec![
-            Cell::new("Failed Services"),
-            Cell::new(
+            cell("Failed Services"),
+            cell(
                 report
                     .host
                     .failed_services
@@ -804,28 +815,25 @@ fn render_security_health(report: &AgentReport) {
     let tiers = crate::utils::classify_listeners(&report.network.listening_ports);
 
     if !tiers.suspicious.is_empty() {
-        let shadow_cell = Cell::new(format!("{} listener(s)", tiers.suspicious.len()))
+        let shadow_cell = cell(format!("{} listener(s)", tiers.suspicious.len()))
             .fg(Color::Red)
             .add_attribute(Attribute::Bold);
-        t_risk.add_row(vec![
-            Cell::new("Shadow IT / Suspicious Listener"),
-            shadow_cell,
-        ]);
+        t_risk.add_row(vec![cell("Shadow IT / Suspicious Listener"), shadow_cell]);
     }
 
     if !tiers.devtool.is_empty() {
         let dev_cell =
-            Cell::new(format!("{} loopback IPC port(s)", tiers.devtool.len())).fg(Color::Green);
-        t_risk.add_row(vec![Cell::new("Developer Tools (IPC)"), dev_cell]);
+            cell(format!("{} loopback IPC port(s)", tiers.devtool.len())).fg(Color::Green);
+        t_risk.add_row(vec![cell("Developer Tools (IPC)"), dev_cell]);
     }
 
     if !tiers.provisional.is_empty() {
-        let prov_cell = Cell::new(format!(
+        let prov_cell = cell(format!(
             "{} user-space IPC port(s)",
             tiers.provisional.len()
         ))
         .fg(Color::Yellow);
-        t_risk.add_row(vec![Cell::new("User Tools (Provisional)"), prov_cell]);
+        t_risk.add_row(vec![cell("User Tools (Provisional)"), prov_cell]);
     }
 
     outln!("{t_risk}\n");
@@ -844,13 +852,11 @@ fn render_storage(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_store.set_header(vec![
-        Cell::new("Mount")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Total (GB)").add_attribute(Attribute::Bold),
-        Cell::new("Used (GB)").add_attribute(Attribute::Bold),
-        Cell::new("Usage %").add_attribute(Attribute::Bold),
-        Cell::new("Inodes %").add_attribute(Attribute::Bold),
+        cell("Mount").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Total (GB)").add_attribute(Attribute::Bold),
+        cell("Used (GB)").add_attribute(Attribute::Bold),
+        cell("Usage %").add_attribute(Attribute::Bold),
+        cell("Inodes %").add_attribute(Attribute::Bold),
     ]);
     for disk in &report.storage.disks {
         if disk.total_mb == 0 {
@@ -858,7 +864,7 @@ fn render_storage(report: &AgentReport) {
         }
         let size_gb = disk.total_mb as f64 / 1024.0;
         let used_gb = disk.used_mb as f64 / 1024.0;
-        let mut usage_cell = Cell::new(format!("{:.1}%", disk.usage_pct));
+        let mut usage_cell = cell(format!("{:.1}%", disk.usage_pct));
         if disk.usage_pct > 90.0 {
             usage_cell = usage_cell.fg(Color::Red).add_attribute(Attribute::Bold);
         } else if disk.usage_pct > 75.0 {
@@ -869,11 +875,11 @@ fn render_storage(report: &AgentReport) {
             .clone()
             .unwrap_or_else(|| "-".to_string());
         t_store.add_row(vec![
-            Cell::new(sanitize_terminal(&disk.mount_point)),
-            Cell::new(format!("{:.2}", size_gb)),
-            Cell::new(format!("{:.2}", used_gb)),
+            cell(sanitize_terminal(&disk.mount_point)),
+            cell(format!("{:.2}", size_gb)),
+            cell(format!("{:.2}", used_gb)),
             usage_cell,
-            Cell::new(sanitize_terminal(&inode_val)),
+            cell(sanitize_terminal(&inode_val)),
         ]);
     }
     outln!("{t_store}\n");
@@ -888,12 +894,10 @@ fn render_network_listeners(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_ports.set_header(vec![
-        Cell::new("Proto")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Bind Address").add_attribute(Attribute::Bold),
-        Cell::new("Port").add_attribute(Attribute::Bold),
-        Cell::new("Process").add_attribute(Attribute::Bold),
+        cell("Proto").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Bind Address").add_attribute(Attribute::Bold),
+        cell("Port").add_attribute(Attribute::Bold),
+        cell("Process").add_attribute(Attribute::Bold),
     ]);
     for p in &report.network.listening_ports {
         if p.port == "0" || p.port == "*" {
@@ -902,10 +906,12 @@ fn render_network_listeners(report: &AgentReport) {
         let exposed = crate::utils::is_wildcard_bind(&p.bind_address);
         let loopback = crate::utils::is_loopback_bind(&p.bind_address);
 
-        let mut addr_cell = Cell::new(sanitize_terminal(&p.bind_address));
-        let mut port_cell = Cell::new(&p.port);
-        let mut proto_cell = Cell::new(&p.protocol);
-        let mut proc_cell = Cell::new(sanitize_terminal(&p.process));
+        let mut addr_cell = cell(sanitize_terminal(&p.bind_address));
+        // R35-14: `p.port` and `p.protocol` come from remote JSON; `cell()`
+        // sanitizes them by construction.
+        let mut port_cell = cell(&p.port);
+        let mut proto_cell = cell(&p.protocol);
+        let mut proc_cell = cell(sanitize_terminal(&p.process));
 
         if exposed {
             addr_cell = addr_cell.fg(Color::Red).add_attribute(Attribute::Bold);
@@ -947,14 +953,12 @@ fn render_foreign_netns_listeners(report: &AgentReport) {
 
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("Netns")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Proto").add_attribute(Attribute::Bold),
-        Cell::new("Bind Address").add_attribute(Attribute::Bold),
-        Cell::new("Port").add_attribute(Attribute::Bold),
-        Cell::new("Container").add_attribute(Attribute::Bold),
-        Cell::new("Runtime Infra").add_attribute(Attribute::Bold),
+        cell("Netns").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Proto").add_attribute(Attribute::Bold),
+        cell("Bind Address").add_attribute(Attribute::Bold),
+        cell("Port").add_attribute(Attribute::Bold),
+        cell("Container").add_attribute(Attribute::Bold),
+        cell("Runtime Infra").add_attribute(Attribute::Bold),
     ]);
 
     for l in &report.network.foreign_netns_listeners {
@@ -966,12 +970,12 @@ fn render_foreign_netns_listeners(report: &AgentReport) {
         };
 
         t.add_row(vec![
-            Cell::new(sanitize_terminal(&l.netns)),
-            Cell::new(sanitize_terminal(&l.protocol)),
-            Cell::new(sanitize_terminal(&l.bind_address)),
-            Cell::new(sanitize_terminal(&l.port)),
-            Cell::new(sanitize_terminal(container)),
-            Cell::new(runtime),
+            cell(sanitize_terminal(&l.netns)),
+            cell(sanitize_terminal(&l.protocol)),
+            cell(sanitize_terminal(&l.bind_address)),
+            cell(sanitize_terminal(&l.port)),
+            cell(sanitize_terminal(container)),
+            cell(runtime),
         ]);
     }
 
@@ -1049,13 +1053,13 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
 
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("PID(s)")
+        cell("PID(s)")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Process").add_attribute(Attribute::Bold),
-        Cell::new("Exe Path").add_attribute(Attribute::Bold),
-        Cell::new("Container").add_attribute(Attribute::Bold),
-        Cell::new("Mount NS").add_attribute(Attribute::Bold),
+        cell("Process").add_attribute(Attribute::Bold),
+        cell("Exe Path").add_attribute(Attribute::Bold),
+        cell("Container").add_attribute(Attribute::Bold),
+        cell("Mount NS").add_attribute(Attribute::Bold),
     ]);
 
     for ((mnt_ns, exe), procs) in groups {
@@ -1069,16 +1073,16 @@ fn render_mount_namespace_anomalies(report: &AgentReport, verbose: bool) {
         };
 
         t.add_row(vec![
-            Cell::new(pids),
-            Cell::new(sanitize_terminal(&a.comm)),
-            Cell::new(sanitize_terminal(exe)),
-            Cell::new(
+            cell(pids),
+            cell(sanitize_terminal(&a.comm)),
+            cell(sanitize_terminal(exe)),
+            cell(
                 a.container
                     .as_deref()
                     .map(sanitize_terminal)
                     .unwrap_or_else(|| "-".to_string()),
             ),
-            Cell::new(sanitize_terminal(mnt_ns)),
+            cell(sanitize_terminal(mnt_ns)),
         ]);
     }
 
@@ -1095,27 +1099,27 @@ fn render_ssl_certificates(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_ssl.set_header(vec![
-        Cell::new("Domain")
+        cell("Domain")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Expires").add_attribute(Attribute::Bold),
-        Cell::new("Days Left").add_attribute(Attribute::Bold),
+        cell("Expires").add_attribute(Attribute::Bold),
+        cell("Days Left").add_attribute(Attribute::Bold),
     ]);
     for cert in &report.network.ssl_certificates {
         let days_cell = match cert.days_remaining {
-            Some(d) if cert.is_critical => Cell::new(format!("{} (CRITICAL)", d))
+            Some(d) if cert.is_critical => cell(format!("{} (CRITICAL)", d))
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold),
-            Some(d) if cert.is_warning => Cell::new(format!("{} (WARNING)", d)).fg(Color::Yellow),
-            Some(d) if d < 0 => Cell::new(format!("Expired {} days ago", -d))
+            Some(d) if cert.is_warning => cell(format!("{} (WARNING)", d)).fg(Color::Yellow),
+            Some(d) if d < 0 => cell(format!("Expired {} days ago", -d))
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold),
-            Some(d) => Cell::new(d.to_string()).fg(Color::Green),
-            None => Cell::new("unknown").fg(Color::DarkGrey),
+            Some(d) => cell(d.to_string()).fg(Color::Green),
+            None => cell("unknown").fg(Color::DarkGrey),
         };
         t_ssl.add_row(vec![
-            Cell::new(sanitize_terminal(&cert.domain)),
-            Cell::new(sanitize_terminal(&cert.expiry_date)),
+            cell(sanitize_terminal(&cert.domain)),
+            cell(sanitize_terminal(&cert.expiry_date)),
             days_cell,
         ]);
     }
@@ -1132,22 +1136,20 @@ fn render_shell_users(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_users.set_header(vec![
-        Cell::new("User")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Last Login").add_attribute(Attribute::Bold),
-        Cell::new("Last Remote SSH").add_attribute(Attribute::Bold),
-        Cell::new("SSH Keys").add_attribute(Attribute::Bold),
+        cell("User").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Last Login").add_attribute(Attribute::Bold),
+        cell("Last Remote SSH").add_attribute(Attribute::Bold),
+        cell("SSH Keys").add_attribute(Attribute::Bold),
     ]);
     for u in &report.security.shell_users {
-        let mut keys_cell = Cell::new(u.authorized_keys_count.to_string());
+        let mut keys_cell = cell(u.authorized_keys_count.to_string());
         if u.authorized_keys_count > 0 {
             keys_cell = keys_cell.fg(Color::Yellow);
         }
         t_users.add_row(vec![
-            Cell::new(sanitize_terminal(&u.username)),
-            Cell::new(sanitize_terminal(&u.last_login)),
-            Cell::new(sanitize_terminal(&u.last_ssh_login)),
+            cell(sanitize_terminal(&u.username)),
+            cell(sanitize_terminal(&u.last_login)),
+            cell(sanitize_terminal(&u.last_ssh_login)),
             keys_cell,
         ]);
     }
@@ -1161,10 +1163,10 @@ fn render_system_internals(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_internals.set_header(vec![
-        Cell::new("System Internals")
+        cell("System Internals")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Count").add_attribute(Attribute::Bold),
+        cell("Count").add_attribute(Attribute::Bold),
     ]);
     t_internals.add_row(vec![
         "System & Custom Cronjobs",
@@ -1183,12 +1185,12 @@ fn render_system_internals(report: &AgentReport) {
     if !report.network.custom_host_overrides.is_empty() {
         let mut t_hosts = create_dynamic_table();
         t_hosts.set_header(vec![
-            Cell::new("Custom /etc/hosts Overrides")
+            cell("Custom /etc/hosts Overrides")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Yellow),
         ]);
         for host in &report.network.custom_host_overrides {
-            t_hosts.add_row(vec![Cell::new(sanitize_terminal(host))]);
+            t_hosts.add_row(vec![cell(sanitize_terminal(host))]);
         }
         outln!("{t_hosts}\n");
     }
@@ -1196,26 +1198,26 @@ fn render_system_internals(report: &AgentReport) {
     if !report.host.cron_jobs.is_empty() {
         let mut t_cron = create_dynamic_table();
         t_cron.set_header(vec![
-            Cell::new("Cronjob Rule")
+            cell("Cronjob Rule")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("Status").add_attribute(Attribute::Bold),
+            cell("Status").add_attribute(Attribute::Bold),
         ]);
 
         for cron in &report.host.cron_jobs {
             let safe_cmd = sanitize_terminal(&cron.command);
             let (status_cell, cmd_cell) = match cron.severity {
                 CronSeverity::Critical => (
-                    Cell::new("Suspicious!")
+                    cell("Suspicious!")
                         .fg(Color::Red)
                         .add_attribute(Attribute::Bold),
-                    Cell::new(safe_cmd).fg(Color::Red),
+                    cell(safe_cmd).fg(Color::Red),
                 ),
                 CronSeverity::Warning => (
-                    Cell::new("Review").fg(Color::Yellow),
-                    Cell::new(safe_cmd).fg(Color::Yellow),
+                    cell("Review").fg(Color::Yellow),
+                    cell(safe_cmd).fg(Color::Yellow),
                 ),
-                CronSeverity::Ok => (Cell::new("OK").fg(Color::Green), Cell::new(safe_cmd)),
+                CronSeverity::Ok => (cell("OK").fg(Color::Green), cell(safe_cmd)),
             };
             t_cron.add_row(vec![cmd_cell, status_cell]);
         }
@@ -1242,10 +1244,10 @@ fn render_packages(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_pkg.set_header(vec![
-        Cell::new("Packages")
+        cell("Packages")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Value").add_attribute(Attribute::Bold),
+        cell("Value").add_attribute(Attribute::Bold),
     ]);
     t_pkg.add_row(vec!["Package Manager", manager_str]);
     t_pkg.add_row(vec![
@@ -1259,7 +1261,7 @@ fn render_packages(report: &AgentReport) {
         .iter()
         .filter(|p| p.is_security)
         .count();
-    let mut upgradable_cell = Cell::new(report.packages.upgradable.len().to_string());
+    let mut upgradable_cell = cell(report.packages.upgradable.len().to_string());
     if security_count > 0 {
         upgradable_cell = upgradable_cell
             .fg(Color::Red)
@@ -1267,11 +1269,11 @@ fn render_packages(report: &AgentReport) {
     } else if !report.packages.upgradable.is_empty() {
         upgradable_cell = upgradable_cell.fg(Color::Yellow);
     }
-    t_pkg.add_row(vec![Cell::new("Upgradable Packages"), upgradable_cell]);
+    t_pkg.add_row(vec![cell("Upgradable Packages"), upgradable_cell]);
     if security_count > 0 {
         t_pkg.add_row(vec![
-            Cell::new("  ...of which Security"),
-            Cell::new(security_count.to_string())
+            cell("  ...of which Security"),
+            cell(security_count.to_string())
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold),
         ]);
@@ -1281,10 +1283,7 @@ fn render_packages(report: &AgentReport) {
     } else {
         "No (may be stale — use --refresh-packages)"
     };
-    t_pkg.add_row(vec![
-        Cell::new("Cache Freshly Refreshed"),
-        Cell::new(cache_str),
-    ]);
+    t_pkg.add_row(vec![cell("Cache Freshly Refreshed"), cell(cache_str)]);
     outln!("{t_pkg}\n");
 
     if !report.packages.upgradable.is_empty() {
@@ -1293,27 +1292,25 @@ fn render_packages(report: &AgentReport) {
             .load_preset(UTF8_FULL)
             .apply_modifier(UTF8_ROUND_CORNERS);
         t_upg.set_header(vec![
-            Cell::new("Package")
+            cell("Package")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("Current").add_attribute(Attribute::Bold),
-            Cell::new("Available").add_attribute(Attribute::Bold),
-            Cell::new("Security").add_attribute(Attribute::Bold),
+            cell("Current").add_attribute(Attribute::Bold),
+            cell("Available").add_attribute(Attribute::Bold),
+            cell("Security").add_attribute(Attribute::Bold),
         ]);
         let mut sorted_upgradable: Vec<_> = report.packages.upgradable.iter().collect();
         sorted_upgradable.sort_by_key(|b| std::cmp::Reverse(b.is_security));
         for pkg in sorted_upgradable.iter().take(20) {
             let sec_cell = if pkg.is_security {
-                Cell::new("YES")
-                    .fg(Color::Red)
-                    .add_attribute(Attribute::Bold)
+                cell("YES").fg(Color::Red).add_attribute(Attribute::Bold)
             } else {
-                Cell::new("-")
+                cell("-")
             };
             t_upg.add_row(vec![
-                Cell::new(sanitize_terminal(&pkg.name)),
-                Cell::new(sanitize_terminal(&pkg.current_version)),
-                Cell::new(sanitize_terminal(&pkg.new_version)),
+                cell(sanitize_terminal(&pkg.name)),
+                cell(sanitize_terminal(&pkg.current_version)),
+                cell(sanitize_terminal(&pkg.new_version)),
                 sec_cell,
             ]);
         }
@@ -1363,10 +1360,10 @@ fn render_runtime(report: &AgentReport) {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS);
     t_dock_sum.set_header(vec![
-        Cell::new(format!("{} Storage Summary", runtime))
+        cell(format!("{} Storage Summary", runtime))
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Value").add_attribute(Attribute::Bold),
+        cell("Value").add_attribute(Attribute::Bold),
     ]);
     t_dock_sum.add_row(vec![
         "Total Images",
@@ -1388,8 +1385,8 @@ fn render_runtime(report: &AgentReport) {
         ]);
     } else {
         let dang_img_gb = report.topology.total_dangling_size_mb as f64 / 1024.0;
-        let mut dang_count_cell = Cell::new(report.topology.dangling_images_count.to_string());
-        let mut dang_size_cell = Cell::new(format!("{:.2} GB", dang_img_gb));
+        let mut dang_count_cell = cell(report.topology.dangling_images_count.to_string());
+        let mut dang_size_cell = cell(format!("{:.2} GB", dang_img_gb));
         if report.topology.dangling_images_count > 0 {
             dang_count_cell = dang_count_cell
                 .fg(Color::Yellow)
@@ -1402,8 +1399,8 @@ fn render_runtime(report: &AgentReport) {
                     .add_attribute(Attribute::Bold);
             }
         }
-        t_dock_sum.add_row(vec![Cell::new("Dangling (Unused) Images"), dang_count_cell]);
-        t_dock_sum.add_row(vec![Cell::new("Dangling Wasted Space"), dang_size_cell]);
+        t_dock_sum.add_row(vec![cell("Dangling (Unused) Images"), dang_count_cell]);
+        t_dock_sum.add_row(vec![cell("Dangling Wasted Space"), dang_size_cell]);
     }
 
     t_dock_sum.add_row(vec![
@@ -1419,18 +1416,18 @@ fn render_runtime(report: &AgentReport) {
             .load_preset(UTF8_FULL)
             .apply_modifier(UTF8_ROUND_CORNERS);
         t_dang.set_header(vec![
-            Cell::new("Dangling Image ID")
+            cell("Dangling Image ID")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("Virtual Size (GB)").add_attribute(Attribute::Bold),
+            cell("Virtual Size (GB)").add_attribute(Attribute::Bold),
         ]);
         for d in &report.topology.dangling_images {
             let d_size_gb = d.size_mb as f64 / 1024.0;
-            let mut size_cell = Cell::new(format!("{:.2}", d_size_gb));
+            let mut size_cell = cell(format!("{:.2}", d_size_gb));
             if d_size_gb > 1.0 {
                 size_cell = size_cell.fg(Color::Yellow);
             }
-            t_dang.add_row(vec![Cell::new(sanitize_terminal(&d.id)), size_cell]);
+            t_dang.add_row(vec![cell(sanitize_terminal(&d.id)), size_cell]);
         }
         outln!("Top Dangling Images:");
         outln!(
@@ -1442,18 +1439,18 @@ fn render_runtime(report: &AgentReport) {
     if !report.topology.containers.is_empty() {
         let mut t_docker = create_dynamic_table();
         t_docker.set_header(vec![
-            Cell::new("Container Name")
+            cell("Container Name")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("Uptime / Status").add_attribute(Attribute::Bold),
-            Cell::new("Size (GB)").add_attribute(Attribute::Bold),
-            Cell::new("RW Size (MB)").add_attribute(Attribute::Bold),
-            Cell::new("Log Size (GB)").add_attribute(Attribute::Bold),
-            Cell::new("Security Issues").add_attribute(Attribute::Bold),
-            Cell::new("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
+            cell("Uptime / Status").add_attribute(Attribute::Bold),
+            cell("Size (GB)").add_attribute(Attribute::Bold),
+            cell("RW Size (MB)").add_attribute(Attribute::Bold),
+            cell("Log Size (GB)").add_attribute(Attribute::Bold),
+            cell("Security Issues").add_attribute(Attribute::Bold),
+            cell("Data Mounts (Host -> Container)").add_attribute(Attribute::Bold),
         ]);
         for c in &report.topology.containers {
-            let mut status_cell = Cell::new(sanitize_terminal(&c.status));
+            let mut status_cell = cell(sanitize_terminal(&c.status));
             if c.state == "running" {
                 status_cell = status_cell.fg(Color::Green);
             } else if c.state == "exited" {
@@ -1462,7 +1459,7 @@ fn render_runtime(report: &AgentReport) {
             let c_size_gb = c.size_mb as f64 / 1024.0;
             let rw_size_mb = c.rw_size_mb;
             let c_log_gb = c.log_size_mb as f64 / 1024.0;
-            let mut log_cell = Cell::new(format!("{:.2}", c_log_gb));
+            let mut log_cell = cell(format!("{:.2}", c_log_gb));
             if c_log_gb > 1.0 {
                 log_cell = log_cell.fg(Color::Red);
             }
@@ -1474,21 +1471,21 @@ fn render_runtime(report: &AgentReport) {
                 issue_list.join(", ")
             };
             let issue_cell = if issue_str == "-" {
-                Cell::new(issue_str)
+                cell(issue_str)
             } else {
-                Cell::new(sanitize_terminal(&issue_str))
+                cell(sanitize_terminal(&issue_str))
                     .fg(Color::Red)
                     .add_attribute(Attribute::Bold)
             };
 
             let mounts_display = truncate_docker_mounts(&c.mounts, 80);
-            let mounts_cell = Cell::new(mounts_display).fg(Color::DarkGrey);
+            let mounts_cell = cell(mounts_display).fg(Color::DarkGrey);
 
             t_docker.add_row(vec![
-                Cell::new(sanitize_terminal(&c.name)),
+                cell(sanitize_terminal(&c.name)),
                 status_cell,
-                Cell::new(format!("{:.2}", c_size_gb)),
-                Cell::new(rw_size_mb.to_string()),
+                cell(format!("{:.2}", c_size_gb)),
+                cell(rw_size_mb.to_string()),
                 log_cell,
                 issue_cell,
                 mounts_cell,
@@ -1506,12 +1503,12 @@ fn render_capability_audit(report: &AgentReport) {
 
     let mut t_caps = create_dynamic_table();
     t_caps.set_header(vec![
-        Cell::new("Process")
+        cell("Process")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("PID / EUID").add_attribute(Attribute::Bold),
-        Cell::new("Capabilities").add_attribute(Attribute::Bold),
-        Cell::new("Security Flags").add_attribute(Attribute::Bold),
+        cell("PID / EUID").add_attribute(Attribute::Bold),
+        cell("Capabilities").add_attribute(Attribute::Bold),
+        cell("Security Flags").add_attribute(Attribute::Bold),
     ]);
 
     for f in &report.security.capability_audit {
@@ -1549,10 +1546,11 @@ fn render_capability_audit(report: &AgentReport) {
         };
 
         t_caps.add_row(vec![
-            Cell::new(sanitize_terminal(&f.comm)),
-            Cell::new(format!("{} / {}", f.pid, f.euid)),
-            Cell::new(cap_list).fg(Color::Red),
-            Cell::new(flags_display).fg(Color::DarkGrey),
+            cell(sanitize_terminal(&f.comm)),
+            cell(format!("{} / {}", f.pid, f.euid)),
+            // R35-14: `cap_list` comes from remote JSON; `cell()` sanitizes it.
+            cell(cap_list).fg(Color::Red),
+            cell(flags_display).fg(Color::DarkGrey),
         ]);
     }
 
@@ -1580,15 +1578,15 @@ fn render_cpu_vulnerabilities(report: &AgentReport, theme: &Theme) {
 
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("CVE family")
+        cell("CVE family")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Kernel verdict").add_attribute(Attribute::Bold),
+        cell("Kernel verdict").add_attribute(Attribute::Bold),
     ]);
     for v in vulns {
         t.add_row(vec![
-            Cell::new(sanitize_terminal(&v.name)),
-            Cell::new(sanitize_terminal(&v.status)).fg(Color::Yellow),
+            cell(sanitize_terminal(&v.name)),
+            cell(sanitize_terminal(&v.status)).fg(Color::Yellow),
         ]);
     }
 
@@ -1619,10 +1617,8 @@ fn render_root_equivalent_groups(report: &AgentReport, theme: &Theme) {
 
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("Group")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Members").add_attribute(Attribute::Bold),
+        cell("Group").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Members").add_attribute(Attribute::Bold),
     ]);
     for g in groups {
         let members = if g.members.is_empty() {
@@ -1635,10 +1631,10 @@ fn render_root_equivalent_groups(report: &AgentReport, theme: &Theme) {
                 .join(", ")
         };
         t.add_row(vec![
-            Cell::new(sanitize_terminal(&g.group))
+            cell(sanitize_terminal(&g.group))
                 .fg(Color::Red)
                 .add_attribute(Attribute::Bold),
-            Cell::new(members),
+            cell(members),
         ]);
     }
 
@@ -1657,21 +1653,21 @@ fn render_mount_masking(report: &AgentReport, theme: &Theme) {
     }
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("Masked Path")
+        cell("Masked Path")
             .add_attribute(Attribute::Bold)
             .fg(Color::Cyan),
-        Cell::new("Source / FS").add_attribute(Attribute::Bold),
-        Cell::new("Reason").add_attribute(Attribute::Bold),
+        cell("Source / FS").add_attribute(Attribute::Bold),
+        cell("Reason").add_attribute(Attribute::Bold),
     ]);
     for m in &report.security.mount_masking {
         t.add_row(vec![
-            Cell::new(sanitize_terminal(&m.target_path)),
-            Cell::new(format!(
+            cell(sanitize_terminal(&m.target_path)),
+            cell(format!(
                 "{} ({})",
                 sanitize_terminal(&m.mount_source),
                 sanitize_terminal(&m.fstype)
             )),
-            Cell::new(sanitize_terminal(&m.reason)),
+            cell(sanitize_terminal(&m.reason)),
         ]);
     }
     outln!("{}Bind‑Mount Masking Detected (SEC‑021):", theme.warn_sm);
@@ -1686,12 +1682,10 @@ fn render_reverse_shells(report: &AgentReport, theme: &Theme) {
     }
     let mut t = create_dynamic_table();
     t.set_header(vec![
-        Cell::new("PID")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Cyan),
-        Cell::new("Process").add_attribute(Attribute::Bold),
-        Cell::new("Remote C2").add_attribute(Attribute::Bold),
-        Cell::new("Stdio").add_attribute(Attribute::Bold),
+        cell("PID").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("Process").add_attribute(Attribute::Bold),
+        cell("Remote C2").add_attribute(Attribute::Bold),
+        cell("Stdio").add_attribute(Attribute::Bold),
     ]);
     for r in &report.security.reverse_shells {
         let fd = match r.stdio_fd {
@@ -1702,10 +1696,10 @@ fn render_reverse_shells(report: &AgentReport, theme: &Theme) {
             None => "—".to_string(),
         };
         t.add_row(vec![
-            Cell::new(r.pid.to_string()),
-            Cell::new(sanitize_terminal(&r.process)),
-            Cell::new(sanitize_terminal(&r.remote_address)),
-            Cell::new(fd),
+            cell(r.pid.to_string()),
+            cell(sanitize_terminal(&r.process)),
+            cell(sanitize_terminal(&r.remote_address)),
+            cell(fd),
         ]);
     }
     outln!("{}Reverse Shell / C2 Connections (SEC‑022):", theme.alert);
@@ -1747,21 +1741,20 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
     if !classic.is_empty() {
         let mut t = create_dynamic_table();
         t.set_header(vec![
-            Cell::new("PID")
-                .add_attribute(Attribute::Bold)
-                .fg(Color::Cyan),
-            Cell::new("Process").add_attribute(Attribute::Bold),
-            Cell::new("Injected Object").add_attribute(Attribute::Bold),
-            Cell::new("Source").add_attribute(Attribute::Bold),
-            Cell::new("Deleted").add_attribute(Attribute::Bold),
+            cell("PID").add_attribute(Attribute::Bold).fg(Color::Cyan),
+            cell("Process").add_attribute(Attribute::Bold),
+            cell("Injected Object").add_attribute(Attribute::Bold),
+            cell("Source").add_attribute(Attribute::Bold),
+            cell("Deleted").add_attribute(Attribute::Bold),
         ]);
         for l in classic {
             t.add_row(vec![
-                Cell::new(l.pid.to_string()),
-                Cell::new(sanitize_terminal(&l.process)),
-                Cell::new(sanitize_terminal(&l.object_path)),
-                Cell::new(&l.source).fg(Color::Red),
-                Cell::new(if l.is_deleted { "yes" } else { "no" }),
+                cell(l.pid.to_string()),
+                cell(sanitize_terminal(&l.process)),
+                cell(sanitize_terminal(&l.object_path)),
+                // R35-14: `l.source` is remote JSON; sanitized by cell().
+                cell(&l.source).fg(Color::Red),
+                cell(if l.is_deleted { "yes" } else { "no" }),
             ]);
         }
         outln!(
@@ -1803,13 +1796,11 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
         if verbose {
             let mut t = create_dynamic_table();
             t.set_header(vec![
-                Cell::new("PID")
-                    .add_attribute(Attribute::Bold)
-                    .fg(Color::Cyan),
-                Cell::new("Process").add_attribute(Attribute::Bold),
-                Cell::new("Type").add_attribute(Attribute::Bold),
-                Cell::new("Address").add_attribute(Attribute::Bold),
-                Cell::new("Detail").add_attribute(Attribute::Bold),
+                cell("PID").add_attribute(Attribute::Bold).fg(Color::Cyan),
+                cell("Process").add_attribute(Attribute::Bold),
+                cell("Type").add_attribute(Attribute::Bold),
+                cell("Address").add_attribute(Attribute::Bold),
+                cell("Detail").add_attribute(Attribute::Bold),
             ]);
             let mut all: Vec<_> = memory_anomalies.iter().collect();
             all.sort_by_key(|l| std::cmp::Reverse(region_kind(&l.source).1));
@@ -1817,11 +1808,12 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                 let (kind, rank) = region_kind(&l.source);
                 let c = if rank >= 3 { Color::Red } else { Color::Yellow };
                 t.add_row(vec![
-                    Cell::new(l.pid.to_string()),
-                    Cell::new(sanitize_terminal(&l.process)),
-                    Cell::new(kind).fg(c),
-                    Cell::new(l.region_addr.as_deref().unwrap_or("?")),
-                    Cell::new(sanitize_terminal(&l.object_path)),
+                    cell(l.pid.to_string()),
+                    cell(sanitize_terminal(&l.process)),
+                    cell(kind).fg(c),
+                    // R35-14: `region_addr` is a remote-JSON field; sanitized.
+                    cell(l.region_addr.as_deref().unwrap_or("?")),
+                    cell(sanitize_terminal(&l.object_path)),
                 ]);
             }
             outln!(
@@ -1908,16 +1900,16 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
 
             let mut t = create_dynamic_table();
             let mut header = vec![
-                Cell::new("Process")
+                cell("Process")
                     .add_attribute(Attribute::Bold)
                     .fg(Color::Yellow),
-                Cell::new("PID(s)").add_attribute(Attribute::Bold),
-                Cell::new("Regions").add_attribute(Attribute::Bold),
-                Cell::new("Address").add_attribute(Attribute::Bold),
+                cell("PID(s)").add_attribute(Attribute::Bold),
+                cell("Regions").add_attribute(Attribute::Bold),
+                cell("Address").add_attribute(Attribute::Bold),
             ];
             if has_deep {
                 header.push(
-                    Cell::new("Origin")
+                    cell("Origin")
                         .add_attribute(Attribute::Bold)
                         .fg(Color::Cyan),
                 );
@@ -1951,10 +1943,10 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                 };
 
                 let mut cells = vec![
-                    Cell::new(sanitize_terminal(&r.process)),
-                    Cell::new(pids),
-                    Cell::new(&r.kinds).fg(c),
-                    Cell::new(&r.anchor),
+                    cell(sanitize_terminal(&r.process)),
+                    cell(pids),
+                    cell(&r.kinds).fg(c),
+                    cell(&r.anchor),
                 ];
 
                 if has_deep {
@@ -1963,7 +1955,7 @@ fn render_library_injections(report: &AgentReport, verbose: bool, theme: &Theme)
                         Some(o) => (o.to_string(), Color::Green),
                         None => ("—".to_string(), Color::DarkGrey),
                     };
-                    cells.push(Cell::new(lbl).fg(col));
+                    cells.push(cell(lbl).fg(col));
                 }
                 t.add_row(cells);
             }
@@ -2246,13 +2238,11 @@ fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
     if !hard.is_empty() {
         let mut t = create_dynamic_table();
         t.set_header(vec![
-            Cell::new("PID")
-                .add_attribute(Attribute::Bold)
-                .fg(Color::Cyan),
-            Cell::new("State").add_attribute(Attribute::Bold),
-            Cell::new("Age").add_attribute(Attribute::Bold),
-            Cell::new("Confirmed via").add_attribute(Attribute::Bold),
-            Cell::new("Socket").add_attribute(Attribute::Bold),
+            cell("PID").add_attribute(Attribute::Bold).fg(Color::Cyan),
+            cell("State").add_attribute(Attribute::Bold),
+            cell("Age").add_attribute(Attribute::Bold),
+            cell("Confirmed via").add_attribute(Attribute::Bold),
+            cell("Socket").add_attribute(Attribute::Bold),
         ]);
         for g in hard {
             let state = g.state.as_deref().unwrap_or("?");
@@ -2261,11 +2251,12 @@ fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
                 .map(|a| format!("{a}s"))
                 .unwrap_or_else(|| "age?".to_string());
             t.add_row(vec![
-                Cell::new(g.pid.to_string()),
-                Cell::new(state),
-                Cell::new(age),
-                Cell::new(&g.confirmed_via),
-                Cell::new(if g.holds_socket { "yes" } else { "no" }),
+                cell(g.pid.to_string()),
+                // R35-14: `state` and `confirmed_via` are remote JSON.
+                cell(state),
+                cell(age),
+                cell(&g.confirmed_via),
+                cell(if g.holds_socket { "yes" } else { "no" }),
             ]);
         }
         outln!(
@@ -2278,13 +2269,11 @@ fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
     if !soft.is_empty() {
         let mut t = create_dynamic_table();
         t.set_header(vec![
-            Cell::new("PID")
-                .add_attribute(Attribute::Bold)
-                .fg(Color::Cyan),
-            Cell::new("State").add_attribute(Attribute::Bold),
-            Cell::new("Age").add_attribute(Attribute::Bold),
-            Cell::new("Confirmed via").add_attribute(Attribute::Bold),
-            Cell::new("Socket").add_attribute(Attribute::Bold),
+            cell("PID").add_attribute(Attribute::Bold).fg(Color::Cyan),
+            cell("State").add_attribute(Attribute::Bold),
+            cell("Age").add_attribute(Attribute::Bold),
+            cell("Confirmed via").add_attribute(Attribute::Bold),
+            cell("Socket").add_attribute(Attribute::Bold),
         ]);
         for g in soft {
             let state = g.state.as_deref().unwrap_or("?");
@@ -2293,11 +2282,11 @@ fn render_ghost_pids(report: &AgentReport, theme: &Theme) {
                 .map(|a| format!("{a}s"))
                 .unwrap_or_else(|| "age?".to_string());
             t.add_row(vec![
-                Cell::new(g.pid.to_string()),
-                Cell::new(state),
-                Cell::new(age),
-                Cell::new(&g.confirmed_via),
-                Cell::new(if g.holds_socket { "yes" } else { "no" }),
+                cell(g.pid.to_string()),
+                cell(state),
+                cell(age),
+                cell(&g.confirmed_via),
+                cell(if g.holds_socket { "yes" } else { "no" }),
             ]);
         }
         outln!(
@@ -2355,5 +2344,22 @@ mod tests {
         assert_eq!(format_install_date("20a4-03-15T10:22:31Z"), None);
         assert_eq!(format_install_date("2024/03/15T10:22:31Z"), None);
         assert_eq!(format_install_date("unknown"), None);
+    }
+
+    // ── R35-14 regression ────────────────────────────────────
+
+    #[test]
+    fn every_cell_is_sanitized_by_construction() {
+        // Any host-controlled byte that reaches a table cell passes through
+        // sanitize_terminal. Idempotent for inputs that were already
+        // sanitized by the caller.
+        assert_eq!(cell("\x1b[2Jevil").content(), "\u{FFFD}[2Jevil");
+        assert_eq!(cell(42).content(), "42");
+        assert_eq!(cell("PID").content(), "PID");
+        // Double sanitization is idempotent: safe to pass a sanitized String.
+        assert_eq!(
+            cell(sanitize_terminal("\x1b[2Jevil")).content(),
+            "\u{FFFD}[2Jevil"
+        );
     }
 }
