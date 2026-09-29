@@ -177,8 +177,9 @@ pub fn gather_network_info() -> NetworkInfo {
 
     // ---------- Listening ports via /proc (zero-dependency) ----------
     let sockets = collect_listening_sockets();
-    // M4-01: pass the inventory we already have — do not re-parse /proc/net/*.
-    let foreign_netns_listeners = report_foreign_netns_listeners(&sockets);
+    // R35-06: identity is the inode; the tuple filter is gone. The scanner
+    // enumerates every socket in a namespace other than PID 1's.
+    let foreign_netns_listeners = report_foreign_netns_listeners();
     let attrs = attribute_sockets(&sockets);
 
     let mut listening_ports = Vec::new();
