@@ -15,13 +15,16 @@ use crate::safe_io;
 // Hardened tool resolution
 // ---------------------------------------------------------------------------
 
-fn tool_cache() -> &'static Mutex<HashMap<String, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+// R35-05: the cache also stores refusals. A binary that is writable by a
+// non-root principal must not be executed, and the disclosure of that refusal
+// must happen exactly once per tool.
+fn tool_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // R10-04: poison-tolerant lock helper
-fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, Option<String>>> {
     tool_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -29,13 +32,30 @@ fn lock_cache() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
 
 /// Resolve a system tool by searching fixed standard directories.
 /// This avoids a fork of `which` and is resilient against PATH manipulation.
+///
+/// R35-05: a candidate is only accepted if it and every directory on its
+/// lexical AND canonical path is owned by root (or our euid) and is not
+/// group/other writable. On a Debian layout `/usr/local` is `root:staff 2775`
+/// — group writable — so `/usr/local/*` no longer resolves until the admin
+/// fixes the mode. Intended.
+///
+/// Negative results are cached too: the refusal is disclosed once.
 pub fn resolve_tool(tool: &str) -> Option<String> {
-    // Fast path: hit the (poison-tolerant) cache
-    if let Some(path) = lock_cache().get(tool) {
-        return Some(path.clone());
+    // Fast path: hit the (poison-tolerant) cache. Scope the guard explicitly
+    // so the lock is not held while `resolve_tool_uncached` runs.
+    {
+        let guard = lock_cache();
+        if let Some(hit) = guard.get(tool) {
+            return hit.clone();
+        }
     }
+    let found = resolve_tool_uncached(tool);
+    lock_cache().insert(tool.to_string(), found.clone());
+    found
+}
 
-    use std::os::unix::fs::PermissionsExt;
+fn resolve_tool_uncached(tool: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
     for dir in [
         "/usr/local/sbin",
         "/usr/local/bin",
@@ -45,14 +65,70 @@ pub fn resolve_tool(tool: &str) -> Option<String> {
         "/bin",
     ] {
         let candidate = format!("{dir}/{tool}");
-        if let Ok(md) = std::fs::metadata(&candidate)
-            && md.is_file()
-            && md.permissions().mode() & 0o111 != 0
-        {
-            lock_cache().insert(tool.to_string(), candidate.clone());
+        let Ok(md) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !md.is_file() || md.mode() & 0o111 == 0 {
+            continue;
+        }
+        if is_trusted_exec(&candidate) {
             return Some(candidate);
         }
+        coverage::record(format!(
+            "tool resolution: {candidate} (or a directory on its path) is writable by a \
+             non-root principal — NOT executed; trying the next standard directory"
+        ));
     }
+    None
+}
+
+/// R35-05: may we exec this file with our privileges? The file and every
+/// directory on its lexical AND canonical paths must be owned by root (or our
+/// euid) and not writable by group or other.
+///
+/// Both chains matter: an attacker who can rewrite the directory holding a
+/// symlink can swap the target between check and exec. We do not stat the
+/// symlink itself (which we would be able to replace), we canonicalise and
+/// also verify the lexical ancestors.
+fn is_trusted_exec(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid(2) cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let owned_ok =
+        |md: &std::fs::Metadata| (md.uid() == 0 || md.uid() == euid) && md.mode() & 0o022 == 0;
+
+    let lexical = std::path::Path::new(path);
+    let Ok(real) = std::fs::canonicalize(lexical) else {
+        return false;
+    };
+    let Ok(md) = std::fs::metadata(&real) else {
+        return false;
+    };
+    md.is_file()
+        && md.mode() & 0o111 != 0
+        && owned_ok(&md)
+        && lexical
+            .ancestors()
+            .skip(1)
+            .chain(real.ancestors().skip(1))
+            .all(|d| std::fs::metadata(d).is_ok_and(|m| owned_ok(&m)))
+}
+
+/// R35-05: the single gate for everything `run_*` execs. A bare name goes
+/// through `resolve_tool`; an absolute path is re-verified in place. There is
+/// no PATH fallback: the PATH dirs of `hardened_command` are a subset of the
+/// search dirs, so the only thing PATH lookup could add is a refused binary.
+fn exec_target(program: &str) -> Option<String> {
+    if !program.starts_with('/') {
+        return resolve_tool(program);
+    }
+    if is_trusted_exec(program) {
+        return Some(program.to_string());
+    }
+    coverage::record(format!(
+        "tool resolution: {program} (or a directory on its path) is writable by a \
+         non-root principal — NOT executed"
+    ));
     None
 }
 
@@ -76,12 +152,18 @@ pub fn hardened_command(program: &str, args: &[&str]) -> Command {
 }
 
 /// SIGKILL the whole process group (pgid == pid thanks to setsid), then reap.
+///
+/// R35-09: unregister the child BEFORE the reap. Once `wait()` returns the
+/// PID/PGID is free for the kernel to recycle, and a group SIGTERM from
+/// `terminate_registered_children` can land on an unrelated process. The
+/// registry is what proves the PGID is still ours.
 fn kill_group_and_reap(child: &mut Child) {
-    let pid = child.id() as libc::pid_t;
+    let pid = child.id();
     unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL); // belt and braces
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        libc::kill(pid as libc::pid_t, libc::SIGKILL); // belt and braces
     }
+    unregister_child(pid);
     let _ = child.wait();
 }
 
@@ -468,6 +550,8 @@ fn wait_group_safe(child: &mut Child, deadline: Duration) -> Option<std::process
         if peek_exited(pid) {
             // Group killed BEFORE the reap: the PGID is still ours.
             unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            // R35-09: forget the PGID before the reap reserves it no longer.
+            unregister_child(pid);
             return child.wait().ok();
         }
         if start.elapsed() < deadline {
@@ -475,6 +559,7 @@ fn wait_group_safe(child: &mut Child, deadline: Duration) -> Option<std::process
             backoff = (backoff * 2).min(POLL_MAX);
         } else {
             // Timeout: kill group and reap, no status available.
+            // `kill_group_and_reap` unregisters itself.
             kill_group_and_reap(child);
             return None;
         }
@@ -486,7 +571,8 @@ pub fn run_child_with_timeout(
     args: &[&str],
     timeout_secs: u64,
 ) -> Option<std::process::Output> {
-    let resolved = resolve_tool(program).unwrap_or_else(|| program.to_string());
+    // R35-05: no PATH fallback; a refused binary returns None here.
+    let resolved = exec_target(program)?;
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -500,14 +586,12 @@ pub fn run_child_with_timeout(
     // stdout safety block
     let Some(out_pipe) = child.stdout.take() else {
         kill_group_and_reap(&mut child);
-        unregister_child(child_pid);
         return None;
     };
 
     // stderr safety block
     let Some(err_pipe) = child.stderr.take() else {
         kill_group_and_reap(&mut child);
-        unregister_child(child_pid);
         return None;
     };
 
@@ -539,14 +623,14 @@ pub fn run_child_with_timeout(
             // inside wait_group_safe has already SIGKILLed the group and reaped,
             // so both write ends are closed and the readers hit EOF at once —
             // join is bounded and releases the pipe fds deterministically.
+            // R35-09: the child was unregistered inside kill_group_and_reap.
             let _ = out_handle.join();
             let _ = err_handle.join();
-            unregister_child(child_pid);
             return None;
         }
     };
 
-    unregister_child(child_pid);
+    // R35-09: the child was unregistered inside wait_group_safe.
     Some(std::process::Output {
         status,
         stdout: out_handle.join().unwrap_or_default(),
@@ -575,7 +659,8 @@ fn run_with_timeout_inner(
     timeout_secs: u64,
     require_success: bool,
 ) -> Option<String> {
-    let resolved = resolve_tool(program).unwrap_or_else(|| program.to_string());
+    // R35-05: no PATH fallback; a refused binary returns None here.
+    let resolved = exec_target(program)?;
     let mut child = hardened_command(&resolved, args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -590,7 +675,6 @@ fn run_with_timeout_inner(
     // Defensive: if stdout was somehow not captured, reap the child immediately
     let Some(child_stdout) = child.stdout.take() else {
         kill_group_and_reap(&mut child);
-        unregister_child(child_pid);
         return None;
     };
     let prog = program.to_string();
@@ -613,21 +697,20 @@ fn run_with_timeout_inner(
         Ok(stdout) => {
             // R26-01: the group kill is issued INSIDE wait_group_safe, before
             // the reap. Killing after wait() can land on a recycled PGID.
+            // R35-09: wait_group_safe unregisters the child before reaping.
             let status = wait_group_safe(&mut child, Duration::from_secs(2));
-            let result = if require_success {
+            if require_success {
                 match status {
                     Some(s) if s.success() => Some(stdout),
                     _ => None,
                 }
             } else {
                 Some(stdout)
-            };
-            unregister_child(child_pid);
-            result
+            }
         }
         Err(_timeout) => {
+            // kill_group_and_reap unregisters the child before the reap.
             kill_group_and_reap(&mut child);
-            unregister_child(child_pid);
             None
         }
     }
@@ -914,6 +997,50 @@ mod tests {
             child.wait().is_ok(),
             "second wait must use the cached status"
         );
+    }
+
+    // ── R35-05: trusted-exec gate ────────────────────────────
+
+    #[test]
+    fn a_packaged_shell_is_trusted() {
+        // usrmerge makes either canonical; at least one must exist and pass.
+        assert!(
+            is_trusted_exec("/bin/sh") || is_trusted_exec("/usr/bin/sh"),
+            "/bin/sh or /usr/bin/sh must be trusted on a normal host"
+        );
+    }
+
+    #[test]
+    fn a_nonexistent_path_is_not_trusted() {
+        assert!(!is_trusted_exec("/nonexistent/path/to/nothing"));
+        assert!(exec_target("/nonexistent/absolute/tool").is_none());
+    }
+
+    #[test]
+    fn a_group_writable_binary_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // /tmp is o+w, so a fixture there fails the ancestor check for a
+        // reason unrelated to the file's own mode. Use a private tree under
+        // /root, reachable only when running as root.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = std::path::Path::new("/root/.owlzops-test-r35-05");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = dir.join("tool");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            !is_trusted_exec(bin.to_str().unwrap()),
+            "group-writable binary must be refused even under a root-owned dir"
+        );
+        assert!(
+            exec_target(bin.to_str().unwrap()).is_none(),
+            "absolute paths are re-verified"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1231,7 +1358,7 @@ mod system_path_tests {
             "/nix/store/abc/bin/foo",
             "/snap/firefox/1/usr/lib/firefox/firefox",
             "/var/lib/flatpak/app/x/y/z",
-            "/opt/app/bin/server",
+            "/opt/app/bin/foo",
         ] {
             assert!(
                 !SYSTEM_BIN.iter().any(|s| p.starts_with(s)),
