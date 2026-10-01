@@ -43,4 +43,13 @@ if [ -n "$hits" ]; then
   fail=1
 fi
 
+# R35-14: every table cell in src/ui.rs must go through cell() / cell_multiline().
+# The bare comfy_table constructor bypasses sanitize_terminal.
+hits=$(grep -nE '(^|[^:])Cell::new\(' src/ui.rs || true)
+if [ -n "$hits" ]; then
+  echo "::error file=src/ui.rs::use cell() — every table cell must pass sanitize_terminal (R35-14)"
+  echo "$hits"
+  fail=1
+fi
+
 exit $fail
