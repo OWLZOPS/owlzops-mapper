@@ -1,5 +1,97 @@
 # Changelog
 
+## [0.5.39] - 2026-10-01
+
+
+### Bug Fixes
+
+- **runner:** Isolate mount-namespace scanner, drop pid prefilter
+- **sudoers:** Detect Defaults !authenticate as a passwordless grant
+- **sudo:** Self_sudo_target must see the whole Cmnd_Spec_List
+- **proc_net:** ENOENT on a vanished pid is not a denial (R33-05)
+- **ssh:** Do not mask key-load failures as remote auth failures (R33-07)
+- **mount_namespace:** Prefer the systemd cgroup on hybrid/v1 hosts (R33-10)
+- **scoring:** Bump SCORING_VERSION to 15 for R33-03/R33-04 (R33-12)
+- **host:** Wall-clock timestamps for dmesg_errors (R33-QW-2 follow-up)
+- **systemd:** Restore systemctl for active timers (R33-QW-5 follow-up)
+- **access:** Use safe_io capped read for /etc/group
+- **access:** Empty bypassing groups are inventoried, not weighted (R33-QW-7)
+- **scoring:** Passwordless-root class is weighted once (R34-01)
+- **compare:** Track every root-equivalent group, not just bypassing ones (R34-02)
+- **access:** Disclose unreadable or truncated /etc/group (R34-03)
+- **sec-022:** Correlate per netns of interpreter (R35-01)
+- **sec-023:** Byte-level env split; ENOENT maps is a race (R35-04, R35-11)
+- **sec-014:** Non-UTF-8 secret must not hide key/flag (R35-04)
+- **sudoers:** Sudoers(5) comment rules; #uid is an entry (R35-03
+- **utils:** Trusted-exec gate; forget PGID before reap (R35-05, R35-09)
+- **runtime:** Split size query off security inventory (R35-02)
+- **net:** Drop tuple filter; host = pid 1 ns (R35-06)
+- **ebpf:** ENOENT silent, other errors disclosed (R35-08)
+- **ui:** Sanitize remote report fields (R35-07)
+- **ssh:** Derive host ceiling from stage budgets (R35-10)
+- **main:** Host ceiling + no-panic signal task; cli range validation (R35-10, R35-12)
+- **ui:** Cell() is the only table-cell constructor (R35-14)
+- **utils:** Signal children while holding the registry lock (R35-15)
+- **sec-022:** Disclose coverage only when the gap is real (R35-16)
+- **ui:** Preserve our own newlines in multi-line cells
+
+### Build System
+
+- **deps:** Bump taiki-e/install-action from 2.87.11 to 2.87.15 (#297)
+- **deps:** Bump clap from 4.6.6 to 4.6.7 (#298)
+- **deps:** Bump rust_xlsxwriter from 0.99.0 to 0.99.1 (#299)
+- **deps:** Bump taiki-e/install-action from 2.87.15 to 2.87.20 (#309)
+- **deps:** Bump rand from 0.10.2 to 0.10.3 (#311)
+- **deps:** Bump io-uring from 0.7.14 to 0.7.15 (#312)
+
+### CI/CD
+
+- Gate bare Cell::new in ui.rs (R35-14)
+
+### Documentation
+
+- **fields:** Exe_path is never null in mount_namespace_anomalies
+- **models:** ContainerNetnsMapping.pid is not serialized (R33-13)
+- **readme:** SEC-060 and SEC-061 in findings table
+- **fields:** CpuVulnerability and RootEquivalentGroup schemas
+- **r33-qw:** Align SEC-061 weight and passwordless-root class (R34-01)
+- **fields:** R35 updates for netns, runtime sizes, dlp, sudoers, ebpf, reverse-shell
+
+### Features
+
+- **access:** Emit SudoersEntry for Defaults !authenticate
+- **host:** NTP truth via clock_adjtime(2) (R33-QW-1)
+- **host:** OOM count from /proc/vmstat, dmesg via /dev/kmsg (R33-QW-2)
+- **host:** GPU inventory from sysfs PCI class (R33-QW-3)
+- **host:** Os_install_date via statx birth time (R33-QW-4)
+- **ui:** Show GPU inventory in System Overview (R33-QW-3)
+- **ui:** Show OS install date in System Overview (R33-QW-4)
+- **systemd:** Read active-state from /run/systemd/units (R33-QW-5)
+- **security:** CPU mitigation state via sysfs (R33-QW-6)
+- **access:** Root-equivalent groups outside sudoers policy (R33-QW-7)
+- **ui:** Dashboard sections for SEC-060 and SEC-061
+- **security:** Sshd login-path directives, replaceable targets (R33-QW-8)
+- **security:** Authorized_keys options and environment= gate (R33-QW-9)
+- **security:** Immutable/append-only trust anchors (R33-QW-10)
+
+### Miscellaneous
+
+- **sudoers:** Drop temporary allow(dead_code) on the new predicates
+- **scoring:** SCORING_VERSION 15 → 16 (R33-QW batch)
+
+### Refactoring
+
+- **mount_namespace:** Share the /proc miss classifier
+- **main:** Extract missing_hosts helper (R33-11)
+- **env:** One byte-level KEY=VALUE splitter (R35-04 verification)
+- **sec-023:** Share env record splitter, test R35-11 race (R35-04/R35-11 verification)
+- **sec-014:** Share env record splitter, single mysql predicate (R35-04 verification)
+
+### Testing
+
+- **net:** Behavioural check for R35-06 tuple filter (R35-06 verification)
+- **utils:** Exercise the trust-gate refusal branch without root (R35-05 verification)
+
 ## [0.5.38] - 2026-09-15
 
 
