@@ -149,6 +149,10 @@ chmod +x owlzops-agent-linux
 
 > The macOS binary is an orchestrator only — it cannot scan the machine it runs on. Extracting the Linux agent with a plain `tar xz` in the same directory replaces the orchestrator with a Linux ELF, and the next command fails with `cannot execute binary file`. `tar xzO … > owlzops-agent-linux` avoids that entirely. Apple Silicon only; there is no Intel macOS build.
 
+### Deployment notes
+
+**`/usr/local` must not be group- or world-writable for tool resolution to work.** From v0.5.39, `resolve_tool` rejects any system tool whose path (lexical or canonical) contains a directory writable by a non-root principal. On a Debian layout, `/usr/local` is commonly `root:staff 2775` — group-writable — so tools the scanner invokes from there (`systemctl`, `last`, `dpkg-query`, …) are skipped with a coverage warning. This is deliberate: before v0.5.39, a member of `staff` could plant `/usr/local/bin/systemctl` and have the audit execute it as root. To restore resolution: `chmod g-w /usr/local`, or install those tools under `/usr/bin` / `/usr/sbin`.
+
 ---
 
 ## Usage
