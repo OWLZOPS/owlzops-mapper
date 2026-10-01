@@ -14,6 +14,12 @@
 //! [`cell_multiline()`], which sanitizes each line independently and rejoins
 //! with a real newline. A host-supplied `\n` inside a line is still
 //! neutralized.
+//!
+//! VS16: `🛡`, `⚙` and `⚠` carry `Emoji_Presentation=No` in Unicode; without
+//! a trailing U+FE0F the terminal falls back to a monochrome text glyph that
+//! many fonts (Ubuntu/Fedora defaults) do not ship, and the icon renders as
+//! an empty cell. Every such codepoint in [`Theme::new`] is followed by
+//! `\u{FE0F}`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -79,13 +85,15 @@ impl Theme {
                 owl: "\u{1F989}  ",
                 spy: "\u{1F50D}  ",
                 shield: "\u{1F512}  ",
-                sec_cat: "\u{1F6E1} ",
-                rel_cat: "\u{2699} ",
+                // VS16 forces emoji presentation; without it the terminal
+                // falls back to a monochrome glyph that most fonts lack.
+                sec_cat: "\u{1F6E1}\u{FE0F} ",
+                rel_cat: "\u{2699}\u{FE0F} ",
                 hyg_cat: "\u{1F9F9} ",
-                sec_item: "\u{1F6E1}  ",
+                sec_item: "\u{1F6E1}\u{FE0F}  ",
                 alert: "\u{1F6A8} ",
                 warn: "\u{26A0}\u{FE0F}  ",
-                warn_sm: "\u{26A0} ",
+                warn_sm: "\u{26A0}\u{FE0F} ",
                 ghost: "\u{1F47B} ",
                 dna: "\u{1F9EC} ",
                 mag: "\u{1F50D} ",
@@ -2417,5 +2425,25 @@ mod tests {
             cell_multiline("NNP=1\nSeccomp=2").content(),
             "NNP=1\nSeccomp=2"
         );
+    }
+
+    // ── VS16: emoji presentation forced ──────────────────────
+
+    #[test]
+    fn theme_icons_carry_vs16_where_required() {
+        let t = Theme::new();
+        if !t.is_tty {
+            // Non-TTY branch is ASCII-only; nothing to check.
+            return;
+        }
+        // U+1F6E1 SHIELD and U+2699 GEAR have Emoji_Presentation=No; without
+        // VS16 they fall back to a monochrome glyph most fonts lack. U+26A0
+        // WARNING is the same. Check every occurrence carries \u{FE0F}.
+        for s in [t.sec_cat, t.rel_cat, t.sec_item, t.warn, t.warn_sm] {
+            assert!(
+                s.contains('\u{FE0F}'),
+                "icon string {s:?} must carry VS16 (U+FE0F)"
+            );
+        }
     }
 }
