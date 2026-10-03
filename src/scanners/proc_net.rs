@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 
 use crate::coverage;
 use crate::models::ForeignNetnsListener;
@@ -230,10 +231,16 @@ fn host_net_base() -> &'static str {
 /// nowhere. `host_net_base` picks the same namespace `report_foreign_netns_listeners`
 /// treats as host.
 pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
-    let base = host_net_base();
+    collect_listening_sockets_from(Path::new(host_net_base()))
+}
+
+/// M9: same walk, rooted at `proc_root`. Tests pass a tempdir; production
+/// uses `host_net_base()` (see the wrapper above).
+pub fn collect_listening_sockets_from(proc_root: &Path) -> HashMap<u64, SocketMeta> {
+    let root = proc_root.to_string_lossy().into_owned();
     let mut map = HashMap::new();
     for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
-        let _ = parse_proc_net(p, &mut map, base);
+        let _ = parse_proc_net(p, &mut map, &root);
     }
     map
 }
@@ -244,10 +251,9 @@ pub fn collect_listening_sockets() -> HashMap<u64, SocketMeta> {
 /// pid (ENOENT, a race) from a permission failure (EACCES, a real
 /// coverage fact). The pre-R33-05 `Option` collapsed both into one.
 ///
-/// R35-06 verification: `proc_root` is parameterised so the walk can be
-/// exercised against a tempdir (see `report_foreign_netns_listeners_from`).
-fn netns_inode(proc_root: &str, pid: u32) -> io::Result<String> {
-    let link = fs::read_link(format!("{proc_root}/{pid}/ns/net"))?;
+/// M9: takes `&Path` so the walk can be rooted at any procfs mount.
+fn netns_inode(proc_root: &Path, pid: u32) -> io::Result<String> {
+    let link = fs::read_link(proc_root.join(format!("{pid}/ns/net")))?;
     link.to_str().map(str::to_string).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -270,19 +276,21 @@ fn netns_inode(proc_root: &str, pid: u32) -> io::Result<String> {
 /// Aggregated per network namespace: a Docker host has many processes sharing
 /// one netns, but only one entry per unique socket is returned.
 pub fn report_foreign_netns_listeners() -> Vec<ForeignNetnsListener> {
-    report_foreign_netns_listeners_from("/proc")
+    report_foreign_netns_listeners_from(Path::new("/proc"))
 }
 
-/// R35-06 verification: same walk, but rooted at `proc_root`. Production
-/// calls `report_foreign_netns_listeners` (`/proc`); tests call this against
-/// a tempdir so the tuple-filter regression has a real behavioural check
-/// instead of a signature check.
-fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListener> {
-    let host_ns = match fs::read_link(format!("{proc_root}/1/ns/net")) {
+/// M9: same walk, rooted at `proc_root`. Production calls
+/// `report_foreign_netns_listeners` (`/proc`); tests call this against a
+/// tempdir so the tuple-filter regression (R35-06) has a real behavioural
+/// check instead of a signature check.
+pub(crate) fn report_foreign_netns_listeners_from(proc_root: &Path) -> Vec<ForeignNetnsListener> {
+    let proc_root_str = proc_root.to_string_lossy().into_owned();
+
+    let host_ns = match fs::read_link(proc_root.join("1/ns/net")) {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
             coverage::record(format!(
-                "netns visibility: {proc_root}/1/ns/net unreadable ({}) — foreign-namespace \
+                "netns visibility: {proc_root_str}/1/ns/net unreadable ({}) — foreign-namespace \
                  listeners NOT enumerated; the port inventory may be missing sockets",
                 e.kind()
             ));
@@ -294,7 +302,7 @@ fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListe
         Ok(e) => e,
         Err(e) => {
             coverage::record(format!(
-                "netns visibility: {proc_root} unreadable ({}) — foreign-namespace \
+                "netns visibility: {proc_root_str} unreadable ({}) — foreign-namespace \
                  listeners NOT enumerated",
                 e.kind()
             ));
@@ -350,7 +358,7 @@ fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListe
             continue;
         }
 
-        let base = format!("{proc_root}/{pid}");
+        let base = format!("{proc_root_str}/{pid}");
         let mut foreign = HashMap::new();
         let mut any_read = false;
         for p in [Proto::Tcp, Proto::Tcp6, Proto::Udp, Proto::Udp6] {
@@ -369,7 +377,7 @@ fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListe
         // inventory item.
         let listeners: Vec<SocketMeta> = foreign.into_values().collect();
 
-        let comm = safe_io::read_procfs_capped(&format!("{proc_root}/{pid}/comm"), 4096)
+        let comm = safe_io::read_procfs_capped(&format!("{proc_root_str}/{pid}/comm"), 4096)
             .ok()
             .map(|(c, _)| c.trim().to_string())
             .unwrap_or_else(|| "?".to_string());
@@ -408,7 +416,7 @@ fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListe
 
     if ns_denied > 0 {
         coverage::record(format!(
-            "netns visibility: {proc_root}/<pid>/ns/net unreadable for {ns_denied} process(es) \
+            "netns visibility: {proc_root_str}/<pid>/ns/net unreadable for {ns_denied} process(es) \
              (needs root/CAP_SYS_PTRACE) — foreign-namespace listeners are a LOWER BOUND"
         ));
     }
@@ -423,13 +431,23 @@ fn report_foreign_netns_listeners_from(proc_root: &str) -> Vec<ForeignNetnsListe
 }
 
 pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, ProcAttr> {
+    attribute_sockets_from(Path::new("/proc"), wanted)
+}
+
+/// M9: same walk, rooted at `proc_root`. Production uses `/proc`; tests pass
+/// a tempdir. Returns `inode -> ProcAttr` for every socket in `wanted` that
+/// could be attributed to a live pid's `/proc/<pid>/fd`.
+pub fn attribute_sockets_from(
+    proc_root: &Path,
+    wanted: &HashMap<u64, SocketMeta>,
+) -> HashMap<u64, ProcAttr> {
     let mut attributed: HashMap<u64, ProcAttr> = HashMap::new();
     if wanted.is_empty() {
         return attributed;
     }
 
     let mut pids: Vec<u32> = Vec::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
+    if let Ok(entries) = fs::read_dir(proc_root) {
         for e in entries.flatten() {
             if let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) {
                 pids.push(pid);
@@ -446,10 +464,11 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
             break;
         }
 
-        let fd_dir = format!("/proc/{pid}/fd");
+        let pid_dir = proc_root.join(pid.to_string());
+        let fd_dir = pid_dir.join("fd");
         let fds = match fs::read_dir(&fd_dir) {
             Ok(f) => f,
-            // R33-05: the pid exited between the outer readdir("/proc") and
+            // R33-05: the pid exited between the outer readdir(proc_root) and
             // this readdir. A race, not a permission fact. Before this fix
             // every vanishing pid on a busy host bumped `denied` and inflated
             // the "port attribution incomplete" line.
@@ -490,15 +509,16 @@ pub fn attribute_sockets(wanted: &HashMap<u64, SocketMeta>) -> HashMap<u64, Proc
 
             let exe_path = exe_cache
                 .get_or_insert_with(|| {
-                    fs::read_link(format!("/proc/{pid}/exe"))
+                    fs::read_link(pid_dir.join("exe"))
                         .ok()
                         .map(|p| p.to_string_lossy().into_owned())
                 })
                 .clone();
 
+            let comm_path = pid_dir.join("comm");
             let comm = comm_cache
                 .get_or_insert_with(|| {
-                    match safe_io::read_procfs_capped(&format!("/proc/{pid}/comm"), 4096) {
+                    match safe_io::read_procfs_capped(comm_path.to_string_lossy().as_ref(), 4096) {
                         Ok((c, truncated)) => {
                             if truncated {
                                 coverage::record(format!("/proc/{pid}/comm truncated"));
@@ -565,7 +585,7 @@ mod tests {
 
     /// One fake PID with its netns symlink, comm, and a single TCP listener
     /// line. `inode` distinguishes the socket inside its namespace.
-    fn fake_ns_pid(root: &std::path::Path, pid: u32, netns: &str, inode: u64) {
+    fn fake_ns_pid(root: &Path, pid: u32, netns: &str, inode: u64) {
         let base = root.join(pid.to_string());
         std::fs::create_dir_all(base.join("ns")).unwrap();
         std::fs::create_dir_all(base.join("net")).unwrap();
@@ -592,7 +612,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fake_ns_pid(tmp.path(), 1, "net:[1]", 5001);
         fake_ns_pid(tmp.path(), 4242, "net:[2]", 6001);
-        let out = report_foreign_netns_listeners_from(tmp.path().to_str().unwrap());
+        let out = report_foreign_netns_listeners_from(tmp.path());
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(
             (
@@ -602,5 +622,73 @@ mod tests {
             ),
             ("net:[2]", "0.0.0.0", "22")
         );
+    }
+
+    // ── M9: full-fixture test ─────────────────────────────────
+
+    /// Two-namespace fixture:
+    ///   host netns `net:[1]` — socket 12345 listening on 8080, owned by
+    ///     pid 100 (`nginx`), so `attribute_sockets` can find it via fd 3;
+    ///   foreign netns `net:[2]` — pid 4242 (`sandboxed`) listening on 9000.
+    fn fake_proc(root: &Path) {
+        use std::os::unix::fs::symlink;
+        let tcp = |port: u16, inode: u64| {
+            format!(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                 \x20  0: 00000000:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {inode} 1 0000000000000000 100 0 0 10 0\n"
+            )
+        };
+
+        // Host's own socket table (read by collect_listening_sockets_from).
+        std::fs::create_dir_all(root.join("net")).unwrap();
+        std::fs::write(root.join("net/tcp"), tcp(8080, 12345)).unwrap();
+
+        // PID 1 in the host netns — provides the reference host_ns.
+        std::fs::create_dir_all(root.join("1/ns")).unwrap();
+        symlink("net:[1]", root.join("1/ns/net")).unwrap();
+
+        // PID 100 in the host netns, owning socket 12345 via fd 3.
+        std::fs::create_dir_all(root.join("100/ns")).unwrap();
+        std::fs::create_dir_all(root.join("100/fd")).unwrap();
+        symlink("net:[1]", root.join("100/ns/net")).unwrap();
+        symlink("socket:[12345]", root.join("100/fd/3")).unwrap();
+        symlink("/usr/sbin/nginx", root.join("100/exe")).unwrap();
+        std::fs::write(root.join("100/comm"), "nginx\n").unwrap();
+
+        // PID 4242 in a foreign netns with its own listener on 9000.
+        std::fs::create_dir_all(root.join("4242/ns")).unwrap();
+        std::fs::create_dir_all(root.join("4242/net")).unwrap();
+        symlink("net:[2]", root.join("4242/ns/net")).unwrap();
+        std::fs::write(root.join("4242/net/tcp"), tcp(9000, 777)).unwrap();
+        std::fs::write(root.join("4242/comm"), "sandboxed\n").unwrap();
+    }
+
+    #[test]
+    fn host_inventory_foreign_netns_and_attribution_work_on_a_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_proc(tmp.path());
+
+        // collect_listening_sockets_from reads `{root}/net/tcp`.
+        let host = collect_listening_sockets_from(tmp.path());
+        assert_eq!(host.get(&12345).map(|s| s.port), Some(8080));
+
+        // report_foreign_netns_listeners_from compares against pid 1's netns.
+        let (foreign, cov) =
+            crate::coverage::capture(|| report_foreign_netns_listeners_from(tmp.path()));
+        assert_eq!(foreign.len(), 1, "{foreign:?}");
+        assert_eq!(foreign[0].netns, "net:[2]");
+        assert_eq!(foreign[0].port, "9000");
+        assert_eq!(foreign[0].example_process.as_deref(), Some("sandboxed"));
+        assert!(
+            cov.is_empty(),
+            "complete fixture must not degrade coverage: {cov:?}"
+        );
+
+        // attribute_sockets_from walks `{root}/<pid>/fd` for each pid.
+        let attr = attribute_sockets_from(tmp.path(), &host);
+        let a = attr.get(&12345).expect("host socket attributed");
+        assert_eq!(a.pid, Some(100));
+        assert_eq!(a.exe_path.as_deref(), Some("/usr/sbin/nginx"));
+        assert_eq!(a.comm.as_deref(), Some("nginx"));
     }
 }

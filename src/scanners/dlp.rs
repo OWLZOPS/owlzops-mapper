@@ -2,6 +2,7 @@ use crate::models::SecretLeak;
 use crate::{coverage, safe_io};
 use std::fmt::Write;
 use std::fs;
+use std::path::Path;
 
 const SENSITIVE_KEYS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
@@ -129,9 +130,13 @@ fn self_attribution(source: &str) -> String {
 ///
 /// `None` is load-bearing: SEC-014 treats unknown age as long-lived and keeps
 /// the full weight. Every failure path here returns `None`, never 0.
-fn process_age_secs(pid: u32, uptime_secs: u64, path_buf: &mut String) -> Option<u64> {
+///
+/// M9: `root` is the procfs mount point the caller scanned (`/proc` in
+/// production, a tempdir in tests) so the /proc/<pid>/stat read follows the
+/// same tree as the rest of the scan.
+fn process_age_secs(root: &str, pid: u32, uptime_secs: u64, path_buf: &mut String) -> Option<u64> {
     path_buf.clear();
-    let _ = write!(path_buf, "/proc/{}/stat", pid);
+    let _ = write!(path_buf, "{root}/{pid}/stat");
     let (stat, _truncated) = safe_io::read_procfs_capped(path_buf, 4096).ok()?;
     let clk_tck = crate::proc_time::clock_ticks_per_sec()?;
     crate::proc_time::age_from_parts(
@@ -142,11 +147,22 @@ fn process_age_secs(pid: u32, uptime_secs: u64, path_buf: &mut String) -> Option
 }
 
 pub fn scan_process_memory() -> Vec<SecretLeak> {
+    scan_process_memory_from(Path::new("/proc"))
+}
+
+/// M9: parameterised on `proc_root` so the scanner can be exercised against a
+/// tempdir fixture. Production passes `/proc`. Self-attribution (R27-16) keys
+/// on the live pid and stays inert against a fixture tree.
+pub fn scan_process_memory_from(proc_root: &Path) -> Vec<SecretLeak> {
     let mut leaks = Vec::new();
 
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let Ok(entries) = fs::read_dir(proc_root) else {
         return leaks;
     };
+
+    // M9: one owned string, reused in every format!/write! below. `Cow` would
+    // work too, but `.into_owned()` keeps the closure captures unambiguous.
+    let proc_root_str = proc_root.to_string_lossy().into_owned();
 
     let uptime_secs = crate::proc_time::uptime_secs();
     if uptime_secs.is_none() {
@@ -185,7 +201,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
 
         // Process name
         path_buf.clear();
-        let _ = write!(path_buf, "/proc/{}/comm", pid);
+        let _ = write!(path_buf, "{proc_root_str}/{pid}/comm");
         let process_name = safe_io::read_procfs_capped(&path_buf, 4096)
             .map(|(s, truncated)| {
                 if truncated {
@@ -214,14 +230,14 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
                 matched_key,
                 self_attributed: self_pid.map(|_| self_attribution(source)),
                 age_secs: *age_memo.get_or_insert_with(|| {
-                    uptime_secs.and_then(|u| process_age_secs(pid, u, &mut age_buf))
+                    uptime_secs.and_then(|u| process_age_secs(&proc_root_str, pid, u, &mut age_buf))
                 }),
             });
         };
 
         // 1. Environment Variables
         path_buf.clear();
-        let _ = write!(path_buf, "/proc/{}/environ", pid);
+        let _ = write!(path_buf, "{proc_root_str}/{pid}/environ");
         match safe_io::read_procfs_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
             Ok((env_data, truncated)) => {
                 if truncated {
@@ -248,7 +264,7 @@ pub fn scan_process_memory() -> Vec<SecretLeak> {
 
         // 2. Command Line Arguments
         path_buf.clear();
-        let _ = write!(path_buf, "/proc/{}/cmdline", pid);
+        let _ = write!(path_buf, "{proc_root_str}/{pid}/cmdline");
         match safe_io::read_procfs_bytes_capped(&path_buf, safe_io::CAP_PROC_ENVIRON) {
             Ok((cmd_data, truncated)) => {
                 if truncated {
@@ -457,5 +473,35 @@ mod tests {
         // `-p=` without a value is caught by the flag list, not by this
         // predicate — keep them distinct.
         assert!(is_mysql_inline_password(b"-p="));
+    }
+
+    // ── M9: fixture-tree test ────────────────────────────────
+
+    #[test]
+    fn environ_and_cmdline_leaks_are_found_in_a_fixture_tree() {
+        // M9: the scanner is exercised against a tempdir, so the test does
+        // not depend on host processes. `comm` is "app", so the cmdline
+        // `mysql -pSECRET` shape is deliberately NOT triggered (that path
+        // requires comm to be `mysql`/`mysqldump`); the environ leak is the
+        // subject of this test.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("4242");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("comm"), "app\n").unwrap();
+        std::fs::write(d.join("environ"), b"PATH=/bin\0VAULT_TOKEN=s.abc\0HOME=/\0").unwrap();
+        std::fs::write(d.join("cmdline"), b"mysql\0-psecret\0").unwrap();
+        std::fs::write(
+            d.join("stat"),
+            "4242 (app) S 1 1 1 0 -1 4194304 1 0 0 0 1 2 0 0 20 0 1 0 100",
+        )
+        .unwrap();
+
+        let (leaks, cov) = crate::coverage::capture(|| scan_process_memory_from(tmp.path()));
+        let keys: Vec<&str> = leaks.iter().map(|l| l.matched_key.as_str()).collect();
+        assert!(keys.contains(&"VAULT_TOKEN"), "{keys:?}");
+        assert!(leaks.iter().all(|l| l.pid == 4242));
+        // /proc/uptime is read from the live host, so no age warning fires;
+        // the fixture is otherwise complete → no "unreadable" lines.
+        assert!(cov.iter().all(|l| !l.contains("unreadable")), "{cov:?}");
     }
 }
