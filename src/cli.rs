@@ -73,6 +73,11 @@ pub struct AuditArgs {
     #[arg(long, default_value = "~/.ssh/id_rsa")]
     pub ssh_key: String,
 
+    /// Authenticate through the running ssh-agent ($SSH_AUTH_SOCK) instead of
+    /// --ssh-key. Hardware-backed keys (FIDO/PKCS#11) work only this way.
+    #[arg(long, default_value_t = false)]
+    pub ssh_agent: bool,
+
     #[arg(long, default_value_t = false)]
     pub copy_binary: bool,
 

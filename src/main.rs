@@ -354,7 +354,9 @@ async fn scan_remote_host(
     // A retry loop lives INSIDE this ceiling: retries share the host's
     // budget, they do not multiply it.
     let overall = ssh_engine::host_ceiling(a.remote_timeout_secs);
-    let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+    // M2: credential source is now an enum. `--ssh-agent` picks the agent;
+    // otherwise the tilde is expanded and a key file is loaded as before.
+    let ssh_auth = ssh_engine::SshAuth::from_args(&a);
     let attempts = a.retries.saturating_add(1);
     let host_for_log = host.clone();
 
@@ -368,7 +370,7 @@ async fn scan_remote_host(
             match ssh_engine::run_remote_scan_russh(
                 &host,
                 &a.ssh_user,
-                &ssh_key_expanded,
+                &ssh_auth,
                 a.remote_path.as_deref(),
                 pass.as_deref(),
                 a.copy_binary,
@@ -663,6 +665,23 @@ async fn run_command(
     sudo_from_env: Option<SecretString>,
 ) -> i32 {
     let verbose = cli.verbose; // carry verbose flag into output functions
+
+    // M2: a missing SSH_AUTH_SOCK is a usage error, not a runtime failure —
+    // catch it before the fleet loop starts. Exhaustive on purpose: a new
+    // subcommand that dispatches a remote scan must not silently inherit
+    // "no check" as a default.
+    let ssh_agent_wanted = match &cli.command {
+        Commands::Audit(a) => a.ssh_agent,
+        Commands::Snapshot(s) => s.audit.ssh_agent,
+        Commands::Compare(_)
+        | Commands::DirCompare(_)
+        | Commands::Sign(_)
+        | Commands::Verify(_) => false,
+    };
+    if ssh_agent_wanted && std::env::var_os("SSH_AUTH_SOCK").is_none() {
+        eprintln!("Error: --ssh-agent given but SSH_AUTH_SOCK is not set");
+        return EXIT_USAGE;
+    }
 
     // The deprecated env secret was lifted out of the environment at startup.
     // If nothing consumes it, say so — on every subcommand, not just `audit`.

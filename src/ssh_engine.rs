@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
+use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh::*;
 use std::io::{IsTerminal, Read};
@@ -12,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
+use crate::cli::AuditArgs;
 use crate::known_hosts::KnownHostsChecker;
 use crate::models::AgentReport;
 use crate::safe_io;
@@ -110,6 +112,35 @@ pub(crate) fn host_ceiling(remote_timeout_secs: u64) -> Duration {
         .saturating_add(scan_budget(remote_timeout_secs))
         .saturating_add(CLEANUP_BUDGET)
         .saturating_add(CEILING_MARGIN)
+}
+
+// ---------------------------------------------------------------------------
+// SSH auth source (M2)
+// ---------------------------------------------------------------------------
+
+/// How the orchestrator proves its identity to the remote host.
+///
+/// M2: previously the key file path was the only credential the engine could
+/// present. Hardware-backed keys (YubiKey/FIDO, PKCS#11) cannot be read from
+/// disk and only work through the agent; adding this enum costs no new
+/// dependency — russh already speaks the agent protocol behind its `agent`
+/// feature.
+#[derive(Debug, Clone)]
+pub enum SshAuth {
+    /// A private key file on disk. Path is already tilde-expanded.
+    KeyFile(String),
+    /// The running ssh-agent, reached through `$SSH_AUTH_SOCK`.
+    Agent,
+}
+
+impl SshAuth {
+    pub fn from_args(a: &AuditArgs) -> Self {
+        if a.ssh_agent {
+            SshAuth::Agent
+        } else {
+            SshAuth::KeyFile(shellexpand::tilde(&a.ssh_key).to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +263,10 @@ pub enum RemoteError {
     /// such message per host on the fleet. The operator then looks for
     /// the problem in `authorized_keys` on 5000 machines instead of in
     /// the permissions of their own `~/.ssh/id_ed25519`.
+    ///
+    /// M2 reuses this variant for agent-side failures (agent unreachable,
+    /// empty identity list, signing refused): same reasoning — the fix is
+    /// `ssh-add` on the operator's machine, not authorized_keys on the host.
     #[error("cannot load SSH private key {path}: {detail}")]
     KeyLoad { path: String, detail: String },
     #[error("sudo authentication failed on {host}: {detail}")]
@@ -1275,7 +1310,7 @@ impl RemoteCoverage {
 pub async fn run_remote_scan_russh(
     host: &str,
     ssh_user: &str,
-    ssh_key_path: &str,
+    ssh_auth: &SshAuth,
     remote_path: Option<&str>,
     sudo_pass: Option<&SecretString>,
     copy_binary: bool,
@@ -1360,19 +1395,27 @@ pub async fn run_remote_scan_russh(
     // `RemoteError::Auth` (as before) sent the operator looking at
     // authorized_keys on every host on the fleet instead of at
     // `chmod 600 ~/.ssh/id_ed25519` on their own machine.
-    let key_path = ssh_key_path.to_string();
-    let key = {
-        let p = key_path.clone();
-        tokio::task::spawn_blocking(move || load_secret_key(&p, None))
-            .await
-            .map_err(|e| RemoteError::KeyLoad {
-                path: key_path.clone(),
-                detail: format!("key loader task failed: {e}"),
-            })?
-            .map_err(|e| RemoteError::KeyLoad {
-                path: key_path,
-                detail: e.to_string(),
-            })?
+    //
+    // M2: `KeyFile` reads the key from disk exactly as before. `Agent` never
+    // lets the private key enter this process — the signature is produced by
+    // ssh-agent. Both branches converge on an `AuthResult` checked uniformly
+    // below.
+    let key_file: Option<Arc<_>> = match ssh_auth {
+        SshAuth::KeyFile(path) => {
+            let p = path.clone();
+            let key = tokio::task::spawn_blocking(move || load_secret_key(&p, None))
+                .await
+                .map_err(|e| RemoteError::KeyLoad {
+                    path: path.clone(),
+                    detail: format!("key loader task failed: {e}"),
+                })?
+                .map_err(|e| RemoteError::KeyLoad {
+                    path: path.clone(),
+                    detail: e.to_string(),
+                })?;
+            Some(Arc::new(key))
+        }
+        SshAuth::Agent => None,
     };
 
     // R35-10: HANDSHAKE_AUTH_BUDGET lives at module level so host_ceiling can
@@ -1382,13 +1425,64 @@ pub async fn run_remote_scan_russh(
     let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
         let mut session = client::connect_stream(config, stream, handler).await?;
         let hash = session.best_supported_rsa_hash().await?.flatten();
-        let auth = session
-            .authenticate_publickey(
-                ssh_user.to_string(),
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-            )
-            .await
-            .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+        let auth = match key_file {
+            Some(key) => session
+                .authenticate_publickey(ssh_user.to_string(), PrivateKeyWithHashAlg::new(key, hash))
+                .await
+                .map_err(|e| RemoteError::from_russh(e, &hostname))?,
+            None => {
+                // M2: every identity the agent holds, in agent order, until
+                // one is accepted. `KeyLoad` is reused as the error carrier
+                // — every failure on this branch is a LOCAL key-material
+                // problem (agent unreachable, no identities, signing refused),
+                // not a remote auth failure. The operator needs to look at
+                // their own `ssh-add -l`, not at the host's authorized_keys.
+                let agent_err = |detail: String| RemoteError::KeyLoad {
+                    path: "$SSH_AUTH_SOCK".into(),
+                    detail,
+                };
+                let mut agent = AgentClient::connect_env()
+                    .await
+                    .map_err(|e| agent_err(format!("cannot connect to ssh-agent: {e}")))?;
+                let identities = agent
+                    .request_identities()
+                    .await
+                    .map_err(|e| agent_err(format!("agent refused identity list: {e}")))?;
+                if identities.is_empty() {
+                    return Err(agent_err(
+                        "agent holds no identities — run `ssh-add` first".into(),
+                    ));
+                }
+                let mut last = None;
+                for id in identities {
+                    // `identities` is `Vec<AgentIdentity>`; the public key
+                    // is the part `authenticate_publickey_with` needs — the
+                    // signature is produced inside the agent, we only ever
+                    // hold the public half here. `public_key()` returns a
+                    // `Cow<PublicKey>`, so `into_owned()` avoids a borrow
+                    // that cannot outlive the loop iteration.
+                    let key = id.public_key().into_owned();
+                    let r = session
+                        .authenticate_publickey_with(ssh_user.to_string(), key, hash, &mut agent)
+                        .await
+                        .map_err(|e| agent_err(format!("agent signing failed: {e}")))?;
+                    let ok = r.success();
+                    last = Some(r);
+                    if ok {
+                        break;
+                    }
+                }
+                // `identities` was checked non-empty, so the loop ran at least
+                // once and `last` is Some. The match avoids a panic-on-unwrap
+                // in a scanner that denies `clippy::unwrap_used` outside tests.
+                match last {
+                    Some(r) => r,
+                    None => {
+                        return Err(agent_err("agent held no usable identities".into()));
+                    }
+                }
+            }
+        };
         Ok::<_, RemoteError>((session, auth))
     })
     .await
