@@ -315,6 +315,152 @@ fn missing_of(hosts: &[String], ok: &HashSet<String>) -> Vec<String> {
     hosts.iter().filter(|h| !ok.contains(*h)).cloned().collect()
 }
 
+// ---------------------------------------------------------------------------
+// M3: one scan_remote_host() replaces the two identical spawn bodies
+// ---------------------------------------------------------------------------
+
+/// One remote host, `1 + retries` attempts, all inside the host's overall
+/// budget. Replaces the two identical spawn bodies of the fleet loop (M3).
+///
+/// Returns the CLI input address with the report so the caller can credit it
+/// in `successful_hosts` (R25-97: `report.host.hostname` is not the input
+/// address).
+async fn scan_remote_host(
+    host: String,
+    a: AuditArgs,
+    pass: Option<Arc<SecretString>>,
+    upload_pb: Option<ProgressBar>,
+) -> Option<(String, AgentReport)> {
+    // R16 hardening: validation must not depend on the presence of a sudo
+    // password. A malformed host/user/path is a caller mistake, not a
+    // transient failure — validate once, before the retry loop.
+    if let Err(e) = runner::validate_host(&host) {
+        warn!("{e}");
+        return None;
+    }
+    if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
+        warn!("{e}");
+        return None;
+    }
+    if let Some(rp) = &a.remote_path
+        && let Err(e) = runner::validate_remote_path(rp)
+    {
+        warn!("{e}");
+        return None;
+    }
+
+    // R13-02 / R35-10: the ceiling is derived from ssh_engine's per-stage
+    // budgets and must outlive connect + handshake + inner scan + cleanup.
+    // A retry loop lives INSIDE this ceiling: retries share the host's
+    // budget, they do not multiply it.
+    let overall = ssh_engine::host_ceiling(a.remote_timeout_secs);
+    let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
+    let attempts = a.retries.saturating_add(1);
+    let host_for_log = host.clone();
+
+    let result = tokio::time::timeout(overall, async {
+        // Coverage notes accumulated across attempts. They belong in the
+        // report of the host they describe, not in the orchestrator's local
+        // sink (R25-14/R25-72).
+        let mut retry_notes: Vec<String> = Vec::new();
+
+        for attempt in 1..=attempts {
+            match ssh_engine::run_remote_scan_russh(
+                &host,
+                &a.ssh_user,
+                &ssh_key_expanded,
+                a.remote_path.as_deref(),
+                pass.as_deref(),
+                a.copy_binary,
+                a.keep_binary,
+                a.local_binary.as_deref(),
+                a.deep,
+                a.remote_timeout_secs,
+                upload_pb.clone(),
+            )
+            .await
+            {
+                Ok((stdout, coverage)) => {
+                    return match serde_json::from_slice::<AgentReport>(&stdout) {
+                        Ok(mut report) => {
+                            // R25-14: remote coverage belongs in THIS host's
+                            // report, not in orchestrator's local sink.
+                            // R25-72: centralised via RemoteCoverage::apply_to.
+                            coverage.apply_to(&mut report);
+                            // Disclose any retries that preceded this report
+                            // (Raw Truth: the operator sees the delay they paid).
+                            report.coverage_warnings.extend(retry_notes);
+                            Some(report)
+                        }
+                        Err(e) => {
+                            let raw_preview: String =
+                                String::from_utf8_lossy(&stdout).chars().take(200).collect();
+                            let preview = crate::utils::sanitize_for_log(&raw_preview);
+                            warn!(
+                                host = %host,
+                                error = %e,
+                                preview = %preview,
+                                "remote output is not a valid AgentReport"
+                            );
+                            None
+                        }
+                    };
+                }
+                Err(e) if e.is_transient() && attempt < attempts => {
+                    let delay = retry_delay(a.retry_backoff_secs, attempt);
+                    warn!(
+                        host = %host,
+                        attempt,
+                        error = %e,
+                        delay_ms = delay.as_millis() as u64,
+                        "transient failure — retrying"
+                    );
+                    retry_notes.push(format!(
+                        "attempt {attempt} failed transiently ({e}); retried after {}s",
+                        delay.as_secs()
+                    ));
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    // BarAwareStderr suspends the progress bars for every
+                    // tracing record; a direct write here would duplicate the
+                    // warning (R25-82).
+                    warn!(host = %host, error = %e, "russh scan failed");
+                    return None;
+                }
+            }
+        }
+        // Unreachable in practice: the loop always returns on the last
+        // iteration (attempt == attempts disables the retry arm and the
+        // failure arm returns None). Kept for exhaustiveness.
+        None
+    })
+    .await;
+
+    match result {
+        Ok(Some(report)) => Some((host, report)),
+        Ok(None) => None,
+        Err(_elapsed) => {
+            warn!(host = %host_for_log, "global timeout for host");
+            None
+        }
+    }
+}
+
+/// base × 2^(attempt-1), capped at 16×, plus up to 1 s of clock-derived
+/// jitter so a fleet does not retry a flapping bastion in lock-step.
+///
+/// Deterministic shape (the cap, the doubling) is what the test asserts;
+/// the jitter is a property of the wall clock and is bounded by construction.
+fn retry_delay(base_secs: u64, attempt: u32) -> Duration {
+    let factor = 1u64 << (attempt.saturating_sub(1)).min(4);
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos() % 1000))
+        .unwrap_or(0);
+    Duration::from_secs(base_secs.saturating_mul(factor)) + Duration::from_millis(jitter_ms)
+}
+
 /// Strict JSONL parser for `compare --multi-host`.
 /// Accepts either a JSON array, a single JSON object, or newline-delimited
 /// JSON records. Unlike the previous permissive version, any unreadable line
@@ -876,102 +1022,13 @@ async fn run_command(
                             ..args.clone()
                         };
                         let pass = sudo_pass.clone();
-                        let host_for_log = host.clone();
                         let upload_pb = upload_bar.clone();
 
+                        // M3: one call, one body — the ~60-line duplicate that
+                        // used to live here is now scan_remote_host().
                         join_set.spawn(async move {
-                            // Permit is already held; no acquire inside the task.
                             let _permit = permit;
-
-                            // R16 hardening: validation must not depend on the presence
-                            // of a sudo password.
-                            if let Err(e) = runner::validate_host(&host) {
-                                warn!("{e}");
-                                return None;
-                            }
-                            if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
-                                warn!("{e}");
-                                return None;
-                            }
-                            if let Some(rp) = &a.remote_path
-                                && let Err(e) = runner::validate_remote_path(rp)
-                            {
-                                warn!("{e}");
-                                return None;
-                            }
-
-                            // R13-02 / R35-10: ceiling derived from ssh_engine's
-                            // per-stage budgets. Must outlive connect + handshake
-                            // + inner scan + cleanup, so it can never drop the
-                            // future before cleanup ran.
-                            let overall = ssh_engine::host_ceiling(a.remote_timeout_secs);
-
-                            let result = tokio::time::timeout(overall, async {
-                                let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
-
-                                match ssh_engine::run_remote_scan_russh(
-                                    &host,
-                                    &a.ssh_user,
-                                    &ssh_key_expanded,
-                                    a.remote_path.as_deref(),
-                                    pass.as_deref(),
-                                    a.copy_binary,
-                                    a.keep_binary,
-                                    a.local_binary.as_deref(),
-                                    a.deep,
-                                    a.remote_timeout_secs,
-                                    upload_pb,
-                                )
-                                .await
-                                {
-                                    Ok((stdout, coverage)) => {
-                                        match serde_json::from_slice::<AgentReport>(&stdout) {
-                                            Ok(mut report) => {
-                                                // R25-14: remote coverage belongs
-                                                // in this host's report, not in
-                                                // orchestrator's local sink.
-                                                // R25-72: centralized via RemoteCoverage::apply_to
-                                                coverage.apply_to(&mut report);
-                                                Some(report)
-                                            }
-                                            Err(e) => {
-                                                let raw_preview: String =
-                                                    String::from_utf8_lossy(&stdout)
-                                                        .chars()
-                                                        .take(200)
-                                                        .collect();
-                                                let preview =
-                                                    crate::utils::sanitize_for_log(&raw_preview);
-                                                warn!(
-                                                    host = %host,
-                                                    error = %e,
-                                                    preview = %preview,
-                                                    "remote output is not a valid AgentReport"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // BarAwareStderr suspends the progress
-                                        // bars for every tracing record; a
-                                        // direct write here would duplicate the
-                                        // warning (R25-82).
-                                        warn!(host = %host, error = %e, "russh scan failed");
-                                        None
-                                    }
-                                }
-                            })
-                            .await;
-
-                            match result {
-                                Ok(Some(report)) => Some((host.clone(), report)),
-                                Ok(None) => None,
-                                Err(_elapsed) => {
-                                    warn!(host = %host_for_log, "global timeout for host");
-                                    None
-                                }
-                            }
+                            scan_remote_host(host, a, pass, upload_pb).await
                         });
                     }
 
@@ -1074,85 +1131,12 @@ async fn run_command(
                                                 ..args.clone()
                                             };
                                             let pass = sudo_pass.clone();
-                                            let host_for_log = host.clone();
                                             let upload_pb = upload_bar.clone();
 
+                                            // M3: same single call as the initial fill.
                                             join_set.spawn(async move {
                                                 let _permit = permit;
-                                                if let Err(e) = runner::validate_host(&host) {
-                                                    warn!("{e}");
-                                                    return None;
-                                                }
-                                                if let Err(e) = runner::validate_ssh_user(&a.ssh_user) {
-                                                    warn!("{e}");
-                                                    return None;
-                                                }
-                                                if let Some(rp) = &a.remote_path
-                                                    && let Err(e) = runner::validate_remote_path(rp)
-                                                {
-                                                    warn!("{e}");
-                                                    return None;
-                                                }
-                                                // R13-02 / R35-10: same derivation
-                                                // as the initial spawn.
-                                                let overall =
-                                                    ssh_engine::host_ceiling(a.remote_timeout_secs);
-                                                let result = tokio::time::timeout(overall, async {
-                                                    let ssh_key_expanded = shellexpand::tilde(&a.ssh_key).to_string();
-                                                    match ssh_engine::run_remote_scan_russh(
-                                                        &host,
-                                                        &a.ssh_user,
-                                                        &ssh_key_expanded,
-                                                        a.remote_path.as_deref(),
-                                                        pass.as_deref(),
-                                                        a.copy_binary,
-                                                        a.keep_binary,
-                                                        a.local_binary.as_deref(),
-                                                        a.deep,
-                                                        a.remote_timeout_secs,
-                                                        upload_pb,
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok((stdout, coverage)) => {
-                                                            match serde_json::from_slice::<AgentReport>(&stdout) {
-                                                                Ok(mut report) => {
-                                                                    coverage.apply_to(&mut report);
-                                                                    Some(report)
-                                                                }
-                                                                Err(e) => {
-                                                                    let raw_preview: String =
-                                                                        String::from_utf8_lossy(&stdout)
-                                                                            .chars()
-                                                                            .take(200)
-                                                                            .collect();
-                                                                    let preview =
-                                                                        crate::utils::sanitize_for_log(&raw_preview);
-                                                                    warn!(
-                                                                        host = %host,
-                                                                        error = %e,
-                                                                        preview = %preview,
-                                                                        "remote output is not a valid AgentReport"
-                                                                    );
-                                                                    None
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(host = %host, error = %e, "russh scan failed");
-                                                            None
-                                                        }
-                                                    }
-                                                })
-                                                .await;
-                                                match result {
-                                                    Ok(Some(report)) => Some((host.clone(), report)),
-                                                    Ok(None) => None,
-                                                    Err(_elapsed) => {
-                                                        warn!(host = %host_for_log, "global timeout for host");
-                                                        None
-                                                    }
-                                                }
+                                                scan_remote_host(host, a, pass, upload_pb).await
                                             });
                                         }
                                     }
@@ -2239,5 +2223,20 @@ mod tests {
             missing_of(&hosts, &ok),
             vec!["z.example".to_string(), "a.example".to_string()]
         );
+    }
+
+    // ── M3: retry backoff ───────────────────────────────────────
+
+    #[test]
+    fn retry_delay_doubles_and_caps() {
+        // The jitter is bounded by construction (<1 s), so a range check is
+        // safe. base=2: 2, 4, 8, 16, 32 (cap), 32 (cap), ...
+        let secs = |n| retry_delay(2, n).as_secs();
+        assert!((2..=3).contains(&secs(1)));
+        assert!((4..=5).contains(&secs(2)));
+        assert!((8..=9).contains(&secs(3)));
+        assert!((16..=17).contains(&secs(4)));
+        assert!((32..=33).contains(&secs(5)), "16× cap");
+        assert!((32..=33).contains(&secs(9)), "still capped");
     }
 }

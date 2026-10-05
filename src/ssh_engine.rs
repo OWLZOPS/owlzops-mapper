@@ -265,8 +265,16 @@ pub enum RemoteError {
         path.as_deref().unwrap_or("<not determined — failed at pre-flight>")
     )]
     SudoRequiresTty { host: String, path: Option<String> },
+    /// The host's overall scan budget expired. Distinct from
+    /// `ConnectTimeout`: this one is final (retrying would not help — the
+    /// remote is either slow or wedged, not unreachable).
     #[error("timeout on {host}")]
     Timeout { host: String },
+    /// M3: TCP connect or SSH handshake did not complete. Distinct from the
+    /// host budget `Timeout`: this one is retry-worthy (transient network
+    /// blip, momentary bastion overload), that one is not.
+    #[error("connect/handshake to {host} timed out")]
+    ConnectTimeout { host: String },
     /// Not a timeout: the channel closed without ever reporting an exit
     /// status. Saying "timeout" would send the operator after --remote-timeout.
     #[error("channel on {host} closed without an exit status while running `{cmd}`")]
@@ -312,6 +320,41 @@ impl RemoteError {
         RemoteError::Ssh {
             host: host.to_string(),
             source: err,
+        }
+    }
+
+    /// M3: transport-level failures a retry can plausibly fix. Everything
+    /// about policy, credentials, host keys, sudo or the remote's own
+    /// answer is final — retrying changes nothing but the log noise.
+    ///
+    /// `Timeout` (host budget) is deliberately NOT transient: the remote
+    /// had its full budget and still did not answer; a second attempt
+    /// would just burn another budget. `ConnectTimeout` IS transient:
+    /// the remote may not have been reachable in the first 15 s.
+    pub fn is_transient(&self) -> bool {
+        use std::io::ErrorKind::*;
+        match self {
+            RemoteError::ConnectTimeout { .. } | RemoteError::ChannelClosedEarly { .. } => true,
+            RemoteError::Io { source, .. } => {
+                matches!(
+                    source.kind(),
+                    ConnectionReset
+                        | ConnectionRefused
+                        | ConnectionAborted
+                        | TimedOut
+                        | BrokenPipe
+                        | UnexpectedEof
+                        | NotConnected
+                        | Interrupted
+                ) || matches!(
+                    source.raw_os_error(),
+                    Some(libc::ENETUNREACH) | Some(libc::EHOSTUNREACH)
+                )
+            }
+            RemoteError::Ssh { source, .. } => {
+                matches!(source, russh::Error::Disconnect | russh::Error::IO(_))
+            }
+            _ => false,
         }
     }
 }
@@ -701,6 +744,11 @@ async fn exec_capture(
 /// Execute a short command with an explicit deadline. Used when the default
 /// `PROBE_BUDGET` is not appropriate, e.g. sudo NOPASSWD probe where a wedged
 /// PAM stack must not stall the whole scan.
+///
+/// M3: a probe deadline is NOT `ConnectTimeout`. It is a per-command budget
+/// on an already-established session; `Timeout` here says "this specific
+/// command did not answer in time", and retrying the whole host would not
+/// help.
 async fn exec_capture_with_budget(
     session: &client::Handle<ClientHandler>,
     host: &str,
@@ -1240,12 +1288,14 @@ pub async fn run_remote_scan_russh(
     let (hostname, port) = split_host_port(host);
 
     // R35-10: CONNECT_BUDGET is one of the stage budgets host_ceiling sums.
+    // M3: classified as ConnectTimeout — the TCP handshake may simply not
+    // have reached a momentarily overloaded peer.
     let stream = tokio::time::timeout(
         CONNECT_BUDGET,
         tokio::net::TcpStream::connect((hostname.as_str(), port)),
     )
     .await
-    .map_err(|_| RemoteError::Timeout {
+    .map_err(|_| RemoteError::ConnectTimeout {
         host: hostname.clone(),
     })?
     .map_err(|e| RemoteError::Io {
@@ -1327,6 +1377,8 @@ pub async fn run_remote_scan_russh(
 
     // R35-10: HANDSHAKE_AUTH_BUDGET lives at module level so host_ceiling can
     // include it in the per-host ceiling.
+    // M3: classified as ConnectTimeout — banner/KEX/auth not completing is
+    // a transport-level failure, retry-worthy.
     let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
         let mut session = client::connect_stream(config, stream, handler).await?;
         let hash = session.best_supported_rsa_hash().await?.flatten();
@@ -1340,7 +1392,7 @@ pub async fn run_remote_scan_russh(
         Ok::<_, RemoteError>((session, auth))
     })
     .await
-    .map_err(|_| RemoteError::Timeout {
+    .map_err(|_| RemoteError::ConnectTimeout {
         host: hostname.clone(),
     })??;
 
@@ -1704,6 +1756,8 @@ pub async fn run_remote_scan_russh(
     match result {
         Ok(Ok(stdout)) => Ok((stdout, remote_coverage)),
         Ok(Err(e)) => Err(e),
+        // The overall scan_budget expired: NOT transient, the remote had its
+        // full budget. M3 leaves this as `Timeout` on purpose.
         Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
     }
 }
@@ -1863,5 +1917,83 @@ mod tests {
             let expected = Duration::from_secs(crate::utils::host_budget_secs(t).saturating_add(5));
             assert_eq!(scan_budget(t), expected, "t={t}");
         }
+    }
+
+    // ── M3: transient classification ────────────────────────────
+
+    #[test]
+    fn only_transport_errors_are_transient() {
+        let io = |k| RemoteError::Io {
+            host: "h".into(),
+            source: std::io::Error::from(k),
+        };
+
+        // Retry-worthy: the network may have been momentarily unreachable.
+        assert!(RemoteError::ConnectTimeout { host: "h".into() }.is_transient());
+        assert!(io(std::io::ErrorKind::ConnectionReset).is_transient());
+        assert!(io(std::io::ErrorKind::ConnectionRefused).is_transient());
+        assert!(io(std::io::ErrorKind::TimedOut).is_transient());
+        assert!(io(std::io::ErrorKind::BrokenPipe).is_transient());
+        assert!(
+            RemoteError::ChannelClosedEarly {
+                host: "h".into(),
+                cmd: "probe".into(),
+            }
+            .is_transient()
+        );
+
+        // Final: policy, credentials, or the remote's own answer.
+        assert!(!io(std::io::ErrorKind::PermissionDenied).is_transient());
+        assert!(
+            !RemoteError::Timeout { host: "h".into() }.is_transient(),
+            "host budget is final: the remote had its full scan budget and did not answer"
+        );
+        assert!(
+            !RemoteError::Auth {
+                host: "h".into(),
+                user: "u".into(),
+            }
+            .is_transient()
+        );
+        assert!(!RemoteError::HostKeyUnknown { host: "h".into() }.is_transient());
+        assert!(
+            !RemoteError::KeyLoad {
+                path: "/k".into(),
+                detail: "d".into(),
+            }
+            .is_transient(),
+            "a local key problem does not heal between attempts"
+        );
+        assert!(
+            !RemoteError::SudoAuth {
+                host: "h".into(),
+                detail: "bad password".into(),
+            }
+            .is_transient()
+        );
+        assert!(
+            !RemoteError::SudoRequiresTty {
+                host: "h".into(),
+                path: None,
+            }
+            .is_transient(),
+            "requiretty is a policy answer, not a transport failure"
+        );
+        assert!(
+            !RemoteError::NonZeroExit {
+                host: "h".into(),
+                code: 2,
+                stderr: String::new(),
+            }
+            .is_transient()
+        );
+        assert!(
+            !RemoteError::ReportTruncated {
+                host: "h".into(),
+                cap: 1024,
+            }
+            .is_transient(),
+            "truncation is deterministic for the same host; retrying is pointless"
+        );
     }
 }
