@@ -229,16 +229,19 @@ mod tests {
     #[test]
     fn a_vanished_pid_is_not_counted_as_denied() {
         // R33-05: a dangling readdir entry (dir without ns/) must not produce
-        // an "unreadable" coverage line. The behavioural guarantee is the
-        // `continue` arm in the loop; we cannot assert on the coverage sink
-        // from here without draining the global state.
+        // an "unreadable" coverage line. M8 lets us assert that directly:
+        // capture() redirects coverage::record to a per-thread buffer.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fake_pid(root, 1, "mnt:[1]", "/sbin/init", "0::/init.scope\n");
         std::fs::create_dir_all(root.join("999")).unwrap(); // exited: no ns/mnt
 
-        let out = scan_mount_namespace_anomalies_from(root);
+        let (out, cov) = crate::coverage::capture(|| scan_mount_namespace_anomalies_from(root));
         assert!(out.is_empty());
+        assert!(
+            cov.iter().all(|l| !l.contains("unreadable")),
+            "a vanished pid must not produce a coverage line: {cov:?}"
+        );
     }
 
     #[test]

@@ -3184,6 +3184,7 @@ mod tests {
             topology: TopologyInfo::default(),
             security: SecurityInfo::default(),
             packages: PackagesInfo::default(),
+            input_address: None,
         }
     }
 

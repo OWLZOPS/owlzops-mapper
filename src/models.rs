@@ -55,6 +55,12 @@ pub struct AgentReport {
     pub topology: TopologyInfo,
     pub security: SecurityInfo,
     pub packages: PackagesInfo,
+    /// M4: the address exactly as given on the CLI / hosts file that produced
+    /// this record. `None` for legacy snapshots and standalone local scans.
+    /// `--resume` keys on it; `host.hostname` is the machine's own name and
+    /// cannot be matched against the input list (R25-97).
+    #[serde(default)]
+    pub input_address: Option<String>,
 }
 
 impl AgentReport {
@@ -105,6 +111,7 @@ impl Default for AgentReport {
             packages: PackagesInfo::default(),
             failed_scanners: Vec::new(),
             remote_privileged: None,
+            input_address: None,
         }
     }
 }

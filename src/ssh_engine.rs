@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
+use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh::*;
 use std::io::{IsTerminal, Read};
@@ -12,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
+use crate::cli::AuditArgs;
 use crate::known_hosts::KnownHostsChecker;
 use crate::models::AgentReport;
 use crate::safe_io;
@@ -110,6 +112,35 @@ pub(crate) fn host_ceiling(remote_timeout_secs: u64) -> Duration {
         .saturating_add(scan_budget(remote_timeout_secs))
         .saturating_add(CLEANUP_BUDGET)
         .saturating_add(CEILING_MARGIN)
+}
+
+// ---------------------------------------------------------------------------
+// SSH auth source (M2)
+// ---------------------------------------------------------------------------
+
+/// How the orchestrator proves its identity to the remote host.
+///
+/// M2: previously the key file path was the only credential the engine could
+/// present. Hardware-backed keys (YubiKey/FIDO, PKCS#11) cannot be read from
+/// disk and only work through the agent; adding this enum costs no new
+/// dependency — russh already speaks the agent protocol behind its `agent`
+/// feature.
+#[derive(Debug, Clone)]
+pub enum SshAuth {
+    /// A private key file on disk. Path is already tilde-expanded.
+    KeyFile(String),
+    /// The running ssh-agent, reached through `$SSH_AUTH_SOCK`.
+    Agent,
+}
+
+impl SshAuth {
+    pub fn from_args(a: &AuditArgs) -> Self {
+        if a.ssh_agent {
+            SshAuth::Agent
+        } else {
+            SshAuth::KeyFile(shellexpand::tilde(&a.ssh_key).to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +263,10 @@ pub enum RemoteError {
     /// such message per host on the fleet. The operator then looks for
     /// the problem in `authorized_keys` on 5000 machines instead of in
     /// the permissions of their own `~/.ssh/id_ed25519`.
+    ///
+    /// M2 reuses this variant for agent-side failures (agent unreachable,
+    /// empty identity list, signing refused): same reasoning — the fix is
+    /// `ssh-add` on the operator's machine, not authorized_keys on the host.
     #[error("cannot load SSH private key {path}: {detail}")]
     KeyLoad { path: String, detail: String },
     #[error("sudo authentication failed on {host}: {detail}")]
@@ -265,8 +300,16 @@ pub enum RemoteError {
         path.as_deref().unwrap_or("<not determined — failed at pre-flight>")
     )]
     SudoRequiresTty { host: String, path: Option<String> },
+    /// The host's overall scan budget expired. Distinct from
+    /// `ConnectTimeout`: this one is final (retrying would not help — the
+    /// remote is either slow or wedged, not unreachable).
     #[error("timeout on {host}")]
     Timeout { host: String },
+    /// M3: TCP connect or SSH handshake did not complete. Distinct from the
+    /// host budget `Timeout`: this one is retry-worthy (transient network
+    /// blip, momentary bastion overload), that one is not.
+    #[error("connect/handshake to {host} timed out")]
+    ConnectTimeout { host: String },
     /// Not a timeout: the channel closed without ever reporting an exit
     /// status. Saying "timeout" would send the operator after --remote-timeout.
     #[error("channel on {host} closed without an exit status while running `{cmd}`")]
@@ -312,6 +355,41 @@ impl RemoteError {
         RemoteError::Ssh {
             host: host.to_string(),
             source: err,
+        }
+    }
+
+    /// M3: transport-level failures a retry can plausibly fix. Everything
+    /// about policy, credentials, host keys, sudo or the remote's own
+    /// answer is final — retrying changes nothing but the log noise.
+    ///
+    /// `Timeout` (host budget) is deliberately NOT transient: the remote
+    /// had its full budget and still did not answer; a second attempt
+    /// would just burn another budget. `ConnectTimeout` IS transient:
+    /// the remote may not have been reachable in the first 15 s.
+    pub fn is_transient(&self) -> bool {
+        use std::io::ErrorKind::*;
+        match self {
+            RemoteError::ConnectTimeout { .. } | RemoteError::ChannelClosedEarly { .. } => true,
+            RemoteError::Io { source, .. } => {
+                matches!(
+                    source.kind(),
+                    ConnectionReset
+                        | ConnectionRefused
+                        | ConnectionAborted
+                        | TimedOut
+                        | BrokenPipe
+                        | UnexpectedEof
+                        | NotConnected
+                        | Interrupted
+                ) || matches!(
+                    source.raw_os_error(),
+                    Some(libc::ENETUNREACH) | Some(libc::EHOSTUNREACH)
+                )
+            }
+            RemoteError::Ssh { source, .. } => {
+                matches!(source, russh::Error::Disconnect | russh::Error::IO(_))
+            }
+            _ => false,
         }
     }
 }
@@ -701,6 +779,11 @@ async fn exec_capture(
 /// Execute a short command with an explicit deadline. Used when the default
 /// `PROBE_BUDGET` is not appropriate, e.g. sudo NOPASSWD probe where a wedged
 /// PAM stack must not stall the whole scan.
+///
+/// M3: a probe deadline is NOT `ConnectTimeout`. It is a per-command budget
+/// on an already-established session; `Timeout` here says "this specific
+/// command did not answer in time", and retrying the whole host would not
+/// help.
 async fn exec_capture_with_budget(
     session: &client::Handle<ClientHandler>,
     host: &str,
@@ -1227,7 +1310,7 @@ impl RemoteCoverage {
 pub async fn run_remote_scan_russh(
     host: &str,
     ssh_user: &str,
-    ssh_key_path: &str,
+    ssh_auth: &SshAuth,
     remote_path: Option<&str>,
     sudo_pass: Option<&SecretString>,
     copy_binary: bool,
@@ -1240,12 +1323,14 @@ pub async fn run_remote_scan_russh(
     let (hostname, port) = split_host_port(host);
 
     // R35-10: CONNECT_BUDGET is one of the stage budgets host_ceiling sums.
+    // M3: classified as ConnectTimeout — the TCP handshake may simply not
+    // have reached a momentarily overloaded peer.
     let stream = tokio::time::timeout(
         CONNECT_BUDGET,
         tokio::net::TcpStream::connect((hostname.as_str(), port)),
     )
     .await
-    .map_err(|_| RemoteError::Timeout {
+    .map_err(|_| RemoteError::ConnectTimeout {
         host: hostname.clone(),
     })?
     .map_err(|e| RemoteError::Io {
@@ -1310,37 +1395,98 @@ pub async fn run_remote_scan_russh(
     // `RemoteError::Auth` (as before) sent the operator looking at
     // authorized_keys on every host on the fleet instead of at
     // `chmod 600 ~/.ssh/id_ed25519` on their own machine.
-    let key_path = ssh_key_path.to_string();
-    let key = {
-        let p = key_path.clone();
-        tokio::task::spawn_blocking(move || load_secret_key(&p, None))
-            .await
-            .map_err(|e| RemoteError::KeyLoad {
-                path: key_path.clone(),
-                detail: format!("key loader task failed: {e}"),
-            })?
-            .map_err(|e| RemoteError::KeyLoad {
-                path: key_path,
-                detail: e.to_string(),
-            })?
+    //
+    // M2: `KeyFile` reads the key from disk exactly as before. `Agent` never
+    // lets the private key enter this process — the signature is produced by
+    // ssh-agent. Both branches converge on an `AuthResult` checked uniformly
+    // below.
+    let key_file: Option<Arc<_>> = match ssh_auth {
+        SshAuth::KeyFile(path) => {
+            let p = path.clone();
+            let key = tokio::task::spawn_blocking(move || load_secret_key(&p, None))
+                .await
+                .map_err(|e| RemoteError::KeyLoad {
+                    path: path.clone(),
+                    detail: format!("key loader task failed: {e}"),
+                })?
+                .map_err(|e| RemoteError::KeyLoad {
+                    path: path.clone(),
+                    detail: e.to_string(),
+                })?;
+            Some(Arc::new(key))
+        }
+        SshAuth::Agent => None,
     };
 
     // R35-10: HANDSHAKE_AUTH_BUDGET lives at module level so host_ceiling can
     // include it in the per-host ceiling.
+    // M3: classified as ConnectTimeout — banner/KEX/auth not completing is
+    // a transport-level failure, retry-worthy.
     let (session, auth) = tokio::time::timeout(HANDSHAKE_AUTH_BUDGET, async {
         let mut session = client::connect_stream(config, stream, handler).await?;
         let hash = session.best_supported_rsa_hash().await?.flatten();
-        let auth = session
-            .authenticate_publickey(
-                ssh_user.to_string(),
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-            )
-            .await
-            .map_err(|e| RemoteError::from_russh(e, &hostname))?;
+        let auth = match key_file {
+            Some(key) => session
+                .authenticate_publickey(ssh_user.to_string(), PrivateKeyWithHashAlg::new(key, hash))
+                .await
+                .map_err(|e| RemoteError::from_russh(e, &hostname))?,
+            None => {
+                // M2: every identity the agent holds, in agent order, until
+                // one is accepted. `KeyLoad` is reused as the error carrier
+                // — every failure on this branch is a LOCAL key-material
+                // problem (agent unreachable, no identities, signing refused),
+                // not a remote auth failure. The operator needs to look at
+                // their own `ssh-add -l`, not at the host's authorized_keys.
+                let agent_err = |detail: String| RemoteError::KeyLoad {
+                    path: "$SSH_AUTH_SOCK".into(),
+                    detail,
+                };
+                let mut agent = AgentClient::connect_env()
+                    .await
+                    .map_err(|e| agent_err(format!("cannot connect to ssh-agent: {e}")))?;
+                let identities = agent
+                    .request_identities()
+                    .await
+                    .map_err(|e| agent_err(format!("agent refused identity list: {e}")))?;
+                if identities.is_empty() {
+                    return Err(agent_err(
+                        "agent holds no identities — run `ssh-add` first".into(),
+                    ));
+                }
+                let mut last = None;
+                for id in identities {
+                    // `identities` is `Vec<AgentIdentity>`; the public key
+                    // is the part `authenticate_publickey_with` needs — the
+                    // signature is produced inside the agent, we only ever
+                    // hold the public half here. `public_key()` returns a
+                    // `Cow<PublicKey>`, so `into_owned()` avoids a borrow
+                    // that cannot outlive the loop iteration.
+                    let key = id.public_key().into_owned();
+                    let r = session
+                        .authenticate_publickey_with(ssh_user.to_string(), key, hash, &mut agent)
+                        .await
+                        .map_err(|e| agent_err(format!("agent signing failed: {e}")))?;
+                    let ok = r.success();
+                    last = Some(r);
+                    if ok {
+                        break;
+                    }
+                }
+                // `identities` was checked non-empty, so the loop ran at least
+                // once and `last` is Some. The match avoids a panic-on-unwrap
+                // in a scanner that denies `clippy::unwrap_used` outside tests.
+                match last {
+                    Some(r) => r,
+                    None => {
+                        return Err(agent_err("agent held no usable identities".into()));
+                    }
+                }
+            }
+        };
         Ok::<_, RemoteError>((session, auth))
     })
     .await
-    .map_err(|_| RemoteError::Timeout {
+    .map_err(|_| RemoteError::ConnectTimeout {
         host: hostname.clone(),
     })??;
 
@@ -1704,6 +1850,8 @@ pub async fn run_remote_scan_russh(
     match result {
         Ok(Ok(stdout)) => Ok((stdout, remote_coverage)),
         Ok(Err(e)) => Err(e),
+        // The overall scan_budget expired: NOT transient, the remote had its
+        // full budget. M3 leaves this as `Timeout` on purpose.
         Err(_elapsed) => Err(RemoteError::Timeout { host: hostname }),
     }
 }
@@ -1863,5 +2011,83 @@ mod tests {
             let expected = Duration::from_secs(crate::utils::host_budget_secs(t).saturating_add(5));
             assert_eq!(scan_budget(t), expected, "t={t}");
         }
+    }
+
+    // ── M3: transient classification ────────────────────────────
+
+    #[test]
+    fn only_transport_errors_are_transient() {
+        let io = |k| RemoteError::Io {
+            host: "h".into(),
+            source: std::io::Error::from(k),
+        };
+
+        // Retry-worthy: the network may have been momentarily unreachable.
+        assert!(RemoteError::ConnectTimeout { host: "h".into() }.is_transient());
+        assert!(io(std::io::ErrorKind::ConnectionReset).is_transient());
+        assert!(io(std::io::ErrorKind::ConnectionRefused).is_transient());
+        assert!(io(std::io::ErrorKind::TimedOut).is_transient());
+        assert!(io(std::io::ErrorKind::BrokenPipe).is_transient());
+        assert!(
+            RemoteError::ChannelClosedEarly {
+                host: "h".into(),
+                cmd: "probe".into(),
+            }
+            .is_transient()
+        );
+
+        // Final: policy, credentials, or the remote's own answer.
+        assert!(!io(std::io::ErrorKind::PermissionDenied).is_transient());
+        assert!(
+            !RemoteError::Timeout { host: "h".into() }.is_transient(),
+            "host budget is final: the remote had its full scan budget and did not answer"
+        );
+        assert!(
+            !RemoteError::Auth {
+                host: "h".into(),
+                user: "u".into(),
+            }
+            .is_transient()
+        );
+        assert!(!RemoteError::HostKeyUnknown { host: "h".into() }.is_transient());
+        assert!(
+            !RemoteError::KeyLoad {
+                path: "/k".into(),
+                detail: "d".into(),
+            }
+            .is_transient(),
+            "a local key problem does not heal between attempts"
+        );
+        assert!(
+            !RemoteError::SudoAuth {
+                host: "h".into(),
+                detail: "bad password".into(),
+            }
+            .is_transient()
+        );
+        assert!(
+            !RemoteError::SudoRequiresTty {
+                host: "h".into(),
+                path: None,
+            }
+            .is_transient(),
+            "requiretty is a policy answer, not a transport failure"
+        );
+        assert!(
+            !RemoteError::NonZeroExit {
+                host: "h".into(),
+                code: 2,
+                stderr: String::new(),
+            }
+            .is_transient()
+        );
+        assert!(
+            !RemoteError::ReportTruncated {
+                host: "h".into(),
+                cap: 1024,
+            }
+            .is_transient(),
+            "truncation is deterministic for the same host; retrying is pointless"
+        );
     }
 }

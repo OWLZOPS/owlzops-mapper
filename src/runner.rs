@@ -383,6 +383,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             packages: packages_info,
             scoring_version: crate::scoring::SCORING_VERSION,
             self_integrity: None,
+            // M4: standalone local scans have no CLI address. `main.rs` sets
+            // the field only when it dispatches from a `--host` argument.
+            input_address: None,
         };
 
         report.security.preload_injections = p.preload;
@@ -531,12 +534,15 @@ pub async fn snapshot_run(args: SnapshotArgs) -> i32 {
 // ── Helper: remote scan via russh (used by snapshot) ──────
 
 async fn run_remote_scan_russh(host: &str, args: &AuditArgs) -> Result<AgentReport, String> {
-    let ssh_key_expanded = shellexpand::tilde(&args.ssh_key).to_string();
+    // M2: `SshAuth::from_args` picks between the key file and the running
+    // ssh-agent, applying tilde expansion to the key path in the KeyFile arm.
+    // Mirrors the fleet path in main.rs::scan_remote_host.
+    let ssh_auth = crate::ssh_engine::SshAuth::from_args(args);
 
     let (stdout, coverage) = crate::ssh_engine::run_remote_scan_russh(
         host,
         &args.ssh_user,
-        &ssh_key_expanded,
+        &ssh_auth,
         args.remote_path.as_deref(),
         None, // sudo_pass
         args.copy_binary,

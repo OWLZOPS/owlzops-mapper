@@ -73,6 +73,11 @@ pub struct AuditArgs {
     #[arg(long, default_value = "~/.ssh/id_rsa")]
     pub ssh_key: String,
 
+    /// Authenticate through the running ssh-agent ($SSH_AUTH_SOCK) instead of
+    /// --ssh-key. Hardware-backed keys (FIDO/PKCS#11) work only this way.
+    #[arg(long, default_value_t = false)]
+    pub ssh_agent: bool,
+
     #[arg(long, default_value_t = false)]
     pub copy_binary: bool,
 
@@ -132,6 +137,25 @@ pub struct AuditArgs {
     /// Path to the verdict cache file (default: /var/lib/owlzops/verdict-cache.json).
     #[arg(long)]
     pub verdict_cache: Option<PathBuf>,
+
+    // ---- M3: retries ---------------------------------------------------------
+    /// Re-attempt a host after a TRANSPORT failure (connect timeout, reset,
+    /// SSH channel closed before an exit status). Policy answers — auth,
+    /// host key, sudo, non-zero exit — are never retried. All attempts share
+    /// the host's overall time budget.
+    #[arg(long, default_value_t = 0)]
+    pub retries: u32,
+
+    /// Base delay between attempts; doubles per attempt (cap 16×) plus ≤1s jitter.
+    #[arg(long, default_value_t = 2)]
+    pub retry_backoff_secs: u64,
+
+    // ---- M4: resume ----------------------------------------------------------
+    /// Append to the JSONL in --output and skip every host that already has a
+    /// record there. Requires --format json --output <file>. The existing
+    /// records are re-scored so the exit code covers the whole fleet.
+    #[arg(long, default_value_t = false)]
+    pub resume: bool,
 }
 
 #[derive(Args, Debug, Clone)]
