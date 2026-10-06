@@ -149,6 +149,13 @@ pub struct AuditArgs {
     /// Base delay between attempts; doubles per attempt (cap 16×) plus ≤1s jitter.
     #[arg(long, default_value_t = 2)]
     pub retry_backoff_secs: u64,
+
+    // ---- M4: resume ----------------------------------------------------------
+    /// Append to the JSONL in --output and skip every host that already has a
+    /// record there. Requires --format json --output <file>. The existing
+    /// records are re-scored so the exit code covers the whole fleet.
+    #[arg(long, default_value_t = false)]
+    pub resume: bool,
 }
 
 #[derive(Args, Debug, Clone)]

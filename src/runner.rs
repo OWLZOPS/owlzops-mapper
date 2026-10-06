@@ -383,6 +383,9 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
             packages: packages_info,
             scoring_version: crate::scoring::SCORING_VERSION,
             self_integrity: None,
+            // M4: standalone local scans have no CLI address. `main.rs` sets
+            // the field only when it dispatches from a `--host` argument.
+            input_address: None,
         };
 
         report.security.preload_injections = p.preload;

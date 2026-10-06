@@ -315,6 +315,45 @@ fn missing_of(hosts: &[String], ok: &HashSet<String>) -> Vec<String> {
     hosts.iter().filter(|h| !ok.contains(*h)).cloned().collect()
 }
 
+/// M4: stream the existing JSONL once — credit each record's input address
+/// and feed it to the aggregator, then drop it (O(1) memory).
+///
+/// Any unreadable line, or a record without `input_address` (written by a
+/// pre-M4 binary), refuses the resume. A silently skipped record would come
+/// back as a "missing host" at the end of the run, or — worse — as a second
+/// scan of the same host appended below the first, silently double-counting
+/// it.
+fn resume_scan(
+    path: &std::path::Path,
+    agg: &mut OutcomeBuilder,
+) -> Result<HashSet<String>, String> {
+    use std::io::{BufRead, BufReader};
+    let file = crate::safe_io::open_regular_streaming(&path.to_string_lossy())
+        .map_err(|e| format!("--resume: cannot open {}: {e}", path.display()))?;
+    let mut done = HashSet::new();
+    for (n, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("--resume: read error at line {}: {e}", n + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let report: AgentReport = serde_json::from_str(&line).map_err(|e| {
+            format!(
+                "--resume: line {} is not a valid record ({e}) — refusing",
+                n + 1
+            )
+        })?;
+        let Some(addr) = report.input_address.clone() else {
+            return Err(format!(
+                "--resume: line {} has no input_address (written by an older version) — refusing",
+                n + 1
+            ));
+        };
+        agg.add(&report);
+        done.insert(addr);
+    }
+    Ok(done)
+}
+
 // ---------------------------------------------------------------------------
 // M3: one scan_remote_host() replaces the two identical spawn bodies
 // ---------------------------------------------------------------------------
@@ -392,6 +431,9 @@ async fn scan_remote_host(
                             // Disclose any retries that preceded this report
                             // (Raw Truth: the operator sees the delay they paid).
                             report.coverage_warnings.extend(retry_notes);
+                            // M4: the CLI address travels on the record so a
+                            // later --resume can match it (R25-97).
+                            report.input_address = Some(host.clone());
                             Some(report)
                         }
                         Err(e) => {
@@ -834,10 +876,47 @@ async fn run_command(
                 // R26-09: failed sends to the JSONL channel are lost records.
                 let mut send_failures = 0usize;
 
-                // Fail-fast: create the output file before launching any scan
+                // M4: --resume credits every host already recorded in --output
+                // and skips re-spawning them. Runs before the file is opened:
+                // resume_scan reads the same path we are about to append to.
+                let mut resumed: HashSet<String> = HashSet::new();
+                if args.resume {
+                    if !use_streaming {
+                        eprintln!("Error: --resume requires --format json --output <file.jsonl>");
+                        return EXIT_USAGE;
+                    }
+                    let path =
+                        std::path::Path::new(args.output.as_deref().unwrap_or("report.jsonl"));
+                    if path.exists() {
+                        match resume_scan(path, &mut agg) {
+                            Ok(done) => resumed = done,
+                            Err(e) => {
+                                eprintln!("{e}");
+                                return EXIT_USAGE;
+                            }
+                        }
+                        eprintln!(
+                            "resume: {} host(s) already recorded in {}",
+                            resumed.len(),
+                            path.display()
+                        );
+                    }
+                }
+
+                // Fail-fast: create the output file before launching any scan.
+                // A plain run truncates; --resume appends to the existing
+                // records resume_scan just read.
                 let output_path = args.output.clone();
                 let mut jsonl_file = if use_streaming {
-                    match std::fs::File::create(output_path.as_deref().unwrap_or("report.jsonl")) {
+                    let target = output_path.as_deref().unwrap_or("report.jsonl");
+                    let mut oo = std::fs::OpenOptions::new();
+                    oo.create(true).write(true);
+                    if args.resume {
+                        oo.append(true);
+                    } else {
+                        oo.truncate(true);
+                    }
+                    match oo.open(target) {
                         Ok(f) => Some(f),
                         Err(e) => {
                             eprintln!("Cannot create output file: {e}");
@@ -891,6 +970,17 @@ async fn run_command(
                 // is the machine's own name and cannot be diffed against the CLI list
                 // (R25-97).
                 let mut successful_hosts: HashSet<String> = HashSet::new();
+                // M4: resumed hosts are credited and never re-spawned — they
+                // already have a record in the JSONL we are appending to.
+                successful_hosts.extend(resumed.iter().cloned());
+                #[cfg(feature = "local-scan")]
+                if local.iter().any(|h| resumed.contains(h)) {
+                    // Every alias of the resumed local scan counts toward
+                    // the credit set; the scan itself is skipped.
+                    successful_hosts.extend(local_aliases.iter().cloned());
+                    local.clear();
+                }
+                remote.retain(|h| !resumed.contains(h));
 
                 // Process local hosts synchronously (no SSH needed)
                 #[cfg(feature = "local-scan")]
@@ -958,6 +1048,9 @@ async fn run_command(
                     agg.add(&local_report);
                     // Credit every alias, not just the one that was scanned (R25-100).
                     successful_hosts.extend(local_aliases.iter().cloned());
+                    // M4: persist the CLI input address on the record so
+                    // --resume on the next run can match it (R25-97).
+                    local_report.input_address = Some(host.clone());
                     let _ = &host;
 
                     if let Some(tx) = &tx {
@@ -1996,6 +2089,7 @@ mod tests {
             packages: PackagesInfo::default(),
             failed_scanners: Vec::new(),
             remote_privileged: None,
+            input_address: None,
         }
     }
 
@@ -2257,5 +2351,28 @@ mod tests {
         assert!((16..=17).contains(&secs(4)));
         assert!((32..=33).contains(&secs(5)), "16× cap");
         assert!((32..=33).contains(&secs(9)), "still capped");
+    }
+
+    // ── M4: --resume ────────────────────────────────────────────
+
+    #[test]
+    fn resume_credits_recorded_hosts_and_refuses_legacy_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("fleet.jsonl");
+        let mut r = minimal_report();
+        r.input_address = Some("10.0.0.1".into());
+        let mut legacy = minimal_report();
+        legacy.input_address = None;
+        std::fs::write(&p, format!("{}\n", serde_json::to_string(&r).unwrap())).unwrap();
+        let mut agg = OutcomeBuilder::default();
+        let done = resume_scan(&p, &mut agg).unwrap();
+        assert!(done.contains("10.0.0.1"));
+        assert_eq!(
+            agg.reports_seen, 1,
+            "resumed records count toward hosts_missing accounting"
+        );
+
+        std::fs::write(&p, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
+        assert!(resume_scan(&p, &mut OutcomeBuilder::default()).is_err());
     }
 }
