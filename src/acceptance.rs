@@ -33,6 +33,18 @@ use std::path::Path;
 /// drift out of the refusal path.
 const EXTRA_NEVER_ACCEPTABLE: &[&str] = &["SEC-041", "COV-001"];
 
+/// Marker written into `Finding::suppressed` by [`Acceptances::apply`].
+///
+/// The `suppressed` field is shared with scanner-level suppressions
+/// (SEC-027 JIT advisory, SEC-029 provisional trust, SEC-034 file
+/// capabilities, SEC-037 setuid/setgid — see `scoring.rs`). Those exist
+/// whether or not the operator passed `--accept`, so any code that counts
+/// "risks the operator accepted" must key off this marker, not off
+/// `suppressed.is_some()`. Centralising the marker here keeps the
+/// producer (`apply`) and the consumer (`accepted_count`) from drifting
+/// apart.
+pub const ACCEPTED_MARKER: &str = "ACCEPTED:";
+
 fn is_never_acceptable(id: &str) -> bool {
     crate::scoring::COMPROMISE_IDS.contains(&id) || EXTRA_NEVER_ACCEPTABLE.contains(&id)
 }
@@ -165,12 +177,32 @@ impl Acceptances {
                 .map(|t| format!(", {t}"))
                 .unwrap_or_default();
             f.suppressed = Some(format!(
-                "ACCEPTED: {} (until {}{ticket})",
+                "{} {} (until {}{ticket})",
+                ACCEPTED_MARKER,
                 rule.justification.trim(),
                 rule.expires
             ));
         }
         notes
+    }
+
+    /// Number of findings carrying the accept.json marker.
+    ///
+    /// Used by the dashboard's `Accepted risks: N finding(s)` line.
+    /// Deliberately **not** `findings.iter().filter(|f| f.suppressed.is_some())`:
+    /// the scanners already mark SEC-027 / SEC-029 / SEC-034 / SEC-037 as
+    /// suppressed regardless of `--accept`, so the naive counter reported
+    /// "Accepted risks: 10" on a run that never saw a policy file at all —
+    /// see R35 batch note on `suppressed` being overloaded.
+    pub fn accepted_count(findings: &[Finding]) -> usize {
+        findings
+            .iter()
+            .filter(|f| {
+                f.suppressed
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with(ACCEPTED_MARKER))
+            })
+            .count()
     }
 }
 
@@ -340,5 +372,39 @@ mod tests {
         }];
         acc.apply("web-1", &mut findings);
         assert_eq!(findings[0].suppressed.as_deref(), Some("scanner-level"));
+    }
+
+    /// Regression for the R35 `Accepted risks: N` mis-count.
+    ///
+    /// The scanners already suppress SEC-027 / SEC-029 / SEC-034 / SEC-037
+    /// regardless of `--accept`. Counting `suppressed.is_some()` reported
+    /// "Accepted risks: 10" on a local `audit --deep` run that was never
+    /// given a policy file. `accepted_count` must key off the accept marker.
+    #[test]
+    fn accepted_count_ignores_scanner_level_suppressions() {
+        let mk = |id: &'static str, suppressed: Option<&str>| Finding {
+            id,
+            source: crate::scoring::Scanner::Security,
+            title: String::new(),
+            category: crate::scoring::Category::Security,
+            weight: 0,
+            evidence: String::new(),
+            suppressed: suppressed.map(str::to_string),
+            cis_ref: None,
+        };
+        let findings = vec![
+            // Scanner-level: SEC-027 fires without --accept.
+            mk("SEC-027", Some("JIT writable-code advisory")),
+            // Scanner-level: SEC-034 fires without --accept.
+            mk("SEC-034", Some("expected capability")),
+            // The only true accept.json decision in this set.
+            mk(
+                "SEC-001",
+                Some("ACCEPTED: cloud SG is the firewall (until 2099-01-01)"),
+            ),
+            // Live finding.
+            mk("SEC-002", None),
+        ];
+        assert_eq!(Acceptances::accepted_count(&findings), 1);
     }
 }

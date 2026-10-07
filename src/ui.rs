@@ -435,15 +435,13 @@ fn render_header(report: &AgentReport, theme: &Theme, acceptances: Option<&Accep
         outln!();
     }
 
-    // M5: findings that are suppressed by an accept.json entry are not part
-    // of the risk score, but the operator must still see that the report was
-    // read against a policy file. Print a single summary line so the count
-    // is visible at a glance.
-    let accepted_count = scored
-        .findings
-        .iter()
-        .filter(|f| f.suppressed.is_some())
-        .count();
+    // M5: count only findings the policy file actually turned off.
+    // `Acceptances::accepted_count` filters on the marker `apply` writes
+    // (`ACCEPTED:`); a bare `suppressed.is_some()` also picks up the
+    // scanner-level suppressions (SEC-027 / SEC-029 / SEC-034 / SEC-037 …)
+    // and printed "Accepted risks: 10" on runs that never saw `--accept`.
+    // The zero-count case is silent on purpose.
+    let accepted_count = Acceptances::accepted_count(&scored.findings);
     if accepted_count > 0 {
         outln!(
             "{}Accepted risks: {} finding(s)",
