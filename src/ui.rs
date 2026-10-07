@@ -23,10 +23,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::acceptance::Acceptances;
 use crate::models::{
     AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
 };
-use crate::scoring::{classify_cap_binary, classify_setuid};
+use crate::scoring::{Finding, classify_cap_binary, classify_setuid};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -198,17 +199,37 @@ fn create_dynamic_table() -> Table {
 }
 
 // ---------------------------------------------------------------------------
+// M5: acceptances overlay
+// ---------------------------------------------------------------------------
+
+/// Evaluate the report, overlay acceptances (if any), and return the
+/// resulting findings. Accepted entries carry `suppressed: Some(..)` and are
+/// therefore excluded from the score by [`crate::scoring::score`] while still
+/// remaining visible to the dashboard (Risk Breakdown / Accepted risks lines).
+///
+/// This is the single place where `Acceptances` enters the scoring pipeline
+/// on the UI path; `OutcomeBuilder::add()` does the analogous thing on the
+/// fleet path in `main.rs`.
+fn findings_with_accept(report: &AgentReport, acc: Option<&Acceptances>) -> Vec<Finding> {
+    let mut findings = crate::scoring::evaluate(report);
+    if let Some(a) = acc {
+        a.apply(&report.host.hostname, &mut findings);
+    }
+    findings
+}
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn render_dashboard(report: &AgentReport, verbose: bool) {
+pub fn render_dashboard(report: &AgentReport, verbose: bool, acceptances: Option<&Acceptances>) {
     let theme = Theme::new();
 
-    render_header(report, &theme);
+    render_header(report, &theme, acceptances);
     render_system_overview(report);
     render_top_memory(report);
     render_databases(report);
-    render_security_health(report);
+    render_security_health(report, acceptances);
     render_storage(report);
     render_network_listeners(report);
     render_foreign_netns_listeners(report);
@@ -238,7 +259,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool) {
     render_footer();
 }
 
-pub fn render_multi_host_summary(reports: &[AgentReport]) {
+pub fn render_multi_host_summary(reports: &[AgentReport], acceptances: Option<&Acceptances>) {
     let theme = Theme::new();
 
     if reports.is_empty() {
@@ -257,7 +278,7 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
     ]);
 
     for r in reports {
-        let scored = crate::scoring::score(crate::scoring::evaluate(r));
+        let scored = crate::scoring::score(findings_with_accept(r, acceptances));
         let risk_score = scored.total;
 
         let score_cell = if risk_score >= 70 {
@@ -297,8 +318,8 @@ pub fn render_multi_host_summary(reports: &[AgentReport]) {
 // Private render helpers
 // ---------------------------------------------------------------------------
 
-fn render_header(report: &AgentReport, theme: &Theme) {
-    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+fn render_header(report: &AgentReport, theme: &Theme, acceptances: Option<&Acceptances>) {
+    let scored = crate::scoring::score(findings_with_accept(report, acceptances));
     let risk_score = scored.total;
 
     let risk_label = if risk_score < 40 {
@@ -350,7 +371,7 @@ fn render_header(report: &AgentReport, theme: &Theme) {
         scored.hygiene
     );
 
-    let active_findings: Vec<&crate::scoring::Finding> = scored
+    let active_findings: Vec<&Finding> = scored
         .findings
         .iter()
         .filter(|f| f.suppressed.is_none())
@@ -412,6 +433,23 @@ fn render_header(report: &AgentReport, theme: &Theme) {
             }
         }
         outln!();
+    }
+
+    // M5: findings that are suppressed by an accept.json entry are not part
+    // of the risk score, but the operator must still see that the report was
+    // read against a policy file. Print a single summary line so the count
+    // is visible at a glance.
+    let accepted_count = scored
+        .findings
+        .iter()
+        .filter(|f| f.suppressed.is_some())
+        .count();
+    if accepted_count > 0 {
+        outln!(
+            "{}Accepted risks: {} finding(s)",
+            theme.sec_item,
+            accepted_count
+        );
     }
 
     if !report.is_root_execution {
@@ -651,8 +689,8 @@ fn render_databases(report: &AgentReport) {
     outln!("{t_dbs}\n");
 }
 
-fn render_security_health(report: &AgentReport) {
-    let scored = crate::scoring::score(crate::scoring::evaluate(report));
+fn render_security_health(report: &AgentReport, acceptances: Option<&Acceptances>) {
+    let scored = crate::scoring::score(findings_with_accept(report, acceptances));
     let suppressed_evidence: std::collections::HashSet<&str> = scored
         .findings
         .iter()

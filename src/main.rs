@@ -21,6 +21,8 @@ mod ui;
 mod utils;
 #[cfg(feature = "local-scan")]
 mod verdict_cache;
+// ── NEW SCANNERS (SEC-038/039/040) ──
+mod acceptance;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli::{AuditArgs, Cli, Commands, OutputFormat};
@@ -151,17 +153,25 @@ struct Outcome {
     coverage: Coverage,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct OutcomeBuilder {
     verdict: Option<SecurityVerdict>,
     coverage: Coverage,
     reports_seen: usize,
+    /// M5: `--accept accept.json` policy overlay. Every report fed to `add()`
+    /// is evaluated and then have acceptances applied before the verdict is
+    /// derived, so a `Compromised` that is policy-accepted no longer forces
+    /// exit 3. `None` = no policy file given, findings pass through unchanged.
+    acceptances: Option<Arc<acceptance::Acceptances>>,
 }
 
 impl OutcomeBuilder {
     fn add(&mut self, report: &AgentReport) {
         scoring::warn_unmapped_scanners(&report.failed_scanners);
-        let findings = scoring::evaluate(report);
+        let mut findings = scoring::evaluate(report);
+        if let Some(acc) = &self.acceptances {
+            acc.apply(&report.host.hostname, &mut findings);
+        }
         let v = scoring::security_verdict_from_findings(&findings);
         self.verdict = Some(match self.verdict {
             None => v,
@@ -285,9 +295,15 @@ fn warn_for_coverage(c: &Coverage, missing_hosts: &[String]) {
 }
 
 /// Build an Outcome for a single report (local path n=1).
+///
+/// M5: `acceptances` is cloned into the builder so `add()` can overlay the
+/// policy file onto the derived findings before the verdict is computed.
 #[cfg_attr(not(feature = "local-scan"), allow(dead_code))]
-fn outcome_for(report: &AgentReport) -> Outcome {
-    let mut agg = OutcomeBuilder::default();
+fn outcome_for(report: &AgentReport, acceptances: Option<Arc<acceptance::Acceptances>>) -> Outcome {
+    let mut agg = OutcomeBuilder {
+        acceptances,
+        ..Default::default()
+    };
     agg.add(report);
     agg.finish(1, 0)
 }
@@ -807,6 +823,21 @@ async fn run_command(
             let hosts_requested = hosts.len();
             let fail_on_incomplete = args.fail_on_incomplete;
 
+            // M5: load the --accept policy file once, before either branch
+            // (fleet or single-local) runs. The builder clones the Arc, the
+            // output helpers borrow it via `as_deref()`. A malformed file is
+            // a usage error — never silently ignored, never silently applied.
+            let acceptances: Option<Arc<acceptance::Acceptances>> = match &args.accept {
+                Some(p) => match acceptance::Acceptances::load(p) {
+                    Ok(a) => Some(Arc::new(a)),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return EXIT_USAGE;
+                    }
+                },
+                None => None,
+            };
+
             // If local-scan is disabled (non-Linux), reject local-only audits early.
             if !hosts.is_empty() {
                 let mut remote = Vec::new();
@@ -872,7 +903,14 @@ async fn run_command(
 
                 // Aggregator lives in the main task from this point on, so
                 // writer failure can never erase a recorded verdict.
-                let mut agg = OutcomeBuilder::default();
+                //
+                // M5: `acceptances` is cloned into the builder so every report
+                // that flows through the fleet path (initial scan, resume, and
+                // teardown drain) is evaluated against the policy file.
+                let mut agg = OutcomeBuilder {
+                    acceptances: acceptances.clone(),
+                    ..Default::default()
+                };
                 // R26-09: failed sends to the JSONL channel are lost records.
                 let mut send_failures = 0usize;
 
@@ -1369,6 +1407,7 @@ async fn run_command(
                         &args.format,
                         args.output.as_deref().map(std::path::Path::new),
                         verbose,
+                        acceptances.as_deref(),
                     ) {
                         warn!("output error: {e}");
                     }
@@ -1381,6 +1420,7 @@ async fn run_command(
                     &args.format,
                     args.output.as_deref().map(std::path::Path::new),
                     verbose,
+                    acceptances.as_deref(),
                 ) {
                     warn!("output error: {e}");
                     outcome.coverage.output_failed = true;
@@ -1438,13 +1478,17 @@ async fn run_command(
 
                 local_spinner.finish_and_clear();
 
-                let mut outcome = outcome_for(&report);
+                // M5: single-host path also honours --accept; the Arc is
+                // cloned into the builder so `add()` applies the policy
+                // before the verdict is computed.
+                let mut outcome = outcome_for(&report, acceptances.clone());
 
                 if let Err(e) = output::output_single(
                     &report,
                     &args.format,
                     args.output.as_deref().map(std::path::Path::new),
                     verbose,
+                    acceptances.as_deref(),
                 ) {
                     warn!("output error: {e}");
                     outcome.coverage.output_failed = true;
@@ -2194,7 +2238,7 @@ mod tests {
         report.network.firewall_active = false;
         report.is_root_execution = false;
 
-        let local_code = exit_code(&outcome_for(&report), false);
+        let local_code = exit_code(&outcome_for(&report, None), false);
 
         let mut agg = OutcomeBuilder::default();
         agg.add(&report);
@@ -2223,8 +2267,8 @@ mod tests {
         r.network.firewall_active = false; // SEC-001, network healthy
         r.failed_scanners = vec!["security".to_string()];
         // Critical is reported; coverage degrades the code but does not erase it.
-        assert_eq!(exit_code(&outcome_for(&r), false), EXIT_DEGRADED);
-        assert_eq!(exit_code(&outcome_for(&r), true), EXIT_INCOMPLETE);
+        assert_eq!(exit_code(&outcome_for(&r, None), false), EXIT_DEGRADED);
+        assert_eq!(exit_code(&outcome_for(&r, None), true), EXIT_INCOMPLETE);
     }
 
     #[test]

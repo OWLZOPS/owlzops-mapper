@@ -1,3 +1,4 @@
+use crate::acceptance::Acceptances;
 use crate::cli::OutputFormat;
 use crate::models::AgentReport;
 use crate::ui;
@@ -33,6 +34,11 @@ pub fn output_single(
     format: &OutputFormat,
     output_file: Option<&Path>,
     verbose: bool,
+    // M5: rules loaded from `--accept`. Applied inside `ui::render_dashboard`
+    // to the same `Finding` list the verdict was computed from, so an
+    // accepted finding disappears from the tables exactly the way it
+    // disappears from the score and exit code. `None` for no `--accept`.
+    acceptances: Option<&Acceptances>,
 ) -> Result<(), String> {
     match format {
         OutputFormat::Json => {
@@ -46,7 +52,7 @@ pub fn output_single(
             Ok(())
         }
         OutputFormat::Text => {
-            ui::render_dashboard(report, verbose);
+            ui::render_dashboard(report, verbose, acceptances);
             Ok(())
         }
         OutputFormat::Xlsx => {
@@ -74,6 +80,11 @@ pub fn output_multi(
     format: &OutputFormat,
     output_file: Option<&Path>,
     verbose: bool,
+    // M5: same contract as `output_single`. Only the `Text` branch reads it;
+    // `Json` and `Xlsx` dump the raw `AgentReport` and are unaffected by
+    // accepted-risk rules by design — the JSON export is the Raw Truth, and
+    // the operator can re-run the acceptance logic on it if needed.
+    acceptances: Option<&Acceptances>,
 ) -> Result<(), String> {
     match format {
         OutputFormat::Text => {
@@ -82,11 +93,11 @@ pub fn output_multi(
                 return Ok(());
             }
             if reports.len() == 1 {
-                ui::render_dashboard(&reports[0], verbose);
+                ui::render_dashboard(&reports[0], verbose, acceptances);
             } else {
-                ui::render_multi_host_summary(reports);
+                ui::render_multi_host_summary(reports, acceptances);
                 println!("\n--- Detail for first host ---\n");
-                ui::render_dashboard(&reports[0], verbose);
+                ui::render_dashboard(&reports[0], verbose, acceptances);
             }
             Ok(())
         }

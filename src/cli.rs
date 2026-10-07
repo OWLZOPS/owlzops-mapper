@@ -156,6 +156,16 @@ pub struct AuditArgs {
     /// records are re-scored so the exit code covers the whole fleet.
     #[arg(long, default_value_t = false)]
     pub resume: bool,
+
+    // ---- M5: accept.json -----------------------------------------------------
+    /// Path to an accept.json policy file. Findings matched by an entry are
+    /// marked suppressed and excluded from the risk score and the exit
+    /// verdict, but remain visible in the report (dashboard and JSON) so the
+    /// operator can audit the policy. `COMPROMISE_IDS` (SEC-015…024, SEC-040,
+    /// DOCK-010, …) and `SEC-041` / `COV-001` are NEVER acceptable and will
+    /// cause the file to be rejected on load.
+    #[arg(long, value_name = "FILE")]
+    pub accept: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
