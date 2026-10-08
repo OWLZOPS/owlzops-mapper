@@ -67,6 +67,25 @@ pub struct AuditArgs {
     #[arg(long)]
     pub hosts: Option<String>,
 
+    // ---- M7: hosts from ssh config -------------------------------------------
+    /// Select `Host` blocks from `~/.ssh/config` by alias glob (`*` and `?`,
+    /// anchored). Each matching block contributes its `HostName` — or the
+    /// alias itself, if the alias is not a glob and there is no `HostName` —
+    /// to the fleet. May be repeated; merged with `--host` / `--hosts` and
+    /// deduplicated.
+    ///
+    /// MVP limitations: `Include` is not followed, `Match` blocks are not
+    /// evaluated, `Host *` catch-alls are skipped, and per-host
+    /// `User` / `Port` / `IdentityFile` are ignored (`--ssh-user` /
+    /// `--ssh-key` remain the only credential source).
+    #[arg(
+        long = "hosts-from-ssh-config",
+        value_name = "PATTERN",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    pub hosts_from_ssh_config: Vec<String>,
+
     #[arg(long, default_value = "root")]
     pub ssh_user: String,
 
