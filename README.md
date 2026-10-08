@@ -212,6 +212,44 @@ The password is held in a protected `SecretString` (zeroized on drop, locked
 from swap and core dumps where supported) and removed from the process
 environment as early as possible. See `SECURITY.md` for details.
 
+### Accepting known risks
+
+Recurring scans lose their value the moment the operator stops reading them.
+`--accept` lets you formally accept a finding you have looked at and decided
+against remediating — so it stops appearing in the score, without disappearing
+from the report.
+
+```json
+[
+  { "finding_id": "SEC-001", "host": "web-*",
+    "justification": "cloud SG is the firewall",
+    "expires": "2027-01-01", "ticket": "OPS-1234" }
+]
+```
+
+```bash
+sudo owlzops-mapper audit --deep --accept accept.json
+```
+
+What a rule does:
+
+- Matching findings are marked `suppressed` and excluded from the **Risk
+  Score** and the **exit verdict**.
+- They stay in the **dashboard** (line `Accepted risks: N finding(s)`) and in
+  **JSON export** with the full acceptance text — the policy is auditable.
+- `justification` must be ≥ 10 characters. `expires` is required, `YYYY-MM-DD`
+  or RFC 3339. Expired rules are ignored and reported on stderr — the finding
+  comes back live.
+- `host` is a glob over `host.hostname` (`*`, `?`, anchored).
+
+**Compromise-class findings cannot be accepted.** `SEC-015…024`, `SEC-028`,
+`SEC-040`, `DOCK-010`, plus `SEC-041` and `COV-001`, are refused at load. An
+accepted rootkit is not a risk decision, it is a cover-up. The load fails with
+`EXIT_USAGE (64)` naming the offending rule.
+
+If nothing matches, or no `--accept` was passed, the report is identical to
+before — this flag never changes behaviour on its own.
+
 ### Snapshot & drift
 
 ```bash
@@ -269,6 +307,7 @@ The design commitments above are stated as testable properties in [SECURITY.md](
 | `--sudo-pass-fd N` | Read sudo password from an already-open file descriptor (most secure) |
 | `--keep-binary` | Skip cleanup, leave the binary on the remote host. Requires `--remote-path` when used with `--copy-binary` |
 | `--fail-on-incomplete` | Exit with code 4 when coverage is incomplete (failed scanner, missing host, non-root, warnings) |
+| `--accept <FILE>` | Policy file: matching findings leave the score and the exit verdict, but stay visible in the report. See [Accepting known risks](#accepting-known-risks) |
 | `--external-ip` | Opt-in public IP lookup |
 | `-v, --verbose` | Full per-region memory detail |
 
@@ -293,6 +332,9 @@ Codes **0–3 are a stable public contract from v0.6.0**.
 Their meaning does not change between releases from v0.6.0 onwards.  
 New failure modes get new codes; they never override the existing band.
 
+`--accept` can suppress a finding that would otherwise drive code 1 or 2, but
+never code 3: compromise IDs are refused at load.
+
 In fleet mode, hosts that produced no report are listed by address in stderr.
 `hosts_missing` in the exit-code path remains a count; the stderr line carries
 the actual address list for operator follow-up.
@@ -314,6 +356,11 @@ sudo owlzops-mapper audit || echo "Security scan failed — check the report"
 | Hygiene | 10 | NTP |
 
 Colour legend: green < 40 · yellow 40–69 · red ≥ 70.
+
+`--accept` can remove a finding from the score entirely — see [Accepting known
+risks](#accepting-known-risks). The scanner-level suppression lines
+(`SEC-027`, `SEC-029`, `SEC-034`, `SEC-037`) that appear under the findings
+table are a different mechanism and are not affected by `--accept`.
 
 Active-compromise indicators escalate to exit code 3 regardless of score. When comparing snapshots taken with different scoring engine versions, score changes are reported as `~ Changed` rather than improved or degraded.
 

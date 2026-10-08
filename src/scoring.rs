@@ -2918,8 +2918,28 @@ impl SecurityVerdict {
     }
 }
 
+/// Findings that count: scanner-suppressed and operator-accepted ones carry
+/// `suppressed` and contribute neither score nor verdict.
+///
+/// A no-op in the current code, because `CriticalFlags::from_findings`
+/// already filters by `f.suppressed.is_none()` on every check. Passing
+/// `live()` here makes the contract explicit: if the inner predicate ever
+/// stops checking `suppressed`, the scanner-level suppression test
+/// (`suppressed_findings_not_scored`) catches scoring but NOT the verdict.
+///
+/// Does not bump SCORING_VERSION: without `--accept` no finding gains a
+/// `suppressed` marker from the operator, and every scanner-level
+/// suppression today is weight 0.
+fn live(findings: &[Finding]) -> Vec<Finding> {
+    findings
+        .iter()
+        .filter(|f| f.suppressed.is_none())
+        .cloned()
+        .collect()
+}
+
 pub fn security_verdict_from_findings(findings: &[Finding]) -> SecurityVerdict {
-    let flags = CriticalFlags::from_findings(findings);
+    let flags = CriticalFlags::from_findings(&live(findings));
     if flags.compromised_host {
         SecurityVerdict::Compromised
     } else if flags.has_critical() {
@@ -2991,6 +3011,23 @@ pub fn score(findings: Vec<Finding>) -> ScoredReport {
 
 // ── Legacy CriticalFlags (unchanged API, backed by findings) ──
 
+/// The set of finding IDs whose presence forces `SecurityVerdict::Compromised`
+/// (exit code 3). Single source of truth:
+///   * `CriticalFlags::from_findings` reads it to set `compromised_host`;
+///   * `crate::acceptance` reads it to refuse `--accept` rules that would
+///     otherwise silence a confirmed compromise (an accepted rootkit is not
+///     a risk decision, it is a cover-up).
+///
+/// Adding a new IoC-class finding requires adding its ID here. The acceptance
+/// side adds two IDs on top (`EXTRA_NEVER_ACCEPTABLE`) that are also
+/// un-acceptable but do not currently feed `compromised_host`;
+/// `acceptance::tests::compromise_ids_are_never_acceptable` enforces the
+/// subset invariant so a new IoC cannot be silently forgettable.
+pub(crate) const COMPROMISE_IDS: &[&str] = &[
+    "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
+    "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043", "SEC-052", "SEC-055",
+];
+
 pub struct CriticalFlags {
     pub firewall_disabled: bool,
     pub ssh_root_login: bool,
@@ -3017,17 +3054,12 @@ impl CriticalFlags {
                 .iter()
                 .any(|f| f.id == id && f.suppressed.is_none())
         };
-        const IOC_IDS: [&str; 16] = [
-            "SEC-015", "SEC-016", "SEC-017", "SEC-019", "SEC-020", "SEC-021", "SEC-022", "SEC-023",
-            "SEC-024", "SEC-028", "SEC-040", "DOCK-010", "SEC-042", "SEC-043", "SEC-052",
-            "SEC-055",
-        ];
 
         debug_assert!(
             findings.iter().all(|f| {
-                !(IOC_IDS.contains(&f.id) && f.suppressed.is_none()) || f.weight >= 55
+                !(COMPROMISE_IDS.contains(&f.id) && f.suppressed.is_none()) || f.weight >= 55
             }),
-            "IOC_IDS finding with sub-IoC weight — exit-3 semantics broken"
+            "compromise-ID finding with sub-IoC weight — exit-3 semantics broken"
         );
 
         let count_sysctl = findings
@@ -3047,7 +3079,7 @@ impl CriticalFlags {
             sudo_nopasswd: has("SEC-005") || has("SEC-012"),
             ntp_not_synced: has("HYG-001"),
             sysctl_issues_count: count_sysctl,
-            compromised_host: IOC_IDS.iter().any(|&id| has(id)),
+            compromised_host: COMPROMISE_IDS.iter().any(|&id| has(id)),
         }
     }
 
