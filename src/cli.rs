@@ -223,6 +223,22 @@ pub struct CompareArgs {
     /// Treat the input files as arrays of host reports (multi-host)
     #[arg(long, default_value_t = false)]
     pub multi_host: bool,
+
+    // ---- M6: baseline mode ------------------------------------------------
+    /// Treat `before` as a known-good baseline and `after` as the current
+    /// fleet; pair hosts by hostname, same as `--multi-host`. Output is
+    /// worded as drift from a baseline ("not yet baselined" instead of
+    /// "+ added", "decommissioned" instead of "− removed"). Implies
+    /// `--multi-host`.
+    #[arg(long, default_value_t = false)]
+    pub baseline: bool,
+
+    /// Exit 1 when any compared host has at least one Degraded change.
+    /// Without this flag a diff always exits 0, matching historical
+    /// behaviour. Applies to single-host compare and to `--multi-host` /
+    /// `--baseline`.
+    #[arg(long, default_value_t = false)]
+    pub fail_on_drift: bool,
 }
 
 #[derive(Args, Debug)]

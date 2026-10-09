@@ -30,7 +30,7 @@ use cli::{AuditArgs, Cli, Commands, OutputFormat};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 #[cfg(feature = "local-scan")]
 use models::SelfIntegrityReport;
-use models::{AgentReport, HostDiffStatus};
+use models::{AgentReport, HostDiffStatus, Severity};
 use runner::snapshot_run;
 #[cfg(feature = "local-scan")]
 use runner::{is_local_host, run_local_scan_async};
@@ -1639,7 +1639,10 @@ async fn run_command(
         }
 
         Commands::Compare(cmp_args) => {
-            if cmp_args.multi_host {
+            let is_multi = cmp_args.multi_host || cmp_args.baseline;
+            let is_baseline = cmp_args.baseline;
+
+            if is_multi {
                 let before =
                     match parse_jsonl_strict_path(std::path::Path::new(&cmp_args.before), "before")
                     {
@@ -1666,17 +1669,24 @@ async fn run_command(
                             .filter(|d| !d.diff.changes.is_empty())
                             .collect();
                         let unchanged = diffs.len() - changed.len();
+                        let header = if is_baseline {
+                            "Baseline drift"
+                        } else {
+                            "Fleet drift"
+                        };
                         println!(
-                            "Fleet drift: {} host(s) — {} changed, {} unchanged",
+                            "{header}: {} host(s) — {} changed, {} unchanged",
                             diffs.len(),
                             changed.len(),
                             unchanged
                         );
                         for mh in &changed {
-                            let tag = match mh.status {
-                                HostDiffStatus::Added => " [+ added]",
-                                HostDiffStatus::Removed => " [− removed]",
-                                HostDiffStatus::Compared => "",
+                            let tag = match (is_baseline, &mh.status) {
+                                (true, HostDiffStatus::Added) => " [not yet baselined]",
+                                (true, HostDiffStatus::Removed) => " [decommissioned]",
+                                (false, HostDiffStatus::Added) => " [+ added]",
+                                (false, HostDiffStatus::Removed) => " [− removed]",
+                                (_, HostDiffStatus::Compared) => "",
                             };
                             println!("\nHost: {}{}", st(&mh.hostname), tag);
                             compare::print_diff_terminal(&mh.diff);
@@ -1712,6 +1722,17 @@ async fn run_command(
                         });
                         println!("Multi-host diff Excel written to {}", path.display());
                     }
+                }
+
+                if cmp_args.fail_on_drift
+                    && diffs.iter().any(|d| {
+                        d.diff
+                            .changes
+                            .iter()
+                            .any(|c| c.severity == Severity::Degraded)
+                    })
+                {
+                    return EXIT_CRITICAL;
                 }
                 return 0;
             }
@@ -1784,6 +1805,15 @@ async fn run_command(
                     });
                     println!("Diff Excel written to {}", path.display());
                 }
+            }
+
+            if cmp_args.fail_on_drift
+                && diff
+                    .changes
+                    .iter()
+                    .any(|c| c.severity == Severity::Degraded)
+            {
+                return EXIT_CRITICAL;
             }
             0
         }

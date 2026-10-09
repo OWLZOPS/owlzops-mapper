@@ -258,6 +258,58 @@ owlzops-mapper dir-compare ~/.owlzops/snapshots/hostname
 owlzops-mapper compare before.json after.json --format excel -o drift.xlsx
 ```
 
+#### Drift against a baseline
+
+A nightly fleet scan is only useful if you can tell the operator what
+**changed**, not what the full state is. `--baseline` pairs each host in the
+second file with the same hostname in the first, and words the output as
+drift from a known-good snapshot:
+
+```bash
+# 1. On a good day, run audit, review the result, and commit it as baseline
+owlzops-mapper audit --hosts prod.txt --format json --output golden.jsonl
+git add golden.jsonl && git commit -m "baseline: 2026-10-09"
+
+# 2. Every night thereafter
+owlzops-mapper audit --hosts prod.txt --format json --output today.jsonl
+owlzops-mapper compare --baseline golden.jsonl today.jsonl
+```
+
+Output is per host, only for hosts that changed:
+
+```
+Baseline drift: 50 host(s) — 3 changed, 47 unchanged
+
+Host: web-05
+╭─────────────────────────────┬─────────┬──────────────┬────────────╮
+│ Field                       ┆ Before  ┆ After        ┆ Severity   │
+╞═════════════════════════════╪═════════╪══════════════╪════════════╡
+│ network.listening_ports     ┆ -       ┆ 0.0.0.0:4444 ┆ ↓ Degraded │
+╰─────────────────────────────┴─────────┴──────────────┴────────────╯
+```
+
+A host present only in `today.jsonl` is tagged `[not yet baselined]` — it has
+no baseline to compare against. A host present only in `golden.jsonl` is
+tagged `[decommissioned]`. Neither counts as `Degraded` by default: a new
+server is not worse than an old one, and a removed server is not inherently a
+regression.
+
+To make this a CI gate, add `--fail-on-drift`:
+
+```bash
+owlzops-mapper compare --baseline golden.jsonl today.jsonl --fail-on-drift
+```
+
+Exit code is `1` when any compared host has at least one `Degraded` change,
+`0` otherwise. The same gate works on the single-host path:
+
+```bash
+owlzops-mapper compare before.json after.json --fail-on-drift
+```
+
+Without `--fail-on-drift`, `compare` always exits `0` — historical behaviour
+is preserved. A pipeline that never opted in keeps working.
+
 ---
 
 ## Core features
@@ -300,6 +352,7 @@ The design commitments above are stated as testable properties in [SECURITY.md](
 | `-o, --output` | Output file for Excel reports |
 | `--offline` | Disable all network calls, overrides other flags |
 | `--host` / `--hosts` | Remote target(s): comma-separated list or file |
+| `--hosts-from-ssh-config <PATTERN>` | Select `Host` blocks from `~/.ssh/config` by alias glob; each contributes its `HostName` to the fleet. May be repeated |
 | `--ssh-user` / `--ssh-key` | SSH credentials for remote scanning |
 | `--copy-binary` | Upload the static binary automatically |
 | `--local-binary` | Path to the static binary to upload instead of the running one |
@@ -308,6 +361,8 @@ The design commitments above are stated as testable properties in [SECURITY.md](
 | `--keep-binary` | Skip cleanup, leave the binary on the remote host. Requires `--remote-path` when used with `--copy-binary` |
 | `--fail-on-incomplete` | Exit with code 4 when coverage is incomplete (failed scanner, missing host, non-root, warnings) |
 | `--accept <FILE>` | Policy file: matching findings leave the score and the exit verdict, but stay visible in the report. See [Accepting known risks](#accepting-known-risks) |
+| `--baseline` | `compare`: treat the first input as a known-good baseline; pair hosts by hostname and word output as drift. Implies `--multi-host`. See [Drift against a baseline](#drift-against-a-baseline) |
+| `--fail-on-drift` | `compare`: exit 1 when any compared host has a `Degraded` change. Without it, `compare` always exits 0 |
 | `--external-ip` | Opt-in public IP lookup |
 | `-v, --verbose` | Full per-region memory detail |
 
@@ -334,6 +389,10 @@ New failure modes get new codes; they never override the existing band.
 
 `--accept` can suppress a finding that would otherwise drive code 1 or 2, but
 never code 3: compromise IDs are refused at load.
+
+`compare` uses the same band: `0` when nothing drifted, `1` when
+`--fail-on-drift` saw at least one `Degraded` change. Without the flag a diff
+still exits `0`, so an existing pipeline keeps its old behaviour.
 
 In fleet mode, hosts that produced no report are listed by address in stderr.
 `hosts_missing` in the exit-code path remains a count; the stderr line carries
