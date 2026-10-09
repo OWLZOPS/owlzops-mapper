@@ -16,6 +16,7 @@ mod scoring;
 mod secrets;
 mod self_identity;
 mod signing;
+mod ssh_config;
 mod ssh_engine;
 mod ui;
 mod utils;
@@ -787,6 +788,51 @@ async fn run_command(
             for h in &args.host {
                 hosts.push(h.clone());
             }
+
+            // M7: append every matching HostName from ~/.ssh/config.
+            //
+            // The config file is optional as an input but mandatory when the
+            // flag is given: if the operator asked for a specific set of hosts
+            // by name and the config yields nothing, that is a usage error,
+            // not a silent fallback to a local scan (same rule as an empty
+            // --hosts file, R24-13).
+            //
+            // Warnings about Include / Match / skipped Host * blocks go to
+            // stderr via tracing. They describe the operator's config file —
+            // a fleet-level fact, not per-host coverage — so they do not
+            // belong in any one AgentReport's coverage_warnings.
+            if !args.hosts_from_ssh_config.is_empty() {
+                let Some(home) = dirs_next::home_dir() else {
+                    eprintln!(
+                        "Error: --hosts-from-ssh-config needs ~/.ssh/config, but the \
+                         home directory could not be resolved"
+                    );
+                    return EXIT_USAGE;
+                };
+                let config_path = home.join(".ssh").join("config");
+                let before = hosts.len();
+                match crate::ssh_config::load_hosts(&config_path, &args.hosts_from_ssh_config) {
+                    Ok((cfg_hosts, warnings)) => {
+                        for w in &warnings {
+                            warn!("{w}");
+                        }
+                        hosts.extend(cfg_hosts);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return EXIT_USAGE;
+                    }
+                }
+                if hosts.len() == before {
+                    eprintln!(
+                        "Error: --hosts-from-ssh-config matched no hosts in {} — \
+                         refusing to fall back to a local scan",
+                        config_path.display()
+                    );
+                    return EXIT_USAGE;
+                }
+            }
+
             // R24-13: an unreadable --hosts file must never degrade into a
             // local scan — the object of the audit would silently change.
             if let Some(ref path) = args.hosts {
