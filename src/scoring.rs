@@ -62,7 +62,12 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 /// replaceable targets), SEC-063 (authorized_keys environment=),
 /// SEC-064 (immutable trust anchors) — new weighted inputs, same
 /// rule as v15/R33-12.
-pub const SCORING_VERSION: u8 = 16;
+/// v17 (unreleased): SEC-065 / SEC-066 — Docker published ports on wildcard
+/// bind addresses correlated with the host firewall state. New weighted
+/// inputs (20/25 non-sensitive, 35/25 sensitive). Same rule as v15/v16:
+/// pairs spanning this version are a collection-semantics change, not
+/// real drift. The version tag ships with the release that introduces it.
+pub const SCORING_VERSION: u8 = 17;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -2685,6 +2690,97 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         });
     }
 
+    // ── SEC-065 / SEC-066: Docker published ports bypass host firewall ──
+    //
+    // Docker writes iptables rules in the `DOCKER` chain, which is traversed
+    // *before* the `INPUT` chain that ufw / firewalld manage. A container port
+    // published on a wildcard bind address (`-p 8080:80`, i.e. `0.0.0.0:8080`)
+    // is therefore reachable from the network even when `firewall_active` is
+    // true. The operator sees "firewall on" and never learns the specific
+    // port is unprotected.
+    //
+    // Two findings, one per firewall state — the remediation differs:
+    //   * SEC-065 — firewall active, Docker bypasses it. Fix the Docker
+    //     config (loopback bind, `daemon.json` `"ip": "127.0.0.1"`, or a
+    //     `DOCKER-USER` rule).
+    //   * SEC-066 — no firewall, the port is exposed because nothing
+    //     protects it. Fix is to enable a firewall.
+    //
+    // Weight tiers by port: a published database / cache / admin-plane port
+    // is materially worse than a reverse proxy on 8080. `sensitive` is set
+    // by `scanners::docker_firewall_bypass::SENSITIVE_PORTS` — the score
+    // here reads the flag, it does not re-derive it, so the two layers
+    // cannot drift.
+    //
+    // Source is `Network`, not `Docker`: the finding depends on the network
+    // scanner's `firewall_active`, and if the network scanner failed we must
+    // not report a "no firewall" state from its Default::default() (false).
+    // `finding_from_failed_scanner` filters on `source`, so a network-scanner
+    // panic removes both SEC-065 and SEC-066 from the report before scoring.
+    {
+        let mut bypass_active = Vec::new();
+        let mut exposed_no_fw = Vec::new();
+        let mut active_sensitive = false;
+        let mut nofw_sensitive = false;
+
+        for b in &report.security.firewall_bypass_findings {
+            let entry = format!(
+                "{} {} (host port {}, {})",
+                b.container, b.published, b.host_port, b.protocol
+            );
+            if b.firewall_was_active {
+                if b.sensitive {
+                    active_sensitive = true;
+                }
+                bypass_active.push(entry);
+            } else {
+                if b.sensitive {
+                    nofw_sensitive = true;
+                }
+                exposed_no_fw.push(entry);
+            }
+        }
+
+        if !bypass_active.is_empty() {
+            let weight = if active_sensitive { 35 } else { 20 };
+            findings.push(Finding {
+                id: "SEC-065",
+                source: Scanner::Network,
+                title: "Docker published port bypasses active host firewall".to_string(),
+                category: Category::Security,
+                weight,
+                evidence: format!(
+                    "{} port(s) published on a wildcard bind while the host firewall is \
+                     active. Docker writes iptables rules that precede the INPUT chain, \
+                     so the firewall does not filter these ports: {}",
+                    bypass_active.len(),
+                    evidence_list(&bypass_active, 8)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        if !exposed_no_fw.is_empty() {
+            let weight = if nofw_sensitive { 25 } else { 15 };
+            findings.push(Finding {
+                id: "SEC-066",
+                source: Scanner::Network,
+                title: "Docker published port exposed without any host firewall".to_string(),
+                category: Category::Security,
+                weight,
+                evidence: format!(
+                    "{} port(s) published on a wildcard bind on a host with no active \
+                     firewall — reachable from the network: {}",
+                    exposed_no_fw.len(),
+                    evidence_list(&exposed_no_fw, 8)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     let mut has_socket_or_root = false;
     let mut has_sensitive_rw = false;
 
@@ -3338,6 +3434,119 @@ mod tests {
         assert_eq!(inv.weight, 0);
     }
 
+    // ── SEC-065 / SEC-066 (M-DOCK-FW) ───────────────────────
+    #[test]
+    fn sec065_fires_on_bypass_with_active_firewall() {
+        use crate::models::FirewallBypassFinding;
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.security.firewall_bypass_findings = vec![FirewallBypassFinding {
+            container: "redis".into(),
+            published: "0.0.0.0:6379->6379/tcp".into(),
+            host_port: 6379,
+            container_port: 6379,
+            protocol: "tcp".into(),
+            sensitive: true,
+            firewall_was_active: true,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-065")
+            .expect("SEC-065 fires");
+        assert_eq!(f.weight, 35, "sensitive port tier");
+        assert!(f.evidence.contains("redis"));
+        assert!(f.evidence.contains("6379"));
+        assert!(
+            !evaluate(&r).iter().any(|f| f.id == "SEC-066"),
+            "firewall active ⇒ no SEC-066"
+        );
+    }
+
+    #[test]
+    fn sec066_fires_when_firewall_is_off() {
+        use crate::models::FirewallBypassFinding;
+        let mut r = minimal_report();
+        r.network.firewall_active = false;
+        r.security.firewall_bypass_findings = vec![FirewallBypassFinding {
+            container: "web".into(),
+            published: "0.0.0.0:8080->80/tcp".into(),
+            host_port: 8080,
+            container_port: 80,
+            protocol: "tcp".into(),
+            sensitive: false,
+            firewall_was_active: false,
+        }];
+        let f = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-066")
+            .expect("SEC-066 fires");
+        assert_eq!(f.weight, 15, "non-sensitive port tier");
+        assert!(f.evidence.contains("web"));
+        assert!(
+            !evaluate(&r).iter().any(|f| f.id == "SEC-065"),
+            "firewall inactive ⇒ no SEC-065"
+        );
+    }
+
+    #[test]
+    fn sec065_066_split_by_firewall_state_at_scan_time() {
+        use crate::models::FirewallBypassFinding;
+        let mut r = minimal_report();
+        r.network.firewall_active = true;
+        r.security.firewall_bypass_findings = vec![
+            FirewallBypassFinding {
+                container: "alpha-svc".into(),
+                published: "0.0.0.0:8080->80/tcp".into(),
+                host_port: 8080,
+                container_port: 80,
+                protocol: "tcp".into(),
+                sensitive: false,
+                firewall_was_active: true,
+            },
+            FirewallBypassFinding {
+                container: "beta-svc".into(),
+                published: "0.0.0.0:9090->90/tcp".into(),
+                host_port: 9090,
+                container_port: 90,
+                protocol: "tcp".into(),
+                sensitive: false,
+                firewall_was_active: false,
+            },
+        ];
+        let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"SEC-065"));
+        assert!(ids.contains(&"SEC-066"));
+        let sec065 = evaluate(&r)
+            .into_iter()
+            .find(|f| f.id == "SEC-065")
+            .unwrap();
+        assert!(sec065.evidence.contains("alpha-svc"));
+        assert!(!sec065.evidence.contains("beta-svc"));
+    }
+
+    #[test]
+    fn sec065_066_removed_when_network_scanner_failed() {
+        use crate::models::FirewallBypassFinding;
+        let mut r = minimal_report();
+        r.network.firewall_active = false;
+        r.failed_scanners = vec!["network".to_string()];
+        r.security.firewall_bypass_findings = vec![FirewallBypassFinding {
+            container: "redis".into(),
+            published: "0.0.0.0:6379->6379/tcp".into(),
+            host_port: 6379,
+            container_port: 6379,
+            protocol: "tcp".into(),
+            sensitive: true,
+            firewall_was_active: false,
+        }];
+        let ids: Vec<&str> = evaluate(&r).iter().map(|f| f.id).collect();
+        assert!(
+            !ids.contains(&"SEC-066"),
+            "network-scanner panic ⇒ firewall state is unknown ⇒ no finding"
+        );
+        assert!(!ids.contains(&"SEC-065"));
+    }
+
     // ── existing tests below ────────────────────────────────────────────
 
     fn rel_container(name: &str) -> ContainerInfo {
@@ -3589,7 +3798,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (16, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (17, 15));
     }
 
     #[test]
@@ -3606,7 +3815,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .expect("SEC-005 fires");
-        assert_eq!((SCORING_VERSION, f.weight), (16, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (17, 15));
     }
 
     #[test]

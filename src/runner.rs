@@ -347,6 +347,18 @@ pub async fn run_local_scan_async(args: &AuditArgs) -> AgentReport {
         // pid — a container's children share its mount namespace.
         link_mount_ns_to_containers(&mut security_info, &topology_info);
 
+        // SEC-065 / SEC-066: cross-reference Docker's published ports with the
+        // firewall state. Pure post-processing — no new syscall, no new spawn,
+        // reuses what `topology` and `network` already collected. A network
+        // scanner that panicked yields `firewall_active == false` by
+        // `Default`, and `finding_from_failed_scanner` strips both findings
+        // in scoring; the assignment is still safe to run unconditionally.
+        security_info.firewall_bypass_findings =
+            crate::scanners::docker_firewall_bypass::detect_firewall_bypass(
+                &topology_info.containers,
+                network_info.firewall_active,
+            );
+
         let p = persistence_res.unwrap_or_else(|e| {
             warn!(scanner = "persistence", error = ?e, "persistence scanner panicked");
             scan_warnings.push(format!(

@@ -25,7 +25,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::acceptance::Acceptances;
 use crate::models::{
-    AgentReport, CronSeverity, InjectionClass, LibraryInjectionFinding, Origin, PackageManager,
+    AgentReport, CronSeverity, FirewallBypassFinding, InjectionClass, LibraryInjectionFinding,
+    Origin, PackageManager,
 };
 use crate::scoring::{Finding, classify_cap_binary, classify_setuid};
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
@@ -239,6 +240,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool, acceptances: Option
     render_system_internals(report);
     render_packages(report);
     render_runtime(report);
+    render_firewall_bypass(report, &theme);
     render_capability_audit(report);
 
     render_cpu_vulnerabilities(report, &theme);
@@ -1573,6 +1575,105 @@ fn render_runtime(report: &AgentReport) {
         outln!("{} Containers & Data Persistency:", runtime);
         outln!("{t_docker}\n");
     }
+}
+
+// ── SEC-065 / SEC-066: Docker published ports bypassing the firewall ──────
+//
+// Docker publishes container ports by writing its own iptables rules into the
+// `DOCKER` chain, which the kernel traverses *before* the `INPUT` chain that
+// ufw / firewalld manage. A `docker run -p 8080:80` on a host with an active
+// firewall therefore produces a reachable port that the firewall reports as
+// closed. This section surfaces that mismatch, in two flavours chosen by the
+// firewall state at scan time:
+//
+//   * SEC-065 — firewall active, Docker bypasses it
+//   * SEC-066 — firewall inactive, port exposed because nothing protects it
+//
+// The two are in `security.firewall_bypass_findings`; the `firewall_was_active`
+// flag on each entry selects the row label. This is a display layer only —
+// scoring already assigned the weight from the same flag; the fact that
+// `detect_firewall_bypass` filtered loopback bindings is why every entry here
+// is by construction a wildcard publish.
+fn render_firewall_bypass(report: &AgentReport, theme: &Theme) {
+    let findings = &report.security.firewall_bypass_findings;
+    if findings.is_empty() {
+        return;
+    }
+
+    let (bypass, no_firewall): (Vec<&FirewallBypassFinding>, Vec<&FirewallBypassFinding>) =
+        findings.iter().partition(|f| f.firewall_was_active);
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        cell("Container")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        cell("Published").add_attribute(Attribute::Bold),
+        cell("Firewall").add_attribute(Attribute::Bold),
+        cell("Port").add_attribute(Attribute::Bold),
+    ]);
+
+    let render_row = |f: &FirewallBypassFinding| -> Vec<Cell> {
+        // `published` is a Docker-generated string, but container names are
+        // operator-controlled and can carry terminal escapes. `cell()`
+        // sanitizes by construction.
+        let firewall_label = if f.firewall_was_active {
+            "active (bypassed)"
+        } else {
+            "none"
+        };
+        let firewall_cell = cell(firewall_label)
+            .fg(Color::Red)
+            .add_attribute(Attribute::Bold);
+
+        let mut port_cell = cell(f.host_port.to_string());
+        if f.sensitive {
+            port_cell = port_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+        } else {
+            port_cell = port_cell.fg(Color::Yellow);
+        }
+
+        vec![
+            cell(sanitize_terminal(&f.container)),
+            cell(sanitize_terminal(&f.published)),
+            firewall_cell,
+            port_cell,
+        ]
+    };
+
+    for f in &bypass {
+        t.add_row(render_row(f));
+    }
+    for f in &no_firewall {
+        t.add_row(render_row(f));
+    }
+
+    outln!(
+        "{}Docker published ports bypassing the host firewall \
+         (SEC-065 / SEC-066):",
+        theme.warn_sm
+    );
+    if !bypass.is_empty() {
+        outln!(
+            "    {} host firewall is active, but Docker writes its own iptables \
+             rules ahead of it — these ports are reachable from the network.",
+            theme.sec_item
+        );
+    }
+    if !no_firewall.is_empty() {
+        outln!(
+            "    {} no host firewall is active; these ports are reachable \
+             because nothing filters them.",
+            theme.warn_sm
+        );
+    }
+    outln!("{t}\n");
+    outln!(
+        "    \x1b[1;36m{}FIX: bind to loopback (`-p 127.0.0.1:PORT:PORT`), set \
+         `\"ip\": \"127.0.0.1\"` in /etc/docker/daemon.json, or add a rule to \
+         the DOCKER-USER chain.\x1b[0m\n",
+        theme.hint
+    );
 }
 
 fn render_capability_audit(report: &AgentReport) {

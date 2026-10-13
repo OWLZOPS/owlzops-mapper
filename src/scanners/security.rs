@@ -776,6 +776,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         sshd_sensitive_directives: sshd_sensitive,
         // ── QW-10 / SEC-064
         immutable_anchors: crate::scanners::immutable::scan_immutable_anchors(),
+        // ── SEC-065 / SEC-066: cross-reference, filled by runner.rs ──
+        firewall_bypass_findings: Vec::new(),
     }
 }
 
