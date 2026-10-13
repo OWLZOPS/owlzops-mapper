@@ -44,6 +44,8 @@ pub(crate) mod sudoers;
 #[cfg(feature = "local-scan")]
 mod confinement;
 #[cfg(feature = "local-scan")]
+pub mod docker_firewall_bypass;
+#[cfg(feature = "local-scan")]
 pub mod exec_provenance;
 #[cfg(feature = "local-scan")]
 mod ftrace;

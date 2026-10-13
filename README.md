@@ -48,6 +48,7 @@ Built because running six different tools still left the question "is something 
 - **Active compromise** — reverse shells, memfd/fileless implants, library injection, bind-mount masking, known miners
 - **Ghost PIDs / LKM rootkits** (`--deep`) — true hidden processes via `/proc` discrepancies
 - **Container escapes** — `docker.sock` / Podman socket mounts, privileged containers, dangerous capabilities, missing resource limits
+- **Docker published ports bypassing the firewall** — container ports reachable from the network even when `ufw status` reports `active` (`SEC-065` / `SEC-066`, see below)
 - **Classic landmines** — SSH root login + password auth, `sudo NOPASSWD:ALL`, wide-open listeners, disabled firewall
 - **CIS-mapped findings** with evidence and penalty scores
 - **Drift** — snapshot → compare → colour-coded Excel or terminal diff
@@ -66,7 +67,7 @@ Risk Score is split into **Security / Reliability / Hygiene** so one noisy categ
 Security −60  Reliability −5  Hygiene −15
 
 🛡 Security Findings
-╭─────────────────────────────────────────────────────────────────────────────────────────────╮
+╭───────────────────────────┬──────────┬──────────────────────────────────────────────────────╮
 │ CIS / Ref                 ┆ Penalty  ┆ Finding                                              │
 ╞═══════════════════════════╪══════════╪══════════════════════════════════════════════════════╡
 │ SEC-014                   ┆   -30    ┆ Cleartext credentials in process memory              │
@@ -78,7 +79,7 @@ Security −60  Reliability −5  Hygiene −15
 │ DOCK-001 (CIS 5.10)       ┆   -5     ┆ Containers run without memory limits                 │
 │ DOCK-002 (CIS 5.11)       ┆   -3     ┆ Containers run without CPU limits                    │
 │ …                         ┆          ┆                                                      │
-╰─────────────────────────────────────────────────────────────────────────────────────────────╯
+╰───────────────────────────┴──────────┴──────────────────────────────────────────────────────╯
 ```
 
 Full evidence column, memory-forensics tables and suppression counts appear with `--deep`.
@@ -250,6 +251,58 @@ accepted rootkit is not a risk decision, it is a cover-up. The load fails with
 If nothing matches, or no `--accept` was passed, the report is identical to
 before — this flag never changes behaviour on its own.
 
+### Docker published ports bypassing the firewall
+
+`docker run -p 8080:80` writes its own `iptables` rules into the `DOCKER`
+chain, which the kernel traverses **before** the `INPUT` chain that ufw /
+firewalld manage. On a host where `ufw status` reports `active`, the
+container's published port is still reachable from the network — the
+firewall says `on`, the port is open. The scanner surfaces this contradiction
+directly, next to the containers table:
+
+```
+⚠️ Docker published ports bypassing the host firewall (SEC-065 / SEC-066):
+    🛡️   host firewall is active, but Docker writes its own iptables rules
+         ahead of it — these ports are reachable from the network.
+╭─────────────┬──────────────────────┬───────────────────┬──────╮
+│ Container   ┆ Published            ┆ Firewall          ┆ Port │
+╞═════════════╪══════════════════════╪═══════════════════╪══════╡
+│ nginx-proxy ┆ 0.0.0.0:80->80/tcp   ┆ active (bypassed) ┆ 80   │
+│ nginx-proxy ┆ :::80->80/tcp        ┆ active (bypassed) ┆ 80   │
+│ nginx-proxy ┆ 0.0.0.0:443->443/tcp ┆ active (bypassed) ┆ 443  │
+│ nginx-proxy ┆ :::443->443/tcp      ┆ active (bypassed) ┆ 443  │
+╰─────────────┴──────────────────────┴───────────────────┴──────╯
+
+    💡 FIX: bind to loopback (`-p 127.0.0.1:PORT:PORT`), set
+       `"ip": "127.0.0.1"` in /etc/docker/daemon.json, or add a rule to
+       the DOCKER-USER chain.
+```
+
+Two finding IDs, split on the firewall state at scan time because the
+remediation differs:
+
+| ID | Condition | Penalty | Fix |
+|---|---|---|---|
+| **SEC-065** | Host firewall active, Docker bypasses it | +20 (35 for a database / cache / admin port) | Loopback bind, `daemon.json` override, or a `DOCKER-USER` rule |
+| **SEC-066** | No host firewall, port exposed because nothing protects it | +15 (25 for a sensitive port) | Enable a firewall |
+
+Loopback bindings (`127.0.0.1:*`, `[::1]:*`) are excluded: they are already
+unreachable from the network. The firewall state is read from the same flag
+that drives `network.firewall_active`; the finding is a cross-reference of
+`topology.containers` and the network scanner, not a new scan.
+
+If the publish is intentional — a reverse proxy on 80/443, for example —
+the finding is accepted with an `--accept` rule rather than silenced by the
+scanner:
+
+```json
+[
+  { "finding_id": "SEC-065", "host": "proxy-*",
+    "justification": "nginx-proxy is the intended edge; UFW sits inside",
+    "expires": "2026-12-31", "ticket": "OPS-4242" }
+]
+```
+
 ### Snapshot & drift
 
 ```bash
@@ -281,11 +334,11 @@ Output is per host, only for hosts that changed:
 Baseline drift: 50 host(s) — 3 changed, 47 unchanged
 
 Host: web-05
-╭─────────────────────────────┬─────────┬──────────────┬────────────╮
-│ Field                       ┆ Before  ┆ After        ┆ Severity   │
-╞═════════════════════════════╪═════════╪══════════════╪════════════╡
-│ network.listening_ports     ┆ -       ┆ 0.0.0.0:4444 ┆ ↓ Degraded │
-╰─────────────────────────────┴─────────┴──────────────┴────────────╯
+╭─────────────────────────┬─────────┬──────────────┬────────────╮
+│ Field                   ┆ Before  ┆ After        ┆ Severity   │
+╞═════════════════════════╪═════════╪══════════════╪════════════╡
+│ network.listening_ports ┆ -       ┆ 0.0.0.0:4444 ┆ ↓ Degraded │
+╰─────────────────────────┴─────────┴──────────────┴────────────╯
 ```
 
 A host present only in `today.jsonl` is tagged `[not yet baselined]` — it has
@@ -324,6 +377,7 @@ is preserved. A pipeline that never opted in keeps working.
 - Docker + Podman (including rootless) socket detection
 - Privileged containers, dangerous capabilities, sensitive host mounts
 - Missing resource limits, OOM kills, restart loops, health status
+- Published ports cross-referenced with the host firewall state (SEC-065 / SEC-066)
 
 **Operational**
 - Agentless SSH fleet orchestration — parallel, automatic cleanup
@@ -462,6 +516,8 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Containers in restart loop | +5 |
 | Containers without memory limits | +5 |
 | Containers without CPU limits | +3 |
+| **SEC-065** – Docker published port on wildcard bind, firewall active | **+20** (+35 for a database / cache / admin port) |
+| **SEC-066** – Docker published port on wildcard bind, no host firewall | **+15** (+25 for a sensitive port) |
 
 **Active compromise (IoC)** — these escalate to exit code 3
 
@@ -522,7 +578,7 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Malware & Intrusion | `/proc` sweep, memfd, deleted executables, reverse shells, library injection, hidden PIDs, bind-mount masking |
 | Security | SSH config, root login, password auth, sudo/NOPASSWD, sudoers permissions, sysctl, fail2ban/auditd |
 | Network | Listening ports + bind address, firewall state, DNS, TLS certificate expiry |
-| Docker / Podman | Privileged flag, capabilities, sensitive mounts, resource limits, OOM, health, socket exposure |
+| Docker / Podman | Privileged flag, capabilities, sensitive mounts, resource limits, OOM, health, socket exposure, published ports vs host firewall |
 | Kernel | Taint flags, hidden modules, ftrace syscall hooks, LSM confinement downgrade |
 | Memory (`--deep`) | `process_vm_readv`, entropy, binary headers, origin attribution, verdict cache |
 | Packages | Security updates (apt/dnf/yum/pacman/zypper) |

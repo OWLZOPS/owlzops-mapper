@@ -433,6 +433,51 @@ impl ContainerInfo {
     }
 }
 
+// ── Docker firewall bypass (SEC-065 / SEC-066) ─────────────────────────
+
+/// A Docker-published port on a wildcard bind address, correlated with the
+/// host's firewall state.
+///
+/// Docker writes iptables rules that precede ufw / firewalld chains, so a
+/// published port on `0.0.0.0` is reachable from the network regardless of
+/// what the firewall reports. `firewall_was_active` distinguishes the two
+/// cases:
+///
+///   * `true`  — **SEC-065**: firewall is bypassed by Docker's own rules;
+///     the fix is in the Docker config (loopback bind or `DOCKER-USER`).
+///   * `false` — **SEC-066**: firewall is off, the port is exposed because
+///     nothing protects it; the fix is to enable a firewall.
+///
+/// The remediation differs, so the two cases are separate finding IDs. This
+/// struct carries the shared facts; scoring derives the ID from
+/// `firewall_was_active`.
+///
+/// Loopback bindings (`127.0.0.1:*`, `[::1]:*`) are never recorded —
+/// `detect_firewall_bypass` filters them out before constructing a finding.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct FirewallBypassFinding {
+    /// Container name as Docker reports it.
+    pub container: String,
+    /// The Docker-reported binding, verbatim, e.g. `"0.0.0.0:8080->80/tcp"`.
+    /// Kept as Docker shows it in `docker ps`, so the operator can match the
+    /// report line against their own terminal without translating formats.
+    pub published: String,
+    /// Host-side port from `published`.
+    pub host_port: u16,
+    /// Container-internal port from `published`, for the remediation hint.
+    pub container_port: u16,
+    /// `"tcp"` or `"udp"`.
+    pub protocol: String,
+    /// True when `host_port` is in the curated sensitive set
+    /// (database / cache / admin-plane ports). Drives the weight tier.
+    pub sensitive: bool,
+    /// Whether the host firewall was active at scan time. Mirrors
+    /// `network.firewall_active`; kept here so the finding is self-contained
+    /// when read from a report fragment or a diff.
+    pub firewall_was_active: bool,
+}
+
 // ── Provenance source (moved from provenance.rs for model visibility) ──
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -603,6 +648,14 @@ pub struct SecurityInfo {
     /// rootkits set it on /etc/ld.so.preload to survive remediation.
     #[serde(default)]
     pub immutable_anchors: Vec<ImmutableFlag>,
+
+    // ── SEC-065 / SEC-066: Docker firewall bypass ────────────────────────
+    /// Docker-published ports on a wildcard bind address, correlated with
+    /// the host firewall state at scan time. SEC-065 (firewall active,
+    /// Docker bypasses it) and SEC-066 (no firewall, port exposed) both
+    /// read from here; scoring derives the ID from `firewall_was_active`.
+    #[serde(default)]
+    pub firewall_bypass_findings: Vec<FirewallBypassFinding>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
