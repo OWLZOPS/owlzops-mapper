@@ -656,6 +656,10 @@ pub struct SecurityInfo {
     /// read from here; scoring derives the ID from `firewall_was_active`.
     #[serde(default)]
     pub firewall_bypass_findings: Vec<FirewallBypassFinding>,
+    /// SEC-070…079: account & credential hygiene. Populated by the
+    /// account_hygiene scanner, not by the security scanner itself.
+    #[serde(default)]
+    pub account_hygiene: AccountHygieneInfo,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -821,6 +825,67 @@ pub struct UserInfo {
     pub last_login: String,
     pub last_ssh_login: String,
     pub authorized_keys_count: usize,
+}
+
+// ── Account & credential hygiene (SEC-070…079) ────────────────────────
+
+/// A user whose password hash in `/etc/shadow` uses a deprecated
+/// algorithm: MD5-crypt, DES-crypt, or SHA-256-crypt. All three are
+/// brute-forceable on a modern GPU; yescrypt (`$y$`) or SHA-512 (`$6$`)
+/// is the expected baseline.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct WeakHashFinding {
+    pub username: String,
+    /// The raw algorithm prefix, e.g. `"$1$ (MD5-crypt)"`.
+    pub hash_type: String,
+    /// Human-readable reason.
+    pub description: String,
+}
+
+/// A credential file with permissions that let a non-root principal read
+/// or write what root trusts.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct CredentialFileIssue {
+    pub path: String,
+    /// Octal string, e.g. `"0644"`.
+    pub mode: String,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub reason: String,
+}
+
+/// A private SSH key readable by group or other.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct PrivateKeyFinding {
+    pub user: String,
+    pub path: String,
+    pub mode: String,
+}
+
+/// Account & credential hygiene findings (SEC-070…079). Populated by
+/// `scanners::account_hygiene::scan_account_hygiene`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct AccountHygieneInfo {
+    /// Users whose shadow hash is MD5/DES/SHA-256.
+    pub weak_password_hashes: Vec<WeakHashFinding>,
+    /// Users with an empty password field in `/etc/shadow`.
+    pub empty_password_users: Vec<String>,
+    /// Non-root users with UID 0.
+    pub duplicate_uid_zero: Vec<String>,
+    /// System accounts (UID < 1000) with an interactive shell.
+    pub system_accounts_with_shell: Vec<String>,
+    /// Permission issues on `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers.d/*`.
+    pub file_permission_issues: Vec<CredentialFileIssue>,
+    /// `~/.ssh/id_*` readable by group or other.
+    pub ssh_private_key_readable: Vec<PrivateKeyFinding>,
+    /// `~/.ssh/authorized_keys` writable by group or other.
+    pub authorized_keys_writable: Vec<String>,
+    /// `/root/.bash_history`, `/root/.zsh_history`, `/root/.ssh` readable by non-root.
+    pub root_dotfiles_readable: Vec<CredentialFileIssue>,
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Default)]

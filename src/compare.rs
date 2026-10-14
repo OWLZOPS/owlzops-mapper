@@ -1304,6 +1304,222 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // --- security.account_hygiene (SEC-070…079) ---
+    //
+    // Drift on the credential surface. Not compromise-class — a weak hash
+    // becoming present is not evidence of a compromise; the finding weight
+    // is what carries severity. Direction matters for every diff:
+    //   appearance of a hygiene problem → Degraded
+    //   removal                          → Improved
+    // except the cases R28-21 already established for disappearing
+    // inventory (system shell inventory is symmetric noise → Changed).
+    {
+        let b = &before.security.account_hygiene;
+        let a = &after.security.account_hygiene;
+
+        // Weak hashes — keyed by username. A user whose hash *algorithm*
+        // changes (e.g. re-hashing from MD5 to yescrypt) drops out of the
+        // set: that surfaces as Improved, which is the intended reading.
+        let b_weak: HashSet<&str> = b
+            .weak_password_hashes
+            .iter()
+            .map(|h| h.username.as_str())
+            .collect();
+        let a_weak: HashSet<&str> = a
+            .weak_password_hashes
+            .iter()
+            .map(|h| h.username.as_str())
+            .collect();
+        for user in a_weak.difference(&b_weak) {
+            changes.push(Change {
+                field: "security.account_hygiene.weak_password_hash".into(),
+                before: None,
+                after: Some(format!("{user} — weak hash")),
+                severity: Severity::Degraded,
+            });
+        }
+        for user in b_weak.difference(&a_weak) {
+            changes.push(Change {
+                field: "security.account_hygiene.weak_password_hash".into(),
+                before: Some(format!("{user} — weak hash")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+
+        // Empty passwords — same shape.
+        let b_ep: HashSet<&str> = b.empty_password_users.iter().map(String::as_str).collect();
+        let a_ep: HashSet<&str> = a.empty_password_users.iter().map(String::as_str).collect();
+        for user in a_ep.difference(&b_ep) {
+            changes.push(Change {
+                field: "security.account_hygiene.empty_password".into(),
+                before: None,
+                after: Some((*user).to_string()),
+                severity: Severity::Degraded,
+            });
+        }
+        for user in b_ep.difference(&a_ep) {
+            changes.push(Change {
+                field: "security.account_hygiene.empty_password".into(),
+                before: Some((*user).to_string()),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+
+        // Duplicate UID 0. New appears → Degraded; removed → Changed (not
+        // Improved: removal could be post-use cleanup). A non-root UID 0
+        // account is a persistence primitive, so its disappearance deserves
+        // an operator's eye either way. But `diff_str_set` classifies
+        // appearance as Degraded and disappearance as Improved, which is the
+        // standard disposition for set-valued fields — and matches how a
+        // real remediation of `/etc/passwd` reads. Use it.
+        diff_str_set(
+            &mut changes,
+            "security.account_hygiene.duplicate_uid_zero",
+            &b.duplicate_uid_zero,
+            &a.duplicate_uid_zero,
+        );
+
+        // System accounts with an interactive shell. Inventory noise: a
+        // package upgrade flipping `sync`'s shell is not an escalation by
+        // itself. Track in both directions as Changed, same rule R28-21
+        // applied to containers/listeners.
+        let b_sys: HashSet<&str> = b
+            .system_accounts_with_shell
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let a_sys: HashSet<&str> = a
+            .system_accounts_with_shell
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for entry in a_sys.difference(&b_sys) {
+            changes.push(Change {
+                field: "security.account_hygiene.system_shell_added".into(),
+                before: None,
+                after: Some((*entry).to_string()),
+                severity: Severity::Changed,
+            });
+        }
+        for entry in b_sys.difference(&a_sys) {
+            changes.push(Change {
+                field: "security.account_hygiene.system_shell_removed".into(),
+                before: Some((*entry).to_string()),
+                after: None,
+                severity: Severity::Changed,
+            });
+        }
+
+        // Credential-file permissions — keyed by path. A mode change on the
+        // same path is Degraded (the check is one-way: the only modes that
+        // surface are the unsafe ones, so a change can only be worse or
+        // cosmetic). A path that stops being reported is Improved.
+        let key = |f: &crate::models::CredentialFileIssue| f.path.clone();
+        let b_perm: HashMap<String, &crate::models::CredentialFileIssue> = b
+            .file_permission_issues
+            .iter()
+            .map(|f| (key(f), f))
+            .collect();
+        let a_perm: HashMap<String, &crate::models::CredentialFileIssue> = a
+            .file_permission_issues
+            .iter()
+            .map(|f| (key(f), f))
+            .collect();
+        for (path, f) in &a_perm {
+            match b_perm.get(path) {
+                None => changes.push(Change {
+                    field: "security.account_hygiene.file_permissions".into(),
+                    before: None,
+                    after: Some(format!("{path} now mode {}", f.mode)),
+                    severity: Severity::Degraded,
+                }),
+                Some(prev) if prev.mode != f.mode => changes.push(Change {
+                    field: "security.account_hygiene.file_permissions".into(),
+                    before: Some(format!("{path} was {}", prev.mode)),
+                    after: Some(format!("{path} now {}", f.mode)),
+                    severity: Severity::Degraded,
+                }),
+                _ => {}
+            }
+        }
+        for path in b_perm.keys().filter(|p| !a_perm.contains_key(*p)) {
+            changes.push(Change {
+                field: "security.account_hygiene.file_permissions".into(),
+                before: Some(format!("{path} unsafe")),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+
+        // SSH private keys — keyed by path.
+        let b_pk: HashSet<&str> = b
+            .ssh_private_key_readable
+            .iter()
+            .map(|k| k.path.as_str())
+            .collect();
+        let a_pk: HashSet<&str> = a
+            .ssh_private_key_readable
+            .iter()
+            .map(|k| k.path.as_str())
+            .collect();
+        for path in a_pk.difference(&b_pk) {
+            changes.push(Change {
+                field: "security.account_hygiene.private_key".into(),
+                before: None,
+                after: Some((*path).to_string()),
+                severity: Severity::Degraded,
+            });
+        }
+        for path in b_pk.difference(&a_pk) {
+            changes.push(Change {
+                field: "security.account_hygiene.private_key".into(),
+                before: Some((*path).to_string()),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+
+        // authorized_keys writable by non-owner.
+        diff_str_set(
+            &mut changes,
+            "security.account_hygiene.authorized_keys_writable",
+            &b.authorized_keys_writable,
+            &a.authorized_keys_writable,
+        );
+
+        // /root dotfiles readable by non-root. Set of paths; new is Degraded,
+        // gone is Improved — the check is one-way (only unsafe paths land
+        // here), so a disappearance is a real remediation.
+        let b_rd: HashSet<&str> = b
+            .root_dotfiles_readable
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        let a_rd: HashSet<&str> = a
+            .root_dotfiles_readable
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        for path in a_rd.difference(&b_rd) {
+            changes.push(Change {
+                field: "security.account_hygiene.root_dotfiles".into(),
+                before: None,
+                after: Some((*path).to_string()),
+                severity: Severity::Degraded,
+            });
+        }
+        for path in b_rd.difference(&a_rd) {
+            changes.push(Change {
+                field: "security.account_hygiene.root_dotfiles".into(),
+                before: Some((*path).to_string()),
+                after: None,
+                severity: Severity::Improved,
+            });
+        }
+    }
+
     // --- security.ftrace_hooks (SEC-041 drift) ---
     {
         let before_h: HashSet<&str> = before

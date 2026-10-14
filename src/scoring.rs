@@ -67,7 +67,10 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 /// inputs (20/25 non-sensitive, 35/25 sensitive). Same rule as v15/v16:
 /// pairs spanning this version are a collection-semantics change, not
 /// real drift. The version tag ships with the release that introduces it.
-pub const SCORING_VERSION: u8 = 17;
+/// v18 (unreleased): SEC-070…079 — account & credential hygiene. New
+/// weighted inputs; pairs spanning this version are a collection-semantics
+/// change, not real drift (R33-12 rule).
+pub const SCORING_VERSION: u8 = 18;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
 /// Truncate a list of items for display, appending "+N more" if beyond limit.
@@ -2781,6 +2784,218 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
         }
     }
 
+    // ── SEC-070…079: account & credential hygiene ───────────────────────
+    //
+    // Ten checks over /etc/passwd, /etc/shadow, /etc/gshadow, ~/.ssh/*, and
+    // /etc/sudoers.d/*. Populated by `scanners::account_hygiene` and read
+    // here — the weights live in this file so `--accept` and compare see one
+    // source of truth, same as every other rule.
+    //
+    // Not compromise-class: an empty password is an open door, not evidence
+    // someone walked through it. The findings drive exit 1 by score, never 3.
+    // None of the IDs appear in COMPROMISE_IDS.
+    {
+        let ah = &report.security.account_hygiene;
+
+        // SEC-070: weak password hashes. Two tiers — MD5/DES at 20,
+        // SHA-256-crypt at 10 — max weight across the entries, matching
+        // how SEC-036/037 collapse per-file severities into one finding.
+        if !ah.weak_password_hashes.is_empty() {
+            let weight = if ah
+                .weak_password_hashes
+                .iter()
+                .any(|h| h.hash_type.starts_with("DES") || h.hash_type.starts_with("$1$"))
+            {
+                20
+            } else {
+                10
+            };
+            let list = ah
+                .weak_password_hashes
+                .iter()
+                .take(6)
+                .map(|h| format!("{}: {}", h.username, h.hash_type))
+                .collect::<Vec<_>>();
+            findings.push(Finding {
+                id: "SEC-070",
+                source: Scanner::Security,
+                title: "Weak password hash algorithm in /etc/shadow".to_string(),
+                category: Category::Security,
+                weight,
+                evidence: format!(
+                    "{} user(s): {}",
+                    ah.weak_password_hashes.len(),
+                    evidence_list(&list, 6)
+                ),
+                suppressed: None,
+                cis_ref: Some("CIS 5.4.4"),
+            });
+        }
+
+        // SEC-071: empty password field. Account logs in with no password.
+        if !ah.empty_password_users.is_empty() {
+            findings.push(Finding {
+                id: "SEC-071",
+                source: Scanner::Security,
+                title: "Account with no password (empty shadow field)".to_string(),
+                category: Category::Security,
+                weight: 40,
+                evidence: format!(
+                    "{} user(s): {}",
+                    ah.empty_password_users.len(),
+                    evidence_list(&ah.empty_password_users, 8)
+                ),
+                suppressed: None,
+                cis_ref: Some("CIS 5.4.2"),
+            });
+        }
+
+        // SEC-072: duplicate UID 0. Persistence flag or forgotten backup.
+        if !ah.duplicate_uid_zero.is_empty() {
+            findings.push(Finding {
+                id: "SEC-072",
+                source: Scanner::Security,
+                title: "Non-root account with UID 0".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: format!(
+                    "{} user(s): {}",
+                    ah.duplicate_uid_zero.len(),
+                    evidence_list(&ah.duplicate_uid_zero, 6)
+                ),
+                suppressed: None,
+                cis_ref: Some("CIS 5.5.2"),
+            });
+        }
+
+        // SEC-073: system account with an interactive shell.
+        if !ah.system_accounts_with_shell.is_empty() {
+            findings.push(Finding {
+                id: "SEC-073",
+                source: Scanner::Security,
+                title: "System account with interactive shell".to_string(),
+                category: Category::Security,
+                weight: 5,
+                evidence: format!(
+                    "{} account(s): {}",
+                    ah.system_accounts_with_shell.len(),
+                    evidence_list(&ah.system_accounts_with_shell, 8)
+                ),
+                suppressed: None,
+                cis_ref: Some("CIS 5.4.2"),
+            });
+        }
+
+        // SEC-074/075/076: credential file permissions. Reason-driven:
+        // `path` inside the issue decides which finding it lands in.
+        let mut perm_074: Vec<String> = Vec::new();
+        let mut perm_075: Vec<String> = Vec::new();
+        let mut perm_076: Vec<String> = Vec::new();
+        for f in &ah.file_permission_issues {
+            let entry = format!("{} (mode {}, {})", f.path, f.mode, f.reason);
+            if f.path == "/etc/shadow" {
+                perm_074.push(entry);
+            } else if f.path == "/etc/gshadow" {
+                perm_075.push(entry);
+            } else if f.path.starts_with("/etc/sudoers.d/") {
+                perm_076.push(entry);
+            }
+        }
+        if !perm_074.is_empty() {
+            findings.push(Finding {
+                id: "SEC-074",
+                source: Scanner::Security,
+                title: "/etc/shadow readable by non-root".to_string(),
+                category: Category::Security,
+                weight: 15,
+                evidence: evidence_list(&perm_074, 4),
+                suppressed: None,
+                cis_ref: Some("CIS 1.8.1"),
+            });
+        }
+        if !perm_075.is_empty() {
+            findings.push(Finding {
+                id: "SEC-075",
+                source: Scanner::Security,
+                title: "/etc/gshadow readable by non-root".to_string(),
+                category: Category::Security,
+                weight: 10,
+                evidence: evidence_list(&perm_075, 4),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+        if !perm_076.is_empty() {
+            findings.push(Finding {
+                id: "SEC-076",
+                source: Scanner::Security,
+                title: "sudoers.d file has unsafe permissions".to_string(),
+                category: Category::Security,
+                weight: 15,
+                evidence: evidence_list(&perm_076, 6),
+                suppressed: None,
+                cis_ref: Some("CIS 1.8.2"),
+            });
+        }
+
+        // SEC-077: SSH private key readable by non-owner.
+        if !ah.ssh_private_key_readable.is_empty() {
+            let list = ah
+                .ssh_private_key_readable
+                .iter()
+                .take(6)
+                .map(|k| format!("{} (mode {})", k.path, k.mode))
+                .collect::<Vec<_>>();
+            findings.push(Finding {
+                id: "SEC-077",
+                source: Scanner::Security,
+                title: "SSH private key readable by group or other".to_string(),
+                category: Category::Security,
+                weight: 20,
+                evidence: format!(
+                    "{} key(s): {}",
+                    ah.ssh_private_key_readable.len(),
+                    evidence_list(&list, 6)
+                ),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // SEC-078: authorized_keys writable by non-owner.
+        if !ah.authorized_keys_writable.is_empty() {
+            findings.push(Finding {
+                id: "SEC-078",
+                source: Scanner::Security,
+                title: "authorized_keys writable by non-owner".to_string(),
+                category: Category::Security,
+                weight: 25,
+                evidence: evidence_list(&ah.authorized_keys_writable, 6),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+
+        // SEC-079: /root dotfiles readable by non-root.
+        if !ah.root_dotfiles_readable.is_empty() {
+            let list = ah
+                .root_dotfiles_readable
+                .iter()
+                .map(|f| format!("{} (mode {}, {})", f.path, f.mode, f.reason))
+                .collect::<Vec<_>>();
+            findings.push(Finding {
+                id: "SEC-079",
+                source: Scanner::Security,
+                title: "/root dotfile readable by non-root".to_string(),
+                category: Category::Security,
+                weight: 10,
+                evidence: evidence_list(&list, 6),
+                suppressed: None,
+                cis_ref: None,
+            });
+        }
+    }
+
     let mut has_socket_or_root = false;
     let mut has_sensitive_rw = false;
 
@@ -3798,7 +4013,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .unwrap();
-        assert_eq!((SCORING_VERSION, f.weight), (17, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (18, 15));
     }
 
     #[test]
@@ -3815,7 +4030,7 @@ mod tests {
             .into_iter()
             .find(|f| f.id == "SEC-005")
             .expect("SEC-005 fires");
-        assert_eq!((SCORING_VERSION, f.weight), (17, 15));
+        assert_eq!((SCORING_VERSION, f.weight), (18, 15));
     }
 
     #[test]
@@ -4632,9 +4847,9 @@ mod tests {
     fn failed_scanner_does_not_hide_independent_findings() {
         let mut r = minimal_report();
         r.packages.upgradable.push(UpgradablePackage {
-            name: "libc".into(),
-            current_version: "1.0".into(),
-            new_version: "1.1".into(),
+            name: "libc".to_string(),
+            current_version: "1.0".to_string(),
+            new_version: "1.1".to_string(),
             is_security: true,
         });
         r.failed_scanners = vec!["security".to_string()];

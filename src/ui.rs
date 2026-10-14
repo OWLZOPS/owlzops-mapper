@@ -237,6 +237,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool, acceptances: Option
     render_mount_namespace_anomalies(report, verbose);
     render_ssl_certificates(report);
     render_shell_users(report);
+    render_account_hygiene(report, &theme);
     render_system_internals(report);
     render_packages(report);
     render_runtime(report);
@@ -1230,6 +1231,145 @@ fn render_shell_users(report: &AgentReport) {
     }
     outln!("Shell Users & SSH Access:");
     outln!("{t_users}\n");
+}
+
+// ── SEC-070…079: account & credential hygiene ─────────────────────────────
+
+/// One table with a row per category, only for categories that produced a
+/// finding. A host with none of these problems sees nothing.
+fn render_account_hygiene(report: &AgentReport, theme: &Theme) {
+    let ah = &report.security.account_hygiene;
+    let has_anything = !ah.weak_password_hashes.is_empty()
+        || !ah.empty_password_users.is_empty()
+        || !ah.duplicate_uid_zero.is_empty()
+        || !ah.system_accounts_with_shell.is_empty()
+        || !ah.file_permission_issues.is_empty()
+        || !ah.ssh_private_key_readable.is_empty()
+        || !ah.authorized_keys_writable.is_empty()
+        || !ah.root_dotfiles_readable.is_empty();
+    if !has_anything {
+        return;
+    }
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        cell("Account Hygiene")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        cell("Issue").add_attribute(Attribute::Bold),
+        cell("Details").add_attribute(Attribute::Bold),
+    ]);
+
+    if !ah.empty_password_users.is_empty() {
+        t.add_row(vec![
+            cell("Empty password")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold),
+            cell(format!("{} user(s)", ah.empty_password_users.len())),
+            cell(ah.empty_password_users.join(", ")).fg(Color::Red),
+        ]);
+    }
+    if !ah.weak_password_hashes.is_empty() {
+        let list = ah
+            .weak_password_hashes
+            .iter()
+            .take(6)
+            .map(|h| format!("{} ({})", h.username, h.hash_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.add_row(vec![
+            cell("Weak hash").fg(Color::Red),
+            cell(format!("{} user(s)", ah.weak_password_hashes.len())),
+            cell(list).fg(Color::Yellow),
+        ]);
+    }
+    if !ah.duplicate_uid_zero.is_empty() {
+        t.add_row(vec![
+            cell("UID 0").fg(Color::Red).add_attribute(Attribute::Bold),
+            cell(format!("{} account(s)", ah.duplicate_uid_zero.len())),
+            cell(ah.duplicate_uid_zero.join(", ")),
+        ]);
+    }
+    if !ah.system_accounts_with_shell.is_empty() {
+        let list = ah
+            .system_accounts_with_shell
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.add_row(vec![
+            cell("System shell").fg(Color::Yellow),
+            cell(format!(
+                "{} account(s)",
+                ah.system_accounts_with_shell.len()
+            )),
+            cell(list),
+        ]);
+    }
+    if !ah.file_permission_issues.is_empty() {
+        let list = ah
+            .file_permission_issues
+            .iter()
+            .take(4)
+            .map(|f| format!("{} ({})", f.path, f.mode))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.add_row(vec![
+            cell("Permissions").fg(Color::Red),
+            cell(format!("{} file(s)", ah.file_permission_issues.len())),
+            cell(list),
+        ]);
+    }
+    if !ah.ssh_private_key_readable.is_empty() {
+        let list = ah
+            .ssh_private_key_readable
+            .iter()
+            .take(4)
+            .map(|k| format!("{} ({})", k.path, k.mode))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.add_row(vec![
+            cell("Private key").fg(Color::Red),
+            cell(format!("{} key(s)", ah.ssh_private_key_readable.len())),
+            cell(list),
+        ]);
+    }
+    if !ah.authorized_keys_writable.is_empty() {
+        let list = ah
+            .authorized_keys_writable
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.add_row(vec![
+            cell("auth_keys writable")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold),
+            cell(format!("{} file(s)", ah.authorized_keys_writable.len())),
+            cell(list),
+        ]);
+    }
+    if !ah.root_dotfiles_readable.is_empty() {
+        let list = ah
+            .root_dotfiles_readable
+            .iter()
+            .map(|f| format!("{} ({})", f.path, f.mode))
+            .collect::<Vec<_>>()
+            .join(", ");
+        t.add_row(vec![
+            cell("Root files").fg(Color::Yellow),
+            cell(format!("{} path(s)", ah.root_dotfiles_readable.len())),
+            cell(list),
+        ]);
+    }
+
+    outln!(
+        "{}Account & Credential Hygiene (SEC-070…079):",
+        theme.warn_sm
+    );
+    outln!("{t}\n");
 }
 
 fn render_system_internals(report: &AgentReport) {

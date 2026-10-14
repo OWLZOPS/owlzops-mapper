@@ -728,6 +728,14 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         Vec::new()
     };
 
+    // --- SEC-070…079: account & credential hygiene ------------------------
+    // Independent scanner: reads /etc/passwd, /etc/shadow, /etc/gshadow,
+    // stats a handful of credential paths and per-user SSH files. Non-root
+    // runs get partial coverage (shadow unreadable) rather than a false
+    // "clean" reading; the permission and SSH checks still run because
+    // stat() does not require the file to be readable.
+    let account_hygiene = crate::scanners::account_hygiene::scan_account_hygiene();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -778,6 +786,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         immutable_anchors: crate::scanners::immutable::scan_immutable_anchors(),
         // ── SEC-065 / SEC-066: cross-reference, filled by runner.rs ──
         firewall_bypass_findings: Vec::new(),
+        // ── SEC-070…079: account & credential hygiene (this scanner) ──
+        account_hygiene,
     }
 }
 
