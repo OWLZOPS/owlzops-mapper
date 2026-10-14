@@ -54,6 +54,15 @@ fn is_system_uid(uid: u32) -> bool {
     uid < SYSTEM_UID_THRESHOLD
 }
 
+/// `true` when this is a non-root system account that should not have an
+/// interactive shell. UID 0 is excluded: CIS 5.4.2's own audit command
+/// excludes `root`, because an interactive shell on root is required for
+/// break-glass recovery. Without this exclusion every host pays the SEC-073
+/// weight for a correct configuration.
+fn is_system_account_with_shell(uid: u32, shell: &str) -> bool {
+    uid != 0 && is_system_uid(uid) && INTERACTIVE_SHELLS.contains(&shell)
+}
+
 /// Classify a shadow hash field. `None` = locked / no password marker
 /// (`!`, `*`, `!!`) — not a weak hash, not an empty password. Empty string
 /// is handled separately by the caller as SEC-071.
@@ -284,13 +293,17 @@ pub fn scan_account_hygiene() -> AccountHygieneInfo {
                 if uid == 0 && user != "root" {
                     duplicate_uid_zero.push(user.to_string());
                 }
-                // System account with an interactive shell.
-                if is_system_uid(uid) && INTERACTIVE_SHELLS.contains(&shell) {
+                // Non-root system account with an interactive shell.
+                if is_system_account_with_shell(uid, shell) {
                     system_accounts_with_shell.push(format!("{user} ({shell})"));
                 }
                 // Collect homes for the per-user SSH checks — only for
                 // accounts that have an interactive shell, otherwise we
-                // would stat dozens of /var/lib/... directories.
+                // would stat dozens of /var/lib/... directories. Root is
+                // included: its authorized_keys and private keys are the
+                // most sensitive on the host, and CIS 5.4.2's exclusion of
+                // root applies to the shell check only (SEC-073), not to
+                // SEC-077 / SEC-078.
                 if INTERACTIVE_SHELLS.contains(&shell) {
                     per_user_homes.push((user.to_string(), home.to_string()));
                 }
@@ -477,6 +490,23 @@ mod tests {
         assert!(is_system_uid(999));
         assert!(!is_system_uid(1000));
         assert!(!is_system_uid(65534));
+    }
+
+    #[test]
+    fn root_with_interactive_shell_is_not_flagged() {
+        // CIS 5.4.2's audit command excludes `root`. An interactive shell
+        // on root is required for break-glass recovery; flagging it charges
+        // every host +5 for a correct configuration.
+        assert!(!is_system_account_with_shell(0, "/bin/bash"));
+        assert!(!is_system_account_with_shell(0, "/bin/sh"));
+        // Non-root system accounts with a shell remain findings.
+        assert!(is_system_account_with_shell(987, "/bin/sh")); // plasma-setup
+        assert!(is_system_account_with_shell(999, "/bin/bash"));
+        // Normal users are not "system accounts".
+        assert!(!is_system_account_with_shell(1000, "/bin/bash"));
+        // System accounts with a nologin shell are correct.
+        assert!(!is_system_account_with_shell(999, "/sbin/nologin"));
+        assert!(!is_system_account_with_shell(999, "/bin/false"));
     }
 
     #[test]
