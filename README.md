@@ -49,6 +49,7 @@ Built because running six different tools still left the question "is something 
 - **Ghost PIDs / LKM rootkits** (`--deep`) — true hidden processes via `/proc` discrepancies
 - **Container escapes** — `docker.sock` / Podman socket mounts, privileged containers, dangerous capabilities, missing resource limits
 - **Docker published ports bypassing the firewall** — container ports reachable from the network even when `ufw status` reports `active` (`SEC-065` / `SEC-066`, see below)
+- **Account & credential hygiene** — weak password hashes, empty password fields, duplicate UID 0, system accounts with a login shell, unsafe permissions on `/etc/shadow`, `~/.ssh/*`, `/etc/sudoers.d/*` (`SEC-070…079`, see below)
 - **Classic landmines** — SSH root login + password auth, `sudo NOPASSWD:ALL`, wide-open listeners, disabled firewall
 - **CIS-mapped findings** with evidence and penalty scores
 - **Drift** — snapshot → compare → colour-coded Excel or terminal diff
@@ -303,6 +304,62 @@ scanner:
 ]
 ```
 
+### Account & credential hygiene
+
+Weak password hashes, an empty password field, duplicate UID 0 accounts,
+system accounts with a login shell, and unsafe permissions on
+`/etc/shadow`, `~/.ssh/*`, `/etc/sudoers.d/*`. The set of checks a
+security auditor opens with — every one of them a concrete remediation
+(`chmod`, `passwd -l`, `usermod -s /usr/sbin/nologin`, switch to
+yescrypt).
+
+The dashboard renders one table with only the categories that fired; a
+clean host shows nothing.
+
+```
+⚠️ Account & Credential Hygiene (SEC-070…079):
+╭──────────────────┬──────────────┬─────────────────────────────────────────────╮
+│ Account Hygiene  ┆ Issue        ┆ Details                                     │
+╞══════════════════╪══════════════╪═════════════════════════════════════════════╡
+│ Empty password   ┆ 2 user(s)    ┆ backup, sync                                │
+│ Weak hash        ┆ 3 user(s)    ┆ alice ($1$ (MD5-crypt)), bob ($5$ (...)), … │
+│ Permissions      ┆ 1 file(s)    ┆ /etc/sudoers.d/90-deploy (0664)             │
+│ auth_keys wri…   ┆ 1 file(s)    ┆ deploy: /home/deploy/.ssh/authorized_keys … │
+╰──────────────────┴──────────────┴─────────────────────────────────────────────╯
+```
+
+| ID | Finding | Weight |
+|---|---|---|
+| **SEC-070** | Weak password hash (MD5/DES/SHA-256) | +10 (MD5/DES +20) |
+| **SEC-071** | Empty password in `/etc/shadow` | +40 |
+| **SEC-072** | Non-root account with UID 0 | +25 |
+| **SEC-073** | System account with interactive shell | +5 |
+| **SEC-074** | `/etc/shadow` readable by non-root | +15 |
+| **SEC-075** | `/etc/gshadow` readable by non-root | +10 |
+| **SEC-076** | `/etc/sudoers.d/*` unsafe permissions | +15 |
+| **SEC-077** | SSH private key readable by group/other | +20 |
+| **SEC-078** | `authorized_keys` writable by non-owner | +25 |
+| **SEC-079** | `/root` dotfile readable by non-root | +10 |
+
+None of these are compromise-class: they are hygiene, not evidence of an
+active compromise. The scanner never escalates them to exit code 3.
+
+Non-root scans: `/etc/shadow` is unreadable, which is recorded as a
+coverage warning and *not* counted as "no weak hashes". The permission
+and SSH key checks still run — `stat()` does not require the file to be
+readable.
+
+A legitimate second root (BSD-style `toor`, or a break-glass account) is
+accepted with an `--accept` rule on SEC-072, not by silencing the check:
+
+```json
+[
+  { "finding_id": "SEC-072", "host": "*",
+    "justification": "break-glass recovery account, login audited",
+    "expires": "2026-12-31", "ticket": "OPS-4242" }
+]
+```
+
 ### Snapshot & drift
 
 ```bash
@@ -378,6 +435,13 @@ is preserved. A pipeline that never opted in keeps working.
 - Privileged containers, dangerous capabilities, sensitive host mounts
 - Missing resource limits, OOM kills, restart loops, health status
 - Published ports cross-referenced with the host firewall state (SEC-065 / SEC-066)
+
+**Account & credential hygiene**
+- Weak password hashes (`$1$`, `$5$`, DES), empty password fields, duplicate UID 0
+- System accounts with an interactive shell
+- Credential-file permissions: `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers.d/*`
+- SSH private keys readable by group/other; `authorized_keys` writable by non-owner
+- `/root` dotfiles readable by non-root (SEC-070…079)
 
 **Operational**
 - Agentless SSH fleet orchestration — parallel, automatic cleanup
@@ -503,6 +567,20 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Sudoers permissions not 0440 | +5 |
 | Sysctl security issues | +5 per issue (context-sensitive) |
 
+**Account & credential hygiene**
+
+| Finding | Penalty |
+| --- | --- |
+| Empty password in `/etc/shadow` | +40 |
+| Non-root UID 0 account | +25 |
+| `authorized_keys` writable by non-owner | +25 |
+| Weak password hash (MD5/DES) | +20 |
+| SSH private key readable by non-owner | +20 |
+| `/etc/shadow` or `/etc/sudoers.d/*` unsafe permissions | +15 |
+| `/etc/gshadow` unsafe permissions, `/root` dotfiles readable | +10 |
+| Weak password hash (SHA-256-crypt) | +10 |
+| System account with interactive shell | +5 |
+
 **Containers**
 
 | Finding | Penalty |
@@ -576,7 +654,7 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Category | Details |
 |----------|---------|
 | Malware & Intrusion | `/proc` sweep, memfd, deleted executables, reverse shells, library injection, hidden PIDs, bind-mount masking |
-| Security | SSH config, root login, password auth, sudo/NOPASSWD, sudoers permissions, sysctl, fail2ban/auditd |
+| Security | SSH config, root login, password auth, sudo/NOPASSWD, sudoers permissions, sysctl, fail2ban/auditd, account & credential hygiene (SEC-070…079) |
 | Network | Listening ports + bind address, firewall state, DNS, TLS certificate expiry |
 | Docker / Podman | Privileged flag, capabilities, sensitive mounts, resource limits, OOM, health, socket exposure, published ports vs host firewall |
 | Kernel | Taint flags, hidden modules, ftrace syscall hooks, LSM confinement downgrade |

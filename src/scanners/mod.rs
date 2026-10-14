@@ -42,6 +42,8 @@ pub mod storage;
 pub(crate) mod sudoers;
 
 #[cfg(feature = "local-scan")]
+pub mod account_hygiene;
+#[cfg(feature = "local-scan")]
 mod confinement;
 #[cfg(feature = "local-scan")]
 pub mod docker_firewall_bypass;
