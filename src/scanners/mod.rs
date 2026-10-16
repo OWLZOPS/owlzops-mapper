@@ -72,4 +72,6 @@ pub mod pam;
 #[cfg(feature = "local-scan")]
 pub mod preload;
 #[cfg(feature = "local-scan")]
+mod systemd_hardening;
+#[cfg(feature = "local-scan")]
 pub mod systemd_state;

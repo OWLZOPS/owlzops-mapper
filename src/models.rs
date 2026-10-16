@@ -660,6 +660,10 @@ pub struct SecurityInfo {
     /// account_hygiene scanner, not by the security scanner itself.
     #[serde(default)]
     pub account_hygiene: AccountHygieneInfo,
+    /// SEC-081: running systemd services below the hardening baseline.
+    /// Populated by `scanners::systemd_hardening`.
+    #[serde(default)]
+    pub systemd_hardening: Vec<HardeningFinding>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -886,6 +890,33 @@ pub struct AccountHygieneInfo {
     pub authorized_keys_writable: Vec<String>,
     /// `/root/.bash_history`, `/root/.zsh_history`, `/root/.ssh` readable by non-root.
     pub root_dotfiles_readable: Vec<CredentialFileIssue>,
+}
+
+// ── systemd unit hardening (SEC-081) ──────────────────────────────────
+
+/// One running systemd service whose *effective* hardening posture is
+/// weaker than the project baseline, plus the missing directives that
+/// got it there. Populated by `scanners::systemd_hardening`.
+///
+/// Empty `missing` never appears: units that pass every check are
+/// dropped, not emitted with an empty vector.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+pub struct HardeningFinding {
+    /// Unit name, e.g. `nginx.service`.
+    pub unit: String,
+    /// Directives not set to their hardened value on this unit, in the
+    /// order they are declared in `DIRECTIVES` (most severe first).
+    pub missing: Vec<String>,
+    /// Pre-cap sum of per-directive weights. `scoring.rs` caps the
+    /// aggregate at 25, so this is an upper bound, not a score.
+    pub raw_weight: u8,
+    /// Effective `User=`. Empty string means root (systemd default).
+    pub user: String,
+    /// Value of `FragmentPath=` — where systemd loaded the unit from.
+    /// `/usr/lib/systemd/system/...` for vendor units, `/etc/systemd/system/...`
+    /// for operator units.
+    pub fragment_path: String,
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Default)]

@@ -736,6 +736,13 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
     // stat() does not require the file to be readable.
     let account_hygiene = crate::scanners::account_hygiene::scan_account_hygiene();
 
+    // ── SEC-081: systemd hardening posture ────────────────────────────────
+    // Enumerates running services via `systemctl list-units` and reads
+    // effective hardening directives via `systemctl show`. Non-systemd
+    // hosts (containers, minimal images) yield a coverage warning, not a
+    // false "clean" reading.
+    let systemd_hardening = crate::scanners::systemd_hardening::scan_systemd_hardening();
+
     SecurityInfo {
         ssh_password_auth_enabled,
         ssh_root_login_enabled,
@@ -788,6 +795,8 @@ pub fn gather_security_info(deep: bool, verdict_cache: Option<PathBuf>) -> Secur
         firewall_bypass_findings: Vec::new(),
         // ── SEC-070…079: account & credential hygiene (this scanner) ──
         account_hygiene,
+        // ── SEC-081: systemd hardening posture (this scanner) ──
+        systemd_hardening,
     }
 }
 
