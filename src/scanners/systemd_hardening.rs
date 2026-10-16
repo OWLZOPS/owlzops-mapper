@@ -60,6 +60,23 @@ fn is_systemd_internal(unit: &str) -> bool {
     unit.starts_with("systemd-")
 }
 
+/// `true` for units an operator does not configure and cannot usefully
+/// harden: transient units, per-user systemd managers, and D-Bus
+/// activation units. These are runtime artifacts, not service posture.
+///
+/// Transient units live in `/run/systemd/transient/` and are spawned and
+/// destroyed by D-Bus activation; `user@*.service` runs the per-user
+/// systemd instance, whose hardening boundary is the user's own session,
+/// not the host's; `dbus-:*` are the D-Bus activations themselves. All
+/// three produce findings an operator cannot act on, and 39-row walls in
+/// the dashboard are exactly what the project's "one noisy category must
+/// not hide a real problem" rule exists to prevent.
+fn is_runtime_artifact(unit: &str, fragment_path: &str) -> bool {
+    unit.starts_with("user@")
+        || unit.starts_with("dbus-:")
+        || fragment_path.starts_with("/run/systemd/transient/")
+}
+
 /// `true` when the effective value of `directive` shows the unit is *not*
 /// hardened on that axis. Directive-specific because systemd uses
 /// different value vocabularies per directive: a boolean for
@@ -193,8 +210,21 @@ pub fn scan_systemd_hardening() -> Vec<HardeningFinding> {
         let stdout = String::from_utf8_lossy(&output);
         let props = parse_show(&stdout);
 
+        let fragment_path = props.get("FragmentPath").cloned().unwrap_or_default();
+
+        // Runtime artifacts are skipped AFTER the show call, not before:
+        // `FragmentPath` is the canonical signal that a unit is transient,
+        // and it is not visible in `list-units --plain` output.
+        if is_runtime_artifact(unit, &fragment_path) {
+            continue;
+        }
+
+        // `systemctl show -p User` emits either a name ("root", "sssd")
+        // or the numeric uid ("0", "1000"). Both forms of root must land
+        // in the ROOT_IRRELEVANT filter — otherwise `user@0.service`
+        // and similar carry `NoNewPrivileges`/`ProtectHome` noise.
         let user = props.get("User").map(String::as_str).unwrap_or("");
-        let is_root = user.is_empty() || user == "root";
+        let is_root = user.is_empty() || user == "root" || user == "0";
 
         let mut missing = Vec::new();
         let mut raw_weight: u16 = 0;
@@ -227,7 +257,7 @@ pub fn scan_systemd_hardening() -> Vec<HardeningFinding> {
             } else {
                 user.to_string()
             },
-            fragment_path: props.get("FragmentPath").cloned().unwrap_or_default(),
+            fragment_path,
         });
     }
 
@@ -261,6 +291,39 @@ mod tests {
         // not an internal unit.
         assert!(!is_systemd_internal("systemd.service"));
         assert!(!is_systemd_internal("mysystemd-agent.service"));
+    }
+
+    #[test]
+    fn runtime_artifacts_are_skipped() {
+        // Per-user systemd manager.
+        assert!(is_runtime_artifact(
+            "user@1000.service",
+            "/usr/lib/systemd/system/user@.service"
+        ));
+        assert!(is_runtime_artifact(
+            "user@0.service",
+            "/usr/lib/systemd/system/user@.service"
+        ));
+        // D-Bus activation, name form.
+        assert!(is_runtime_artifact(
+            "dbus-:1.12-org.freedesktop.problems@0.service",
+            "/run/systemd/transient/dbus-:1.12-org.freedesktop.problems@0.service"
+        ));
+        // Transient unit with an unexpected name — the FragmentPath check
+        // is the backstop when the name-based filter does not fire.
+        assert!(is_runtime_artifact(
+            "weird.service",
+            "/run/systemd/transient/weird.service"
+        ));
+        // Real services are not filtered.
+        assert!(!is_runtime_artifact(
+            "nginx.service",
+            "/usr/lib/systemd/system/nginx.service"
+        ));
+        assert!(!is_runtime_artifact(
+            "sssd-kcm.service",
+            "/usr/lib/systemd/system/sssd-kcm.service"
+        ));
     }
 
     #[test]
