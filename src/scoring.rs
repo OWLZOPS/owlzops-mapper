@@ -42,38 +42,38 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 ///   fires on hosts whose backup tool is configured but was previously
 ///   undetectable under env_clear() (R26-03). Same host, different score.
 /// v13 (0.5.36): R27-16 extended `is_sensitive_key` with suffix rules, so
-/// SEC-014 now fires on hosts where it previously produced no finding.
-/// R27-25 splits self-attributed leaks out of SEC-014 into SEC-058 (weight 0),
-/// so a host whose only leak was the scanner's own environment now scores lower.
-/// Snapshot pairs spanning this version must be flagged as a collection-
-/// semantics change, not reported as real drift (R27-24).
+///   SEC-014 now fires on hosts where it previously produced no finding.
+///   R27-25 splits self-attributed leaks out of SEC-014 into SEC-058 (weight 0),
+///   so a host whose only leak was the scanner's own environment now scores lower.
+///   Snapshot pairs spanning this version must be flagged as a collection-
+///   semantics change, not reported as real drift (R27-24).
 /// v14 (0.5.36): split short-lived secret leaks out of SEC-014 into SEC-059
-/// (weight 0), evidence now includes the age threshold.
+///   (weight 0), evidence now includes the age threshold.
 /// v15 (unreleased): SEC-005 now fires on `Defaults !authenticate` (R33-04)
-/// and `self_sudo_target` no longer excludes multi-command rules (R33-03) —
-/// the same sudoers input can score differently, so pairs spanning this
-/// version are a collection-semantics change, not drift (R33-12). Also:
-/// SEC-061 added (R33-QW-7); SEC-005's ALL/PRIVESC tier, SEC-012 and SEC-061
-/// form one passwordless-root class carried by a single weighted finding
-/// (R34-01) — multi-carrier hosts score lower, SEC-061-only hosts +5. Tag
-/// the release number when the version actually ships; do not backfill it
-/// here.
+///   and `self_sudo_target` no longer excludes multi-command rules (R33-03) —
+///   the same sudoers input can score differently, so pairs spanning this
+///   version are a collection-semantics change, not drift (R33-12). Also:
+///   SEC-061 added (R33-QW-7); SEC-005's ALL/PRIVESC tier, SEC-012 and SEC-061
+///   form one passwordless-root class carried by a single weighted finding
+///   (R34-01) — multi-carrier hosts score lower, SEC-061-only hosts +5. Tag
+///   the release number when the version actually ships; do not backfill it
+///   here.
 /// v16 (0.5.39): SEC-061 (root-equivalent groups), SEC-062 (sshd
-/// replaceable targets), SEC-063 (authorized_keys environment=),
-/// SEC-064 (immutable trust anchors) — new weighted inputs, same
-/// rule as v15/R33-12.
+///   replaceable targets), SEC-063 (authorized_keys environment=),
+///   SEC-064 (immutable trust anchors) — new weighted inputs, same
+///   rule as v15/R33-12.
 /// v17 (unreleased): SEC-065 / SEC-066 — Docker published ports on wildcard
-/// bind addresses correlated with the host firewall state. New weighted
-/// inputs (20/25 non-sensitive, 35/25 sensitive). Same rule as v15/v16:
-/// pairs spanning this version are a collection-semantics change, not
-/// real drift. The version tag ships with the release that introduces it.
+///   bind addresses correlated with the host firewall state. New weighted
+///   inputs (20/25 non-sensitive, 35/25 sensitive). Same rule as v15/v16:
+///   pairs spanning this version are a collection-semantics change, not
+///   real drift. The version tag ships with the release that introduces it.
 /// v18 (unreleased): SEC-070…079 — account & credential hygiene. New
-/// weighted inputs; pairs spanning this version are a collection-semantics
-/// change, not real drift (R33-12 rule).
+///   weighted inputs; pairs spanning this version are a collection-semantics
+///   change, not real drift (R33-12 rule).
 /// v19 (unreleased): SEC-081 — systemd unit hardening posture. New weighted
-/// input, tiered by how many running services are below the baseline; pairs
-/// spanning this version are a collection-semantics change, not real drift
-/// (R33-12 rule).
+///   input, flat weight 5 regardless of how many running services are below
+///   the baseline; pairs spanning this version are a collection-semantics
+///   change, not real drift (R33-12 rule).
 pub const SCORING_VERSION: u8 = 19;
 
 // ── Helper: keep evidence strings readable and JSON compact ─
@@ -3003,30 +3003,27 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
     // ── SEC-081: systemd unit hardening posture ─────────────────────────
     //
     // Running services whose effective hardening directives are below the
-    // project baseline. Populated by `scanners::systemd_hardening`; weight
-    // is tiered by *how many* services are below baseline, not by the
-    // severity of the worst one — a host with 1 unhardened service and a
-    // host with 34 are different problems, and a flat "worst weight" cap
-    // would score both the same.
+    // project baseline. Populated by `scanners::systemd_hardening`.
     //
     // Not compromise-class: a service without `ProtectSystem=strict` is a
-    // privilege-escalation surface, not an exploited one. Weight is capped
-    // at 15 to keep this finding from dominating the security axis — the
-    // top-of-axis findings (firewall, SSH root, sudo NOPASSWD) are the
-    // ones that drive the verdict, and this is posture, not compromise.
+    // privilege-escalation surface, not an exploited one. Posture, not
+    // compromise. See the inline comment on `weight` for why the weight
+    // is flat rather than tiered by count.
     if !report.security.systemd_hardening.is_empty() {
         let n = report.security.systemd_hardening.len();
-        let weight = if n >= 11 {
-            15
-        } else if n >= 4 {
-            10
-        } else {
-            5
-        };
+        // Posture finding, not a risk driver. Every default distro host —
+        // Fedora Workstation, a stock Ubuntu server with Docker, a minimal
+        // VPS — has 10-30 vendor units whose .service files do not set
+        // NoNewPrivileges / ProtectSystem. Charging per-unit-count tiers
+        // scored all three the same anyway (all ≥ 11) and made the finding
+        // dominate the security axis for zero discrimination. Flat 5: the
+        // operator sees the count and the worst unit in the evidence, the
+        // score does not pretend 34 unhardened units are three times
+        // worse than 12.
+        let weight = 5u8;
         // `systemd_hardening` is sorted by raw_weight descending in the
         // scanner; worst is the first element. Missing directives of the
-        // worst unit drive the evidence string; the count of affected
-        // services drives the weight.
+        // worst unit drive the evidence string.
         let worst = &report.security.systemd_hardening[0];
         findings.push(Finding {
             id: "SEC-081",
@@ -5116,9 +5113,9 @@ mod tests {
         assert!(sec059.unwrap().suppressed.is_some());
     }
 
-    // ── SEC-081: systemd hardening tiers ───────────────────────────────
+    // ── SEC-081: systemd hardening ─────────────────────────────────────
     #[test]
-    fn sec081_weight_tiers_by_count() {
+    fn sec081_flat_weight_regardless_of_count() {
         use crate::models::HardeningFinding;
         let mk = |n: usize| -> Vec<HardeningFinding> {
             (0..n)
@@ -5133,47 +5130,22 @@ mod tests {
         };
         let mut r = minimal_report();
 
-        r.security.systemd_hardening = mk(1);
-        let f = evaluate(&r)
-            .into_iter()
-            .find(|f| f.id == "SEC-081")
-            .unwrap();
-        assert_eq!(f.weight, 5, "1-3 services → tier 5");
-
-        r.security.systemd_hardening = mk(3);
-        let f = evaluate(&r)
-            .into_iter()
-            .find(|f| f.id == "SEC-081")
-            .unwrap();
-        assert_eq!(f.weight, 5, "3 services → tier 5");
-
-        r.security.systemd_hardening = mk(4);
-        let f = evaluate(&r)
-            .into_iter()
-            .find(|f| f.id == "SEC-081")
-            .unwrap();
-        assert_eq!(f.weight, 10, "4 services → tier 10");
-
-        r.security.systemd_hardening = mk(10);
-        let f = evaluate(&r)
-            .into_iter()
-            .find(|f| f.id == "SEC-081")
-            .unwrap();
-        assert_eq!(f.weight, 10, "10 services → tier 10");
-
-        r.security.systemd_hardening = mk(11);
-        let f = evaluate(&r)
-            .into_iter()
-            .find(|f| f.id == "SEC-081")
-            .unwrap();
-        assert_eq!(f.weight, 15, "11+ services → tier 15");
-
-        r.security.systemd_hardening = mk(34);
-        let f = evaluate(&r)
-            .into_iter()
-            .find(|f| f.id == "SEC-081")
-            .unwrap();
-        assert_eq!(f.weight, 15, "34 services still tier 15 (no dominance)");
+        // Every count that a default host produces lands on the same weight.
+        for n in [1usize, 5, 12, 26, 34] {
+            r.security.systemd_hardening = mk(n);
+            let f = evaluate(&r)
+                .into_iter()
+                .find(|f| f.id == "SEC-081")
+                .expect("SEC-081 fires for any non-empty list");
+            assert_eq!(
+                f.weight, 5,
+                "SEC-081 is flat posture weight, not count-tiered (n={n})"
+            );
+            assert!(
+                f.evidence.contains(&format!("{n} running service(s)")),
+                "evidence still reports the actual count (n={n})"
+            );
+        }
 
         // Empty = no finding at all.
         r.security.systemd_hardening = Vec::new();
