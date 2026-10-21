@@ -1520,6 +1520,84 @@ pub fn compare_reports(before: &AgentReport, after: &AgentReport) -> DiffReport 
         }
     }
 
+    // ── security.systemd_hardening (SEC-081 drift) ─────────────────────
+    //
+    // SEC-081 is a flat-weight posture finding. The score does not move
+    // when the 34th unit appears below baseline; the drift does. That
+    // makes this the interesting signal: a new service falling below the
+    // baseline, or an existing one losing an additional directive, is
+    // what the operator needs to see. Tracking by unit name — not by
+    // count — catches the case where one unit is hardened and another
+    // regresses in the same window (34 → 34 with one swap).
+    //
+    // Direction follows R28-21 for inventory: absence from the below-
+    // baseline list means either the unit was hardened or the unit was
+    // removed, and the scanner does not distinguish. That is Changed,
+    // not Improved. Directive-level changes on a still-present unit are
+    // a direct observation of that unit's hardening state — gained
+    // directives are Degraded, lost directives are Improved.
+    {
+        use std::collections::{BTreeMap, BTreeSet};
+        let index = |r: &AgentReport| -> BTreeMap<String, BTreeSet<String>> {
+            r.security
+                .systemd_hardening
+                .iter()
+                .map(|h| (h.unit.clone(), h.missing.iter().cloned().collect()))
+                .collect()
+        };
+        let join = |set: &BTreeSet<String>| -> String {
+            if set.is_empty() {
+                "none".to_string()
+            } else {
+                set.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        let (b, a) = (index(before), index(after));
+
+        for (unit, now) in &a {
+            match b.get(unit) {
+                None => changes.push(Change {
+                    field: "security.systemd_hardening".into(),
+                    before: None,
+                    after: Some(format!("{unit} below baseline — missing {}", join(now))),
+                    severity: Severity::Degraded,
+                }),
+                Some(was) if was != now => {
+                    // Any directive newly missing outweighs any directive
+                    // that became present: the operator's default reading of
+                    // "changed hardening state" is "worse until proven
+                    // otherwise". A pure shrink is a genuine partial fix.
+                    let sev = if !now.is_subset(was) {
+                        Severity::Degraded
+                    } else {
+                        Severity::Improved
+                    };
+                    changes.push(Change {
+                        field: "security.systemd_hardening".into(),
+                        before: Some(format!("{unit} — missing {}", join(was))),
+                        after: Some(format!("{unit} — missing {}", join(now))),
+                        severity: sev,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        for (unit, was) in &b {
+            if !a.contains_key(unit) {
+                changes.push(Change {
+                    field: "security.systemd_hardening".into(),
+                    before: Some(format!("{unit} was below baseline — missing {}", join(was))),
+                    after: None,
+                    severity: Severity::Changed,
+                });
+            }
+        }
+    }
+
     // --- security.ftrace_hooks (SEC-041 drift) ---
     {
         let before_h: HashSet<&str> = before
@@ -2897,6 +2975,132 @@ mod tests {
                 .iter()
                 .any(|c| c.field == "security.mount_namespace_anomalies"),
             "a restart must not read as a new finding plus a removal"
+        );
+    }
+
+    // ── SEC-081 drift ───────────────────────────────────────────────────
+    fn hardening(unit: &str, missing: &[&str]) -> HardeningFinding {
+        HardeningFinding {
+            unit: unit.into(),
+            missing: missing.iter().map(|s| (*s).into()).collect(),
+            raw_weight: 10,
+            user: "root".into(),
+            fragment_path: format!("/etc/systemd/system/{unit}"),
+        }
+    }
+
+    #[test]
+    fn a_new_below_baseline_unit_is_drift() {
+        let before = test_report();
+        let mut after = test_report();
+        after.security.systemd_hardening = vec![hardening("svc.service", &["NoNewPrivileges"])];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.systemd_hardening")
+            .expect("new below-baseline unit must surface");
+        assert_eq!(c.severity, Severity::Degraded);
+        assert!(c.after.as_deref().unwrap().contains("svc.service"));
+        assert!(c.after.as_deref().unwrap().contains("NoNewPrivileges"));
+    }
+
+    #[test]
+    fn a_unit_leaving_the_below_baseline_list_is_changed_not_improved() {
+        // Absence means "hardened or removed" — scanner does not distinguish.
+        // Claiming improvement would manufacture a green entry out of a unit
+        // we can no longer see (same rule as R28-21 for containers).
+        let mut before = test_report();
+        before.security.systemd_hardening = vec![hardening("svc.service", &["NoNewPrivileges"])];
+        let after = test_report();
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.systemd_hardening")
+            .expect("removal from below-baseline list must surface");
+        assert_eq!(c.severity, Severity::Changed);
+        assert!(c.before.as_deref().unwrap().contains("svc.service"));
+    }
+
+    #[test]
+    fn an_additional_missing_directive_is_degraded() {
+        let mut before = test_report();
+        before.security.systemd_hardening = vec![hardening("svc.service", &["NoNewPrivileges"])];
+        let mut after = test_report();
+        after.security.systemd_hardening = vec![hardening(
+            "svc.service",
+            &["NoNewPrivileges", "ProtectSystem"],
+        )];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.systemd_hardening")
+            .expect("growing missing set must surface");
+        assert_eq!(c.severity, Severity::Degraded);
+        assert!(c.after.as_deref().unwrap().contains("ProtectSystem"));
+    }
+
+    #[test]
+    fn hardening_a_single_directive_is_improved() {
+        let mut before = test_report();
+        before.security.systemd_hardening = vec![hardening(
+            "svc.service",
+            &["NoNewPrivileges", "ProtectSystem"],
+        )];
+        let mut after = test_report();
+        after.security.systemd_hardening = vec![hardening("svc.service", &["NoNewPrivileges"])];
+
+        let c = compare_reports(&before, &after)
+            .changes
+            .into_iter()
+            .find(|c| c.field == "security.systemd_hardening")
+            .expect("shrinking missing set must surface");
+        assert_eq!(c.severity, Severity::Improved);
+        assert!(!c.after.as_deref().unwrap().contains("ProtectSystem"));
+    }
+
+    #[test]
+    fn a_one_for_one_swap_at_equal_count_is_drift() {
+        // The flat-weight SEC-081 makes 34 → 34 look static in the score.
+        // Unit-level diff is what keeps this observable.
+        let mut before = test_report();
+        before.security.systemd_hardening = vec![hardening("a.service", &["NoNewPrivileges"])];
+        let mut after = test_report();
+        after.security.systemd_hardening = vec![hardening("b.service", &["NoNewPrivileges"])];
+
+        let changes = compare_reports(&before, &after).changes;
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.field == "security.systemd_hardening"
+                    && c.severity == Severity::Degraded
+                    && c.after.as_deref().is_some_and(|s| s.contains("b.service"))),
+            "appearance must be Degraded"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.field == "security.systemd_hardening"
+                    && c.severity == Severity::Changed
+                    && c.before.as_deref().is_some_and(|s| s.contains("a.service"))),
+            "disappearance must be Changed"
+        );
+    }
+
+    #[test]
+    fn identical_systemd_hardening_state_is_not_drift() {
+        let mut before = test_report();
+        before.security.systemd_hardening = vec![hardening("a.service", &["NoNewPrivileges"])];
+        let after = before.clone();
+
+        assert!(
+            !compare_reports(&before, &after)
+                .changes
+                .iter()
+                .any(|c| c.field == "security.systemd_hardening"),
+            "identical below-baseline set must produce no drift"
         );
     }
 }
