@@ -238,6 +238,7 @@ pub fn render_dashboard(report: &AgentReport, verbose: bool, acceptances: Option
     render_ssl_certificates(report);
     render_shell_users(report);
     render_account_hygiene(report, &theme);
+    render_systemd_hardening(report, verbose, &theme);
     render_system_internals(report);
     render_packages(report);
     render_runtime(report);
@@ -1370,6 +1371,82 @@ fn render_account_hygiene(report: &AgentReport, theme: &Theme) {
         theme.warn_sm
     );
     outln!("{t}\n");
+}
+
+// ── SEC-081: systemd unit hardening posture ──────────────────────────────
+
+/// Running services whose effective hardening directives are below the
+/// project baseline. The scanner sorts by `raw_weight` descending; this
+/// function re-sorts defensively so display order does not depend on a
+/// scanner-side guarantee, then shows top-10 unless `-v`.
+///
+/// `raw_weight` is deliberately **not** displayed: it is a per-unit sum of
+/// directive weights, and showing 54 next to a finding whose score weight
+/// is 15 (the tier cap in `scoring.rs`) invites "why the discrepancy?".
+/// The column an operator can act on is `Missing`.
+fn render_systemd_hardening(report: &AgentReport, verbose: bool, theme: &Theme) {
+    let items = &report.security.systemd_hardening;
+    if items.is_empty() {
+        return;
+    }
+
+    let total = items.len();
+
+    let mut sorted: Vec<_> = items.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.raw_weight
+            .cmp(&a.raw_weight)
+            .then_with(|| a.unit.cmp(&b.unit))
+    });
+
+    const CAP: usize = 10;
+    let shown = if verbose {
+        sorted.len()
+    } else {
+        total.min(CAP)
+    };
+
+    let mut t = create_dynamic_table();
+    t.set_header(vec![
+        cell("Unit").add_attribute(Attribute::Bold).fg(Color::Cyan),
+        cell("User").add_attribute(Attribute::Bold),
+        cell("Missing").add_attribute(Attribute::Bold),
+    ]);
+
+    for f in sorted.iter().take(shown) {
+        // Row colour tracks missing-directive count: 6+ is red (a unit with
+        // almost no hardening), 3-5 yellow, else default. The exact
+        // thresholds match the "this is not a hardening gap, this is an
+        // unconfigured unit" intuition from a first audit pass.
+        let mut unit_cell = cell(&f.unit);
+        if f.missing.len() >= 6 {
+            unit_cell = unit_cell.fg(Color::Red).add_attribute(Attribute::Bold);
+        } else if f.missing.len() >= 3 {
+            unit_cell = unit_cell.fg(Color::Yellow);
+        }
+
+        let missing_joined = f.missing.join(", ");
+        t.add_row(vec![
+            unit_cell,
+            cell(&f.user),
+            cell(missing_joined).fg(Color::DarkGrey),
+        ]);
+    }
+
+    outln!(
+        "{}Systemd Hardening (SEC-081): {} service(s) below baseline",
+        theme.warn_sm,
+        total
+    );
+    outln!("{t}");
+    if total > shown {
+        outln!(
+            "    …and {} more — run with -v or see JSON export\n",
+            total - shown
+        );
+    } else {
+        outln!();
+    }
 }
 
 fn render_system_internals(report: &AgentReport) {
