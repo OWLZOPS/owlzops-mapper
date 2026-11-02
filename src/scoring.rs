@@ -62,15 +62,15 @@ const DLP_SHORT_LIVED_AGE_SECS: u64 = 300;
 ///   replaceable targets), SEC-063 (authorized_keys environment=),
 ///   SEC-064 (immutable trust anchors) — new weighted inputs, same
 ///   rule as v15/R33-12.
-/// v17 (unreleased): SEC-065 / SEC-066 — Docker published ports on wildcard
+/// v17 (0.5.40): SEC-065 / SEC-066 — Docker published ports on wildcard
 ///   bind addresses correlated with the host firewall state. New weighted
 ///   inputs (20/25 non-sensitive, 35/25 sensitive). Same rule as v15/v16:
 ///   pairs spanning this version are a collection-semantics change, not
 ///   real drift. The version tag ships with the release that introduces it.
-/// v18 (unreleased): SEC-070…079 — account & credential hygiene. New
+/// v18 (0.5.40): SEC-070…079 — account & credential hygiene. New
 ///   weighted inputs; pairs spanning this version are a collection-semantics
 ///   change, not real drift (R33-12 rule).
-/// v19 (unreleased): SEC-081 — systemd unit hardening posture. New weighted
+/// v19 (0.5.40): SEC-081 — systemd unit hardening posture. New weighted
 ///   input, flat weight 5 regardless of how many running services are below
 ///   the baseline; pairs spanning this version are a collection-semantics
 ///   change, not real drift (R33-12 rule).
