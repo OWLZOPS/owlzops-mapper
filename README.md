@@ -50,6 +50,9 @@ Built because running six different tools still left the question "is something 
 - **Container escapes** — `docker.sock` / Podman socket mounts, privileged containers, dangerous capabilities, missing resource limits
 - **Docker published ports bypassing the firewall** — container ports reachable from the network even when `ufw status` reports `active` (`SEC-065` / `SEC-066`, see below)
 - **Account & credential hygiene** — weak password hashes, empty password fields, duplicate UID 0, system accounts with a login shell, unsafe permissions on `/etc/shadow`, `~/.ssh/*`, `/etc/sudoers.d/*` (`SEC-070…079`, see below)
+<!-- SEC-081: new bullet -->
+- **systemd hardening posture** — running services that skip `NoNewPrivileges`, `ProtectSystem`, `ProtectHome` and the rest of the project baseline (`SEC-081`, see below)
+<!-- /SEC-081 -->
 - **Classic landmines** — SSH root login + password auth, `sudo NOPASSWD:ALL`, wide-open listeners, disabled firewall
 - **CIS-mapped findings** with evidence and penalty scores
 - **Drift** — snapshot → compare → colour-coded Excel or terminal diff
@@ -360,6 +363,69 @@ accepted with an `--accept` rule on SEC-072, not by silencing the check:
 ]
 ```
 
+<!-- SEC-081: new section -->
+### systemd hardening posture
+
+Running systemd units whose `.service` files do not set the project baseline
+hardening directives: `NoNewPrivileges`, `ProtectSystem`,
+`ProtectKernelTunables`, `ProtectKernelModules`, `ProtectHome`,
+`PrivateTmp`, `PrivateDevices`, `ProtectControlGroups`. The scanner reads
+the effective unit file for each running service and reports the ones below
+baseline, worst first:
+
+```
+⚠️ Systemd Hardening (SEC-081): 12 service(s) below baseline
+╭────────────────────┬──────┬──────────────────────────────────────────────────────────────────────────────────╮
+│ Unit               ┆ User ┆ Missing                                                                          │
+╞════════════════════╪══════╪══════════════════════════════════════════════════════════════════════════════════╡
+│ atd.service        ┆ root ┆ ProtectSystem, ProtectKernelTunables, ProtectKernelModules, PrivateTmp,          │
+│                    ┆      ┆ PrivateDevices, ProtectControlGroups                                             │
+│ containerd.service ┆ root ┆ ProtectSystem, ProtectKernelTunables, ProtectKernelModules, PrivateTmp, …        │
+│ cron.service       ┆ root ┆ ProtectSystem, ProtectKernelTunables, ProtectKernelModules, PrivateTmp, …        │
+│ docker.service     ┆ root ┆ ProtectSystem, ProtectKernelTunables, ProtectKernelModules, PrivateTmp, …        │
+╰────────────────────┴──────┴──────────────────────────────────────────────────────────────────────────────────╯
+    …and 8 more — run with -v or see JSON export
+```
+
+Weight is **flat `5`**, not tiered by count. Every default distro host has
+10–35 vendor units below baseline — Fedora Workstation, a stock Ubuntu
+server, a minimal VPS — and charging per-unit-count tiers scored all three
+the same anyway. The finding is posture, not compromise; the count and the
+worst unit are in the evidence so the operator can see the scope, but the
+score does not pretend 34 unhardened units are three times worse than 12.
+
+**Drift is where this finding earns its keep.** A flat weight means the
+score does not move when a new unit falls below baseline, or when one unit
+is hardened and another regresses in the same window. `compare` tracks the
+below-baseline set by **unit name**, not by count:
+
+- New unit below baseline → `Degraded`
+- Unit leaves the list → `Changed` — hardened *or* removed; the scanner
+  cannot distinguish, and a decommissioned service is not a security
+  improvement (same rule as containers, `R28-21`)
+- Missing set grew on the same unit → `Degraded`
+- Missing set shrank on the same unit → `Improved`
+
+A 34→34 swap with one unit hardened and one regressed shows as one
+`Changed` and one `Degraded`, not as "no change".
+
+Units whose target resolves to a runtime-provisioned path (LXD/Incus agent,
+cloud-init, dracut) are excluded: the target is placed on tmpfs by the
+runtime by design and the vendor has already accepted the hardening gap. A
+`.service` file whose `ExecStart` binary is placed on tmpfs at boot is not
+an operator-configurable hardening gap — it is the runtime's design.
+
+`--accept` works on SEC-081 like on any other posture finding:
+
+```json
+[
+  { "finding_id": "SEC-081", "host": "lab-*",
+    "justification": "development workstation, hardening deferred to image bake",
+    "expires": "2027-01-01", "ticket": "OPS-4242" }
+]
+```
+<!-- /SEC-081 -->
+
 ### Snapshot & drift
 
 ```bash
@@ -566,6 +632,9 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Root login with password (combo) | +5 |
 | Sudoers permissions not 0440 | +5 |
 | Sysctl security issues | +5 per issue (context-sensitive) |
+<!-- SEC-081: new penalty row -->
+| **SEC-081** – systemd unit hardening posture below baseline | **+5** (flat; count and worst unit in evidence) |
+<!-- /SEC-081 -->
 
 **Account & credential hygiene**
 
@@ -654,7 +723,7 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Category | Details |
 |----------|---------|
 | Malware & Intrusion | `/proc` sweep, memfd, deleted executables, reverse shells, library injection, hidden PIDs, bind-mount masking |
-| Security | SSH config, root login, password auth, sudo/NOPASSWD, sudoers permissions, sysctl, fail2ban/auditd, account & credential hygiene (SEC-070…079) |
+| Security | SSH config, root login, password auth, sudo/NOPASSWD, sudoers permissions, sysctl, fail2ban/auditd, account & credential hygiene (SEC-070…079), systemd unit hardening (SEC-081) |
 | Network | Listening ports + bind address, firewall state, DNS, TLS certificate expiry |
 | Docker / Podman | Privileged flag, capabilities, sensitive mounts, resource limits, OOM, health, socket exposure, published ports vs host firewall |
 | Kernel | Taint flags, hidden modules, ftrace syscall hooks, LSM confinement downgrade |
