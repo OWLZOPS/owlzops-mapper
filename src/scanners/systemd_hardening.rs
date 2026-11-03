@@ -14,11 +14,21 @@
 //! a coverage warning, not a false "clean" reading. The tool not being
 //! present, or `systemctl` failing to talk to the bus, is a fact about
 //! the host, not a hygiene finding.
+//!
+//! R37-01: every exec goes through `utils::run_child_with_timeout` —
+//! trusted path, env_clear + LC_ALL=C, setsid, capped stdout, registry,
+//! kill-before-reap. `show` is batched at `SHOW_BATCH` units per call;
+//! records are blank-line-separated and keyed by `Id`, so the original
+//! "FragmentPath mid-record" objection to batching no longer applies.
+//!
+//! R37-06: `systemd-*` and `user@*` are excluded only when `FragmentPath`
+//! is under a vendor directory. A persistence unit named
+//! `systemd-update.service` in `/etc/systemd/system` is an operator file
+//! and enters drift like any other.
 
 use crate::models::HardeningFinding;
 use crate::{coverage, utils};
-use std::collections::HashMap;
-use std::process::Command;
+use std::collections::{HashMap, HashSet};
 
 /// Directives we check and the weight each contributes when missing.
 ///
@@ -49,32 +59,38 @@ const DIRECTIVES: &[(&str, u8)] = &[
 /// even root inside the unit's namespace, which is exactly the point.
 const ROOT_IRRELEVANT: &[&str] = &["NoNewPrivileges", "ProtectHome"];
 
-/// `true` when the unit is systemd's own. Its hardening posture is the
-/// init system's decision, not the operator's, and the ones that matter
-/// on a real host (journald, logind, udevd, resolved) ship hardened on
-/// every distro we target. If an operator wants systemd-of-systemd
-/// hardening audited, that is a separate meta-task — the noise of
-/// flagging every `systemd-*.service` would drown the findings that
-/// actually belong to the host.
-fn is_systemd_internal(unit: &str) -> bool {
-    unit.starts_with("systemd-")
+/// One budget per `systemctl` call. sd-bus's own method-call timeout is
+/// 25 s; a wedged PID 1 must cost one budget per batch, not 25 s per unit.
+const SYSTEMCTL_TIMEOUT_SECS: u64 = 30;
+
+/// Units per `systemctl show` call — argv stays far below ARG_MAX.
+const SHOW_BATCH: usize = 256;
+
+/// Written only by the package manager. Provenance is WHERE the unit file
+/// lives; the name is whatever its author chose (R37-06).
+const VENDOR_UNIT_DIRS: &[&str] = &["/usr/lib/systemd/system/", "/lib/systemd/system/"];
+
+fn is_vendor_unit(fragment_path: &str) -> bool {
+    VENDOR_UNIT_DIRS
+        .iter()
+        .any(|d| fragment_path.starts_with(d))
 }
 
-/// `true` for units an operator does not configure and cannot usefully
-/// harden: transient units, per-user systemd managers, and D-Bus
-/// activation units. These are runtime artifacts, not service posture.
-///
-/// Transient units live in `/run/systemd/transient/` and are spawned and
-/// destroyed by D-Bus activation; `user@*.service` runs the per-user
-/// systemd instance, whose hardening boundary is the user's own session,
-/// not the host's; `dbus-:*` are the D-Bus activations themselves. All
-/// three produce findings an operator cannot act on, and 39-row walls in
-/// the dashboard are exactly what the project's "one noisy category must
-/// not hide a real problem" rule exists to prevent.
+/// R37-06: systemd's own unit = `systemd-*` name AND vendor location. A
+/// persistence unit named `systemd-update.service` in `/etc/systemd/system`
+/// is an operator file, not init-system internals, and enters drift.
+fn is_systemd_internal(unit: &str, fragment_path: &str) -> bool {
+    unit.starts_with("systemd-") && is_vendor_unit(fragment_path)
+}
+
+/// Transient units (D-Bus activations live in `/run/systemd/transient/` too)
+/// and instances of the vendor `user@.service` template only. An operator
+/// `user@backdoor.service` in `/etc/systemd/system` is a normal unit.
 fn is_runtime_artifact(unit: &str, fragment_path: &str) -> bool {
-    unit.starts_with("user@")
-        || unit.starts_with("dbus-:")
-        || fragment_path.starts_with("/run/systemd/transient/")
+    fragment_path.starts_with("/run/systemd/transient/")
+        || (unit.starts_with("user@")
+            && is_vendor_unit(fragment_path)
+            && fragment_path.ends_with("/user@.service"))
 }
 
 /// `true` when the effective value of `directive` shows the unit is *not*
@@ -103,7 +119,7 @@ fn is_unhardened(directive: &str, value: &str) -> bool {
     }
 }
 
-/// Parse `systemctl show` output — one `key=value` per line — into a
+/// Parse one `systemctl show` record — one `key=value` per line — into a
 /// map. Lines without `=` are ignored; systemd does not emit any, but
 /// refusing to panic on malformed output is cheaper than validating it.
 fn parse_show(stdout: &str) -> HashMap<String, String> {
@@ -114,36 +130,102 @@ fn parse_show(stdout: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// `systemctl show A B …`: one key=value block per unit, blank-line
+/// separated. Keyed by `Id`, so block order is irrelevant.
+fn parse_show_records(stdout: &str) -> Vec<HashMap<String, String>> {
+    stdout
+        .split("\n\n")
+        .map(parse_show)
+        .filter(|r| r.contains_key("Id"))
+        .collect()
+}
+
+/// Turn one unit's properties into a finding, or `None` when the unit is
+/// out of scope (vanished, inactive, systemd-internal, or runtime
+/// artifact) or already hardened.
+fn evaluate_unit(props: &HashMap<String, String>) -> Option<HardeningFinding> {
+    let get = |k: &str| props.get(k).map(String::as_str);
+    let unit = get("Id")?;
+
+    // Gone between list-units and show: systemctl still exits 0 and reports
+    // every directive at its unhardened default. Not posture.
+    if get("LoadState") == Some("not-found")
+        || matches!(get("ActiveState"), Some("inactive" | "failed"))
+    {
+        return None;
+    }
+
+    let fragment_path = get("FragmentPath").unwrap_or("");
+    if is_systemd_internal(unit, fragment_path) || is_runtime_artifact(unit, fragment_path) {
+        return None;
+    }
+
+    // DynamicUser= runs under a transient non-root uid even with User= empty.
+    let dynamic = get("DynamicUser") == Some("yes");
+    let user = get("User").unwrap_or("");
+    let is_root = !dynamic && (user.is_empty() || user == "root" || user == "0");
+
+    let mut missing = Vec::new();
+    let mut raw_weight: u16 = 0;
+    for (name, weight) in DIRECTIVES {
+        if is_root && ROOT_IRRELEVANT.contains(name) {
+            continue;
+        }
+        if get(name).is_none_or(|v| is_unhardened(name, v)) {
+            missing.push((*name).to_string());
+            raw_weight += u16::from(*weight);
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+
+    Some(HardeningFinding {
+        unit: unit.to_string(),
+        missing,
+        raw_weight: raw_weight.min(u16::from(u8::MAX)) as u8,
+        user: match (is_root, dynamic && user.is_empty()) {
+            (true, _) => "root".to_string(),
+            (false, true) => "dynamic".to_string(),
+            (false, false) => user.to_string(),
+        },
+        fragment_path: fragment_path.to_string(),
+    })
+}
+
 /// Main entry. Returns one finding per running unit whose effective
 /// hardening is weaker than the baseline. Coverage warnings, not
 /// findings, when `systemctl` is unavailable or fails.
 pub fn scan_systemd_hardening() -> Vec<HardeningFinding> {
     let mut out = Vec::new();
 
-    let Some(systemctl) = utils::resolve_tool("systemctl") else {
+    if utils::resolve_tool("systemctl").is_none() {
         coverage::record(
             "systemd hardening scan skipped: `systemctl` not resolvable \
              (missing, or on a path writable by a non-root principal)",
         );
         return out;
-    };
+    }
 
-    // `--plain` strips the ● markers, `--no-legend` drops the header.
-    // `--state=running` is what an auditor cares about: a stopped unit
-    // has no live attack surface, and counting it would make the finding
-    // swing on every reboot.
-    let list = match Command::new(&systemctl)
-        .args([
+    // R37-01: every exec goes through run_child_with_timeout — trusted path,
+    // env_clear + LC_ALL=C, setsid, capped stdout, registry, kill-before-reap.
+    // `--plain` strips the ● markers, `--no-legend` drops the header,
+    // `--state=running` is what an auditor cares about: a stopped unit has
+    // no live attack surface.
+    let list = match utils::run_child_with_timeout(
+        "systemctl",
+        &[
             "list-units",
             "--type=service",
             "--state=running",
             "--no-legend",
             "--plain",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        Ok(o) => {
+            "--no-pager",
+        ],
+        SYSTEMCTL_TIMEOUT_SECS,
+    ) {
+        Some(o) if o.status.success() => o.stdout,
+        Some(o) => {
             coverage::record(format!(
                 "systemd hardening scan: list-units failed (status {}): {}",
                 o.status,
@@ -151,20 +233,24 @@ pub fn scan_systemd_hardening() -> Vec<HardeningFinding> {
             ));
             return out;
         }
-        Err(e) => {
+        None => {
             coverage::record(format!(
-                "systemd hardening scan: list-units could not be spawned: {e}"
+                "systemd hardening scan: `systemctl list-units` did not finish within \
+                 {SYSTEMCTL_TIMEOUT_SECS}s or could not be spawned — SEC-081 NOT evaluated"
             ));
             return out;
         }
     };
 
     let list_stdout = String::from_utf8_lossy(&list);
+    // R37-06: the systemd-internal / runtime-artifact filters moved after
+    // `show` — `FragmentPath` is the provenance signal, and it only exists
+    // in the show output. Filtering by name here would hide a persistence
+    // unit that happens to start with `systemd-`.
     let units: Vec<&str> = list_stdout
         .lines()
         .filter_map(|l| l.split_whitespace().next())
         .filter(|u| u.ends_with(".service"))
-        .filter(|u| !is_systemd_internal(u))
         .collect();
 
     if units.is_empty() {
@@ -173,92 +259,43 @@ pub fn scan_systemd_hardening() -> Vec<HardeningFinding> {
         return out;
     }
 
-    // Query one unit at a time. Batching is possible — `systemctl show`
-    // accepts multiple names — but the output format places FragmentPath
-    // in alphabetical order somewhere in the middle of each record,
-    // forcing us to anchor on it as a delimiter. One call per unit is
-    // ~3 ms of overhead on the average host; correctness wins.
-    for unit in units {
-        let mut cmd = Command::new(&systemctl);
-        cmd.arg("show").arg(unit).arg("--no-pager");
-        cmd.arg("-p").arg("FragmentPath");
-        cmd.arg("-p").arg("User");
-        for (name, _) in DIRECTIVES {
-            cmd.arg("-p").arg(name);
-        }
+    // Every property `evaluate_unit` reads, in one string. `Id` is required
+    // for the record split; `LoadState`/`ActiveState` distinguish a unit
+    // that vanished between list-units and show; `DynamicUser` picks up
+    // transient non-root uids; `FragmentPath` is the provenance signal.
+    let prop_list = std::iter::once("Id,LoadState,ActiveState,FragmentPath,User,DynamicUser")
+        .chain(DIRECTIVES.iter().map(|(n, _)| *n))
+        .collect::<Vec<_>>()
+        .join(",");
 
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o.stdout,
-            Ok(_) => {
-                // A single unit disappearing between list-units and show
-                // is normal on a busy host — do not warn, do not skip the
-                // rest of the units.
-                continue;
-            }
-            Err(_) => {
-                // Spawn failure is a systemic problem (EACCES, ENOENT on
-                // the resolved path). Report once and stop: every
-                // remaining unit would produce the same error.
-                coverage::record(format!(
-                    "systemd hardening scan: `systemctl show {unit}` could not be spawned; \
-                     the rest of the unit list is skipped"
-                ));
-                return out;
-            }
+    let mut unanswered = 0usize;
+    for batch in units.chunks(SHOW_BATCH) {
+        let mut args = vec!["show", "--no-pager", "-p", prop_list.as_str()];
+        args.extend_from_slice(batch);
+        let Some(o) = utils::run_child_with_timeout("systemctl", &args, SYSTEMCTL_TIMEOUT_SECS)
+            .filter(|o| o.status.success())
+        else {
+            unanswered += batch.len();
+            continue;
         };
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let records = parse_show_records(&stdout);
+        let ids: HashSet<&str> = records
+            .iter()
+            .filter_map(|r| r.get("Id").map(String::as_str))
+            .collect();
+        unanswered += batch.iter().filter(|u| !ids.contains(*u)).count();
+        out.extend(records.iter().filter_map(evaluate_unit));
+    }
 
-        let stdout = String::from_utf8_lossy(&output);
-        let props = parse_show(&stdout);
-
-        let fragment_path = props.get("FragmentPath").cloned().unwrap_or_default();
-
-        // Runtime artifacts are skipped AFTER the show call, not before:
-        // `FragmentPath` is the canonical signal that a unit is transient,
-        // and it is not visible in `list-units --plain` output.
-        if is_runtime_artifact(unit, &fragment_path) {
-            continue;
-        }
-
-        // `systemctl show -p User` emits either a name ("root", "sssd")
-        // or the numeric uid ("0", "1000"). Both forms of root must land
-        // in the ROOT_IRRELEVANT filter — otherwise `user@0.service`
-        // and similar carry `NoNewPrivileges`/`ProtectHome` noise.
-        let user = props.get("User").map(String::as_str).unwrap_or("");
-        let is_root = user.is_empty() || user == "root" || user == "0";
-
-        let mut missing = Vec::new();
-        let mut raw_weight: u16 = 0;
-        for (name, weight) in DIRECTIVES {
-            if is_root && ROOT_IRRELEVANT.contains(name) {
-                continue;
-            }
-            // Missing key = systemd did not return the property. In
-            // practice `-p NAME` always yields a line; treating absence
-            // as unhardened is the defensive reading.
-            let unhardened = props.get(*name).is_none_or(|v| is_unhardened(name, v));
-            if unhardened {
-                missing.push((*name).to_string());
-                raw_weight += u16::from(*weight);
-            }
-        }
-
-        if missing.is_empty() {
-            continue;
-        }
-
-        out.push(HardeningFinding {
-            unit: unit.to_string(),
-            missing,
-            // 255-cap is a formality: the sum of DIRECTIVES weights is
-            // 59. Saturating cast keeps the type honest if the list grows.
-            raw_weight: raw_weight.min(u16::from(u8::MAX)) as u8,
-            user: if is_root {
-                "root".to_string()
-            } else {
-                user.to_string()
-            },
-            fragment_path,
-        });
+    // R37-01: a failed or timed-out show is a coverage fact, not a vanished
+    // unit. Without this, the SEC-081 list silently undercounts and the
+    // operator reads a clean finding for a host whose PID 1 was wedged.
+    if unanswered > 0 {
+        coverage::record(format!(
+            "systemd hardening scan: {unanswered} running service(s) returned no properties \
+             (systemctl failed or exceeded {SYSTEMCTL_TIMEOUT_SECS}s) — SEC-081 list is a LOWER BOUND"
+        ));
     }
 
     // Sort by weight descending, then by unit name for determinism.
@@ -278,24 +315,36 @@ pub fn scan_systemd_hardening() -> Vec<HardeningFinding> {
 mod tests {
     use super::*;
 
+    // R37-06: a unit is systemd-internal only when its name says so AND
+    // its file lives under a vendor directory. Masquerading units in
+    // /etc/systemd/system or /run/systemd/system are operator files.
     #[test]
-    fn systemd_internal_units_are_skipped() {
-        assert!(is_systemd_internal("systemd-journald.service"));
-        assert!(is_systemd_internal("systemd-resolved.service"));
-        assert!(is_systemd_internal("systemd-udevd.service"));
-        assert!(is_systemd_internal("systemd-analyze.service"));
-        assert!(!is_systemd_internal("nginx.service"));
-        assert!(!is_systemd_internal("ssh.service"));
-        // Prefix is anchored on `systemd-`: a name that merely contains
-        // the substring, or starts with `systemd` but not the dash, is
-        // not an internal unit.
-        assert!(!is_systemd_internal("systemd.service"));
-        assert!(!is_systemd_internal("mysystemd-agent.service"));
+    fn systemd_internal_needs_vendor_provenance() {
+        assert!(is_systemd_internal(
+            "systemd-journald.service",
+            "/usr/lib/systemd/system/systemd-journald.service"
+        ));
+        assert!(is_systemd_internal(
+            "systemd-resolved.service",
+            "/lib/systemd/system/systemd-resolved.service"
+        ));
+        assert!(!is_systemd_internal(
+            "systemd-update.service",
+            "/etc/systemd/system/systemd-update.service"
+        ));
+        assert!(!is_systemd_internal(
+            "systemd-update.service",
+            "/run/systemd/system/systemd-update.service"
+        ));
+        assert!(!is_systemd_internal(
+            "mysystemd-agent.service",
+            "/usr/lib/systemd/system/mysystemd-agent.service"
+        ));
     }
 
     #[test]
     fn runtime_artifacts_are_skipped() {
-        // Per-user systemd manager.
+        // Per-user systemd manager — vendor template only.
         assert!(is_runtime_artifact(
             "user@1000.service",
             "/usr/lib/systemd/system/user@.service"
@@ -304,7 +353,7 @@ mod tests {
             "user@0.service",
             "/usr/lib/systemd/system/user@.service"
         ));
-        // D-Bus activation, name form.
+        // D-Bus activation, transient path.
         assert!(is_runtime_artifact(
             "dbus-:1.12-org.freedesktop.problems@0.service",
             "/run/systemd/transient/dbus-:1.12-org.freedesktop.problems@0.service"
@@ -323,6 +372,20 @@ mod tests {
         assert!(!is_runtime_artifact(
             "sssd-kcm.service",
             "/usr/lib/systemd/system/sssd-kcm.service"
+        ));
+    }
+
+    // R37-06: an operator unit whose name matches the user@* pattern but
+    // whose file is not the vendor template is a normal unit.
+    #[test]
+    fn an_operator_unit_named_user_at_is_not_a_runtime_artifact() {
+        assert!(!is_runtime_artifact(
+            "user@backdoor.service",
+            "/etc/systemd/system/user@backdoor.service"
+        ));
+        assert!(!is_runtime_artifact(
+            "user@1000.service",
+            "/etc/systemd/system/user@1000.service"
         ));
     }
 
@@ -389,5 +452,21 @@ mod tests {
             "User=nginx\nsome garbage line\nFragmentPath=/etc/systemd/system/x.service\n",
         );
         assert_eq!(out.len(), 2);
+    }
+
+    // R37-01: batched `show` is split per unit; a unit gone between
+    // list-units and show (LoadState=not-found) is skipped, not reported
+    // as fully unhardened.
+    #[test]
+    fn batched_show_is_split_per_unit_and_vanished_units_are_skipped() {
+        let out = "Id=a.service\nLoadState=loaded\nActiveState=active\n\
+                   FragmentPath=/etc/systemd/system/a.service\nUser=\nNoNewPrivileges=no\n\n\
+                   Id=gone.service\nLoadState=not-found\nActiveState=inactive\nFragmentPath=\n";
+        let found: Vec<_> = parse_show_records(out)
+            .iter()
+            .filter_map(evaluate_unit)
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].unit, "a.service");
     }
 }
