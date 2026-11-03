@@ -2,9 +2,10 @@
 //! state (SEC-065 / SEC-066).
 //!
 //! Docker writes its own iptables rules when a container publishes a port
-//! on a wildcard address (`-p 8080:80`, i.e. `0.0.0.0:8080->80/tcp`). Those
-//! rules sit in the `DOCKER` chain, which is traversed *before* the
-//! `ufw-user-input` / `INPUT` chains that a host firewall manages.
+//! on any non-loopback host address — `-p 8080:80` (`0.0.0.0:8080->80/tcp`),
+//! `-p 203.0.113.5:6379:6379`, `-p 10.0.0.5:5432:5432`. Those rules sit in
+//! the `DOCKER` chain, which is traversed *before* the `ufw-user-input` /
+//! `INPUT` chains that a host firewall manages.
 //!
 //! The result: `ufw status` says `active`, `firewall_active: true` in the
 //! report, and a port that the operator believes is firewalled is reachable
@@ -12,6 +13,13 @@
 //! of how Docker integrates with the netfilter stack. But it is a gap
 //! between what the operator believes and what is true, and this scanner
 //! closes it.
+//!
+//! R37-05: the predicate is "not loopback", not "wildcard". Docker DNATs a
+//! publish on a *specific* host address exactly like `0.0.0.0` — the
+//! previous wildcard-only filter let `-p 203.0.113.5:6379:6379` (Redis on
+//! a public IP) through with the firewall showing green. The shared
+//! `crate::utils::is_loopback_bind` is the only exclusion; the local
+//! duplicate `is_wildcard_bind` collapsed into `is_network_reachable_bind`.
 //!
 //! Two outcomes, distinguished by `firewall_active`:
 //!
@@ -26,9 +34,9 @@
 
 use crate::models::{ContainerInfo, FirewallBypassFinding};
 
-/// Ports where a wildcard publish is materially worse than a loopback one.
-/// Not an exhaustive "dangerous port" list — a curated set that catches the
-/// services people actually forget to lock down. `80` and `443` are
+/// Ports where a non-loopback publish is materially worse than a loopback
+/// one. Not an exhaustive "dangerous port" list — a curated set that catches
+/// the services people actually forget to lock down. `80` and `443` are
 /// deliberately absent: publishing a reverse proxy on `0.0.0.0` is the
 /// intended pattern, and flagging it would drown the signal.
 const SENSITIVE_PORTS: &[u16] = &[
@@ -98,11 +106,17 @@ fn parse_binding(s: &str) -> Option<ParsedBinding> {
     })
 }
 
-/// A binding is "wildcard" when it is reachable from off-host. `0.0.0.0`
-/// and `[::]` (unspecified addresses) bind every interface; loopback and
-/// link-local are not exposed.
-fn is_wildcard_bind(addr: &str) -> bool {
-    matches!(addr, "0.0.0.0" | "[::]" | "::" | "[::0]")
+/// R37-05: off-host reachable = anything but loopback. Docker DNATs a
+/// publish on ANY host address ahead of ufw/firewalld — `0.0.0.0`, `[::]`,
+/// `203.0.113.5`, `10.0.0.5`. Delegates to the crate-wide
+/// `is_loopback_bind` after stripping the brackets `docker ps` puts around
+/// IPv6, so there is one predicate with one name across the codebase.
+fn is_network_reachable_bind(addr: &str) -> bool {
+    let bare = addr
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(addr);
+    !crate::utils::is_loopback_bind(bare)
 }
 
 /// Compute the list of bypass findings. Called from `run_local_scan_async`
@@ -127,7 +141,9 @@ pub fn detect_firewall_bypass(
                 let Some(p) = parse_binding(binding) else {
                     continue;
                 };
-                if !is_wildcard_bind(&p.bind_address) {
+                // R37-05: a publish on a specific non-loopback host address
+                // bypasses the firewall exactly like a wildcard publish.
+                if !is_network_reachable_bind(&p.bind_address) {
                     continue;
                 }
                 findings.push(FirewallBypassFinding {
@@ -180,14 +196,16 @@ mod tests {
         let p = parse_binding("[::]:8080->80/tcp").expect("parses");
         assert_eq!(p.bind_address, "[::]");
         assert_eq!(p.host_port, 8080);
-        assert!(is_wildcard_bind(&p.bind_address));
+        // R37-05: `[::]` strips to `::`, which is not loopback.
+        assert!(is_network_reachable_bind(&p.bind_address));
     }
 
     #[test]
     fn parses_ipv6_loopback_binding() {
         let p = parse_binding("[::1]:8080->80/tcp").expect("parses");
         assert_eq!(p.bind_address, "[::1]");
-        assert!(!is_wildcard_bind(&p.bind_address));
+        // R37-05: `[::1]` strips to `::1`, which IS loopback.
+        assert!(!is_network_reachable_bind(&p.bind_address));
     }
 
     #[test]
@@ -260,5 +278,25 @@ mod tests {
         )];
         let findings = detect_firewall_bypass(&containers, true);
         assert!(findings.is_empty());
+    }
+
+    // R37-05: a publish on a specific host address bypasses the firewall
+    // exactly like `0.0.0.0`. Loopback is the only exclusion.
+    #[test]
+    fn a_specific_host_address_publish_is_a_bypass() {
+        let containers = vec![make_container(
+            "db",
+            "running",
+            &[
+                "203.0.113.5:6379->6379/tcp",
+                "10.0.0.5:5432->5432/tcp",
+                "127.0.0.1:8080->80/tcp",
+            ],
+        )];
+        let ports: Vec<u16> = detect_firewall_bypass(&containers, true)
+            .iter()
+            .map(|f| f.host_port)
+            .collect();
+        assert_eq!(ports, vec![6379, 5432], "loopback is the only exclusion");
     }
 }
