@@ -332,6 +332,13 @@ fn missing_of(hosts: &[String], ok: &HashSet<String>) -> Vec<String> {
     hosts.iter().filter(|h| !ok.contains(*h)).cloned().collect()
 }
 
+/// R37-04: `needs_newline` — the file is non-empty and its last byte is not
+/// '\n' (forced exit). Appending without the separator fuses two records.
+struct ResumeState {
+    done: HashSet<String>,
+    needs_newline: bool,
+}
+
 /// M4: stream the existing JSONL once — credit each record's input address
 /// and feed it to the aggregator, then drop it (O(1) memory).
 ///
@@ -340,35 +347,58 @@ fn missing_of(hosts: &[String], ok: &HashSet<String>) -> Vec<String> {
 /// back as a "missing host" at the end of the run, or — worse — as a second
 /// scan of the same host appended below the first, silently double-counting
 /// it.
-fn resume_scan(
-    path: &std::path::Path,
-    agg: &mut OutcomeBuilder,
-) -> Result<HashSet<String>, String> {
+///
+/// R37-04: a torn tail (record without a trailing newline) is refused with
+/// the exact `truncate -s` offset to drop it, because appending to a torn
+/// record would fuse two JSON objects into one line and the next
+/// `compare`/`--resume` would reject the whole file (R26-05).
+fn resume_scan(path: &std::path::Path, agg: &mut OutcomeBuilder) -> Result<ResumeState, String> {
     use std::io::{BufRead, BufReader};
     let file = crate::safe_io::open_regular_streaming(&path.to_string_lossy())
         .map_err(|e| format!("--resume: cannot open {}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
     let mut done = HashSet::new();
-    for (n, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|e| format!("--resume: read error at line {}: {e}", n + 1))?;
-        if line.trim().is_empty() {
+    let mut line = String::new();
+    let (mut n, mut offset, mut terminated) = (0usize, 0u64, true);
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("--resume: read error at line {}: {e}", n + 1))?;
+        if read == 0 {
+            break;
+        }
+        n += 1;
+        let start = offset;
+        offset += read as u64;
+        terminated = line.ends_with('\n');
+        let rec = line.trim();
+        if rec.is_empty() {
             continue;
         }
-        let report: AgentReport = serde_json::from_str(&line).map_err(|e| {
-            format!(
-                "--resume: line {} is not a valid record ({e}) — refusing",
-                n + 1
-            )
+        let report: AgentReport = serde_json::from_str(rec).map_err(|e| {
+            if terminated {
+                format!("--resume: line {n} is not a valid record ({e}) — refusing")
+            } else {
+                format!(
+                    "--resume: last record (line {n}) is torn — the previous run was killed \
+                     mid-write. `truncate -s {start} {}` drops it; that host is then re-scanned",
+                    path.display()
+                )
+            }
         })?;
         let Some(addr) = report.input_address.clone() else {
             return Err(format!(
-                "--resume: line {} has no input_address (written by an older version) — refusing",
-                n + 1
+                "--resume: line {n} has no input_address (written by an older version) — refusing"
             ));
         };
         agg.add(&report);
         done.insert(addr);
     }
-    Ok(done)
+    Ok(ResumeState {
+        done,
+        needs_newline: offset > 0 && !terminated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -963,7 +993,12 @@ async fn run_command(
                 // M4: --resume credits every host already recorded in --output
                 // and skips re-spawning them. Runs before the file is opened:
                 // resume_scan reads the same path we are about to append to.
+                //
+                // R37-04: `resume_needs_newline` is carried past resume_scan so
+                // the append path can terminate a torn tail from a forced exit
+                // before writing the first new record.
                 let mut resumed: HashSet<String> = HashSet::new();
+                let mut resume_needs_newline = false;
                 if args.resume {
                     if !use_streaming {
                         eprintln!("Error: --resume requires --format json --output <file.jsonl>");
@@ -973,7 +1008,10 @@ async fn run_command(
                         std::path::Path::new(args.output.as_deref().unwrap_or("report.jsonl"));
                     if path.exists() {
                         match resume_scan(path, &mut agg) {
-                            Ok(done) => resumed = done,
+                            Ok(st) => {
+                                resume_needs_newline = st.needs_newline;
+                                resumed = st.done;
+                            }
                             Err(e) => {
                                 eprintln!("{e}");
                                 return EXIT_USAGE;
@@ -1001,7 +1039,19 @@ async fn run_command(
                         oo.truncate(true);
                     }
                     match oo.open(target) {
-                        Ok(f) => Some(f),
+                        Ok(mut f) => {
+                            // R37-04: terminate the previous run's last record
+                            // before appending. `writeln!` in the writer issued
+                            // two write_all's — a record ≥ BufWriter capacity hit
+                            // the disk while the trailing '\n' stayed buffered,
+                            // so a forced exit left an unterminated line and the
+                            // next append fused two JSON objects into one.
+                            if resume_needs_newline && let Err(e) = f.write_all(b"\n") {
+                                eprintln!("Cannot terminate the last record of {target}: {e}");
+                                return EXIT_DEGRADED;
+                            }
+                            Some(f)
+                        }
                         Err(e) => {
                             eprintln!("Cannot create output file: {e}");
                             return EXIT_DEGRADED;
@@ -1016,24 +1066,40 @@ async fn run_command(
                         use std::io::Write;
                         let mut file = std::io::BufWriter::new(file);
                         let mut rx = rx;
-                        let mut written = 0usize;
-                        let mut io_errors = 0usize;
+                        let (mut written, mut io_errors) = (0usize, 0usize);
+                        // R37-04: one write_all per record, newline included.
+                        // `writeln!` issued two; a record ≥ BufWriter capacity
+                        // hit the disk while "\n" stayed buffered, so every
+                        // forced exit left an unterminated last line.
+                        let mut line: Vec<u8> = Vec::with_capacity(64 * 1024);
+                        // After a failed write the tail may be a torn record;
+                        // anything appended would fuse onto it. Keep draining,
+                        // count the rest as lost.
+                        let mut poisoned = false;
                         while let Some(report) = rx.blocking_recv() {
-                            match serde_json::to_string(&report) {
-                                Ok(json) => match writeln!(file, "{json}") {
-                                    Ok(()) => written += 1,
-                                    Err(e) => {
-                                        io_errors += 1;
-                                        warn!(error = %e, "JSONL write failed — report lost");
-                                    }
-                                },
+                            if poisoned {
+                                io_errors += 1;
+                                continue;
+                            }
+                            line.clear();
+                            // Serialize fully BEFORE touching the file: a serde
+                            // error never leaves a partial record.
+                            if let Err(e) = serde_json::to_writer(&mut line, &report) {
+                                io_errors += 1;
+                                warn!(error = %e, "report could not be serialized — dropped from JSONL");
+                                continue;
+                            }
+                            line.push(b'\n');
+                            match file.write_all(&line) {
+                                Ok(()) => written += 1,
                                 Err(e) => {
                                     io_errors += 1;
-                                    warn!(error = %e, "report could not be serialized — dropped from JSONL");
+                                    poisoned = true;
+                                    warn!(error = %e, "JSONL write failed — output poisoned, remaining records counted as lost");
                                 }
                             }
                         }
-                        if let Err(e) = file.flush() {
+                        if !poisoned && let Err(e) = file.flush() {
                             io_errors += 1;
                             warn!(error = %e, "JSONL flush failed — tail records may be lost");
                         }
@@ -2475,6 +2541,7 @@ mod tests {
 
     // ── M4: --resume ────────────────────────────────────────────
 
+    // R37-04: resume_scan returns ResumeState { done, needs_newline }.
     #[test]
     fn resume_credits_recorded_hosts_and_refuses_legacy_records() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2485,8 +2552,9 @@ mod tests {
         legacy.input_address = None;
         std::fs::write(&p, format!("{}\n", serde_json::to_string(&r).unwrap())).unwrap();
         let mut agg = OutcomeBuilder::default();
-        let done = resume_scan(&p, &mut agg).unwrap();
-        assert!(done.contains("10.0.0.1"));
+        let st = resume_scan(&p, &mut agg).unwrap();
+        assert!(st.done.contains("10.0.0.1"));
+        assert!(!st.needs_newline, "trailing newline terminates the tail");
         assert_eq!(
             agg.reports_seen, 1,
             "resumed records count toward hosts_missing accounting"
@@ -2494,5 +2562,32 @@ mod tests {
 
         std::fs::write(&p, format!("{}\n", serde_json::to_string(&legacy).unwrap())).unwrap();
         assert!(resume_scan(&p, &mut OutcomeBuilder::default()).is_err());
+    }
+
+    // R37-04: a complete record without a trailing newline (forced exit
+    // between the record body and the '\n' write) is valid and must be
+    // flagged `needs_newline`. A partial record with no newline is torn and
+    // refused with the exact truncate offset.
+    #[test]
+    fn resume_flags_an_unterminated_tail_and_refuses_a_torn_one() {
+        use std::io::Write as _;
+        let mut r = minimal_report();
+        r.input_address = Some("h1".into());
+        let rec = serde_json::to_string(&r).unwrap();
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{rec}").unwrap(); // forced-exit shape: complete, no '\n'
+        let st = resume_scan(f.path(), &mut OutcomeBuilder::default()).unwrap();
+        assert!(st.done.contains("h1") && st.needs_newline);
+
+        let mut g = tempfile::NamedTempFile::new().unwrap();
+        write!(g, "{rec}\n{}", &rec[..rec.len() / 2]).unwrap();
+        let err = resume_scan(g.path(), &mut OutcomeBuilder::default())
+            .err()
+            .unwrap();
+        assert!(
+            err.contains(&format!("truncate -s {}", rec.len() + 1)),
+            "{err}"
+        );
     }
 }
