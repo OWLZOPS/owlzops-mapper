@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.5.40] - 2026-11-04
+
+
+### "fix
+
+- **security:** SEC-081 hardened exec + provenance-based exclusion (R37-01, R37-06)
+
+### Bug Fixes
+
+- **ui:** Force emoji presentation for shield/gear/warn icons (VS16)
+- **accept:** Count only policy-accepted findings in dashboard
+- **scanner:** SEC-073 excludes UID 0
+- **scanner:** SEC-081 skip runtime artifacts, recognise numeric root
+- **deps:** Bump wnaf 0.14.0 → 0.14.1 (yanked upstream)
+- **deps:** Bump rust_xlsxwriter 0.99.1 → 0.101.0 (zip 8.6.0 → 9.x)
+- **deps:** Commit Cargo.lock after rust_xlsxwriter 0.101 bump
+- **scoring:** SEC-081 flat weight 5, drop count tiers
+- **deps:** Resolve yanked crypto-bigint and tokio in lockfile
+- **security:** Passwd pw field, shell denylist, key checks for every account
+- **scoring:** SEC-065/066 evidence says what the check does (R37-05)
+- **fleet:** --resume terminates torn JSONL tail before append (R37-04)
+
+### Build System
+
+- **deps:** Bump thiserror from 2.0.20 to 2.0.21 (#321)
+- **deps:** Bump taiki-e/install-action from 2.87.20 to 2.87.22 (#323)
+- **deps:** Bump libc from 0.2.189 to 0.2.190 (#322)
+- **deps:** Bump pageant from 0.2.1 to 0.2.4 (#324)
+- **deps:** Bump actions/download-artifact from 8.0.1 to 8.0.2 (#330)
+- **deps:** Bump uuid from 1.26.1 to 1.28.0 (#334)
+- **deps:** Bump serde_json from 1.0.151 to 1.0.152 (#332)
+- **deps:** Bump dtolnay/rust-toolchain
+- **deps:** Bump taiki-e/install-action from 2.87.22 to 2.87.27
+- **deps:** Bump actions/upload-artifact from 7.0.1 to 7.0.2
+- **deps:** Bump russh from 0.63.3 to 0.65.0 (#346)
+- **deps:** Bump pageant from 0.2.4 to 0.2.5 (#347)
+- **deps:** Bump uuid from 1.28.0 to 1.29.0 (#350)
+- **deps:** Bump rust_xlsxwriter from 0.101.0 to 0.102.0 (#348)
+- **deps:** Bump taiki-e/install-action from 2.87.27 to 2.88.1 (#349)
+
+### Documentation
+
+- Deployment notes for /usr/local tool resolution
+- **readme:** Document --accept policy overlay
+- **readme:** Document SEC-065 / SEC-066 Docker firewall bypass
+- **readme:** Document SEC-081 systemd hardening posture
+- **readme:** SEC-081 provenance exclusion, SEC-065/066 non-loopback (R37-13, R37-05)
+
+### Features
+
+- **ssh:** --retries with backoff/jitter and a single scan_remote_host (M3)
+- **ssh:** --ssh-agent for hardware-backed keys (M2)
+- **audit:** --resume for idempotent fleet re-runs (M4)
+- **accept:** M5 --accept accept.json policy overlay
+- **hosts:** M7 --hosts-from-ssh-config selects hosts from ~/.ssh/config
+- **compare:** M6 --baseline and --fail-on-drift
+- **scanner:** SEC-065 / SEC-066 Docker ports bypass host firewall
+- **scanner:** SEC-070…079 account & credential hygiene
+- **scanner:** SEC-081 systemd unit hardening — scanner and model
+- **scoring,ui:** SEC-081 systemd hardening scoring and dashboard
+- **compare:** SEC-081 unit-level hardening drift
+
+### Miscellaneous
+
+- **scoring:** Tag v17/v18/v19 as released in 0.5.40
+
+### Testing
+
+- **coverage:** Thread-local capture sink for scanner unit tests (M8)
+- **scanners:** Proc_root fixtures for dlp and proc_net
+
+### ix
+
+- **security:** Passwd pw field, shell denylist, key checks for every account
+
 ## [0.5.39] - 2026-10-01
 
 
