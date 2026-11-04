@@ -50,9 +50,7 @@ Built because running six different tools still left the question "is something 
 - **Container escapes** — `docker.sock` / Podman socket mounts, privileged containers, dangerous capabilities, missing resource limits
 - **Docker published ports bypassing the firewall** — container ports reachable from the network even when `ufw status` reports `active` (`SEC-065` / `SEC-066`, see below)
 - **Account & credential hygiene** — weak password hashes, empty password fields, duplicate UID 0, system accounts with a login shell, unsafe permissions on `/etc/shadow`, `~/.ssh/*`, `/etc/sudoers.d/*` (`SEC-070…079`, see below)
-<!-- SEC-081: new bullet -->
 - **systemd hardening posture** — running services that skip `NoNewPrivileges`, `ProtectSystem`, `ProtectHome` and the rest of the project baseline (`SEC-081`, see below)
-<!-- /SEC-081 -->
 - **Classic landmines** — SSH root login + password auth, `sudo NOPASSWD:ALL`, wide-open listeners, disabled firewall
 - **CIS-mapped findings** with evidence and penalty scores
 - **Drift** — snapshot → compare → colour-coded Excel or terminal diff
@@ -261,8 +259,10 @@ before — this flag never changes behaviour on its own.
 chain, which the kernel traverses **before** the `INPUT` chain that ufw /
 firewalld manage. On a host where `ufw status` reports `active`, the
 container's published port is still reachable from the network — the
-firewall says `on`, the port is open. The scanner surfaces this contradiction
-directly, next to the containers table:
+firewall says `on`, the port is open. The same is true for a publish on a
+specific host address (`-p 203.0.113.5:6379:6379`): Docker DNATs it exactly
+like `-p 6379:6379`, ahead of the firewall. The scanner surfaces this
+contradiction directly, next to the containers table:
 
 ```
 ⚠️ Docker published ports bypassing the host firewall (SEC-065 / SEC-066):
@@ -290,10 +290,13 @@ remediation differs:
 | **SEC-065** | Host firewall active, Docker bypasses it | +20 (35 for a database / cache / admin port) | Loopback bind, `daemon.json` override, or a `DOCKER-USER` rule |
 | **SEC-066** | No host firewall, port exposed because nothing protects it | +15 (25 for a sensitive port) | Enable a firewall |
 
-Loopback bindings (`127.0.0.1:*`, `[::1]:*`) are excluded: they are already
-unreachable from the network. The firewall state is read from the same flag
-that drives `network.firewall_active`; the finding is a cross-reference of
-`topology.containers` and the network scanner, not a new scan.
+Loopback bindings (`127.0.0.1:*`, `[::1]:*`) are the only exclusion: they are
+already unreachable from the network. A publish on **any** non-loopback host
+address — `0.0.0.0`, `[::]`, a specific public IP, a LAN IP — bypasses the
+firewall the same way and fires the finding. The firewall state is read from
+the same flag that drives `network.firewall_active`; the finding is a
+cross-reference of `topology.containers` and the network scanner, not a new
+scan.
 
 If the publish is intentional — a reverse proxy on 80/443, for example —
 the finding is accepted with an `--accept` rule rather than silenced by the
@@ -349,8 +352,9 @@ active compromise. The scanner never escalates them to exit code 3.
 
 Non-root scans: `/etc/shadow` is unreadable, which is recorded as a
 coverage warning and *not* counted as "no weak hashes". The permission
-and SSH key checks still run — `stat()` does not require the file to be
-readable.
+and SSH key checks still run — `stat()` needs `x` on every parent
+directory, so a `0700` home or NFS `root_squash` produces a coverage
+warning, not a false "clean".
 
 A legitimate second root (BSD-style `toor`, or a break-glass account) is
 accepted with an `--accept` rule on SEC-072, not by silencing the check:
@@ -363,14 +367,14 @@ accepted with an `--accept` rule on SEC-072, not by silencing the check:
 ]
 ```
 
-<!-- SEC-081: new section -->
 ### systemd hardening posture
 
-Running systemd units whose `.service` files do not set the project baseline
-hardening directives: `NoNewPrivileges`, `ProtectSystem`,
-`ProtectKernelTunables`, `ProtectKernelModules`, `ProtectHome`,
-`PrivateTmp`, `PrivateDevices`, `ProtectControlGroups`. The scanner reads
-the effective unit file for each running service and reports the ones below
+Running systemd units whose effective hardening is below the project
+baseline: `NoNewPrivileges`, `ProtectSystem`, `ProtectKernelTunables`,
+`ProtectKernelModules`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`,
+`ProtectControlGroups`, `RestrictAddressFamilies`. The scanner reads the
+**effective** value from `systemctl show` — drop-in overrides, instance
+templates and vendor defaults are all resolved — and reports the units below
 baseline, worst first:
 
 ```
@@ -409,11 +413,16 @@ below-baseline set by **unit name**, not by count:
 A 34→34 swap with one unit hardened and one regressed shows as one
 `Changed` and one `Degraded`, not as "no change".
 
-Units whose target resolves to a runtime-provisioned path (LXD/Incus agent,
-cloud-init, dracut) are excluded: the target is placed on tmpfs by the
-runtime by design and the vendor has already accepted the hardening gap. A
-`.service` file whose `ExecStart` binary is placed on tmpfs at boot is not
-an operator-configurable hardening gap — it is the runtime's design.
+Exclusion is by **provenance**, not by name. systemd's own units
+(`systemd-*.service`) and per-user managers (`user@*.service`) are skipped
+only when the `.service` file lives under a vendor directory
+(`/usr/lib/systemd/system/` or `/lib/systemd/system/`). A persistence unit
+named `systemd-update.service` in `/etc/systemd/system/` is an operator
+file — its hardening posture is the operator's responsibility, and it
+enters drift like any other unit. Transient units under
+`/run/systemd/transient/` are skipped as runtime artifacts: they are
+created and destroyed by D-Bus activation and are not operator-configurable
+posture.
 
 `--accept` works on SEC-081 like on any other posture finding:
 
@@ -424,7 +433,6 @@ an operator-configurable hardening gap — it is the runtime's design.
     "expires": "2027-01-01", "ticket": "OPS-4242" }
 ]
 ```
-<!-- /SEC-081 -->
 
 ### Snapshot & drift
 
@@ -632,9 +640,7 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Root login with password (combo) | +5 |
 | Sudoers permissions not 0440 | +5 |
 | Sysctl security issues | +5 per issue (context-sensitive) |
-<!-- SEC-081: new penalty row -->
 | **SEC-081** – systemd unit hardening posture below baseline | **+5** (flat; count and worst unit in evidence) |
-<!-- /SEC-081 -->
 
 **Account & credential hygiene**
 
@@ -663,8 +669,8 @@ Weights are published so you can argue with them. If a penalty looks wrong for y
 | Containers in restart loop | +5 |
 | Containers without memory limits | +5 |
 | Containers without CPU limits | +3 |
-| **SEC-065** – Docker published port on wildcard bind, firewall active | **+20** (+35 for a database / cache / admin port) |
-| **SEC-066** – Docker published port on wildcard bind, no host firewall | **+15** (+25 for a sensitive port) |
+| **SEC-065** – Docker published port on a non-loopback host address, firewall active | **+20** (+35 for a database / cache / admin port) |
+| **SEC-066** – Docker published port on a non-loopback host address, no host firewall | **+15** (+25 for a sensitive port) |
 
 **Active compromise (IoC)** — these escalate to exit code 3
 

@@ -2757,7 +2757,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 category: Category::Security,
                 weight,
                 evidence: format!(
-                    "{} port(s) published on a wildcard bind while the host firewall is \
+                    "{} port(s) published on a non-loopback host address while the host firewall is \
                      active. Docker writes iptables rules that precede the INPUT chain, \
                      so the firewall does not filter these ports: {}",
                     bypass_active.len(),
@@ -2777,7 +2777,7 @@ pub fn evaluate(report: &AgentReport) -> Vec<Finding> {
                 category: Category::Security,
                 weight,
                 evidence: format!(
-                    "{} port(s) published on a wildcard bind on a host with no active \
+                    "{} port(s) published on a non-loopback host address on a host with no active \
                      firewall — reachable from the network: {}",
                     exposed_no_fw.len(),
                     evidence_list(&exposed_no_fw, 8)
